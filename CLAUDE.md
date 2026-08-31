@@ -18,8 +18,9 @@ When the user attaches a PDF, provides a file path, or asks to review a paper:
 ## How the pipeline expects you to drive it
 
 `review` runs every deterministic stage and stops **once**, when the four lens results are
-missing. That pause is the only manual step and it is unavoidable: S2 needs judgement, and
-you are the judge — there is no subprocess to delegate it to.
+missing. That pause is the only manual step, and by default it is unavoidable: S2 needs
+judgement, and you are the judge — the harness holds no API key and has no model of its
+own to call.
 
 ```
 python run.py review --paper papers/x.pdf     # exit 2 → audits pending
@@ -29,6 +30,28 @@ python run.py review --paper <pid>            # exit 0 → prints the report
 
 Exit codes: `0` complete · `2` waiting on audits · `1` error.
 Always run on Windows with `PYTHONUTF8=1` — paper text is full of em dashes and math.
+
+**Batching, and the one way the pause can be skipped.**
+
+```
+python run.py review-suite papers/A.pdf papers/B.pdf papers/C.pdf
+python run.py dossier acl iclr cvpr            # consolidate finished reports only
+```
+
+`review-suite` runs the whole pipeline over many papers and collects every pending audit
+into ONE report at the end, so the judgement happens once per batch rather than once per
+paper, and then writes `reports/Executive_Review_Dossier.{md,pdf}`. Its exit code follows
+the same convention as `review`: `0` all complete, `2` something still awaits audits, `1`
+a paper errored.
+
+`--auto-audit` delegates S2 to an external reviewer instead of stopping. It is gated on
+`SH_ALLOW_AUTO_AUDIT=1` **and** an `SH_AUDIT_CMD` template containing `{prompt}` and
+`{out}`; with either missing it declines and falls back to the normal pause. This does not
+make S2 automatic — it makes the delegation explicit. Every lens filled this way leaves
+`audit/<lens>.driver.json` naming the command that wrote it, and the findings go through
+exactly the same quote re-verification as a human's: a delegated lens that invents evidence
+has it dropped and the count printed, which is verified by running a deliberately
+fabricating stub against a real paper.
 
 ## Performing the audits
 
@@ -145,5 +168,6 @@ standing caveat that it is evidence about the mechanism, not about the paper's t
   this interpreter (Python 3.13). GPU is an RTX 4060 Laptop, 8 GB, sm_89.
 - Tests: `python -m pytest tests -q`. Self-checks: `python -m harness.pdf <pdf>`,
   `python -m harness.local_exec`, `python -m harness.stages.report`,
-  `python -m harness.repo`, `python -m harness.code_audit`, `python -m harness.probe_synth`.
+  `python -m harness.repo`, `python -m harness.code_audit`, `python -m harness.probe_synth`,
+  `python -m harness.dossier`, `python -m harness.audit_driver`.
 - Never edit `projects/<pid>/audit/prompts/*.md` — they are regenerated every run.

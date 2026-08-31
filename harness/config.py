@@ -50,6 +50,27 @@ class Config:
     # writes a script from the PAPER'S OWN published formulation and runs THAT. The code
     # executed is generated here and readable at `runs/<pid>/probe.py` before it runs, so
     # it carries none of the third-party risk the other gates exist to hold back.
+    # --- S2 autonomy -------------------------------------------------------------------
+    # OFF by default, and the default stays off on purpose. S2 is the judgement stage;
+    # this harness has no model of its own to call, so "autonomous" here can only mean
+    # "shell out to whatever reviewer the operator configures". That is a real capability
+    # and a real risk: the findings it produces are authored by an external process, so
+    # every lens filled this way is recorded in `audit/<lens>.driver.json` with the exact
+    # command that wrote it. Provenance for a machine-written audit is the same
+    # requirement as provenance for a machine-written probe.
+    #
+    # `SH_AUDIT_CMD` is a command template with two placeholders:
+    #     {prompt}  the lens prompt file to read
+    #     {out}     the path the command must write valid lens JSON to
+    # e.g.  SH_AUDIT_CMD='claude -p --output-format text "$(cat {prompt})" > {out}'
+    #
+    # Nothing about this weakens verification: `load_reports` re-checks every quote
+    # against the parsed PDF regardless of who wrote the JSON, so an auto-filled lens
+    # that invents evidence has its findings dropped exactly like a human's would.
+    allow_auto_audit: bool = field(default_factory=lambda: _flag("SH_ALLOW_AUTO_AUDIT"))
+    audit_cmd: str = field(default_factory=lambda: os.environ.get("SH_AUDIT_CMD", ""))
+    audit_timeout_s: int = field(default_factory=lambda: int(os.environ.get("SH_AUDIT_TIMEOUT", "900")))
+
     allow_network: bool = field(default_factory=lambda: _flag("SH_ALLOW_NETWORK", True))
     allow_install: bool = field(default_factory=lambda: _flag("SH_ALLOW_INSTALL"))
     allow_repo_exec: bool = field(default_factory=lambda: _flag("SH_ALLOW_REPO_EXEC"))
