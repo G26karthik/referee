@@ -1,0 +1,24 @@
+# single-harness local runtime deps. No API client, no cloud SDK — the harness makes
+# no network calls at all.
+#   uv pip install --python .venv/Scripts/python.exe -r single-harness/requirements.txt
+pydantic>=2
+
+# S1 ingestion. Two extractors on purpose: fitz gives page text in reading order,
+# pdfplumber gives real cell boundaries. Neither does both well.
+pymupdf>=1.24
+pdfplumber>=0.11
+
+# S3 default probe template (imported by the probe subprocess, not by the harness).
+numpy>=1.26
+scikit-learn>=1.4
+
+# OPTIONAL — install to run probes on a local GPU. The probe detects cuda/mps/cpu at
+# runtime and falls back to the sklearn path when torch is absent, so the harness works
+# either way and never imports torch in its own process.
+#
+# Use cu126, NOT cu121: the cu121 channel publishes no wheels for Python 3.13 and the
+# install fails with "No matching distribution found for torch". The download is ~2.6 GB,
+# so give pip a generous timeout.
+#   pip install --timeout 300 --retries 8 torch torchvision \
+#       --index-url https://download.pytorch.org/whl/cu126
+# Verified here: torch 2.13.0+cu126, torchvision 0.28.0+cu126, RTX 4060 Laptop (sm_89).

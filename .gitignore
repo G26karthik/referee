@@ -1,0 +1,7 @@
+# local project state + transient files — never commit
+projects/
+__pycache__/
+*.pyc
+*.pdf
+.env
+.env.*
