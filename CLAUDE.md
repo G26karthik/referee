@@ -23,6 +23,10 @@ papers → controller → ingest → audit → collect → verify → execute �
 | reconcile | `local_exec.reconcile` | metric vs cell | arithmetic only | `INCONCLUSIVE` |
 | report | `stages/report.py` | everything → `reports/<pid>.md` | threshold table | — |
 
+Every started process is recorded whole in `runs/<pid>/execution.jsonl` — command, cwd,
+commit, timestamps, exit code, full stdout/stderr, parsed metric. A reproduction verdict
+must be re-derivable from that file by hand.
+
 ## Commands
 
 ```bash
@@ -31,7 +35,7 @@ python run.py review --paper a.pdf                            # exit 2 → lense
 python run.py status <paper-id>                               # controller state + history
 python run.py list                                            # reviewed papers
 python run.py dossier                                         # consolidate finished reports
-python -m pytest tests -q                                     # 536 tests
+python -m pytest tests -q                                     # 556 tests
 ```
 
 Always `PYTHONUTF8=1` on Windows (paper text is full of em dashes and math) and always
@@ -105,8 +109,10 @@ cannot be provisioned from here"*.
 - `severity` is model-assigned and is what the verdict counts. The report flags
   FATAL/MAJOR findings resting on prose rather than a cited cell; it does not demote
   them. Making severity earned needs a second independent grader.
-- `RESOLVED_VERIFIED` is unreachable on this host: 8 GiB VRAM, `win32`, and the
-  repo-exec gate shut. The machinery is tested; it has never concluded on a real paper.
+- Both reproduction verdicts are reachable and proven end to end through the real
+  execution path (`tests/test_local_execution.py`, synthetic git fixture). Neither has
+  been produced from a real paper: all three pilot papers refuse, APT on five independent
+  blockers (see `docs/HARNESS_ARCHITECTURE.md` §6).
 - Commit pinning is second-run-onward — the first acquisition of a paper is an unpinned
   depth-1 clone of the default branch.
 

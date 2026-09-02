@@ -81,7 +81,7 @@ that column, because it sequences and does not judge.
 | **audit** | `PaperDoc` | `audit/<lens>.json` ×4 | the four lenses (a model) | which claims are defects | `waiting`: lenses pending. Resumable; bounded retries under `--auto-audit`. |
 | **collect** | lens files | verified `Finding[]` | `stages/audit.verify_evidence` | is the quote really there | drops the finding, counts it. `error` only if **no** lens produced anything. |
 | **verify** | doc + checkout | `ProbeSpec` | `experiment_id`, `resources`, `repo.verify_commit`, `backend.capability` | can this be run, and would it answer the question | leaves the spec unpromoted; assessment is still recorded |
-| **execute** | `ProbeSpec` | `ProbeResult` | `backends.authorize` — **sole authority** | may this run | `verdict: blocked`, nothing started |
+| **execute** | `ProbeSpec` | `ProbeResult` + `execution.jsonl` | `backends.authorize` — **sole authority** | may this run | `verdict: blocked`, nothing started |
 | **reconcile** | metric + cell | `Reconciliation` | `local_exec.reconcile` | arithmetic against 2σ | `INCONCLUSIVE` with a named class |
 | **report** | everything | `reports/<pid>.md` | `stages/report.overall_verdict` | threshold table | — |
 
@@ -186,12 +186,39 @@ against the platform the *backend* reports, not the one this process runs on.
 
 ---
 
+## 5a. Execution evidence
+
+Every process the harness starts is recorded whole, one JSON object per line, in
+`runs/<pid>/execution.jsonl` — written for every attempt, success or failure, before
+anything is parsed out of it. Each `ExecutionRecord` carries the command as the backend
+received it, the working directory, the audited commit, start and end timestamps, the
+exit code, untruncated stdout and stderr, and the metric parsed from that attempt.
+
+The point is re-derivability. A reviewer who doubts a `RESOLVED_VERIFIED` can read the
+same bytes the parser read and redo the extraction by hand. Before this file existed,
+`probe_log.json` kept a 400-character stderr tail for failed attempts only, so a
+successful run left no record of what had produced its number.
+
+`ProbeResult.execution_log` and `ExperimentalChain.execution_log` both point at it, so
+the report's chain table ends at a path rather than at a claim.
+
+**One defect this found.** `run_probe` decided a run had failed by counting metrics
+EMITTED rather than processes that succeeded. A seed loop where every process printed a
+plausible number and then crashed reconciled as `RESOLVED_VERIFIED` — *"the printed
+number stands"*. `first_failure` is now forwarded to `reconcile` whenever any process
+exits non-zero: a number printed by a process that then died is not a completed
+measurement, and reconciling only the seeds that survived would be reconciling a smaller
+experiment than the one specified.
+
+---
+
 ## 6. Known limitations
 
 | limitation | consequence |
 |---|---|
 | `severity` is model-assigned and is what the verdict counts | the report flags FATAL/MAJOR findings resting on prose rather than a cited cell, but does not demote them. Earning severity needs a second independent grader. |
-| `RESOLVED_VERIFIED` unreachable on this host | 8 GiB VRAM, `win32`, gate shut. The machinery is tested end to end; it has never concluded on a real paper. |
+| no pilot paper can execute | Both verdicts are proven through the real path against a synthetic git fixture. On real papers: SAPG and CFG advertise no repository at all; APT has five independent blockers — experiment identity `no_candidate` (the cited row is a third-party baseline its code does not produce), metric identity `unmapped`, `linux-64` vs `win32`, 24 GiB required vs 8 GiB present, and no registered backend that can host it. Infrastructure limits explain two of those; the first two are properties of the citation. |
+| provisioning is pip-only | `repo.build_env` creates `runs/<pid>/env` with `python -m venv` and installs `*.txt` requirement files. Verified working on this host (~9 s, isolated, pip 25.1.1). A repository whose stack is a conda `environment.yml` cannot be provisioned, which is itself an abstention. |
 | commit pinning is second-run-onward | `audited_commit` reads a previous run's artifact, so a paper's first acquisition is an unpinned depth-1 clone of the default branch. |
 | lens independence is conditional | guaranteed under `--auto-audit` (one subprocess each); otherwise a convention. |
 | an unparseable lens file counts as a lens that ran | contributes zero findings. The driver can no longer create one, but a hand-written corrupt file still reads as "this lens found nothing". |

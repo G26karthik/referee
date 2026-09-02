@@ -54,6 +54,17 @@ from .artifacts import (CommitVerification, ExecAuthorization, ExecCapability, P
 from .config import Config
 from .experiment_id import identities_established
 
+def _utc() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _text(buf) -> str:
+    """`TimeoutExpired.stdout` is bytes or str depending on how the child was opened."""
+    if buf is None:
+        return ""
+    return buf.decode("utf-8", "replace") if isinstance(buf, bytes) else str(buf)
+
+
 # Provenances whose code the *authors* wrote. Only these may be run as repo execution,
 # and only these may reconcile against a printed cell — the same ceiling `reconcile`
 # enforces, restated here so an unauthorized command cannot even start.
@@ -91,6 +102,11 @@ class ExecOutcome:
     Collapsing the first two into "it failed" is what let an unlaunchable command and a
     long-running experiment cut short read as the same event. They are opposite evidence
     about whether the experiment was reached.
+
+    The identity fields — `argv`, `cwd`, `started_at`, `ended_at` — are echoed back by the
+    backend rather than assumed by the caller. A record that says what the caller INTENDED
+    to run is not evidence of what ran; a reviewer checking a reproduction verdict needs
+    the command the process was actually given, from the thing that gave it.
     """
 
     launched: bool
@@ -102,6 +118,10 @@ class ExecOutcome:
     timed_out: bool = False
     backend: str = ""
     error: str = ""                      # why it did not launch, when launched is False
+    argv: list[str] = field(default_factory=list)
+    cwd: str = ""
+    started_at: str = ""                 # UTC ISO-8601
+    ended_at: str = ""
 
     @property
     def ok(self) -> bool:
@@ -287,25 +307,28 @@ class LocalBackend(ExecutionBackend):
     def execute(self, req: ExecRequest) -> ExecOutcome:
         """Run it. Never raises: a backend that throws turns a runner fault into a crash
         halfway through a seed loop, and the caller needs every ending as data."""
-        started = time.time()
-        env = None
-        if req.env:
-            env = {**os.environ, **req.env}
+        started, t0 = _utc(), time.time()
+        env = {**os.environ, **req.env} if req.env else None
+        stamp = dict(backend=self.name, argv=list(req.argv), cwd=req.cwd, started_at=started)
         try:
             p = subprocess.run(req.argv, cwd=req.cwd or None, capture_output=True, text=True,
                                encoding="utf-8", errors="replace", timeout=req.timeout_s,
                                env=env)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
+            # A timeout is not an absence of evidence. Whatever the process printed before
+            # it was killed is the only thing that can say whether the experiment started,
+            # and `reached_experiment` reads exactly that.
             return ExecOutcome(launched=True, completed=False, timed_out=True,
-                               seconds=round(time.time() - started, 3), backend=self.name,
-                               error=f"timeout after {req.timeout_s}s")
+                               stdout=_text(e.stdout), stderr=_text(e.stderr),
+                               seconds=round(time.time() - t0, 3), ended_at=_utc(),
+                               error=f"timeout after {req.timeout_s}s", **stamp)
         except OSError as e:
             return ExecOutcome(launched=False, completed=False,
-                               seconds=round(time.time() - started, 3), backend=self.name,
-                               error=f"could not start: {e}")
+                               seconds=round(time.time() - t0, 3), ended_at=_utc(),
+                               error=f"could not start: {e}", **stamp)
         return ExecOutcome(launched=True, completed=True, returncode=p.returncode,
                            stdout=p.stdout or "", stderr=p.stderr or "",
-                           seconds=round(time.time() - started, 3), backend=self.name)
+                           seconds=round(time.time() - t0, 3), ended_at=_utc(), **stamp)
 
     def cleanup(self, root: Path, pid: str) -> list[str]:
         """Remove the provisioned environment for one paper. Returns what was removed.

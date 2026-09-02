@@ -730,6 +730,40 @@ class CommitVerification(_Base):
         return self.state == "verified"
 
 
+class ExecutionRecord(_Base):
+    """One process this harness started, kept whole.
+
+    The evidence a reproduction verdict rests on. Before this existed, `run_probe` wrote
+    `{seed, arm, rc, error[-400:]}` for FAILED attempts only — so a successful run left
+    no record of what command ran, where, when, or what it printed, and a reviewer asking
+    "what actually produced this number" had nothing to read.
+
+    Written for every attempt, success or failure, to `runs/<pid>/execution.jsonl`. Full
+    stdout and stderr, untruncated: the whole point is that the parse which produced the
+    metric can be re-done by hand from the same bytes.
+    """
+
+    seed: int = 0
+    arm: str = ""
+    backend: str = ""
+    argv: list[str] = Field(default_factory=list, description="the command as the backend received it")
+    cwd: str = Field(default="", description="working directory the process actually ran in")
+    interpreter: str = Field(default="", description="the python that ran it, when one did")
+    commit: str = Field(default="", description="the audited commit this execution is about")
+    started_at: str = ""
+    ended_at: str = ""
+    seconds: float = 0.0
+    launched: bool = Field(default=False, description="the process existed")
+    completed: bool = Field(default=False, description="it ran to an exit code")
+    timed_out: bool = False
+    returncode: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    error: str = Field(default="", description="why it did not launch or did not finish")
+    metric: float | None = Field(
+        default=None, description="the value parsed from this attempt's output, if any")
+
+
 class ExecAuthorization(_Base):
     """Whether an execution request may proceed. The record of a refusal, not just a bool.
 
@@ -853,6 +887,11 @@ class ProbeResult(_Base):
         default=None, description="mirrors ProbeSpec.capability — S3's execution precondition"
     )
     backend: str = Field(default="local", description="the backend that ran, or would have run, this probe")
+    execution_log: str = Field(
+        default="",
+        description="path to runs/<pid>/execution.jsonl — one ExecutionRecord per attempt, "
+                    "with full stdout/stderr. Empty when nothing was executed.")
+    executions: int = Field(default=0, description="how many processes were started")
     backend_selection: str = Field(
         default="", description="mirrors ProbeSpec.backend_selection — why this environment, "
                                 "or why none")
@@ -939,6 +978,9 @@ class ExperimentalChain(_Base):
     authorization: str = Field(default="", description="the ExecAuthorization decision")
     provenance: str = Field(default="", description="who wrote the code that ran")
     executed: bool = Field(default=False, description="did any process actually run")
+    executions: int = Field(default=0, description="how many processes were started")
+    execution_log: str = Field(
+        default="", description="runs/<pid>/execution.jsonl — the full record of each one")
     reconciliation: str = Field(default="", description="RESOLVED_VERIFIED | FAILED_REPRODUCTION | INCONCLUSIVE")
     failure_class: str = ""
     broken_link: str = Field(

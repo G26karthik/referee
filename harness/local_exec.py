@@ -28,8 +28,8 @@ from dataclasses import dataclass
 import time
 from pathlib import Path
 
-from .artifacts import (ArmStats, CommitVerification, ExecAuthorization, ProbeResult,
-                        ProbeSpec, Reconciliation)
+from .artifacts import (ArmStats, CommitVerification, ExecAuthorization, ExecutionRecord,
+                        ProbeResult, ProbeSpec, Reconciliation)
 from .backends import ExecRequest, ExecutionBackend, authorize, backend_for
 from .repo import verify_commit
 from .experiment_id import identities_established
@@ -582,6 +582,7 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
     script = write_probe(root, spec)
     out_dir = script.parent
 
+    records: list[ExecutionRecord] = []
     per_seed: dict[str, dict[int, float]] = {a: {} for a in spec.arms}
     aux_seed: dict[str, dict[str, dict[int, float]]] = {}
     device, failed, log = "unknown", [], []
@@ -597,6 +598,16 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
             p = backend.execute(ExecRequest(argv=cmd, cwd=str(cwd),
                                             timeout_s=cfg.probe_timeout_s,
                                             label=f"seed={seed} arm={arm}"))
+            # Recorded BEFORE anything is parsed out of it, and for every ending. A record
+            # written only on failure cannot answer "what produced this number", which is
+            # the one question a reproduction verdict has to survive.
+            record = ExecutionRecord(
+                seed=seed, arm=arm, backend=p.backend, argv=p.argv, cwd=p.cwd,
+                interpreter=spec.interpreter, commit=spec.commit,
+                started_at=p.started_at, ended_at=p.ended_at, seconds=p.seconds,
+                launched=p.launched, completed=p.completed, timed_out=p.timed_out,
+                returncode=p.returncode, stdout=p.stdout, stderr=p.stderr, error=p.error)
+            records.append(record)
             evidence.ran_seconds = max(evidence.ran_seconds, p.seconds)
             if not p.completed:
                 # Two different endings arrive here and they are opposite evidence. A
@@ -619,6 +630,7 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
                     evidence.saw_contract_line = True
                 elif m := _METRIC.match(line):
                     per_seed.setdefault(m.group(1), {})[int(m.group(2))] = float(m.group(3))
+                    record.metric = float(m.group(3))
                     saw_metric = True
                     evidence.saw_contract_line = True
                 elif x := _AUX.match(line):
@@ -637,6 +649,7 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
                              if spec.metric_identity and spec.metric_identity.established else "")
                 if (v := json_metric(p.stdout or "", bound_key or spec.metric)) is not None:
                     per_seed.setdefault(arm, {})[seed] = v
+                    record.metric = v
                     evidence.saw_json_metric = True
             if p.returncode != 0:
                 failed.append(seed)
@@ -730,8 +743,27 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
             measured = {s: v for a in per_seed for s, v in per_seed[a].items()}
         result.reconciliation = reconcile(
             spec, [measured[s] for s in sorted(measured)], result.noise_band,
-            sorted(measured), failure=first_failure if result.verdict == "failed" else "",
+            # `first_failure` is passed whenever ANY process exited non-zero, not only when
+            # the run produced too few metrics to aggregate. A seed loop where every
+            # process printed a plausible number and then died reconciled as
+            # RESOLVED_VERIFIED — "the printed number stands" — because `verdict` counts
+            # metrics EMITTED, not processes that succeeded. A metric printed by a process
+            # that then crashed is not a completed measurement, and reconciling the subset
+            # that survived would be reconciling a smaller experiment than the one
+            # specified. `reconcile` already gates a failure through capability and
+            # startup evidence; it simply has to be told there was one.
+            sorted(measured), failure=first_failure,
             evidence=evidence, authorization=auth)
+
+    # One JSON object per line rather than one array: a run that dies mid-loop leaves the
+    # attempts it did make readable, and a long stdout does not have to be held in memory
+    # alongside every other attempt's.
+    if records:
+        result.executions = len(records)
+        result.execution_log = str(out_dir / "execution.jsonl")
+        with (out_dir / "execution.jsonl").open("w", encoding="utf-8") as fh:
+            for r in records:
+                fh.write(json.dumps(r.model_dump(), ensure_ascii=False) + "\n")
 
     (out_dir / "probe_results.json").write_text(
         json.dumps(result.model_dump(), indent=2, ensure_ascii=False), encoding="utf-8")

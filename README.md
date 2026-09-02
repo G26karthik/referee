@@ -97,9 +97,24 @@ Both facts are recorded; neither is a finding about the paper.
 Real hardware: Windows, RTX 4060 Laptop (8 GiB VRAM), Ryzen 9, ~15 GiB RAM. No WSL, no
 Docker, no virtualization.
 
-`RESOLVED_VERIFIED` is therefore unreachable today. `SH_ALLOW_REPO_EXEC` is off by
-default, and with it open the pilot papers refuse independently on resources and on
-platform. Kaggle and Colab are registered as **declarations** — real published specs,
+`LocalBackend` really executes: it starts processes, verifies the audited commit and a
+clean tree immediately beforehand, and records every attempt whole in
+`runs/<pid>/execution.jsonl`. Both reproduction verdicts are proven end to end through
+that path against a synthetic git fixture (`tests/test_local_execution.py`) — a fixture
+that is plumbing evidence and never a paper reproduction.
+
+**No pilot paper can execute here.** SAPG and CFG advertise no repository at all. APT has
+five independent blockers: its cited row reports a third-party baseline its own code does
+not produce, the metric cannot be bound to the cell, the stack is `linux-64` against a
+`win32` host, the experiment declares 24 GiB against 8 GiB present, and no registered
+backend can host it. The first two are properties of the citation; the rest are limits of
+this machine.
+
+Provisioning is `python -m venv` plus pip requirement files, verified on this host (~9 s,
+isolated, no conda, no host mutation). A repository whose stack is a conda
+`environment.yml` cannot be provisioned — itself an abstention, not a paper failure.
+
+Kaggle and Colab are registered as **declarations** — real published specs,
 `can_execute=False`, `execute()` raises — so selection can report that a T4 would fit
 while stating it cannot be provisioned from here. They are not integrations.
 
@@ -127,7 +142,7 @@ harness/
   pdf.py               PDF → sections, tables, numbers
   dossier.py           cross-paper consolidation
   prompts/audit.py     the four lens prompts
-tests/                 536 tests
+tests/                 556 tests
 docs/                  the architecture map
 papers/                source PDFs
 projects/<pid>/        per-paper state: paper, audit, runs, reports, controller.json

@@ -180,6 +180,8 @@ def build_chain(findings: list[Finding], probe: ProbeResult | None) -> Experimen
         backend=probe.backend or "",
         provenance=probe.provenance or "",
         executed=bool(probe.seeds_run),
+        executions=probe.executions,
+        execution_log=probe.execution_log,
         reconciliation=(rec.status if rec else ""),
         failure_class=(rec.failure_class if rec else "") or "",
     )
@@ -235,7 +237,8 @@ def _chain_block(c: ExperimentalChain) -> list[str]:
             ("backend", c.backend or "—"),
             ("authorization", c.authorization or "—"),
             ("code that ran", c.provenance or "—"),
-            ("executed", "yes" if c.executed else "no"),
+            ("executed", f"yes — {c.executions} process(es)" if c.executed else "no"),
+            ("execution log", f"`{c.execution_log}`" if c.execution_log else "—"),
             ("reconciliation", c.reconciliation or "—")]
     out = ["| link | state |", "|---|---|"] + [f"| {k} | {v} |" for k, v in rows]
     if c.broken_link:
