@@ -1,0 +1,246 @@
+"""Backend selection as a matching problem, and the wall between a declaration and a runner.
+
+`select_backend` answers "which backend did the operator name". That is a configuration
+lookup and it is not the question that has to be asked before a reproduction: which
+registered environment can host an experiment that declares 24 GiB of VRAM and a
+Linux-only stack? `select_for` answers that one, against every registered profile.
+
+Kaggle and Colab are registered as DECLARATIONS. They are real places an experiment could
+run, with published hardware, and neither can be driven from this host — no credentials,
+no API, no way to move a checkout into a notebook session. Registering them lets a refusal
+be useful: "a 16 GiB T4 would fit this experiment but cannot be provisioned from here"
+tells an operator what to do next, where a bare "no backend" does not.
+
+The wall those declarations sit behind is tested here and is deliberately redundant.
+`can_execute=False` makes `authorize()` refuse before any other precondition is consulted,
+and `execute()` raises regardless — so the raise is unreachable rather than load-bearing,
+and there is no path by which a published specification becomes a reproduction verdict.
+"""
+from __future__ import annotations
+
+import pytest
+
+from harness.artifacts import (GIB, CommitVerification, ConfigurationIdentity, ExecCapability,
+                               ExperimentIdentity, MetricIdentity, ProbeSpec, ResourceCapability,
+                               ResourceEvidence, ResourceRequirement, SELECTION_CODES)
+from harness.backends import (BackendProfile, ColabBackend, DeclaredBackend, ExecRequest,
+                              KaggleBackend, LocalBackend, authorize, local_backend,
+                              register_backend, registered_backends, select_for)
+from harness.config import Config
+from harness.local_exec import reconcile
+from harness.stages.report import overall_verdict
+
+
+def _cfg(**over) -> Config:
+    cfg = Config.load()
+    for k, v in over.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+def _req(**kw) -> ResourceRequirement:
+    return ResourceRequirement(
+        evidence=[ResourceEvidence(quote="q", kind="declared_requirement")], **kw)
+
+
+def _verified() -> CommitVerification:
+    return CommitVerification(state="verified", expected="a" * 40, actual="a" * 40)
+
+
+def _est(cls):
+    return cls(state="established", established=True, reason="fixture")
+
+
+def _qualified(**over) -> ProbeSpec:
+    spec = ProbeSpec(paper_id="p", command=["python", "eval.py"], provenance="repo_exec",
+                     table_ref="T1:r0:c1", claimed_cell_value="59.28",
+                     experiment=_est(ExperimentIdentity), metric_identity=_est(MetricIdentity),
+                     configuration=_est(ConfigurationIdentity),
+                     capability=ExecCapability(established=True, reason_code="established"),
+                     resources=ResourceCapability(state="satisfied", reason="fits"))
+    for k, v in over.items():
+        setattr(spec, k, v)
+    return spec
+
+
+class BigRunner(DeclaredBackend):
+    """A backend that CAN execute and has room. Only exists to prove selection prefers it."""
+
+    name = "big-runner"
+    spec = BackendProfile(name="big-runner", platform="linux", vram_bytes=80 * GIB,
+                          ram_bytes=512 * GIB, disk_bytes=4000 * GIB, cpu_count=64,
+                          gpu_name="A100-80GB", can_execute=True)
+
+    def available(self):
+        from harness.backends import BackendAvailability
+        return BackendAvailability(True, "")
+
+    def execute(self, req: ExecRequest):
+        raise AssertionError("no test may actually execute anything")
+
+
+# --------------------------------------------------------------------------- #
+# The registry
+# --------------------------------------------------------------------------- #
+def test_the_declared_environments_are_registered():
+    names = registered_backends()
+    assert {"local", "kaggle", "colab"} <= set(names)
+
+
+@pytest.mark.parametrize("cls", [KaggleBackend, ColabBackend])
+def test_a_declared_environment_is_not_a_runner(cls):
+    b = cls()
+    p = b.profile()
+    assert p.can_execute is False and p.requires_credentials is True
+    assert b.available().usable is False and b.available().detail
+    assert p.vram_bytes and p.ram_bytes and p.max_walltime_s, "a declaration states real specs"
+
+
+@pytest.mark.parametrize("cls", [KaggleBackend, ColabBackend])
+def test_executing_a_declaration_raises_rather_than_pretending(cls):
+    with pytest.raises(NotImplementedError) as e:
+        cls().execute(ExecRequest(["python", "train.py"], "", 60))
+    assert "not an integration" in str(e.value)
+
+
+@pytest.mark.parametrize("cls", [KaggleBackend, ColabBackend])
+def test_a_declaration_reports_no_capability(cls):
+    from harness.artifacts import RepoAcquisition
+    cap = cls().capability(RepoAcquisition(status="cached", path="."), "py", "py")
+    assert not cap.established and cap.reason_code == "environment_incompatible"
+
+
+@pytest.mark.parametrize("cls", [KaggleBackend, ColabBackend])
+def test_a_declaration_provisions_nothing(cls, tmp_path):
+    from harness.artifacts import RepoAcquisition
+    acq = cls().provision(_cfg(allow_install=True), tmp_path, "p",
+                          RepoAcquisition(status="cached", path=str(tmp_path)))
+    assert acq.env_status == "blocked"
+
+
+# --------------------------------------------------------------------------- #
+# Matching
+# --------------------------------------------------------------------------- #
+def test_an_experiment_that_fits_this_host_selects_the_local_backend():
+    sel = select_for(_req(vram_bytes=2 * GIB), _cfg())
+    assert sel.reason_code == "selected" and sel.selected
+    assert sel.chosen is not None and sel.chosen.name == "local"
+
+
+def test_an_experiment_too_large_for_everything_registered_is_refused():
+    sel = select_for(_req(vram_bytes=200 * GIB), _cfg())
+    assert sel.reason_code == "resources_insufficient" and sel.chosen is None
+    names = {n for n, _, _ in sel.considered}
+    assert {"local", "kaggle", "colab"} <= names, "every candidate is accounted for"
+
+
+def test_an_experiment_that_only_a_declared_environment_could_host_says_so():
+    """The refusal that is actually useful. 12 GiB does not fit this 8 GiB card but does
+    fit a T4, and the operator needs to be told that rather than 'no backend'."""
+    sel = select_for(_req(vram_bytes=12 * GIB), _cfg(), declared_platform="linux")
+    assert sel.reason_code == "credentials_unavailable" and sel.chosen is None
+    assert "cannot be provisioned from this host" in sel.reason
+    assert any(v == "credentials_unavailable" for _, v, _ in sel.considered)
+
+
+def test_a_linux_only_stack_rules_out_a_windows_host():
+    import sys
+    if sys.platform.startswith("linux"):
+        pytest.skip("needs a non-Linux host")
+    sel = select_for(_req(vram_bytes=1 * GIB), _cfg(), declared_platform="linux")
+    verdicts = {n: v for n, v, _ in sel.considered}
+    assert verdicts["local"] == "platform_incompatible"
+    assert sel.chosen is None
+
+
+def test_a_walltime_beyond_a_backends_session_limit_rules_it_out():
+    sel = select_for(_req(vram_bytes=1 * GIB, walltime_s=40 * 3600), _cfg(),
+                     declared_platform="linux", walltime_s=40 * 3600)
+    assert all(v != "fits" for _, v, _ in sel.considered)
+    assert sel.chosen is None
+
+
+def test_an_unstated_requirement_matches_nothing():
+    """Matching a backend against an unknown demand is choosing one at random."""
+    sel = select_for(ResourceRequirement(), _cfg())
+    assert sel.reason_code == "requirement_unknown" and sel.chosen is None
+    sel_none = select_for(None, _cfg())
+    assert sel_none.reason_code == "requirement_unknown"
+
+
+def test_a_backend_that_cannot_report_a_quantity_does_not_satisfy_it():
+    """An unmeasured offer is not a large one — the same asymmetry E1 encodes."""
+    from harness.backends import _fits
+    assert _fits(None, 5) is True and _fits(5, None) is False
+    assert _fits(5, 5) is True and _fits(6, 5) is False
+
+
+def test_selection_prefers_a_runner_over_a_declaration():
+    register_backend("big-runner", BigRunner)
+    try:
+        sel = select_for(_req(vram_bytes=12 * GIB), _cfg(), declared_platform="linux")
+        assert sel.reason_code == "selected"
+        assert sel.chosen is not None and sel.chosen.name == "big-runner"
+    finally:
+        from harness import backends as b
+        b._REGISTRY.pop("big-runner", None)
+
+
+def test_every_reason_code_is_one_of_the_declared_ones():
+    for req, plat in ((_req(vram_bytes=1 * GIB), ""), (_req(vram_bytes=200 * GIB), ""),
+                      (_req(vram_bytes=12 * GIB), "linux"), (ResourceRequirement(), "")):
+        assert select_for(req, _cfg(), declared_platform=plat).reason_code in SELECTION_CODES
+
+
+# --------------------------------------------------------------------------- #
+# The wall: a declaration can never produce a reproduction verdict
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("cls", [KaggleBackend, ColabBackend])
+def test_authorization_refuses_a_declared_backend_outright(cls):
+    auth = authorize(_cfg(allow_repo_exec=True), _qualified(), cls(), commit=_verified())
+    assert not auth.allowed and auth.decision == "backend_cannot_execute"
+    assert auth.failure_class == "credentials_unavailable"
+
+
+@pytest.mark.parametrize("cls", [KaggleBackend, ColabBackend])
+def test_the_refusal_precedes_every_other_precondition(cls):
+    """Checked before the gate and before identity, so `execute()`'s raise is unreachable
+    rather than the last line of defence."""
+    naked = ProbeSpec(paper_id="p", command=["python", "eval.py"], provenance="repo_exec")
+    auth = authorize(_cfg(allow_repo_exec=False), naked, cls(), commit=None)
+    assert auth.decision == "backend_cannot_execute", auth.decision
+
+
+@pytest.mark.parametrize("values", [[59.30, 59.26], [999.0, 999.0]])
+def test_a_declared_backend_produces_neither_verdict(values):
+    """Both directions: a specification may not acquit a cell any more than convict one."""
+    auth = authorize(_cfg(allow_repo_exec=True), _qualified(), KaggleBackend(),
+                     commit=_verified())
+    spec = ProbeSpec(paper_id="p", provenance="repo_exec", table_ref="T1:r0:c1",
+                     claimed_cell_value="59.28")
+    rec = reconcile(spec, values, 0.10, [0, 1], authorization=auth)
+    assert rec.status == "INCONCLUSIVE"
+    assert rec.failure_class == "credentials_unavailable"
+
+
+def test_a_backend_refusal_cannot_drive_the_paper_red():
+    auth = authorize(_cfg(allow_repo_exec=True), _qualified(), ColabBackend(),
+                     commit=_verified())
+    spec = ProbeSpec(paper_id="p", provenance="repo_exec", table_ref="T1:r0:c1",
+                     claimed_cell_value="59.28")
+    rec = reconcile(spec, [999.0, 999.0], 0.10, [0, 1], authorization=auth)
+    verdict, _ = overall_verdict([], rec)
+    assert verdict == "GREEN", "not being able to reach a GPU says nothing about a paper"
+
+
+def test_a_real_runner_is_still_authorized_when_everything_holds():
+    """The wall must not have made every backend unusable."""
+    auth = authorize(_cfg(allow_repo_exec=True), _qualified(), local_backend(),
+                     commit=_verified())
+    assert auth.allowed and auth.decision == "authorized"
+
+
+def test_the_local_backend_declares_itself_executable():
+    p = LocalBackend().profile()
+    assert p.can_execute is True and p.requires_credentials is False
+    assert p.name == "local" and p.cpu_count

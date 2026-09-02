@@ -94,8 +94,12 @@ def build_spec(cfg: Config, pid: str, doc: PaperDoc) -> ProbeSpec:
             seeds=list(range(max(3, min(cfg.seeds, 5)))),
         )
 
-    by_id = {f.finding_id: f for r in reports for f in r.findings}
-    anchor = by_id.get(spec.finding_id) or target
+    # Keyed by (lens, finding_id), not by finding_id alone. Ids are lens-supplied, and
+    # four lenses independently numbering their findings `overclaim-01`, `protocol-01`
+    # and so on collide readily; a bare-id map silently kept whichever lens was loaded
+    # last, so the probe could anchor to a different finding than the one it targeted.
+    by_id = {(f.lens, f.finding_id): f for r in reports for f in r.findings}
+    anchor = next((f for (_, fid), f in by_id.items() if fid == spec.finding_id), None) or target
 
     if not (spec.script or "").strip() and not spec.command:
         # Identical arms measure this machine, not the paper. Carrying a claimed delta
@@ -253,10 +257,19 @@ def plan_execution(cfg: Config, spec: ProbeSpec, acq: RepoAcquisition,
     repository's dependencies — guaranteeing an import crash whenever the install gate is
     shut, which is the default. There is no longer a path that substitutes an interpreter.
     """
-    if not cfg.allow_repo_exec:
-        return spec
     if acq.status not in ("cloned", "cached") or not acq.path or not acq.entrypoint:
         return spec
+    # ASSESSMENT RUNS EVEN WITH THE GATE SHUT; only PROMOTION is gated. Returning early on
+    # a closed `allow_repo_exec` left the report unable to say anything about why a
+    # reproduction was impossible: identity `unmapped`, resources `unassessed`, no backend
+    # considered. Since the gate is shut by default, that was the normal output — the
+    # harness knew nothing about the very question it exists to answer carefully.
+    #
+    # Every assessment below is read-only. It parses files, reads this machine's hardware
+    # inventory and runs `git rev-parse`. None of it executes the repository, so none of it
+    # needs the gate; the gate exists to permit RUNNING third-party code, and it still
+    # does exactly that a few lines further down.
+    #
     # BOTH preconditions are assessed, and only then is promotion decided. Recording the
     # capability even when identity already failed keeps the report able to say "we could
     # not have run it either" rather than leaving that unknown — two independent blockers
@@ -267,32 +280,53 @@ def plan_execution(cfg: Config, spec: ProbeSpec, acq: RepoAcquisition,
         # An operator typo must not become a substitution. Nothing is promoted, the
         # synthesized/template probe still runs, and the report says why.
         return spec
+
+    # E2 — the commit the static audit read. Carried on the spec so execution has
+    # something to verify against that is not "whatever is on disk".
+    spec.commit = (audit.commit if audit is not None else "") or acq.commit
+
+    if doc is not None:
+        spec.experiment, spec.metric_identity, spec.configuration = experiment_id.resolve(
+            doc, Path(acq.path), spec.table_ref, spec.finding_id, harness_seeds=len(spec.seeds))
+        # E1 — what the CITED experiment costs. Established from the paper BEFORE a
+        # backend is chosen, because the demand is a property of the experiment and the
+        # supply is a property of the environment: matching them the other way round —
+        # taking whatever backend is configured and asking whether the paper fits it —
+        # answers a narrower question and cannot report that somewhere else would.
+        requirement = resources_mod.require_resources(
+            doc, spec.table_ref, spec.claimed_cell_value, caption=_caption(doc, spec.table_ref))
+        budget = cfg.probe_timeout_s * max(1, len(spec.seeds))
+        selection = backends.select_for(
+            requirement, cfg, declared_platform=repo_mod.declared_platform(Path(acq.path)),
+            walltime_s=budget)
+        spec.backend_selection = selection.reason_code
+        spec.backend_considered = [f"{n}: {v} — {w}" for n, v, w in selection.considered]
+        # A selected backend replaces the configured one; a refusal leaves the configured
+        # one in place so capability and resources are still recorded against something
+        # real and the report can say what would have been needed.
+        backend = selection.chosen or backend
+        spec.resources = resources_mod.assess_resources(
+            requirement, backend.resources(), backend=backend.name, walltime_budget_s=budget)
+
     spec.backend = backend.name
     # Capability is asked of the BACKEND, so it is judged against the platform the run
     # would actually see rather than against whatever platform this process is on.
     spec.capability = backend.capability(acq, acq.env_path, cfg.python)
-    # E2 — the commit the static audit read. Carried on the spec so execution has
-    # something to verify against that is not "whatever is on disk".
-    spec.commit = (audit.commit if audit is not None else "") or acq.commit
-    if doc is not None:
-        spec.experiment, spec.metric_identity, spec.configuration = experiment_id.resolve(
-            doc, Path(acq.path), spec.table_ref, spec.finding_id, harness_seeds=len(spec.seeds))
-        # E1 — what the CITED experiment costs, against what this backend has. Assessed
-        # here, before promotion, because the answer cannot be obtained by trying: an
-        # experiment three times larger than the card starts fine and dies minutes in.
-        spec.resources = resources_mod.assess_resources(
-            resources_mod.require_resources(
-                doc, spec.table_ref, spec.claimed_cell_value,
-                caption=_caption(doc, spec.table_ref)),
-            backend.resources(), backend=backend.name,
-            walltime_budget_s=cfg.probe_timeout_s * max(1, len(spec.seeds)))
+    spec.commit_state = repo_mod.verify_commit(acq.path, spec.commit).state
     proven, _cls, _why = experiment_id.identities_established(
         spec.experiment, spec.metric_identity, spec.configuration)
+
+    # --- assessment ends; promotion begins ---------------------------------------------
+    if not cfg.allow_repo_exec:
+        # Everything above is now on the spec, so the report can state precisely what
+        # would have been required and which link was missing — which is the useful thing
+        # to say about a paper nobody was permitted to reproduce.
+        return spec
 
     # Identity is the more fundamental of the two: a capable run of the wrong program is
     # worse than a crash, because nothing about it looks wrong.
     fits = spec.resources is not None and spec.resources.established
-    commit_ok = repo_mod.verify_commit(acq.path, spec.commit).established
+    commit_ok = spec.commit_state == "verified"
     if not proven or not spec.capability.established or not fits or not commit_ok:
         # Any one of these is disqualifying, and none of them is fixed by trying anyway.
         # Note what is NOT here: no branch that reduces the requirement, picks a smaller

@@ -14,15 +14,10 @@ from typing import Any
 from .config import Config
 
 SUBDIRS = [
-    "paper",        # S1 — the ingested PaperDoc
-    "audit",        # S2 — one LensReport per auditor
-    "reports",      # S4 — the rendered evaluation report
-    # S3 reproduction trigger
-    "studies",
-    "grounding",
-    "runs",
-    "analysis",
-    "checkpoints",
+    "paper",     # S1 — the ingested PaperDoc
+    "audit",     # S2 — prompts in, one lens report per lens out
+    "runs",      # S3 — checkout, probe source, probe results
+    "reports",   # S4 — the rendered evaluation report
 ]
 
 
@@ -38,13 +33,6 @@ def slugify(s: str, n: int = 28) -> str:
 def project_dir(cfg: Config, pid: str) -> Path:
     return cfg.projects_dir / pid
 
-
-def slot_dir(cfg: Config, pid: str, slot: str = "") -> Path:
-    """Artifact root for a stage. slot="" → the canonical project dir (single-idea path);
-    a non-empty slot → candidates/<slot>/ so K tournament candidates never clobber each
-    other's chain/spec/grounding artifacts."""
-    root = project_dir(cfg, pid)
-    return (root / "candidates" / slugify(slot, 40)) if slot else root
 
 
 def new_project_id(direction: str) -> str:
@@ -68,8 +56,7 @@ def create_project(cfg: Config, repo_url: str, direction: str, pid: str | None =
         "status": "active",
         "created_at": _now(),
         "updated_at": _now(),
-        "cost_usd": 0.0,       # LLM/agent cost
-        "gpu_cost_usd": 0.0,   # Modal GPU cost — the budgeted resource
+        "cost_usd": 0.0,
     }
     save_meta(cfg, pid, meta)
     (root / "research_log.jsonl").touch()
@@ -99,16 +86,6 @@ def add_cost(cfg: Config, pid: str, cost_usd: float) -> None:
     save_meta(cfg, pid, meta)
 
 
-def add_gpu_cost(cfg: Config, pid: str, gpu_cost_usd: float) -> float:
-    """Accumulate Modal GPU cost (the budgeted resource) and return the new total."""
-    meta = load_meta(cfg, pid)
-    meta["gpu_cost_usd"] = round(float(meta.get("gpu_cost_usd", 0.0)) + float(gpu_cost_usd or 0.0), 4)
-    save_meta(cfg, pid, meta)
-    return meta["gpu_cost_usd"]
-
-
-def gpu_cost(cfg: Config, pid: str) -> float:
-    return float(load_meta(cfg, pid).get("gpu_cost_usd", 0.0))
 
 
 def append_log(

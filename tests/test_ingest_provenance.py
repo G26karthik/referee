@@ -199,3 +199,65 @@ def test_render_sections_gives_every_section_a_slice():
     out = pdf.render_sections(secs, budget_chars=1200)
     assert "Introduction" in out and "Limitations" in out, "the tail must not be dropped"
     assert "…[truncated]" in out
+
+
+# --------------------------------------------------------------------------- #
+# Paper identity — a filename is not an identity
+# --------------------------------------------------------------------------- #
+def test_a_papers_identity_is_its_bytes_not_its_filename(tmp_path):
+    """`APT _ ICML.pdf`, `APT-ICML.pdf` and `apt icml.pdf` all slugify to `apt-icml`.
+
+    Two unrelated papers landing on the same slug used to share one project directory,
+    and the second was reported as `cached` — so it was reviewed against the FIRST
+    paper's parsed text under its own name. Nothing errored and nothing in the report
+    said so, which is the worst shape a bug can take in a system whose output is
+    supposed to be evidence.
+    """
+    from harness.stages.ingest import allocate_paper_id, content_sha, paper_id_for
+
+    a, b = tmp_path / "APT _ ICML.pdf", tmp_path / "apt-icml.pdf"
+    a.write_bytes(b"%PDF-1.4 first paper")
+    b.write_bytes(b"%PDF-1.4 a completely different paper")
+    assert paper_id_for(a) == paper_id_for(b), "the slugs collide, which is the premise"
+    assert content_sha(a) != content_sha(b)
+
+
+def test_a_slug_collision_allocates_a_new_case_rather_than_merging(tmp_path):
+    from harness import state
+    from harness.artifacts import PaperDoc
+    from harness.config import Config
+    from harness.stages.ingest import allocate_paper_id, content_sha
+
+    cfg = Config(projects_dir=tmp_path / "projects")
+    first, second = tmp_path / "x.pdf", tmp_path / "X .pdf"
+    first.write_bytes(b"%PDF one")
+    second.write_bytes(b"%PDF two")
+    sha_a, sha_b = content_sha(first), content_sha(second)
+
+    pid_a, same_a = allocate_paper_id(cfg, first, sha_a)
+    assert same_a is False
+    state.write_json(cfg.projects_dir / pid_a / "paper" / "doc.json",
+                     PaperDoc(paper_id=pid_a, content_sha=sha_a).model_dump())
+
+    # The same document again resolves to the same case — re-ingesting must not fork.
+    assert allocate_paper_id(cfg, first, sha_a) == (pid_a, True)
+    # A different document with the same slug gets its own case.
+    pid_b, same_b = allocate_paper_id(cfg, second, sha_b)
+    assert pid_b != pid_a and same_b is False and sha_b[:6] in pid_b
+
+
+def test_a_document_ingested_before_content_hashing_is_not_forked(tmp_path):
+    """An empty recorded hash means the project predates the field. Treating it as a
+    mismatch would fork every existing case on upgrade."""
+    from harness import state
+    from harness.artifacts import PaperDoc
+    from harness.config import Config
+    from harness.stages.ingest import allocate_paper_id, content_sha
+
+    cfg = Config(projects_dir=tmp_path / "projects")
+    old = tmp_path / "legacy.pdf"
+    old.write_bytes(b"%PDF legacy")
+    pid, _ = allocate_paper_id(cfg, old, content_sha(old))
+    state.write_json(cfg.projects_dir / pid / "paper" / "doc.json",
+                     PaperDoc(paper_id=pid).model_dump())          # no content_sha
+    assert allocate_paper_id(cfg, old, content_sha(old)) == (pid, True)

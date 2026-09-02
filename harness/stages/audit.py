@@ -143,6 +143,43 @@ def load_reports(cfg: Config, pid: str, doc: PaperDoc) -> tuple[list[LensReport]
     return reports, dropped
 
 
+def verify_evidence(quote: str, ref: str, corpus: str,
+                    by_idx: dict) -> tuple[str, str]:
+    """(evidence_class, verified_observation) — WHAT THE HARNESS ITSELF CONFIRMED.
+
+    This is the machine half of a finding, and the reason it lives here rather than in
+    the lens file is that a lens must not be able to assert that its own reasoning was
+    checked. Everything a lens writes is a claim; everything this function returns is an
+    observation, and the report renders the two apart so a reader can tell which is which.
+
+    The observation text is generated, never copied: it names the address, states that the
+    contents matched, and quotes what was found. A reader can re-run the same comparison
+    from `doc.json` in a few seconds.
+    """
+    q = _flat(quote)
+    if not q:
+        return "unverified", ""
+    ref = (ref or "").strip()
+    m = _CELL_REF.fullmatch(ref)
+    if m:
+        t = by_idx.get(int(m.group(1)))
+        if t is None:
+            return "unverified", ""
+        cell = t.cell(int(m.group(2)), int(m.group(3)))
+        if _flat(cell) != q:
+            return "unverified", ""
+        return "cell_verified", (
+            f"Cell {ref} of the parsed paper contains {cell.strip()!r}, which matches the "
+            f"quoted evidence character for character after whitespace normalisation.")
+    if not _PAGE_REF.fullmatch(ref):
+        return "unverified", ""
+    if len(q) < _QUOTE_MIN or q not in corpus:
+        return "unverified", ""
+    return "prose_verified", (
+        f"The quoted text occurs verbatim in the parsed section text; the lens located it "
+        f"at {ref}. Verified as a substring of the paper, not as a page number.")
+
+
 def _substantiated(quote: str, ref: str, corpus: str, by_idx: dict) -> bool:
     """Is this quote really in the paper — and if it cites a cell, is it that cell?
 
@@ -162,18 +199,13 @@ def _substantiated(quote: str, ref: str, corpus: str, by_idx: dict) -> bool:
     evidence an editor can check in seconds and no evidence at all. Requiring the
     reference to be present and well-formed means a lost one is DROPPED and counted,
     where the report already prints the count, instead of quietly downgraded.
+
+    The predicate is now the boolean shadow of `verify_evidence`, which returns the same
+    decision plus the machine-written observation that goes on the finding. One
+    implementation, so the thing that DROPS a finding and the thing that DESCRIBES a kept
+    one can never disagree about whether the evidence held.
     """
-    q = _flat(quote)
-    if not q:
-        return False
-    ref = (ref or "").strip()
-    m = _CELL_REF.fullmatch(ref)
-    if m:
-        t = by_idx.get(int(m.group(1)))
-        return t is not None and _flat(t.cell(int(m.group(2)), int(m.group(3)))) == q
-    if not _PAGE_REF.fullmatch(ref):
-        return False
-    return len(q) >= _QUOTE_MIN and q in corpus
+    return verify_evidence(quote, ref, corpus, by_idx)[0] != "unverified"
 
 
 def _coerce(lens: str, data, corpus: str, by_idx: dict) -> tuple[LensReport, int]:
@@ -187,7 +219,8 @@ def _coerce(lens: str, data, corpus: str, by_idx: dict) -> tuple[LensReport, int
         statement = str(f.get("statement") or "").strip()
         quote = str(f.get("evidence_quote") or "").strip()
         ref = str(f.get("evidence_ref") or "").strip()
-        if not statement or not _substantiated(quote, ref, corpus, by_idx):
+        evidence_class, observation = verify_evidence(quote, ref, corpus, by_idx)
+        if not statement or evidence_class == "unverified":
             dropped += 1
             continue
         sev = str(f.get("severity") or "").upper()
@@ -199,6 +232,18 @@ def _coerce(lens: str, data, corpus: str, by_idx: dict) -> tuple[LensReport, int
             counter_explanations=[str(c) for c in (f.get("counter_explanations") or [])
                                  if isinstance(c, (str, int, float))],
             verifiable_by_experiment=bool(f.get("verifiable_by_experiment")),
+            # The lens's own layers, kept apart from each other and from the evidence.
+            # Each falls back to `statement` so a file written before the split still
+            # produces a complete finding.
+            claim=str(f.get("claim") or f.get("target") or "").strip(),
+            reasoning=str(f.get("reasoning") or statement).strip(),
+            conclusion=str(f.get("conclusion") or statement).strip(),
+            severity_rationale=str(f.get("severity_rationale") or "").strip(),
+            # NOT read from `f`. A lens supplying `verified_observation` or
+            # `evidence_class` is overwritten here, because the whole point of these two
+            # fields is that the harness — not the model — is their author.
+            evidence_class=evidence_class,
+            verified_observation=observation,
         ))
     return LensReport(
         lens=lens, findings=findings,

@@ -6,12 +6,9 @@ writes one of these as JSON into the research log; downstream stages receive an
 allow-listed subset — never the transcript.
 
 Reviewer pipeline (S1 → S4):
-    PaperDoc      ① ingestion: sectioned text + addressable tables + claims
+    PaperDoc      ① ingestion: sectioned text + addressable tables + numbers
     LensReport    ② audit: one blinded auditor's findings
     EvalReport    ④ synthesis: the ranked, rendered verdict
-
-The S3 reproduction-trigger artifacts (StudySpec, GroundingReport, RunReport,
-ResultsAnalysis, CheckpointReview) are retained unchanged.
 """
 from __future__ import annotations
 
@@ -78,17 +75,6 @@ class Section(_Base):
     text: str = ""
 
 
-class Claim(_Base):
-    """One assertion the paper makes about itself, with provenance."""
-
-    claim_id: str
-    kind: str = Field(default="", description="premise | contribution | result | comparison")
-    text: str = Field(default="", description="the claim, as the auditors will judge it")
-    source_quote: str = Field(default="", description="verbatim sentence(s) the claim was read from")
-    section: str = Field(default="", description="section title the quote sits in")
-    page: int = 0
-
-
 class PaperDoc(_Base):
     """The ONLY representation of the paper that crosses into the audit stage.
 
@@ -99,10 +85,16 @@ class PaperDoc(_Base):
     paper_id: str
     title: str = ""
     source_path: str = ""
+    content_sha: str = Field(
+        default="",
+        description="sha256 of the PDF bytes, first 12 hex. The paper's identity as a document "
+                    "rather than as a filename: `paper_id` is a slug of the file stem and two "
+                    "different papers can slugify identically, at which point one would silently "
+                    "load the other's doc.json. Empty on documents ingested before this field.",
+    )
     n_pages: int = 0
     sections: list[Section] = Field(default_factory=list)
     tables: list[Table] = Field(default_factory=list)
-    claims: list[Claim] = Field(default_factory=list)
     reported_numbers: list[QuantFinding] = Field(default_factory=list)
     repo_url: str = Field(
         default="", description="the official code repository the paper advertises ('' = none found)"
@@ -119,7 +111,38 @@ class PaperDoc(_Base):
 SEVERITIES = ("FATAL", "MAJOR", "MINOR")
 
 
+# How strongly a finding's evidence was checked. Computed by the harness in
+# `stages/audit._substantiated` — NEVER read from the lens file. The distinction this
+# encodes is the one the report has to preserve: a cell citation is checkable in seconds
+# by anyone holding the paper, a prose quote is checkable with a search, and everything
+# else is a model's word for it.
+EVIDENCE_CLASSES = (
+    "cell_verified",   # evidence_ref named a cell and that cell's contents match the quote
+    "prose_verified",  # the quote was found verbatim in the parsed section text at a page ref
+    "unverified",      # neither — such findings are dropped, so this should never reach a report
+)
+
+
 class Finding(_Base):
+    """One defect a lens asserts, with the layers of its justification kept apart.
+
+    The fields divide into three groups that must not be confused, because the whole
+    value of the report depends on a reader being able to tell them apart:
+
+      WRITTEN BY THE LENS, VERIFIED   evidence_quote + evidence_ref. Re-checked against
+                                      the parsed paper by `_substantiated`; a finding
+                                      whose quote is not really there is dropped.
+      WRITTEN BY THE HARNESS          verified_observation + evidence_class. Machine
+                                      generated at load time, so a lens cannot assert
+                                      that its own reasoning was confirmed.
+      WRITTEN BY THE LENS, UNVERIFIED claim, reasoning, conclusion, severity. This is
+                                      inference. It is useful and it is not evidence,
+                                      and the renderer labels it as inference.
+
+    Everything after `verifiable_by_experiment` is optional with a fallback to
+    `statement`, so lens files written before this split still load unchanged.
+    """
+
     finding_id: str = ""
     lens: str = Field(default="", description="overclaim | protocol | confound | contradiction")
     severity: str = Field(default="MINOR", description="FATAL | MAJOR | MINOR")
@@ -135,6 +158,42 @@ class Finding(_Base):
         default=False, description="could a reproduction run settle this? drives the S3 trigger"
     )
 
+    # --- the traceability split -------------------------------------------------------
+    claim: str = Field(
+        default="", description="the paper's own assertion under scrutiny. Falls back to `target`.")
+    verified_observation: str = Field(
+        default="",
+        description="WRITTEN BY THE HARNESS at load time, never by the lens: what was actually "
+                    "matched, and where. Any value supplied in a lens file is overwritten.",
+    )
+    evidence_class: str = Field(
+        default="unverified",
+        description="WRITTEN BY THE HARNESS: " + " | ".join(EVIDENCE_CLASSES))
+    reasoning: str = Field(
+        default="",
+        description="the lens's inference from the evidence. UNVERIFIED model prose. Falls back "
+                    "to `statement`.",
+    )
+    conclusion: str = Field(
+        default="",
+        description="what the lens concludes follows. UNVERIFIED. Falls back to `statement`.")
+    severity_rationale: str = Field(
+        default="",
+        description="why this severity and not the one below it. UNVERIFIED, and the reason "
+                    "`severity` is the softest joint in the chain: the evidence behind a "
+                    "finding is machine-checked, the grade attached to it is not, and the "
+                    "grade is what `overall_verdict` counts.",
+    )
+
+    def as_reasoning(self) -> str:
+        return (self.reasoning or self.statement or "").strip()
+
+    def as_conclusion(self) -> str:
+        return (self.conclusion or self.statement or "").strip()
+
+    def as_claim(self) -> str:
+        return (self.claim or self.target or "").strip()
+
 
 class LensReport(_Base):
     lens: str
@@ -148,6 +207,21 @@ class LensReport(_Base):
 # --------------------------------------------------------------------------- #
 # ③ LOCAL REPRODUCTION PROBE (S3)
 # --------------------------------------------------------------------------- #
+# Why a backend was or was not selected for an experiment. Selection is a matching
+# problem, not a configuration lookup: the question is which registered environment can
+# host THIS experiment's declared demand, and the answer has to name the ones that could
+# not and why. "No backend" and "a T4 would fit but cannot be provisioned from here" are
+# different facts, and only the second tells an operator what to do next.
+SELECTION_CODES = (
+    "selected",
+    "no_backend",               # nothing is registered
+    "resources_insufficient",   # every candidate is too small
+    "platform_incompatible",    # every candidate runs the wrong OS
+    "credentials_unavailable",  # a candidate fits but needs provisioning this host cannot do
+    "requirement_unknown",      # the demand was never established, so nothing can be matched
+)
+
+
 class ProbeSpec(_Base):
     """What to actually run locally to test one finding.
 
@@ -227,6 +301,19 @@ class ProbeSpec(_Base):
         description="E2 — the audited commit. The SHA the static audit read and the identity "
                     "layer reasoned over. Execution is verified against THIS, not against "
                     "whatever the checkout happens to hold when the run starts.",
+    )
+    commit_state: str = Field(
+        default="unassessed",
+        description="the checkout's state at PLANNING time. Recorded even when the execution "
+                    "gate is shut, so a report can say the code was not the audited code; "
+                    "execution re-verifies against the disk independently.")
+    backend_selection: str = Field(
+        default="", description="why a backend was or was not chosen: " + " | ".join(SELECTION_CODES))
+    backend_considered: list[str] = Field(
+        default_factory=list,
+        description="every registered environment and why it was accepted or rejected. Kept so "
+                    "an INCONCLUSIVE can say 'a 16 GiB T4 would fit but cannot be provisioned "
+                    "from here' rather than leaving a reader to infer it from a bare refusal.",
     )
 
 
@@ -348,6 +435,8 @@ FAILURE_CLASSES = (
     "execution_unauthorized",   # the harness refused to run it — a fact about us, not them
     "resources_insufficient",   # the experiment as published does not fit the hardware here
     "commit_mismatch",          # the code that would run is not the code that was audited
+    "backend_unavailable",      # no registered backend can host this experiment
+    "credentials_unavailable",  # a backend could host it but cannot be provisioned from here
 )
 
 # How an execution request was decided. `allowed` is the whole decision; the code names
@@ -363,7 +452,10 @@ EXEC_DECISIONS = (
     "capability_unproven",      # this machine cannot give the code a fair run
     "resources_unproven",       # the experiment's resource demand is unmet or unestablished
     "commit_unverified",        # the checkout is not provably the audited commit
+    "backend_cannot_execute",   # the selected backend is a declaration, not a runner
 )
+
+
 
 # Both new decisions above are refusals with the same shape as the others: they name a
 # fact about this harness or this host, never about the paper. `resources_unproven`
@@ -761,6 +853,16 @@ class ProbeResult(_Base):
         default=None, description="mirrors ProbeSpec.capability — S3's execution precondition"
     )
     backend: str = Field(default="local", description="the backend that ran, or would have run, this probe")
+    backend_selection: str = Field(
+        default="", description="mirrors ProbeSpec.backend_selection — why this environment, "
+                                "or why none")
+    backend_considered: list[str] = Field(
+        default_factory=list, description="mirrors ProbeSpec.backend_considered")
+    commit_state: str = Field(
+        default="unassessed",
+        description="mirrors ProbeSpec.commit_state — the checkout's state at PLANNING time. "
+                    "Distinct from `commit_verification`, which is the fresh check made at "
+                    "execution; a probe that never executes has the first and not the second.")
     resources: ResourceCapability | None = Field(
         default=None, description="mirrors ProbeSpec.resources — E1's pre-execution fit check")
     commit_verification: CommitVerification | None = Field(
@@ -797,106 +899,120 @@ class EvalReport(_Base):
     n_pages: int = 0
     n_sections: int = 0
     n_tables: int = 0
-    n_claims: int = 0
     n_numbers: int = 0
     lenses_run: list[str] = Field(default_factory=list)
     dropped_findings: int = Field(
         default=0, description="findings discarded because their evidence could not be substantiated"
     )
     probe: ProbeResult | None = Field(default=None, description="local reproduction result, if S3 ran")
+    experimental_chain: "ExperimentalChain | None" = Field(
+        default=None,
+        description="the link from a finding to what execution did or did not establish about it",
+    )
+
+
+class ExperimentalChain(_Base):
+    """finding → claim → evidence → identity → repo → commit → execution → reconciliation.
+
+    Assembled at report time from artifacts already on disk. It INVENTS NOTHING: every
+    field is copied from a `ProbeResult`, a `RepoAcquisition`, an identity record or a
+    `Reconciliation` that some earlier stage wrote and that a reader can open.
+
+    Its purpose is to make an experimental conclusion refutable in the same way a paper
+    finding is. A reader who doubts an INCONCLUSIVE can see exactly which link was not
+    established; a reader who doubts a FAILED_REPRODUCTION can see the commit, the
+    command, the metric binding and the arithmetic that produced it.
+    """
+
+    finding_id: str = ""
+    claim: str = Field(default="", description="the paper assertion the experiment addresses")
+    evidence_refs: list[str] = Field(default_factory=list, description="cells/pages the claim rests on")
+    repo_url: str = ""
+    commit: str = Field(default="", description="the audited SHA the reasoning is about")
+    commit_state: str = Field(default="unassessed", description=" | ".join(COMMIT_STATES))
+    experiment_state: str = Field(default="unmapped", description=" | ".join(IDENTITY_STATES))
+    metric_state: str = Field(default="unmapped", description=" | ".join(IDENTITY_STATES))
+    configuration_state: str = Field(default="unmapped", description=" | ".join(IDENTITY_STATES))
+    capability_code: str = Field(default="not_attempted", description=" | ".join(CAPABILITY_CODES))
+    resource_state: str = Field(default="unassessed", description=" | ".join(RESOURCE_STATES))
+    backend: str = ""
+    authorization: str = Field(default="", description="the ExecAuthorization decision")
+    provenance: str = Field(default="", description="who wrote the code that ran")
+    executed: bool = Field(default=False, description="did any process actually run")
+    reconciliation: str = Field(default="", description="RESOLVED_VERIFIED | FAILED_REPRODUCTION | INCONCLUSIVE")
+    failure_class: str = ""
+    broken_link: str = Field(
+        default="",
+        description="the FIRST link in the chain that was not established, named so a reader "
+                    "sees why no reproduction verdict was reached without re-deriving it",
+    )
 
 
 # --------------------------------------------------------------------------- #
-# S3 REPRODUCTION TRIGGER — retained from the research pipeline, unchanged
+# ⑤ CONTROLLER — the autonomous orchestration state machine
 # --------------------------------------------------------------------------- #
-class PaperSummary(_Base):
-    """Prior-art record produced by the literature scout (S3 prior-art lookup)."""
+# The controller exists so the workflow is a program rather than a convention. Before it,
+# `review()` ran the deterministic stages, returned "needs_audit", and the process ended;
+# resuming depended on an actor outside the repository following prose instructions.
+#
+# What the controller may and may not do is the whole design. It SEQUENCES and it
+# RETRIES; it does not JUDGE. It cannot authorize an execution, choose a backend, set an
+# identity state, or write a reconciliation status — every one of those stays in the
+# deterministic layer underneath, and the controller only records the answer it got.
+PHASES = ("ingest", "audit", "collect", "probe", "report", "done")
 
-    paper_id: str
-    title: str
-    source_url: str = ""
-    problem_and_context: str = Field(default="", description="what problem, why it matters now")
-    existing_approaches_and_limitations: str = ""
-    proposed_solution_and_methodology: str = ""
-    results_and_impact: str = Field(default="", description="did it work, by what metric")
-    future_work_and_limitations: str = ""
-    research_gaps: list[str] = Field(default_factory=list)
-    quantitative_findings: list[QuantFinding] = Field(default_factory=list)
+CASE_STATUSES = (
+    "pending",    # created, nothing run yet
+    "running",    # mid-pipeline, more work is possible right now
+    "waiting",    # blocked on evidence that must arrive from outside this process
+    "complete",   # a report exists
+    "error",      # the case could not be reviewed at all
+)
 
-
-class StudySpec(_Base):
-    idea_id: str
-    goal: str = ""
-    scientific_hparams: list[str] = []
-    nuisance_hparams: list[str] = []
-    fixed_hparams: list[str] = []
-    baseline: str = ""
-    claim_generality: str = Field(default="", description="'generic' or 'domain-specific'")
-    evaluation_contract: str = ""
-    sesoi: str = Field(default="", description="smallest effect size worth caring about")
-    confirm_threshold: str = Field(default="", description="the number that confirms the hypothesis")
-    refute_threshold: str = Field(default="", description="the number that refutes it")
-    min_seeds: int = Field(default=0, description="seeds needed for the effect to clear noise")
-    baseline_target: str = Field(default="", description="the published baseline number the probe must reproduce")
+# What one phase attempt concluded. `abstain` is deliberately NOT a case outcome: a paper
+# whose reproduction cannot proceed still gets a full review, so an abstention is recorded
+# on the case and the pipeline continues to the report.
+PHASE_OUTCOMES = ("ok", "waiting", "retry", "abstain", "error")
 
 
-class GroundingReport(_Base):
-    idea_id: str
-    baseline_reconciled: bool | None = None
-    baseline_target: str = ""
-    baseline_observed: str = ""
-    scale_downgraded: bool = False
-    measured_noise: str = Field(default="", description="seed-to-seed std measured by the probe")
-    required_delta: str = Field(default="", description="the Δ under test")
-    power_verdict: str = Field(default="", description="'detectable' | 'underpowered' | 'undetectable'")
-    recommended_min_seeds: int = 0
-    sesoi: str = ""
-    confirm_threshold: str = ""
-    refute_threshold: str = ""
-    go_no_go: str = Field(default="", description="'go' | 'underpowered' | 'undetectable' | 'baseline_mismatch'")
+class PhaseEvent(_Base):
+    """One attempt at one phase. The controller's audit trail."""
+
+    phase: str = Field(default="", description=" | ".join(PHASES))
+    outcome: str = Field(default="", description=" | ".join(PHASE_OUTCOMES))
     reason: str = ""
-    l4_gpu_cost_usd: float = 0.0
+    detail: dict = Field(default_factory=dict, description="the stage's own compact result")
+    attempt: int = 1
+    ts: str = ""
 
 
-class RunReport(_Base):
-    experiment_id: str
-    scale: str = Field(default="probe", description="probe | full")
-    status: str = ""
-    metrics: dict = {}
-    subject_planned: str = ""
-    subject_executed: str = ""
-    artifacts_dir: str = ""
-    commit_sha: str = ""
-    branch: str = ""
-    gpu: str = ""
-    pod_seconds: float = 0.0
-    gpu_cost_usd: float = 0.0
+class CaseState(_Base):
+    """One paper's position in the workflow, persisted at `projects/<pid>/controller.json`.
 
+    Persisted rather than held in memory because the loop has to survive the process
+    ending — a run that stops for lens evidence must resume exactly where it stopped,
+    and a batch of papers must be able to advance independently across invocations.
+    """
 
-class ResultsAnalysis(_Base):
-    experiment_id: str
-    verdict: str = Field(default="", description="confirmed|refuted|negative|inconclusive|broken")
-    matches_prediction: bool | None = None
-    adversarial_section: str = Field(default="", description="alt explanations + disconfirming evidence (mandatory)")
-    replicate_before_extend_ok: bool | None = None
-    confidence: str = ""
+    paper_id: str = ""
+    source: str = Field(default="", description="the PDF path or case id this case came from")
+    content_sha: str = ""
+    phase: str = Field(default="ingest", description=" | ".join(PHASES))
+    status: str = Field(default="pending", description=" | ".join(CASE_STATUSES))
+    attempts: dict[str, int] = Field(default_factory=dict, description="attempts made per phase")
+    history: list[PhaseEvent] = Field(default_factory=list)
+    awaiting: list[str] = Field(default_factory=list, description="lenses with no result yet")
+    blocked_reason: str = Field(default="", description="why `waiting` or `error`")
+    reproduction_class: str = Field(
+        default="",
+        description="why reproduction did not conclude, from the deterministic layer. A case can "
+                    "be `complete` with this set — an unreproducible paper is still a reviewed "
+                    "paper, and treating abstention as failure is what makes a harness crash on "
+                    "the papers it most needs to be careful about.",
+    )
+    verdict: str = Field(default="", description="the S4 verdict, once the report exists")
+    report_path: str = ""
 
-
-class Review(_Base):
-    persona: str = ""
-    quality: int = 0
-    clarity: int = 0
-    significance: int = 0
-    originality: int = 0
-    confidence: int = 0
-    verified: str = ""
-    strengths: list[str] = []
-    weaknesses: list[str] = []
-    questions: list[str] = []
-    recommendation: str = ""
-
-
-class CheckpointReview(_Base):
-    checkpoint: str = Field(default="", description="pre_experiment | post_results | post_manuscript")
-    decision: str = Field(default="", description="approve | request_changes")
-    comments: str = ""
+    @property
+    def terminal(self) -> bool:
+        return self.status in ("complete", "error")

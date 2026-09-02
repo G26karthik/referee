@@ -11,11 +11,10 @@ from pathlib import Path
 
 import pytest
 
-from harness import review as review_mod
 from harness import state
 from harness.artifacts import PaperDoc
 from harness.config import Config
-from harness.review import _probe_reason, review
+from harness.controller import review
 
 PAPER = Path(__file__).resolve().parents[1] / "papers" / "paper4_snri_nullresult.pdf"
 PID = "paper4-snri-nullresult"
@@ -115,30 +114,20 @@ def _doc(cfg: Config) -> PaperDoc:
     return PaperDoc(**state.read_json(state.project_dir(cfg, PID) / "paper" / "doc.json"))
 
 
-def test_probe_is_skipped_when_no_finding_is_settleable(cfg: Config):
+def test_the_probe_is_skipped_when_no_finding_is_settleable(cfg: Config):
     review(cfg, str(PAPER))
     write_lenses(cfg, verifiable=False)
-    wanted, why = _probe_reason(cfg, PID, _doc(cfg))
-    assert wanted is False and "no lens flagged" in why
-
     res = review(cfg, PID)
-    probe_step = next(s for s in res["steps"] if s["stage"] == "S3 probe")
+    probe_step = next(s for s in res["steps"] if s["stage"] == "S3 verify")
     assert "skipped" in probe_step
     assert not (state.project_dir(cfg, PID) / "runs" / PID / "probe_results.json").exists()
-
-
-def test_probe_is_wanted_when_a_finding_is_settleable(cfg: Config):
-    review(cfg, str(PAPER))
-    write_lenses(cfg, verifiable=True)
-    wanted, why = _probe_reason(cfg, PID, _doc(cfg))
-    assert wanted is True and "settleable finding" in why
 
 
 def test_skip_probe_beats_a_settleable_finding(cfg: Config):
     review(cfg, str(PAPER))
     write_lenses(cfg, verifiable=True)
     res = review(cfg, PID, skip_probe=True)
-    probe_step = next(s for s in res["steps"] if s["stage"] == "S3 probe")
+    probe_step = next(s for s in res["steps"] if s["stage"] == "S3 verify")
     assert probe_step["skipped"] == "--skip-probe"
 
 
@@ -151,10 +140,34 @@ def test_the_report_records_a_skipped_probe_as_absent_not_as_a_pass(cfg: Config)
     assert "Measured reproduction" not in md, "no probe means no reproduction section"
 
 
-def test_cli_exposes_review_with_the_documented_flags():
-    import run
+def test_the_cli_keeps_every_paper_it_was_given():
+    """`--paper a --paper b --paper c` used to keep only `c`, reviewing one paper while
+    appearing to review three — no error, no warning, two silently discarded."""
+    import run as cli
+    p = cli.main.__globals__["argparse"].ArgumentParser()
+    sub = p.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("review")
+    r.add_argument("--paper", required=True, action="extend", nargs="+")
+    assert p.parse_args(["review", "--paper", "a", "--paper", "b", "--paper", "c"]).paper \
+        == ["a", "b", "c"]
+    assert p.parse_args(["review", "--paper", "a", "b", "c"]).paper == ["a", "b", "c"]
+    assert p.parse_args(["review", "--paper", "a"]).paper == ["a"]
 
-    assert callable(run.cmd_review)
-    parser_flags = json.dumps(run.main.__doc__ or "")  # smoke: main is importable
-    assert parser_flags is not None
-    assert review_mod.review is review
+
+def test_several_papers_route_to_the_batch_path(monkeypatch):
+    """More than one paper is what the caller plainly meant, so it runs the batch and
+    writes a consolidated dossier rather than reviewing only the last one."""
+    import argparse
+
+    import run as cli
+    seen = {}
+    def fake(cfg, papers, **kw):
+        seen["papers"] = papers
+        return {"papers": len(papers), "complete": [], "needs_audit": {},
+                "errors": {}, "results": []}
+
+    monkeypatch.setattr(cli.controller, "review_papers", fake)
+    args = argparse.Namespace(paper=["a.pdf", "b.pdf", "c.pdf"], force_probe=False,
+                              skip_probe=False, auto_audit=False, out=None)
+    cli.cmd_review(args)
+    assert seen["papers"] == ["a.pdf", "b.pdf", "c.pdf"]

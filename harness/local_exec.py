@@ -540,6 +540,8 @@ def _blocked(cfg: Config, root: Path, spec: ProbeSpec, auth: ExecAuthorization,
         authorization=auth, capability=spec.capability, experiment=spec.experiment,
         metric_identity=spec.metric_identity, configuration=spec.configuration,
         seconds=seconds, resources=spec.resources, commit_verification=commit,
+        backend_selection=spec.backend_selection, backend_considered=spec.backend_considered,
+        commit_state=spec.commit_state,
         reason=(f"execution was not authorized ('{auth.decision}'): {auth.detail}. "
                 f"No process was started, so no measurement exists and no claim about "
                 f"the paper is drawn from this."),
@@ -668,6 +670,8 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
         metric_identity=spec.metric_identity, configuration=spec.configuration,
         backend=backend.name, authorization=auth,
         resources=spec.resources, commit_verification=commit,
+        backend_selection=spec.backend_selection, backend_considered=spec.backend_considered,
+        commit_state=spec.commit_state,
     )
 
     if len(ok) < len(spec.arms):

@@ -27,6 +27,8 @@ paper is clean" once it reaches the report.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -40,15 +42,55 @@ class AuditDriverError(RuntimeError):
     """The configured command did not produce a usable lens report."""
 
 
+def default_cmd() -> str:
+    """The built-in reviewer invocation, or '' when no reviewer can be found.
+
+    The harness still has no model of its own and still holds no key. What it can do is
+    notice that the Claude Code CLI is installed on this machine and hand it one lens
+    prompt at a time. That is the same delegation `SH_AUDIT_CMD` always described, with
+    the harness supplying the template instead of the operator — which is the difference
+    between an orchestration loop that exists in code and one that exists in prose.
+
+    One process per lens is not incidental. It is stronger isolation than the convention
+    it replaces: four lenses read by one session share a context and can echo each other,
+    whereas four subprocesses cannot. `stages/audit.py` names that weakness explicitly;
+    this closes it.
+
+    Returns '' when the CLI is absent, so `available()` refuses with a reason and the
+    pipeline falls back to the normal manual pause rather than inventing a reviewer.
+    """
+    exe = shutil.which("claude")
+    if not exe:
+        return ""
+    # `-p` is one-shot and non-interactive. The prompt is PIPED rather than interpolated
+    # into the command line: a lens prompt carries the paper's own text, which is
+    # untrusted data that may contain quotes, backticks or anything else, and a shell
+    # that expands it is a shell that can be made to run it.
+    #
+    # `run_lens` uses shell=True, so the reader differs by platform — cmd.exe has no
+    # `cat` and does not understand POSIX substitution. Getting this wrong does not fail
+    # loudly; it produces an empty output file, which `run_lens` reports as "the command
+    # exited without writing", so the pipeline degrades to the manual pause and the cause
+    # is invisible.
+    reader = "type" if os.name == "nt" else "cat"
+    return f'{reader} "{{prompt}}" | "{exe}" -p --output-format text > "{{out}}"'
+
+
+def resolve_cmd(cfg: Config) -> str:
+    """The command that would run: the operator's if set, otherwise the built-in one."""
+    return cfg.audit_cmd.strip() or default_cmd()
+
+
 def available(cfg: Config) -> tuple[bool, str]:
     """Whether auto-audit can run, and if not, the reason to show the operator."""
     if not cfg.allow_auto_audit:
-        return False, ("auto-audit gate is closed; set SH_ALLOW_AUTO_AUDIT=1 to let "
-                       "`review` fill lenses by running SH_AUDIT_CMD")
-    if not cfg.audit_cmd.strip():
-        return False, ("SH_ALLOW_AUTO_AUDIT is set but SH_AUDIT_CMD is empty; there is no "
-                       "reviewer to delegate to")
-    if "{prompt}" not in cfg.audit_cmd or "{out}" not in cfg.audit_cmd:
+        return False, ("auto-audit gate is closed; set SH_ALLOW_AUTO_AUDIT=1 (or pass "
+                       "--auto-audit) to let the controller fill lenses by running a reviewer")
+    cmd = resolve_cmd(cfg)
+    if not cmd:
+        return False, ("no reviewer is available: SH_AUDIT_CMD is empty and the `claude` CLI "
+                       "is not on PATH, so there is nothing to delegate the audit to")
+    if "{prompt}" not in cmd or "{out}" not in cmd:
         return False, ("SH_AUDIT_CMD must contain both {prompt} and {out} placeholders; "
                        f"got: {cfg.audit_cmd!r}")
     return True, ""
@@ -103,7 +145,20 @@ def parse_lens_json(text: str, lens: str) -> LensReport:
 
 
 def run_lens(cfg: Config, pid: str, lens: str, prompt: Path, out: Path) -> dict:
-    """Run the configured reviewer for one lens. Returns a record; raises on failure."""
+    """Run the configured reviewer for one lens. Returns a record; raises on failure.
+
+    The reviewer writes to a STAGING path, never to `audit/<lens>.json`, and its output
+    is promoted to the lens path only after it validates. Redirecting the command
+    straight at the lens path was a real defect with a silent and severe failure: when
+    the reviewer emitted something that was not a lens report — a rate-limit notice, an
+    error page, a partial response — the shell had already created the file before this
+    module could reject it. `run_audit` then saw four files and reported the panel
+    complete, `load_reports` could not parse them and returned four EMPTY reports, and a
+    paper that had never been audited came out GREEN with "4 lenses run, 0 findings".
+
+    The staged output of a rejected run is kept at `<lens>.rejected.txt` — diagnosable,
+    and not a filename anything downstream mistakes for a result.
+    """
     ok, why = available(cfg)
     if not ok:
         raise AuditDriverError(why)
@@ -113,26 +168,40 @@ def run_lens(cfg: Config, pid: str, lens: str, prompt: Path, out: Path) -> dict:
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists():
         out.unlink()                             # never let a stale file look like success
+    staged = out.with_suffix(".staged")
+    rejected = out.with_name(f"{lens}.rejected.txt")
+    for p_ in (staged, rejected):
+        p_.unlink(missing_ok=True)
 
-    cmd = cfg.audit_cmd.replace("{prompt}", str(prompt)).replace("{out}", str(out))
+    cmd = resolve_cmd(cfg).replace("{prompt}", str(prompt)).replace("{out}", str(staged))
     started = time.time()
     try:
         p = subprocess.run(cmd, shell=True, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=cfg.audit_timeout_s)
     except subprocess.TimeoutExpired as e:
+        staged.unlink(missing_ok=True)
         raise AuditDriverError(f"timed out after {cfg.audit_timeout_s}s") from e
     except OSError as e:
+        staged.unlink(missing_ok=True)
         raise AuditDriverError(f"could not start the command: {e}") from e
 
-    if not out.exists():
+    if not staged.exists():
         tail = (p.stderr or p.stdout or "").strip()[-300:]
         raise AuditDriverError(
             f"the command exited {p.returncode} without writing {out.name}"
             + (f" — {tail}" if tail else ""))
 
-    report = parse_lens_json(out.read_text(encoding="utf-8"), lens)
-    # Rewrite normalised: downstream reads this file, so what is on disk should be exactly
-    # what was validated, not whatever prose the command happened to wrap it in.
+    raw = staged.read_text(encoding="utf-8")
+    try:
+        report = parse_lens_json(raw, lens)
+    except AuditDriverError:
+        # Move the unusable output somewhere nothing reads as a lens result, and keep it,
+        # because "the reviewer said something and it was not a report" is worth seeing.
+        staged.replace(rejected)
+        raise
+    staged.unlink(missing_ok=True)
+    # Written normalised, and only now: downstream reads this file, so what is on disk is
+    # exactly what was validated rather than whatever prose the command wrapped it in.
     state.write_json(out, report.model_dump())
 
     record = {
@@ -170,8 +239,20 @@ if __name__ == "__main__":       # self-check: python -m harness.audit_driver
     # --- gate semantics ---------------------------------------------------------------
     closed = Config(allow_auto_audit=False, audit_cmd="x {prompt} {out}")
     assert available(closed)[0] is False, "the gate must be closed by default"
-    no_cmd = Config(allow_auto_audit=True, audit_cmd="")
-    assert available(no_cmd)[0] is False and "SH_AUDIT_CMD is empty" in available(no_cmd)[1]
+    open_gate = Config(allow_auto_audit=True, audit_cmd="")
+    if default_cmd():
+        # A reviewer was discovered on this machine, so an empty SH_AUDIT_CMD is no
+        # longer a dead end — the harness supplies the invocation itself. This is what
+        # makes the orchestration loop closeable in code.
+        assert available(open_gate)[0] is True, available(open_gate)[1]
+        assert "{prompt}" in default_cmd() and "{out}" in default_cmd()
+        assert "claude" in default_cmd().lower()
+    else:
+        assert available(open_gate)[0] is False
+        assert "not on PATH" in available(open_gate)[1]
+    # The operator's command always wins over the built-in one.
+    mine = Config(allow_auto_audit=True, audit_cmd="mytool {prompt} {out}")
+    assert resolve_cmd(mine) == "mytool {prompt} {out}"
     bad = Config(allow_auto_audit=True, audit_cmd="review --in {prompt}")
     assert available(bad)[0] is False, "a template without {out} must be refused"
     good = Config(allow_auto_audit=True, audit_cmd="cp {prompt} {out}")

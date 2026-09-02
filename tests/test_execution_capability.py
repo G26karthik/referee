@@ -295,7 +295,25 @@ def test_plan_execution_never_substitutes_the_harness_interpreter(tmp_path):
     assert out.interpreter != sys.executable or out.provenance != "repo_exec"
 
 
-def test_plan_execution_is_inert_when_the_gate_is_shut(tmp_path):
+def test_a_shut_gate_blocks_promotion_but_not_assessment(tmp_path):
+    """Rewritten. This previously asserted `capability is None` with the gate shut — that
+    the whole of planning was inert.
+
+    That was the wrong invariant and it had a cost. Since the gate is shut by default, the
+    normal output carried no capability record, no resource assessment and no backend
+    comparison, so a report could not say WHY a reproduction was impossible: identity read
+    `unmapped`, resources read `unassessed`, and the reader learned nothing about the
+    question the harness exists to answer carefully.
+
+    Assessment is read-only — parsing files, reading this machine's hardware inventory,
+    `git rev-parse`. The gate exists to permit RUNNING third-party code, and that is what
+    it still gates: no command, no `repo_exec` provenance, nothing executed.
+    """
     cfg = Config(projects_dir=tmp_path, allow_repo_exec=False)
     out = plan_execution(cfg, ProbeSpec(paper_id="p"), _acq(tmp_path), None)
-    assert out.provenance == "template" and out.capability is None
+
+    assert out.provenance == "template", "nothing may be promoted with the gate shut"
+    assert not out.command and not out.cwd and not out.interpreter
+    assert out.capability is not None, "the report must be able to say what was required"
+    assert out.capability.established is False
+    assert out.backend == "local" and out.commit_state in ("unknown", "mismatch", "verified")

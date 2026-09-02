@@ -1,16 +1,20 @@
-"""Step 0 — the suite imports, and the local pipeline is wired end to end.
+"""Step 0 — the suite imports, and the pipeline is wired end to end.
 
 `single-harness` is not an installed package; this only passes because `conftest.py`
-puts the harness root on sys.path. Nothing here opens a network connection, and
-nothing needs a credential — that is the point of the local build.
+puts the harness root on sys.path.
+
+The invariant worth pinning here is that the HARNESS holds no credential of its own: no
+Agent SDK, no cloud client, no key in any module. Two things do reach the network, and
+neither is a key this repository stores — the read-only shallow clone in S3a, and, only
+under `--auto-audit`, a reviewer subprocess that authenticates itself.
 """
 from __future__ import annotations
 
 import importlib
 
-from harness import local_exec, nodes, pdf
+from harness import local_exec, pdf
 from harness.artifacts import (
-    ArmStats, Claim, EvalReport, Finding, LensReport, PaperDoc, ProbeResult, ProbeSpec,
+    ArmStats, EvalReport, Finding, LensReport, PaperDoc, ProbeResult, ProbeSpec,
     QuantFinding, Table,
 )
 from harness.config import Config
@@ -18,28 +22,23 @@ from harness.prompts import audit as audit_prompts
 from harness.stages import audit as audit_stage
 
 
-def test_every_cli_node_exists_and_is_callable():
+def test_every_cli_stage_exists_and_is_callable():
     import run
 
-    for name in run.NODES:
-        assert callable(getattr(nodes, name)), f"run.py advertises node '{name}' but it is missing"
-
-
-def test_the_four_cli_nodes_are_the_documented_ones():
-    import run
-
-    assert run.NODES == ("ingest_paper", "audit_paper", "run_probe", "synthesize_report")
+    assert sorted(run.STAGES) == ["audit", "ingest", "probe", "report"]
+    for fn in run.STAGES.values():
+        assert callable(fn)
 
 
 def test_config_loads_without_any_credential():
-    """The whole point of the local build: no token, no key, no cloud account."""
+    """`Config.load()` cannot fail for want of a token, because it never wants one."""
     cfg = Config.load()
     assert cfg.projects_dir.exists()
     assert cfg.python and cfg.seeds >= 1
 
 
 def test_no_module_depends_on_the_agent_sdk_or_modal():
-    for name in ("harness.config", "harness.nodes", "harness.local_exec", "harness.pdf",
+    for name in ("harness.config", "harness.controller", "harness.local_exec", "harness.pdf",
                  "harness.stages.ingest", "harness.stages.audit",
                  "harness.stages.probe", "harness.stages.report"):
         src = importlib.import_module(name).__file__
@@ -79,7 +78,6 @@ def test_artifacts_degrade_instead_of_raising_on_partial_input():
     assert EvalReport(paper_id="p").probe is None
     assert Finding().severity == "MINOR"
     assert QuantFinding().page == 0
-    assert Claim(claim_id="c1").page == 0
     assert ProbeSpec(paper_id="p").seeds == [0, 1, 2, 3, 4]
     assert ProbeResult(paper_id="p").is_overclaimed is None
     assert ArmStats().n == 0

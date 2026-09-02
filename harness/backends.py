@@ -137,6 +137,56 @@ class BackendAvailability:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class BackendProfile:
+    """What a backend OFFERS, stated so an experiment's demand can be matched against it.
+
+    Distinct from `BackendResources`, which is what a backend currently measures on the
+    machine it is running on. A profile is a declaration, and a declaration is what makes
+    selection possible for an environment this host cannot interrogate: nobody here can
+    ask a Kaggle notebook how much VRAM it has, but its published specification is a fact
+    that can be compared against a 24 GiB requirement.
+
+    `can_execute` is the load-bearing field. A profile whose `can_execute` is False
+    describes a place an experiment WOULD fit; it is never a place an experiment RUNS.
+    `authorize()` refuses it outright, so a declaration can never become a reproduction.
+    """
+
+    name: str
+    platform: str
+    vram_bytes: int | None = None
+    ram_bytes: int | None = None
+    disk_bytes: int | None = None
+    cpu_count: int | None = None
+    gpu_name: str = ""
+    max_walltime_s: int | None = None
+    network_at_runtime: bool = False
+    requires_credentials: bool = False
+    can_execute: bool = False
+    reproducibility: str = ""
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class BackendSelection:
+    """Which environment can host this experiment, and what was rejected on the way.
+
+    `considered` is not diagnostics padding. An operator reading "resources_insufficient"
+    needs to know whether nothing was close or whether one candidate was one tier away,
+    and a reader auditing an INCONCLUSIVE needs to see that the refusal was a matching
+    result rather than an omission.
+    """
+
+    chosen: "ExecutionBackend | None"
+    reason_code: str
+    reason: str
+    considered: tuple[tuple[str, str, str], ...] = ()      # (name, verdict, why)
+
+    @property
+    def selected(self) -> bool:
+        return self.chosen is not None and self.reason_code == "selected"
+
+
 # --------------------------------------------------------------------------- #
 # The interface
 # --------------------------------------------------------------------------- #
@@ -160,6 +210,18 @@ class ExecutionBackend(ABC):
     # --- resource / platform checks ---------------------------------------------------
     @abstractmethod
     def resources(self) -> BackendResources: ...
+
+    def profile(self) -> BackendProfile:
+        """What this backend offers, for requirement matching. Measured by default.
+
+        A backend that can be interrogated derives its profile from `resources()`. One
+        that cannot — anything remote — overrides this with its published specification.
+        """
+        r = self.resources()
+        return BackendProfile(
+            name=self.name, platform=r.platform, vram_bytes=r.vram_bytes,
+            ram_bytes=r.ram_bytes, disk_bytes=r.disk_bytes, cpu_count=r.cpu_count,
+            gpu_name=r.gpu_name, can_execute=True, detail=r.detail)
 
     @property
     def platform(self) -> str:
@@ -262,11 +324,100 @@ class LocalBackend(ExecutionBackend):
 # --------------------------------------------------------------------------- #
 # Registry
 # --------------------------------------------------------------------------- #
+class DeclaredBackend(ExecutionBackend):
+    """An environment this harness knows the specification of but cannot drive.
+
+    Kaggle and Colab are real places an experiment could run, with published hardware, and
+    neither can be provisioned from this host: there is no API here, no credentials, and
+    no way to move a checkout into a notebook session. Registering them as declarations
+    rather than omitting them is what lets selection produce a useful refusal — "a 16 GiB
+    T4 would fit this experiment but cannot be provisioned from here" tells an operator
+    what to do next, where a bare "no backend" does not.
+
+    Every path that could execute is closed rather than stubbed. `available()` is False,
+    `can_execute` is False so `authorize()` refuses before anything is attempted, and
+    `execute()` raises. There is no integration here to go stale or to be mistaken for
+    one, and no code path by which a declaration becomes a reproduction verdict.
+    """
+
+    spec: BackendProfile
+    why_unavailable: str = "this environment cannot be provisioned from this host"
+
+    def resources(self) -> BackendResources:
+        p = self.spec
+        return BackendResources(
+            name=p.name, platform=p.platform, python="", has_gpu=bool(p.vram_bytes),
+            vram_bytes=p.vram_bytes, ram_bytes=p.ram_bytes, disk_bytes=p.disk_bytes,
+            cpu_count=p.cpu_count, gpu_count=1 if p.vram_bytes else None,
+            gpu_name=p.gpu_name, detail=p.detail)
+
+    def profile(self) -> BackendProfile:
+        return self.spec
+
+    def available(self) -> BackendAvailability:
+        return BackendAvailability(False, self.why_unavailable)
+
+    def capability(self, acq: RepoAcquisition, interpreter: str,
+                   harness_python: str, flag: str = "seed") -> ExecCapability:
+        return ExecCapability(
+            established=False, reason_code="environment_incompatible", backend=self.name,
+            detail=f"'{self.name}' is a declared environment, not a runner: {self.why_unavailable}")
+
+    def provision(self, cfg: Config, root: Path, pid: str,
+                  acq: RepoAcquisition) -> RepoAcquisition:
+        acq.env_status = "blocked"
+        acq.reason = f"'{self.name}' cannot be provisioned from this host"
+        return acq
+
+    def execute(self, req: ExecRequest) -> ExecOutcome:
+        raise NotImplementedError(
+            f"'{self.name}' is a declaration of an environment's specification, not an "
+            f"integration with it. Nothing here can run {req.argv[:1]}. Reaching this line "
+            f"means an authorization gate was bypassed.")
+
+    def cleanup(self, root: Path, pid: str) -> list[str]:
+        return []
+
+
+class KaggleBackend(DeclaredBackend):
+    """Kaggle free tier, as published: one T4, ~13 GiB RAM, a 12-hour session ceiling."""
+
+    name = "kaggle"
+    why_unavailable = ("Kaggle sessions need an account, an API token and a notebook upload; "
+                       "this harness holds no credentials and cannot provision one")
+    spec = BackendProfile(
+        name="kaggle", platform="linux", vram_bytes=16 * (1024 ** 3),
+        ram_bytes=13 * (1024 ** 3), disk_bytes=73 * (1024 ** 3), cpu_count=4,
+        gpu_name="Tesla T4", max_walltime_s=12 * 3600, network_at_runtime=False,
+        requires_credentials=True, can_execute=False, reproducibility="session",
+        detail="Kaggle free tier, published specification")
+
+
+class ColabBackend(DeclaredBackend):
+    """Google Colab free tier, as published: one T4, ~13 GiB RAM, pre-emptible."""
+
+    name = "colab"
+    why_unavailable = ("Colab sessions are interactive, credentialed and pre-emptible; there "
+                       "is no way to drive one from this host")
+    spec = BackendProfile(
+        name="colab", platform="linux", vram_bytes=16 * (1024 ** 3),
+        ram_bytes=13 * (1024 ** 3), disk_bytes=78 * (1024 ** 3), cpu_count=2,
+        gpu_name="Tesla T4", max_walltime_s=12 * 3600, network_at_runtime=False,
+        requires_credentials=True, can_execute=False, reproducibility="session",
+        detail="Google Colab free tier, published specification")
+
+
 class UnknownBackend(ValueError):
     """The operator named a backend that is not registered."""
 
 
-_REGISTRY: dict[str, type[ExecutionBackend]] = {"local": LocalBackend}
+_REGISTRY: dict[str, type[ExecutionBackend]] = {
+    "local": LocalBackend,
+    # Declarations, not integrations. They exist so `select_for` can say WHY an experiment
+    # has nowhere to run — see DeclaredBackend. Neither can execute anything.
+    "kaggle": KaggleBackend,
+    "colab": ColabBackend,
+}
 
 
 def register_backend(name: str, cls: type[ExecutionBackend]) -> None:
@@ -309,6 +460,110 @@ def backend_for(cfg: Config, spec: ProbeSpec) -> ExecutionBackend | None:
         return select_backend(cfg)
     except UnknownBackend:
         return None
+
+
+def _fits(need: int | None, have: int | None) -> bool:
+    """Does a declared demand fit a declared offer? Unknown on EITHER side does not fit.
+
+    An unmeasured offer is not a large one, and an unstated demand is not a small one —
+    the same asymmetry `assess_resources` encodes, applied to matching.
+    """
+    return need is None or (have is not None and need <= have)
+
+
+def select_for(requirement, cfg: Config, declared_platform: str = "",
+               walltime_s: int | None = None) -> BackendSelection:
+    """Which registered environment can host THIS experiment. A matching problem.
+
+    Not a configuration lookup. `select_backend` answers "which backend did the operator
+    name"; this answers "which backend can run an experiment that declares 24 GiB of VRAM
+    and a Linux-only stack", which is a different question and the one that has to be
+    asked before a reproduction is attempted.
+
+    Candidates are ranked so that a runnable backend always beats a declared one, and
+    among runnable ones the smallest sufficient environment wins — a reproduction should
+    not silently claim a larger machine than it needs.
+
+    The refusal codes are ordered by what is most useful to act on. `credentials_
+    unavailable` outranks `resources_insufficient` because "somewhere could run this, but
+    not from here" is actionable and "nothing is big enough" is not.
+    """
+    if requirement is None or not getattr(requirement, "stated", False):
+        return BackendSelection(
+            None, "requirement_unknown",
+            "the experiment's resource demand was never established, so no environment can "
+            "be shown to host it; matching a backend against an unknown demand would be "
+            "choosing one at random")
+
+    if getattr(requirement, "walltime_s", None) and walltime_s is None:
+        walltime_s = requirement.walltime_s
+
+    runnable: list[tuple[int, ExecutionBackend, BackendProfile]] = []
+    declared: list[tuple[ExecutionBackend, BackendProfile]] = []
+    considered: list[tuple[str, str, str]] = []
+
+    for name in registered_backends():
+        backend = _REGISTRY[name]()
+        p = backend.profile()
+
+        if declared_platform and declared_platform not in (p.platform or ""):
+            considered.append((name, "platform_incompatible",
+                               f"the repository declares a {declared_platform}-only stack and "
+                               f"'{name}' offers {p.platform or 'an unknown platform'}"))
+            continue
+
+        short = [lbl for lbl, need, have in
+                 (("VRAM", requirement.vram_bytes, p.vram_bytes),
+                  ("RAM", requirement.ram_bytes, p.ram_bytes),
+                  ("disk", requirement.disk_bytes, p.disk_bytes),
+                  ("CPU", requirement.cpu_count, p.cpu_count))
+                 if not _fits(need, have)]
+        if walltime_s and p.max_walltime_s and walltime_s > p.max_walltime_s:
+            short.append("walltime")
+        if short:
+            considered.append((name, "resources_insufficient",
+                               f"'{name}' cannot meet: {', '.join(short)}"))
+            continue
+
+        if not p.can_execute:
+            considered.append((name, "credentials_unavailable",
+                               f"'{name}' has the hardware for this experiment but "
+                               f"{backend.available().detail}"))
+            declared.append((backend, p))
+            continue
+        if not backend.available().usable:
+            considered.append((name, "unavailable", backend.available().detail))
+            continue
+
+        considered.append((name, "fits", f"'{name}' meets every stated requirement"))
+        # Rank by VRAM so the smallest sufficient environment is preferred.
+        runnable.append((p.vram_bytes or 0, backend, p))
+
+    frozen = tuple(considered)
+    if runnable:
+        runnable.sort(key=lambda t: t[0])
+        backend, p = runnable[0][1], runnable[0][2]
+        return BackendSelection(backend, "selected",
+                                f"'{p.name}' meets every stated requirement of this experiment",
+                                frozen)
+    if declared:
+        names = ", ".join(p.name for _, p in declared)
+        return BackendSelection(
+            None, "credentials_unavailable",
+            f"the experiment fits {names}, but that environment cannot be provisioned from "
+            f"this host, so no reproduction can be attempted. This is a limit of the runner, "
+            f"not a fact about the paper.", frozen)
+    if any(v == "platform_incompatible" for _, v, _ in considered) and \
+            not any(v == "resources_insufficient" for _, v, _ in considered):
+        return BackendSelection(None, "platform_incompatible",
+                                "no registered environment runs the platform this repository "
+                                "declares", frozen)
+    if considered:
+        return BackendSelection(
+            None, "resources_insufficient",
+            "no registered environment is large enough for the experiment as published: "
+            + "; ".join(why for _, v, why in considered if v == "resources_insufficient"), frozen)
+    return BackendSelection(None, "no_backend", "no execution backend is registered", frozen)
 
 
 def local_backend() -> LocalBackend:
@@ -366,15 +621,36 @@ def authorize(cfg: Config, spec: ProbeSpec, backend: ExecutionBackend | None,
             detail="the code under test was authored by this harness or its operator, "
                    "not fetched from the paper's repository")
 
-    if backend is None or not backend.available().usable:
-        detail = (backend.available().detail if backend is not None
-                  else "no execution backend is available")
-        return ExecAuthorization(allowed=False, decision="no_backend",
-                                 backend=getattr(backend, "name", ""),
-                                 failure_class="execution_unauthorized",
-                                 detail=f"repository execution needs a usable backend: {detail}")
+    if backend is None:
+        return ExecAuthorization(allowed=False, decision="no_backend", backend="",
+                                 failure_class="backend_unavailable",
+                                 detail="no execution backend is available for this experiment")
 
     name = backend.name
+    # A declared environment describes a place an experiment WOULD fit. It is never a
+    # place one RUNS. Refusing here, before the gate and before every scientific
+    # precondition, means no path exists by which a specification becomes a reproduction
+    # verdict — `DeclaredBackend.execute` raises, and this is the check that ensures the
+    # raise is unreachable rather than load-bearing.
+    #
+    # Ahead of the generic availability check on purpose. A declaration is also
+    # "unavailable", and reporting it that way would answer "no usable backend" when the
+    # useful answer is "a 16 GiB T4 would host this, but it needs credentials this
+    # harness does not hold" — which is the difference between a dead end and a next step.
+    if not backend.profile().can_execute:
+        return ExecAuthorization(
+            allowed=False, decision="backend_cannot_execute", backend=name,
+            failure_class="credentials_unavailable" if backend.profile().requires_credentials
+            else "backend_unavailable",
+            detail=f"'{name}' is a declared environment, not a runner: "
+                   f"{backend.available().detail}")
+
+    if not backend.available().usable:
+        return ExecAuthorization(allowed=False, decision="no_backend", backend=name,
+                                 failure_class="backend_unavailable",
+                                 detail=f"repository execution needs a usable backend: "
+                                        f"{backend.available().detail}")
+
     if not cfg.allow_repo_exec:
         return ExecAuthorization(
             allowed=False, decision="gate_closed", backend=name,

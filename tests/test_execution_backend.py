@@ -300,7 +300,8 @@ def test_every_condition_together_is_what_authorizes():
 # --------------------------------------------------------------------------- #
 # The invariant: an unqualified execution can reach NEITHER verdict
 # --------------------------------------------------------------------------- #
-_UNAUTHORIZED = ("gate_closed", "no_backend", "provenance_insufficient",
+_UNAUTHORIZED = ("gate_closed", "no_backend", "backend_cannot_execute",
+                 "resources_unproven", "commit_unverified", "provenance_insufficient",
                  "identity_unproven", "capability_unproven")
 
 

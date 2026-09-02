@@ -22,8 +22,8 @@ import re
 from collections import Counter
 
 from .. import state
-from ..artifacts import (CodeAudit, CodeAuditFinding, EvalReport, Finding, LensReport, PaperDoc,
-                         ProbeResult, Reconciliation, RepoAcquisition)
+from ..artifacts import (CodeAudit, CodeAuditFinding, EvalReport, ExperimentalChain, Finding,
+                         LensReport, PaperDoc, ProbeResult, Reconciliation, RepoAcquisition)
 from ..config import Config
 from . import audit as audit_stage
 
@@ -132,6 +132,120 @@ def overall_verdict(findings: list[Finding],
     if n["MINOR"] >= YELLOW_MINOR:
         return "YELLOW", f"{n['MINOR']} MINOR findings (>= {YELLOW_MINOR}) accumulate into real doubt."
     return "GREEN", f"No FATAL or MAJOR findings; {n['MINOR']} MINOR."
+
+
+def severity_review(findings: list[Finding]) -> list[str]:
+    """FATAL/MAJOR findings whose evidence is not a checkable cell citation.
+
+    Severity is the one link in the chain the harness cannot check. The quote behind a
+    finding is re-verified against the parsed paper, the reasoning is labelled as
+    inference — but the GRADE is a model's word, and the grade is what `overall_verdict`
+    counts. A lens that quotes accurately and grades generously can move a paper to RED.
+
+    This FLAGS and does not demote. Demoting would change verdicts on evidence the
+    harness cannot itself assess, which is the same unearned inference it exists to catch.
+    Flagging gives an editor the list to check first and leaves the call with them.
+
+    ponytail: the ceiling is that this is advisory. Making severity earned rather than
+    asserted needs a second independent grader over the same evidence — a real subsystem,
+    and not one to build speculatively. Until then the report states the limitation.
+    """
+    return [f"[{f.severity}] {f.finding_id or f.title[:40]} ({f.lens}) — evidence is "
+            f"{f.evidence_class.replace('_', ' ')}, not a cited table cell"
+            for f in findings
+            if f.severity in ("FATAL", "MAJOR") and f.evidence_class != "cell_verified"]
+
+
+def build_chain(findings: list[Finding], probe: ProbeResult | None) -> ExperimentalChain | None:
+    """Link the reproduction attempt back to the finding it was about. Copies, never derives.
+
+    Every field comes from an artifact some earlier stage wrote. The one thing computed
+    here is `broken_link`: the FIRST precondition that was not established, so a reader
+    of an INCONCLUSIVE sees which link failed instead of having to re-walk the chain.
+    Naming the first one matters — later links are not assessed once an earlier one
+    fails, so listing them all would imply checks that never ran.
+    """
+    if probe is None:
+        return None
+    rec, acq = probe.reconciliation, probe.repo
+    anchor = next((f for f in findings if f.finding_id and f.finding_id == probe.finding_id), None)
+
+    chain = ExperimentalChain(
+        finding_id=probe.finding_id or "",
+        claim=(anchor.as_claim() if anchor else probe.claim or ""),
+        evidence_refs=[anchor.evidence_ref] if anchor and anchor.evidence_ref else (
+            [rec.table_ref] if rec and rec.table_ref else []),
+        repo_url=(acq.url if acq else ""),
+        commit=(acq.commit if acq else ""),
+        backend=probe.backend or "",
+        provenance=probe.provenance or "",
+        executed=bool(probe.seeds_run),
+        reconciliation=(rec.status if rec else ""),
+        failure_class=(rec.failure_class if rec else "") or "",
+    )
+    # The fresh execution-time check when there was one, else what planning established.
+    # A probe that never executed has only the second, and reporting it as `unassessed`
+    # would name the wrong broken link — the commit was checked, something later failed.
+    chain.commit_state = (probe.commit_verification.state
+                          if probe.commit_verification is not None
+                          else (probe.commit_state or "unassessed"))
+    if probe.backend_selection:
+        chain.backend = f"{probe.backend} ({probe.backend_selection})"
+    if probe.experiment is not None:
+        chain.experiment_state = probe.experiment.state
+    if probe.metric_identity is not None:
+        chain.metric_state = probe.metric_identity.state
+    if probe.configuration is not None:
+        chain.configuration_state = probe.configuration.state
+    if probe.capability is not None:
+        chain.capability_code = probe.capability.reason_code
+    if probe.resources is not None:
+        chain.resource_state = probe.resources.state
+    if probe.authorization is not None:
+        chain.authorization = probe.authorization.decision
+
+    for label, ok in (
+            ("repository", bool(chain.repo_url)),
+            ("audited commit", chain.commit_state == "verified"),
+            ("experiment identity", chain.experiment_state == "established"),
+            ("metric identity", chain.metric_state == "established"),
+            ("configuration identity", chain.configuration_state == "established"),
+            ("execution capability", chain.capability_code == "established"),
+            ("resource sufficiency", chain.resource_state == "satisfied"),
+            ("authorization", chain.authorization == "authorized"),
+            ("execution", chain.executed)):
+        if not ok:
+            chain.broken_link = label
+            break
+    return chain
+
+
+def _chain_block(c: ExperimentalChain) -> list[str]:
+    """The experimental chain as a table a reader can walk link by link."""
+    rows = [("finding", f"`{c.finding_id}`" if c.finding_id else "— none targeted"),
+            ("paper claim", _cell(c.claim, 160) or "—"),
+            ("evidence", ", ".join(f"`{r}`" for r in c.evidence_refs) or "—"),
+            ("repository", f"`{c.repo_url}`" if c.repo_url else "— none advertised"),
+            ("audited commit", f"`{c.commit[:12]}` ({c.commit_state})" if c.commit else "— none"),
+            ("experiment identity", c.experiment_state),
+            ("metric identity", c.metric_state),
+            ("configuration identity", c.configuration_state),
+            ("execution capability", c.capability_code),
+            ("resource sufficiency", c.resource_state),
+            ("backend", c.backend or "—"),
+            ("authorization", c.authorization or "—"),
+            ("code that ran", c.provenance or "—"),
+            ("executed", "yes" if c.executed else "no"),
+            ("reconciliation", c.reconciliation or "—")]
+    out = ["| link | state |", "|---|---|"] + [f"| {k} | {v} |" for k, v in rows]
+    if c.broken_link:
+        out += ["", f"⛔ The chain breaks at **{c.broken_link}**. Nothing after that link was "
+                    f"established, so no reproduction verdict follows — this is a limit of "
+                    f"what could be proven here, not a finding about the paper."]
+    else:
+        out += ["", "🟢 Every link established, so the reconciliation above is a real "
+                    "reproduction verdict."]
+    return out
 
 
 def pick_unasked_question(reports: list[LensReport]) -> str:
@@ -378,8 +492,16 @@ def render_eval_report(r: EvalReport) -> str:
         for f in threats[:MAX_THREAT_BULLETS]:
             where = f" — `{f.evidence_ref}`" if f.evidence_ref else ""
             L.append(f"- **[{f.severity}] {f.title}**{where}")
-            L.append(f"  {f.statement}")
+            # Evidence and inference are printed as separate, labelled lines. They are
+            # different kinds of thing: the quote and the observation were checked by the
+            # harness against the parsed paper, and the reasoning is a model's argument
+            # from them. A reader who cannot tell which is which cannot audit either.
             L.append(f"  > \"{_cell(f.evidence_quote, _QUOTE_CHARS)}\"")
+            if f.verified_observation:
+                L.append(f"  ✅ *Verified* ({f.evidence_class}): "
+                         f"{_cell(f.verified_observation, 260)}")
+            L.append(f"  🧠 *Inference (model reasoning, not verified):* "
+                     f"{_cell(f.as_reasoning(), 400)}")
             if f.counter_explanations:
                 L.append(f"  Alternative explanation: {_cell(f.counter_explanations[0], 200)}")
         if len(threats) > MAX_THREAT_BULLETS:
@@ -396,6 +518,19 @@ def render_eval_report(r: EvalReport) -> str:
         if r.probe.reconciliation is not None:
             L += ["## Table-cell reconciliation", "",
                   *_reconciliation_block(r.probe.reconciliation), ""]
+        if r.experimental_chain is not None:
+            L += ["## Experimental evidence chain", "",
+                  *_chain_block(r.experimental_chain), ""]
+
+    ungraded = severity_review(r.findings)
+    if ungraded:
+        L += ["## Severity caveat", "",
+              f"{len(ungraded)} of {sum(1 for f in r.findings if f.severity in ('FATAL', 'MAJOR'))} "
+              f"FATAL/MAJOR finding(s) rest on prose rather than a cited table cell. Severity is "
+              f"assigned by the lens and is not machine-verified, and it is what the verdict "
+              f"counts \u2014 check these first:", ""]
+        L += [f"- {u}" for u in ungraded]
+        L += [""]
 
     L += ["## The unasked obvious question", "",
           r.unasked_question or "_No lens identified a conspicuously missing comparison._", ""]
@@ -448,8 +583,9 @@ def run_report(cfg: Config, pid: str) -> dict:
         paper_id=pid, title=doc.title, verdict=verdict, verdict_reason=reason,
         findings=findings, unasked_question=pick_unasked_question(reports),
         n_pages=doc.n_pages, n_sections=len(doc.sections), n_tables=len(doc.tables),
-        n_claims=len(doc.claims), n_numbers=len(doc.reported_numbers),
+        n_numbers=len(doc.reported_numbers),
         lenses_run=[r.lens for r in reports], dropped_findings=dropped, probe=probe,
+        experimental_chain=build_chain(findings, probe),
     )
 
     md_path, json_path = root / "reports" / f"{pid}.md", root / "reports" / f"{pid}.json"

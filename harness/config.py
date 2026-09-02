@@ -70,6 +70,15 @@ class Config:
     allow_auto_audit: bool = field(default_factory=lambda: _flag("SH_ALLOW_AUTO_AUDIT"))
     audit_cmd: str = field(default_factory=lambda: os.environ.get("SH_AUDIT_CMD", ""))
     audit_timeout_s: int = field(default_factory=lambda: int(os.environ.get("SH_AUDIT_TIMEOUT", "900")))
+    # How many times the controller may re-attempt ONE lens whose reviewer failed. A
+    # timeout or a truncated JSON object is transient; the same prompt run again may well
+    # succeed. Bounded, and every attempt is recorded in the case history — a retry that
+    # is not visible is indistinguishable from a stage that never ran.
+    #
+    # Nothing else in the pipeline is retryable. An identity, resource, commit or
+    # authorization refusal is deterministic, and re-running one would be an attempt to
+    # get a different answer out of a gate that is doing its job.
+    audit_retries: int = field(default_factory=lambda: int(os.environ.get("SH_AUDIT_RETRIES", "2")))
 
     # Which execution backend runs THIRD-PARTY repository code. Not a gate — `local` is
     # the only registered backend, and selecting one grants nothing on its own: the

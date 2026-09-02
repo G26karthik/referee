@@ -1,171 +1,134 @@
-# single-harness — AI first-round peer reviewer
+# single-harness
 
-Takes a submitted ML paper (PDF) and produces a 1–2 page structured evaluation report
-with a Red / Yellow / Green verdict and a verbatim evidence pointer behind every finding.
+An autonomous replication auditor for machine-learning papers.
 
-**Fully local. No API keys, no cloud account, no network calls.** Three of the four
-stages are plain deterministic Python. The fourth needs judgement, and the judge is the
-Claude Code session you are already sitting in.
+Give it PDFs. It reads each one, runs a four-lens adversarial audit, verifies every
+quoted piece of evidence against the parsed paper, then tries to settle whichever
+findings an experiment could settle — acquiring the authors' repository, pinning it to
+the commit it audited, and refusing to execute anything until it can prove it is running
+the right code, measuring the right quantity, under the right configuration, on hardware
+that fits. Out comes a RED/YELLOW/GREEN report per paper and a consolidated dossier.
 
-## Pipeline
+Its most useful property is what it refuses to say. An experiment that does not fit the
+machine, a repository whose code does not produce the cited number, a metric that cannot
+be bound to the cell — each yields `INCONCLUSIVE` with a named reason, never a verdict
+against the paper.
+
+## Architecture
 
 ```
-S1  ingest_paper       PDF → PaperDoc: sections, addressable tables, reported numbers
-S2  audit_paper        writes one prompt per lens; the DRIVER performs the audits
-S3  run_probe          conditional local GPU reproduction across seeds → noise floor
-S4  synthesize_report  verify → rank → reports/<paper_id>.md
+papers
+  │
+  ▼
+controller ──────── per-paper state in projects/<pid>/controller.json
+  │                 bounded retries · resumable · papers isolated
+  ├─ S1 ingest      PDF → PaperDoc (sections, tables, every number with provenance)
+  ├─ S2 audit       four lenses: overclaim · protocol · confound · contradiction
+  ├─   collect      every quote re-verified against the paper; failures dropped
+  ├─ S3 verify      repo → commit → experiment/metric/configuration identity
+  │                      → capability → resources → backend → authorization
+  ├─   execute      only if authorization passed. Otherwise: blocked
+  ├─   reconcile    reproduced metric vs the printed cell, arithmetically
+  └─ S4 report      deterministic threshold table → reports/<pid>.md
 ```
 
-All four are driven by one command: `python run.py review --paper <pdf>`.
+Three of the four stages are plain deterministic Python. Only S2 needs judgement, and
+the judge is a language model — either the Claude Code session driving the CLI, or, under
+`--auto-audit`, one subprocess per lens.
 
-### The normal way to run it
+`docs/HARNESS_ARCHITECTURE.md` is the authoritative map, with the per-stage contract and
+the full evidence chain.
+
+## Usage
 
 ```bash
-python run.py review --paper papers/paper4_snri_nullresult.pdf
+# the normal invocation
+PYTHONUTF8=1 ../.venv/Scripts/python.exe run.py review \
+    --paper papers/a.pdf papers/b.pdf papers/c.pdf --auto-audit
 ```
 
-That runs every deterministic stage and stops **once**, when the four lens results are
-missing — printing the prompt paths and exiting `2`. Perform the audits, write
-`audit/<lens>.json`, then re-run to finish:
+Exit codes: `0` every paper complete · `2` some paper waits on lens evidence · `1` error.
 
-```bash
-python run.py review --paper paper4-snri-nullresult      # exit 0, prints the report
-```
+Without `--auto-audit` the run stops after writing `projects/<pid>/audit/prompts/*.md`
+and exits 2; write `audit/<lens>.json` for each and re-run to resume.
 
-Exit codes: `0` complete · `2` waiting on audits · `1` error. Every stage is idempotent,
-so re-running only does the work that had not finished. `--force-probe` runs the GPU probe
-even when nothing is flagged settleable; `--skip-probe` never runs it.
+## Example
 
-That pause is the one manual step and it is not an oversight: S2 needs judgement, and the
-judge is the Claude Code session driving the CLI — there is no subprocess to delegate it
-to. `CLAUDE.md` tells Claude Code how to handle the pause automatically.
-
-### Individual stages
-
-```bash
-python run.py node ingest_paper      --paper papers/paper4_snri_nullresult.pdf
-python run.py node audit_paper       --paper paper4-snri-nullresult
-python run.py node run_probe         --paper paper4-snri-nullresult
-python run.py node synthesize_report --paper paper4-snri-nullresult
-```
-
-`--paper` is a **PDF path** for `ingest_paper` and the **case id** everywhere else. The
-case id is the PDF filename slugified; `ingest_paper` prints it back.
-
-## The four lenses
-
-| Lens | Hunts |
-|---|---|
-| `overclaim` | unsound premises; gains smaller than the paper's own seed noise; undertuned baselines; undeclared prior art |
-| `protocol` | label leakage; fit-before-split; tuning or early-stopping on test; grouped/temporal splits done at row level; metric gaming |
-| `confound` | variables that moved together with the mechanism; the missing single-variable ablation; unequal tuning budget |
-| `contradiction` | narrative vs table cell; abstract vs conclusion vs limitations; baselines that appear in one table and vanish from another |
-
-Each first runs a **first-principles reality check** — why this method at all, what is the
-obvious baseline they avoided, why did they not try it — because that is where human
-review fails far more often than on subtle statistics.
-
-Run each lens in a **separate turn**. Four independent readings are four pieces of
-evidence; one context that remembers the previous three is one reading echoed four times.
-
-## Why you can trust the output
-
-**Provenance is structural, not requested.** S1 is deterministic: a reported number *is*
-a table cell or *is* a whole sentence lifted verbatim. There is no extraction step that
-could round, re-unit, or invent one.
-
-**The harness does not trust the driver either.** Every finding you write is re-verified
-at report time. If `evidence_quote` is not actually in the paper — or cites `T2:r3:c4`
-but does not match what that cell says — the finding is **dropped** and the report says
-how many were dropped. You are a language model; the harness checks.
-
-**No model decides the verdict.** Ranking and RED/YELLOW/GREEN are a lexicographic sort
-and a threshold table in `stages/report.py`. `render_eval_report` is a pure function that
-only copies from artifacts, so nothing can be hallucinated at render time.
-
-RED means a central claim does not stand: a FATAL, or three MAJORs from one lens, or ten
-overall. It is deliberately hard to reach — a four-lens panel returns roughly two MAJORs
-per lens on a *good* paper, and a rule that called that RED would reject everything.
-
-## S3 — the local probe
-
-`harness/local_exec.py` writes `runs/<paper_id>/probe.py`, runs it once per (arm, seed)
-via `subprocess.run`, parses a fixed stdout contract, and writes `probe_results.json`
-**by value** — no git branch, no commit, no push.
+A real refusal, from the APT pilot paper. The audit targeted cell `T2:r3:c11`, and the
+report shows exactly where the chain broke:
 
 ```
-SH_DEVICE <cuda|mps|cpu>
-SH_METRIC arm=<name> seed=<int> value=<float>
+| audited commit        | 56eaf8bc8624 (verified)              |
+| experiment identity   | no_candidate                         |
+| metric identity       | unmapped                             |
+| resource sufficiency  | insufficient                         |
+| backend               | local (resources_insufficient)       |
+| reconciliation        | INCONCLUSIVE                         |
+
+⛔ The chain breaks at experiment identity.
 ```
 
-Any script honouring those two lines plugs in. Put a faithful reproduction of the paper's
-setup in `runs/<paper_id>/spec.json` (`{"script": "..."}`) and it is used verbatim.
+The cited row reports `LLMPruner` — a third-party baseline the authors' code does not
+produce — so no execution of their repository could settle it. Separately, the experiment
+declares 24 GiB of VRAM against 8 GiB present, and no registered backend can host it.
+Both facts are recorded; neither is a finding about the paper.
 
-With no script supplied the default template runs **identical arms**, which measures this
-machine's seed-noise floor — the denominator every "is this gain real?" question divides
-by. The report labels that case as calibration, not as a reproduction of the paper.
+## Scientific guarantees
 
-A separate process per seed is deliberate: re-seeding in-process leaves CUDA state and
-autotune caches warm, which under-reports the true seed spread — the one number this
-stage exists to get right.
+- Every finding carries a verbatim quote and a location (`p7` or `T2:r3:c4`), re-verified
+  against the parsed paper. Unsubstantiated findings are dropped and the count printed.
+- What the harness verified and what the model inferred are rendered separately. A lens
+  cannot mark its own reasoning as confirmed.
+- **Provenance ceiling**: only the authors' own checkout, or a human-written faithful
+  reproduction, may reconcile against a printed cell — in either direction. A probe this
+  harness synthesised can neither convict nor acquit.
+- Execution is permitted by exactly one function, `backends.authorize`, and only when
+  commit, experiment identity, metric identity, configuration identity, capability and
+  resources all hold.
+- Infrastructure failure is never scientific failure. A missing dependency, an
+  incompatible platform, a shut gate and an experiment too large all yield
+  `INCONCLUSIVE`.
+- Nothing is shrunk to fit. There is no code path that reduces a model, batch, precision,
+  sequence length, schedule or seed count to make an experiment run.
+- The RED/YELLOW/GREEN call is a threshold table, not a judgement.
 
-Detectability test: `is_overclaimed = |measured_delta| < 2 × measured_std`, where the std
-is the spread of *per-seed differences* when both arms share seeds (shared variance
-cancels, so a real effect is not hidden), falling back to the wider arm spread otherwise.
-A std of exactly zero yields `degenerate`, never a verdict — you cannot test
-detectability with no noise estimate.
+## Current execution limitations
 
-## Setup
+Real hardware: Windows, RTX 4060 Laptop (8 GiB VRAM), Ryzen 9, ~15 GiB RAM. No WSL, no
+Docker, no virtualization.
 
-```bash
-uv pip install --python .venv/Scripts/python.exe -r single-harness/requirements.txt
-```
+`RESOLVED_VERIFIED` is therefore unreachable today. `SH_ALLOW_REPO_EXEC` is off by
+default, and with it open the pilot papers refuse independently on resources and on
+platform. Kaggle and Colab are registered as **declarations** — real published specs,
+`can_execute=False`, `execute()` raises — so selection can report that a T4 would fit
+while stating it cannot be provisioned from here. They are not integrations.
 
-`pymupdf` + `pdfplumber` are required (S1). `numpy` + `scikit-learn` are required by the
-default probe template. `torch` is **optional** — install it to use a local GPU:
-
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu124
-```
-
-The harness never imports torch itself; only the probe subprocess does, and it falls back
-to sklearn on CPU when torch is absent.
-
-On Windows set `PYTHONUTF8=1`. Paper text is full of em dashes, Greek letters and math;
-the default `cp1252` console encoding mangles them.
-
-| Variable | Default | Effect |
-|---|---|---|
-| `SH_AUDIT_BUDGET_CHARS` | `70000` | body text embedded in each lens prompt |
-| `SH_SEEDS` | `5` | probe seeds (clamped to 3–5) |
-| `SH_PROBE_TIMEOUT` | `1800` | seconds per (arm, seed) run |
-| `SH_PYTHON` | current interpreter | interpreter used for probe subprocesses |
-
-## Layout
+## Repository
 
 ```
-run.py                  CLI: node / list / status
-dashboard.py            stdlib-only live viewer over research_log.jsonl
+run.py                 CLI. Formats; decides nothing.
 harness/
-  pdf.py                PDF → sections, addressable tables, reported numbers (pure)
-  local_exec.py         probe generation, seed loop, stdout parsing, statistics
-  artifacts.py          typed Pydantic artifacts — the only thing crossing a boundary
-  config.py             paths + local execution settings. No credentials.
-  state.py              case directories + the append-only research log
-  nodes.py              the node surface run.py drives
-  stages/               ingest · audit · probe · report
-  prompts/              ingest · audit — the reasoning half, kept out of the code
-projects/<paper_id>/
-  paper/doc.json  audit/prompts/<lens>.md  audit/<lens>.json
-  runs/<paper_id>/probe.py + probe_results.json  reports/<paper_id>.md
-papers/                 sample PDFs to run against
-```
-
-## Self-checks
-
-```bash
-python -m pytest tests -q          # 94 tests, no credentials, no network
-python -m harness.pdf papers/paper1_grokking.pdf    # parser on a real PDF
-python -m harness.local_exec                        # probe runner + statistics
-python -m harness.stages.report                     # ranking + verdict + renderer
+  controller.py        the driver: phase machine, retries, batch scheduling, entry points
+  artifacts.py         every typed artifact that crosses a stage boundary
+  config.py            paths and gates, all from the environment
+  stages/
+    ingest.py          S1
+    audit.py           S2 prompts + evidence verification
+    probe.py           S3 planning
+    report.py          S4 ranking, thresholds, rendering
+  audit_driver.py      optional lens delegation, one subprocess per lens
+  backends.py          execution backends, requirement matching, authorization
+  experiment_id.py     experiment / metric / configuration identity
+  resources.py         what the cited experiment costs vs what a backend offers
+  repo.py              acquisition, commit pinning, capability
+  code_audit.py        static AST audit of the checkout — never imports, never runs
+  probe_synth.py       synthesises a probe from the paper's own formulation
+  local_exec.py        runs probes, parses metrics, reconciles
+  pdf.py               PDF → sections, tables, numbers
+  dossier.py           cross-paper consolidation
+  prompts/audit.py     the four lens prompts
+tests/                 536 tests
+docs/                  the architecture map
+papers/                source PDFs
+projects/<pid>/        per-paper state: paper, audit, runs, reports, controller.json
 ```
