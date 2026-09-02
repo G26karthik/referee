@@ -21,7 +21,7 @@ from harness import code_audit, repo as repo_mod
 from harness.artifacts import (PaperDoc, ProbeSpec, Reconciliation,
                                RepoAcquisition, Section, Table)
 from harness.config import Config
-from harness.local_exec import json_metric, parse_cell_number, reconcile, resolve_command
+from harness.local_exec import StartupEvidence, json_metric, parse_cell_number, reconcile, resolve_command
 from harness.stages.probe import cell_contents, plan_execution
 from harness.stages.report import overall_verdict
 
@@ -248,9 +248,28 @@ def test_a_miss_outside_the_noise_band_is_a_failed_reproduction():
     assert r.delta_error is not None and r.delta_error > r.noise_band
 
 
-def test_code_that_will_not_run_is_a_failed_reproduction():
-    r = reconcile(_spec(), [], 0.10, [], failure="exit 1: ModuleNotFoundError: no module 'mamba'")
-    assert r.status == "FAILED_REPRODUCTION" and "ModuleNotFoundError" in r.reason
+def test_code_that_will_not_START_is_not_a_failed_reproduction():
+    """Superseded contract. This test previously asserted the opposite.
+
+    A `ModuleNotFoundError` is the signature of a dependency that was never installed —
+    a fact about this machine, not about the paper. Reading it as FAILED_REPRODUCTION let
+    `overall_verdict` escalate to RED with "the paper's own code does not reproduce the
+    number it prints", an accusation no measurement supported. The crash must be
+    classified, and only a crash after the experiment demonstrably began may convict; see
+    tests/test_execution_capability.py for the full matrix.
+    """
+    r = reconcile(_spec(), [], 0.10, [], failure="exit 1: ModuleNotFoundError: no module 'mamba'",
+                  evidence=StartupEvidence(setup_error="modulenotfounderror"))
+    assert r.status == "INCONCLUSIVE"
+    assert r.failure_class == "startup_failure" and r.reached_experiment is False
+
+
+def test_code_that_breaks_after_starting_is_still_a_failed_reproduction():
+    """The capability work must not cost the harness its real convictions."""
+    r = reconcile(_spec(), [], 0.10, [], failure="exit 1: RuntimeError: loss became NaN",
+                  evidence=StartupEvidence(saw_contract_line=True, stdout_lines=30,
+                                           ran_seconds=120.0))
+    assert r.status == "FAILED_REPRODUCTION" and r.failure_class == "runtime_failure"
 
 
 def test_a_units_mismatch_is_inconclusive_not_an_accusation():
@@ -303,13 +322,52 @@ def test_execution_is_not_planned_while_the_gate_is_shut(cfg: Config):
     assert plan_execution(cfg, ProbeSpec(paper_id=PID), acq).command == []
 
 
-def test_execution_is_planned_once_every_condition_holds(tmp_path: Path):
+def test_execution_is_planned_once_every_condition_holds(tmp_path: Path, monkeypatch):
+    """Planning now has a fourth condition: this machine must be able to run it fairly.
+
+    The fixture below is a real checkout with a real entrypoint that really accepts
+    `--seed`, because the capability check reads the repository rather than trusting the
+    acquisition record. `assess_capability` is stubbed to `established` so this test stays
+    about PLANNING; the capability decision itself is covered in
+    tests/test_execution_capability.py.
+    """
+    from harness import repo as repo_mod
+    from harness.artifacts import ExecCapability
+    from harness.stages import probe as probe_stage
+
+    repo = tmp_path / "r"
+    repo.mkdir()
+    (repo / "eval.py").write_text('import os\np.add_argument("--seed")\n', encoding="utf-8")
+    monkeypatch.setattr(probe_stage.repo_mod, "assess_capability",
+                        lambda *a, **k: ExecCapability(established=True, reason_code="established"))
+    # Identity is covered in tests/test_experiment_identity.py; stub it so this test stays
+    # about planning rather than about resolution.
+    from harness.artifacts import (CandidateCommand, ConfigurationIdentity,
+                                   ExperimentIdentity, MetricIdentity)
+    monkeypatch.setattr(probe_stage.experiment_id, "resolve", lambda *a, **k: (
+        ExperimentIdentity(state="established",
+                           command=CandidateCommand(argv=["python", "eval.py"],
+                                                    source_ref="README.md:1")),
+        MetricIdentity(state="established"), ConfigurationIdentity(state="established")))
+    # Two more preconditions, stubbed for the same reason as the two above: E1 resource fit
+    # is covered in tests/test_resource_preflight.py and E2 commit pinning in
+    # tests/test_commit_pinning.py. This test is about what PLANNING does once every
+    # precondition holds, so it has to be able to reach that state.
+    from harness.artifacts import CommitVerification, ResourceCapability
+    monkeypatch.setattr(probe_stage.resources_mod, "assess_resources",
+                        lambda *a, **k: ResourceCapability(state="satisfied", reason="stub"))
+    monkeypatch.setattr(probe_stage.repo_mod, "verify_commit",
+                        lambda *a, **k: CommitVerification(state="verified", expected="a" * 40,
+                                                           actual="a" * 40))
+
     cfg = Config(projects_dir=tmp_path, allow_repo_exec=True)
-    acq = RepoAcquisition(url="u", status="cloned", path="/tmp/r", entrypoint="eval.py",
-                          env_path="/tmp/env/python")
-    spec = plan_execution(cfg, ProbeSpec(paper_id=PID), acq)
-    assert spec.command == ["python", "eval.py", "--seed", "{seed}"]
-    assert spec.cwd == "/tmp/r" and spec.interpreter == "/tmp/env/python"
+    acq = RepoAcquisition(url="u", status="cloned", path=str(repo), entrypoint="eval.py",
+                          env_status="ready", env_path="/tmp/env/python")
+    spec = plan_execution(cfg, ProbeSpec(paper_id=PID), acq, doc_with("x"))
+    assert spec.command == ["python", "eval.py"], "the argv comes from the repo, not a filename"
+    assert spec.cwd == str(repo) and spec.interpreter == "/tmp/env/python"
+    assert spec.provenance == "repo_exec"
+    assert repo_mod is not None
 
 
 def test_execution_is_not_planned_without_an_entrypoint(tmp_path: Path):

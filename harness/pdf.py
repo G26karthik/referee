@@ -25,6 +25,9 @@ MAX_TABLES = 40
 MAX_ROWS = 60
 MAX_COLS = 12
 MAX_SECTION_CHARS = 40_000
+# A caption is set within a line or two of the table it names. Beyond this the two are
+# unrelated floats that merely share a page, and pairing them would invent provenance.
+MAX_CAPTION_GAP = 120.0
 
 _KNOWN_HEADINGS = (
     r"abstract|introduction|related work|background|preliminaries|notation|"
@@ -180,35 +183,121 @@ def _grid(rows: list[list[tuple[float, str]]], tol: float = 10.0) -> list[list[s
     return grid
 
 
+def _body_runs(gapped: list[bool], is_caption: list[bool]) -> list[tuple[int, int]]:
+    """Half-open row ranges that look like a table body, found WITHOUT reference to captions.
+
+    Finding bodies independently is the whole point. Anchoring the scan on a caption and
+    reading forward assumes the caption precedes its table, which is true for some venues
+    and false for others; where it is false the scan walks into the NEXT table's rows and
+    drops the first table on the page entirely, shifting every label after it.
+    """
+    runs: list[tuple[int, int]] = []
+    i = 0
+    while i < len(gapped):
+        if gapped[i] and not is_caption[i]:
+            j = i
+            while j < len(gapped) and gapped[j] and not is_caption[j]:
+                j += 1
+            if j - i >= 2:
+                runs.append((i, j))
+            i = j
+        else:
+            i += 1
+    return runs
+
+
+def _caption_side(run_spans: Sequence[tuple[float, float]],
+                  cap_spans: Sequence[tuple[float, float]]) -> str:
+    """Whether this page's captions sit 'above' or 'below' the bodies they name.
+
+    Measured in PAGE COORDINATES, not row indices, because row indices cannot answer the
+    question. Tables stacked back to back put a caption directly after one body and
+    directly before the next, so both readings are exactly one row away and the tie is
+    unbreakable. Typography breaks it: a caption is set tight against the table it belongs
+    to and separated from the next by a full inter-float gap. On the page that exposed this
+    bug the winning margin was 14.5pt against 90pt.
+
+    Ties still resolve to 'above', the more common convention, so a degenerate page
+    behaves as it did before.
+    """
+    above = below = 0
+    for top, bottom in cap_spans:
+        # Distance down to the nearest body below, and up to the nearest body above.
+        # `None` means there is no body on that side at all, which is not a distance of
+        # zero — scoring it as one made a page whose last caption had nothing beneath it
+        # vote for the wrong layout.
+        d_below = min((t - bottom for t, _ in run_spans if t >= bottom), default=None)
+        d_above = min((top - b for _, b in run_spans if b <= top), default=None)
+        if d_below is None and d_above is None:
+            continue
+        if d_above is None or (d_below is not None and d_below <= d_above):
+            above += 1          # this caption sits above the body it names
+        else:
+            below += 1          # this caption sits below it
+    return "below" if below > above else "above"
+
+
+def _pair(run_spans: Sequence[tuple[float, float]], cap_spans: Sequence[tuple[float, float]],
+          captions: Sequence[str]) -> list[str]:
+    """One caption per body, nearest-first on the side this page actually uses.
+
+    Nearest-first rather than positional, so a table whose caption sits on the previous
+    page leaves a blank label instead of stealing its neighbour's and cascading the error
+    down the page. A body that ends up with no caption keeps its cells; only the label is
+    unknown, and an unlabelled table is far less damaging than a mislabelled one.
+    """
+    side = _caption_side(run_spans, cap_spans)
+    labels = [""] * len(run_spans)
+    taken: set[int] = set()
+    for ci, (top, bottom) in enumerate(cap_spans):
+        if ci >= len(captions):
+            break
+        best, best_d = None, None
+        for ri, (r_top, r_bottom) in enumerate(run_spans):
+            if ri in taken:
+                continue
+            d = (r_top - bottom) if side == "above" else (top - r_bottom)
+            if d < 0 or d > MAX_CAPTION_GAP:
+                continue
+            if best_d is None or d < best_d:
+                best, best_d = ri, d
+        if best is not None:
+            labels[best] = captions[ci]
+            taken.add(best)
+    return labels
+
+
 def _unruled_tables(page, captions: list[str]) -> list[tuple[str, list[list[str]]]]:
     """Recover LaTeX-style tables that have no ruling lines for pdfplumber to find.
 
     Column gaps are the signal: a prose line or a wrapped caption has no wide
-    inter-word gap, a table row always does. So each table is the run of gapped rows
-    that follows a "Table N" caption, ending at the first ungapped row after it.
+    inter-word gap, a table row always does. Bodies are located first, on that signal
+    alone; captions are attached afterwards on measured proximity, so the recovery works
+    whether the venue prints captions above its tables or below them.
     """
     rows = _word_rows(page)
     gapped = [any(b["x0"] - a["x1"] > 12 for a, b in zip(r, r[1:])) for r in rows]
     text = [_norm(" ".join(w["text"] for w in r)) for r in rows]
+    is_caption = [bool(_TABLE_CAPTION.match(t)) for t in text]
+    span = [(min(w["top"] for w in r), max(w["bottom"] for w in r)) for r in rows]
+
+    runs = _body_runs(gapped, is_caption)
+    labels = _pair([(span[s][0], span[e - 1][1]) for s, e in runs],
+                   [span[i] for i, c in enumerate(is_caption) if c], captions)
 
     out: list[tuple[str, list[list[str]]]] = []
-    i = 0
-    while i < len(rows):
-        if not _TABLE_CAPTION.match(text[i]):
-            i += 1
+    for (start, end), label in zip(runs, labels):
+        # An unlabelled run is discarded. Detecting bodies without reference to captions
+        # is what fixes the ordering bug, but it also admits any run of wide-gapped prose
+        # - equation blocks, figure legends, two-column body text - as a candidate table.
+        # Requiring a caption is the filter that was previously doing that work implicitly,
+        # and it is the honest one to keep: a table nobody can name is a table nobody can
+        # cite, and admitting it would displace real tables under MAX_TABLES.
+        if not label:
             continue
-        j = i + 1
-        while j < len(rows) and not gapped[j] and not _TABLE_CAPTION.match(text[j]):
-            j += 1  # wrapped caption lines
-        body = []
-        while j < len(rows) and gapped[j] and not _TABLE_CAPTION.match(text[j]):
-            body.append(_chunks(rows[j]))
-            j += 1
-        if len(body) >= 2:
-            grid = _grid(body)
-            if grid and len(grid[0]) >= 2:
-                out.append((captions[len(out)] if len(out) < len(captions) else "", grid))
-        i = max(j, i + 1)
+        grid = _grid([_chunks(rows[i]) for i in range(start, end)])
+        if grid and len(grid[0]) >= 2:
+            out.append((label, grid))
     return out
 
 

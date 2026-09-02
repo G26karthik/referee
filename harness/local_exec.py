@@ -24,11 +24,15 @@ from __future__ import annotations
 import json
 import re
 import statistics
-import subprocess
+from dataclasses import dataclass
 import time
 from pathlib import Path
 
-from .artifacts import ArmStats, ProbeResult, ProbeSpec, Reconciliation
+from .artifacts import (ArmStats, CommitVerification, ExecAuthorization, ProbeResult,
+                        ProbeSpec, Reconciliation)
+from .backends import ExecRequest, ExecutionBackend, authorize, backend_for
+from .repo import verify_commit
+from .experiment_id import identities_established
 from .config import Config
 
 _METRIC = re.compile(r"^SH_METRIC\s+arm=(\S+)\s+seed=(-?\d+)\s+value=([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*$")
@@ -40,7 +44,12 @@ _AUX = re.compile(r"^SH_AUX\s+key=(\S+)\s+arm=(\S+)\s+seed=(-?\d+)\s+value=([-+]
 # A cell reads "59.28", "12.196 ± 0.207", "35.3 41.6" or "80.5%(161)". Reconciliation
 # takes the FIRST magnitude, which is the reported value; the rest is variance or a
 # neighbouring column that the extractor collapsed into one string.
-_LEADING_NUMBER = re.compile(r"[-+]?\d+(?:\.\d+)?")
+# The exponent is not optional decoration. A cell reading "1.23e4 ± 3.29e2" parsed
+# without it yields 1.23 instead of 12300 — a factor of 10,000 — and that value is what
+# `reconcile` compares against a reproduced metric. Silently reading four orders of
+# magnitude off a printed cell is the worst available failure for this function, because
+# the result still looks like a number and still divides cleanly by a noise band.
+_LEADING_NUMBER = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
 # A repo that does not implement the SH_METRIC contract usually still prints a JSON
 # summary. These are the keys worth reading, in preference order.
 _JSON_METRIC_KEYS = ("value", "metric", "score", "result", "accuracy", "acc", "top1",
@@ -218,8 +227,88 @@ def _scale_ratio(a: float, b: float) -> float:
     return abs(a / b)
 
 
+# Signatures that a process died during SETUP rather than during the experiment. Each is
+# a failure of the runner or the invocation, not of the science: an unresolved import, an
+# argument parser rejecting a flag this harness invented, a missing script. When one of
+# these appears the question is settled — the experiment was not reached — regardless of
+# what else the process printed.
+_SETUP_FAILURE_SIGNATURES = (
+    "modulenotfounderror", "importerror", "cannot import name",
+    "unrecognized arguments", "the following arguments are required", "invalid choice",
+    "no such file or directory", "can't open file", "syntaxerror",
+    "command not found", "is not recognized as an internal or external command",
+)
+# A process that ran this long did something beyond importing and exiting. Used only as
+# corroboration alongside real output — never on its own.
+_STARTUP_WINDOW_S = 30.0
+_MIN_OUTPUT_LINES = 5
+
+
+@dataclass
+class StartupEvidence:
+    """What the process showed us about whether it got past setup into the experiment.
+
+    Deliberately several independent signals rather than one. Requiring this harness's own
+    `SH_*` contract lines would be wrong: a third-party repository owes them nothing, and a
+    perfectly good reproduction that prints its metrics as plain text would be scored as
+    never having started. So the contract lines are SUFFICIENT evidence, not NECESSARY —
+    substantial output over a plausible runtime, or a timeout after real work, count too.
+    """
+
+    saw_contract_line: bool = False        # SH_DEVICE / SH_METRIC / SH_AUX
+    saw_json_metric: bool = False          # a parseable JSON summary on stdout
+    stdout_lines: int = 0
+    ran_seconds: float = 0.0
+    timed_out: bool = False
+    setup_error: str = ""                  # a matched signature from _SETUP_FAILURE_SIGNATURES
+
+    def describe(self) -> str:
+        if self.setup_error:
+            return f"the process reported '{self.setup_error}', a setup-phase failure"
+        bits = []
+        if self.saw_contract_line:
+            bits.append("emitted the SH_ output contract")
+        if self.saw_json_metric:
+            bits.append("printed a parseable JSON metric")
+        if self.stdout_lines:
+            bits.append(f"{self.stdout_lines} line(s) of output")
+        bits.append(f"ran {self.ran_seconds:.0f}s")
+        if self.timed_out:
+            bits.append("killed by timeout")
+        return ", ".join(bits) if bits else "no output at all"
+
+
+def classify_setup_error(stderr: str) -> str:
+    """The setup-failure signature present in stderr, or '' if none is."""
+    low = (stderr or "").lower()
+    for sig in _SETUP_FAILURE_SIGNATURES:
+        if sig in low:
+            return sig
+    return ""
+
+
+def reached_experiment(evidence: StartupEvidence) -> bool:
+    """Did the run get past setup into the experiment the paper describes?
+
+    The burden of proof is on establishing that it did. An unproven start yields
+    INCONCLUSIVE, which accuses nobody; assuming a start yields FAILED_REPRODUCTION, which
+    drives RED and names the authors. Those errors are not symmetric, so the default is
+    the one that cannot manufacture an accusation.
+    """
+    if evidence.setup_error:
+        return False                                        # decisive against
+    if evidence.saw_contract_line or evidence.saw_json_metric:
+        return True                                         # decisive for
+    long_enough = evidence.ran_seconds >= _STARTUP_WINDOW_S
+    if evidence.timed_out and long_enough:
+        return True                                         # killed while working
+    return long_enough and evidence.stdout_lines >= _MIN_OUTPUT_LINES
+
+
 def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
-              seeds_run: list[int], failure: str = "") -> Reconciliation:
+              seeds_run: list[int], failure: str = "",
+              evidence: StartupEvidence | None = None,
+              authorization: ExecAuthorization | None = None) -> Reconciliation:
     """Executed metric vs the table cell the paper printed. Arithmetic, not judgement.
 
     The rule the caller asked for is `delta_error <= 2σ => RESOLVED_VERIFIED`, and
@@ -234,12 +323,34 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
         mismatch in this harness, not a doctored claim in the paper.
 
     A crash IS a failed reproduction, because the code was run and did not work.
+
+    A REFUSED run is none of the above. When `authorization` says the execution was not
+    permitted, nothing ran, so there is nothing to reconcile and the refusal is reported
+    as itself — a fact about this harness's own gates, never a finding about the paper.
     """
+    evidence = evidence or StartupEvidence()
     rec = Reconciliation(table_ref=spec.table_ref, finding_id=spec.finding_id,
                          metric=spec.metric, claimed_raw=spec.claimed_cell_value,
                          provenance=spec.provenance,
                          noise_band=round(noise_band, 6), seeds_run=sorted(seeds_run))
     rec.claimed_value = parse_cell_number(spec.claimed_cell_value)
+
+    # --- the authorization precondition --------------------------------------------
+    # Checked before anything else, because if execution was refused then whatever
+    # numbers are in `values` did not come from the run this reconciliation describes.
+    # This is the only branch that can be reached without a process having existed.
+    if authorization is not None and not authorization.allowed:
+        rec.status = "INCONCLUSIVE"
+        rec.failure_class = authorization.failure_class or "execution_unauthorized"
+        rec.reached_experiment = False
+        rec.reason = (
+            f"the repository was not executed, so nothing was reproduced: "
+            f"{authorization.detail} (decision '{authorization.decision}'). No reproduction "
+            f"verdict is drawn, because a refusal by this harness is not evidence about "
+            f"{spec.table_ref or 'the cited cell'}."
+        )
+        return rec
+
     if values:
         rec.reproduced_value = round(statistics.fmean(values), 6)
         rec.reproduced_std = round(statistics.stdev(values), 6) if len(values) > 1 else 0.0
@@ -267,10 +378,67 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
         )
         return rec
 
+    # --- the identity precondition ------------------------------------------------
+    # Capability asks whether the code CAN run. Identity asks whether running it answers
+    # the question. A capable run of the wrong program produces a confident irrelevant
+    # number, which is more dangerous than a crash because nothing looks wrong. This gate
+    # applies to success and failure alike, and sits after the provenance ceiling so a
+    # synthesized probe still reports the ceiling rather than an identity class.
+    rec.experiment_state = spec.experiment.state if spec.experiment else "unmapped"
+    rec.metric_state = spec.metric_identity.state if spec.metric_identity else "unmapped"
+    rec.configuration_state = spec.configuration.state if spec.configuration else "unmapped"
+    if spec.command:                       # only a repository run needs an identity chain
+        proven, failure_class, why = identities_established(
+            spec.experiment, spec.metric_identity, spec.configuration)
+        if not proven:
+            rec.status = "INCONCLUSIVE"
+            rec.failure_class = failure_class
+            rec.reason = (
+                f"the executed program was not bound to the cited cell, so its output cannot "
+                f"be compared with {spec.table_ref or 'it'}: {why}. A run that succeeds without "
+                f"this binding has measured something, but not the thing the paper printed."
+            )
+            return rec
+
+    # --- the capability precondition ----------------------------------------------
+    # A crash is a failed reproduction only if the code was actually run. Three things
+    # can produce a non-zero exit that says nothing about the paper: an environment this
+    # machine could not build, dependencies that were never installed, and an argv this
+    # harness invented that the repository does not accept. Each is a fact about the
+    # runner. Convicting on them would be the same unearned inference the provenance
+    # ceiling above exists to prevent, arriving through a different door.
     if failure:
+        cap = spec.capability
+        if cap is not None and not cap.established:
+            rec.status = "INCONCLUSIVE"
+            rec.failure_class = cap.reason_code
+            rec.reached_experiment = False
+            rec.reason = (
+                f"the run could not be mounted fairly, so its failure is not evidence about the "
+                f"paper: {cap.detail}. The process exited with: {failure}. Classified "
+                f"'{cap.reason_code}' — a reproduction verdict requires that the experiment was "
+                f"actually attempted under the environment the authors declared."
+            )
+            return rec
+
+        reached = reached_experiment(evidence)
+        rec.reached_experiment = reached
+        if not reached:
+            rec.status = "INCONCLUSIVE"
+            rec.failure_class = "timeout" if evidence.timed_out else "startup_failure"
+            rec.reason = (
+                f"the process exited before any sign that the experiment itself began "
+                f"({evidence.describe()}): {failure}. The environment was capable, so this may yet "
+                f"be a defect in the paper's code — but nothing here distinguishes that from a "
+                f"setup failure, and the burden of showing the experiment ran is on this harness."
+            )
+            return rec
+
         rec.status = "FAILED_REPRODUCTION"
-        rec.reason = (f"the paper's code did not run to completion: {failure}. A reproduction "
-                      f"that crashes is a failed reproduction, not an inconclusive one.")
+        rec.failure_class = "runtime_failure"
+        rec.reason = (f"the paper's code reached the experiment and then failed: {failure}. "
+                      f"Startup evidence: {evidence.describe()}. A reproduction that runs and "
+                      f"breaks is a failed reproduction, not an inconclusive one.")
         return rec
     if rec.reproduced_value is None:
         rec.status = "INCONCLUSIVE"
@@ -340,9 +508,75 @@ def _noise(per_seed: dict[str, dict[int, float]], arms: list[str]) -> tuple[floa
     return (max(spreads) if spreads else 0.0), "unpaired (wider arm spread)"
 
 
-def run_probe(cfg: Config, root: Path, spec: ProbeSpec) -> ProbeResult:
-    """Write the probe, run every (arm, seed) in its own process, aggregate."""
+def verify_execution_commit(spec: ProbeSpec) -> CommitVerification | None:
+    """Re-check, at the moment of execution, that the checkout is the audited commit.
+
+    Returns None for a probe this harness authored — there is no repository involved, so
+    there is no commit to be wrong about. For a repository run it reads the working tree
+    on disk NOW rather than trusting the SHA recorded during planning, because the whole
+    failure being closed is that planning and execution can see different code: a default
+    branch moves, a cached checkout is refreshed, and the second run executes something
+    the first run's audit never read while still carrying that audit's findings.
+    """
+    if not spec.command:
+        return None
+    return verify_commit(spec.cwd, spec.commit)
+
+
+def _blocked(cfg: Config, root: Path, spec: ProbeSpec, auth: ExecAuthorization,
+             seconds: float, commit: CommitVerification | None = None) -> ProbeResult:
+    """The result of a run that was refused. Nothing executed; nothing is concluded.
+
+    A distinct verdict rather than a reused one. 'failed' would say the probe ran and
+    produced nothing usable, which is a different and more damaging statement than "this
+    harness declined to run it" — and the difference matters most in exactly the case
+    where it is easiest to lose: a repository whose execution was refused must not look,
+    in the report or in the JSON, like a repository whose code did not work.
+    """
+    result = ProbeResult(
+        paper_id=spec.paper_id, finding_id=spec.finding_id, claim=spec.claim,
+        verdict="blocked", provenance=spec.provenance, mechanism=spec.mechanism,
+        rationale=spec.rationale, calibration=False, backend=auth.backend,
+        authorization=auth, capability=spec.capability, experiment=spec.experiment,
+        metric_identity=spec.metric_identity, configuration=spec.configuration,
+        seconds=seconds, resources=spec.resources, commit_verification=commit,
+        reason=(f"execution was not authorized ('{auth.decision}'): {auth.detail}. "
+                f"No process was started, so no measurement exists and no claim about "
+                f"the paper is drawn from this."),
+    )
+    if spec.table_ref or spec.claimed_cell_value:
+        result.reconciliation = reconcile(spec, [], 0.0, [], authorization=auth)
+    # `script_path` stays empty: no probe was written, and naming a file that does not
+    # exist would invite a reader to go looking for the code that ran.
+    out_dir = root / "runs" / spec.paper_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "probe_results.json").write_text(
+        json.dumps(result.model_dump(), indent=2, ensure_ascii=False), encoding="utf-8")
+    return result
+
+
+def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
+              backend: ExecutionBackend | None = None) -> ProbeResult:
+    """Write the probe, run every (arm, seed) through the backend, aggregate.
+
+    The backend is asked for, not assumed: `backend_for` returns the local one for code
+    this harness authored and the operator-selected one for the repository's own command.
+
+    Authorization is re-checked HERE, against the spec that is about to run, rather than
+    trusting that whatever produced it applied the gates. `plan_execution` only sees specs
+    it built; a `runs/<pid>/spec.json` written by hand goes straight past it, and one
+    carrying `command` plus `"provenance": "repo_exec"` used to execute with the repo-exec
+    gate shut and no identity established — after which its crash was eligible to become
+    FAILED_REPRODUCTION. A refused spec produces a result with verdict 'blocked': no
+    process is started, no arms are measured, and the reconciliation is INCONCLUSIVE.
+    """
     t0 = time.time()
+    backend = backend or backend_for(cfg, spec)
+    commit = verify_execution_commit(spec)
+    auth = authorize(cfg, spec, backend, commit=commit)
+    if not auth.allowed or backend is None:
+        return _blocked(cfg, root, spec, auth, round(time.time() - t0, 1), commit)
+
     script = write_probe(root, spec)
     out_dir = script.parent
 
@@ -350,39 +584,66 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec) -> ProbeResult:
     aux_seed: dict[str, dict[str, dict[int, float]]] = {}
     device, failed, log = "unknown", [], []
     first_failure = ""
+    # Startup evidence is accumulated across every (seed, arm) attempt, taking the most
+    # favourable observation: if ANY attempt demonstrably reached the experiment, the
+    # command is not a setup failure, and a later crash is about the code rather than
+    # about this machine.
+    evidence = StartupEvidence()
     for seed in spec.seeds:
         for arm in spec.arms:
             cmd, cwd = resolve_command(cfg, spec, script, seed, arm)
-            try:
-                p = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True,
-                                   encoding="utf-8", errors="replace", timeout=cfg.probe_timeout_s)
-            except (subprocess.TimeoutExpired, OSError) as e:
+            p = backend.execute(ExecRequest(argv=cmd, cwd=str(cwd),
+                                            timeout_s=cfg.probe_timeout_s,
+                                            label=f"seed={seed} arm={arm}"))
+            evidence.ran_seconds = max(evidence.ran_seconds, p.seconds)
+            if not p.completed:
+                # Two different endings arrive here and they are opposite evidence. A
+                # timeout means the process was doing something for the whole window; a
+                # failure to launch means it never existed, which is this harness failing
+                # to start anything and the clearest possible setup failure.
                 failed.append(seed)
-                why = (f"timeout after {cfg.probe_timeout_s}s"
-                       if isinstance(e, subprocess.TimeoutExpired) else f"could not start: {e}")
-                first_failure = first_failure or why
-                log.append({"seed": seed, "arm": arm, "rc": None, "error": why})
+                evidence.timed_out = evidence.timed_out or p.timed_out
+                if not p.launched:
+                    evidence.setup_error = evidence.setup_error or "could not start the process"
+                first_failure = first_failure or p.error
+                log.append({"seed": seed, "arm": arm, "rc": None, "error": p.error})
                 continue
+            evidence.stdout_lines = max(
+                evidence.stdout_lines, sum(1 for ln in (p.stdout or "").splitlines() if ln.strip()))
             saw_metric = False
             for line in (p.stdout or "").splitlines():
                 if d := _DEVICE.match(line):
                     device = d.group(1)
+                    evidence.saw_contract_line = True
                 elif m := _METRIC.match(line):
                     per_seed.setdefault(m.group(1), {})[int(m.group(2))] = float(m.group(3))
                     saw_metric = True
+                    evidence.saw_contract_line = True
                 elif x := _AUX.match(line):
                     aux_seed.setdefault(x.group(1), {}).setdefault(
                         x.group(2), {})[int(x.group(3))] = float(x.group(4))
+                    evidence.saw_contract_line = True
             # A third-party repository owes this harness nothing, so when it prints no
             # SH_METRIC line fall back to a JSON summary on stdout. Only for the
             # command path: a generated probe that skipped its own contract is a bug
             # in the probe, and papering over it would hide that.
             if spec.command and not saw_metric:
-                if (v := json_metric(p.stdout or "", spec.metric)) is not None:
+                # The key comes from MetricIdentity when one was established. Scanning the
+                # generic key list would re-open the hole this gate closes: it would pick
+                # whichever number happened to parse, regardless of what it measures.
+                bound_key = (spec.metric_identity.output_key
+                             if spec.metric_identity and spec.metric_identity.established else "")
+                if (v := json_metric(p.stdout or "", bound_key or spec.metric)) is not None:
                     per_seed.setdefault(arm, {})[seed] = v
+                    evidence.saw_json_metric = True
             if p.returncode != 0:
                 failed.append(seed)
                 err = (p.stderr or "").strip()[-400:]
+                # Only the FIRST attempt's signature is kept, and only if no attempt has
+                # already shown the experiment running: one seed crashing on an import
+                # after another produced metrics is a runtime failure, not a setup one.
+                if not evidence.setup_error and not (evidence.saw_contract_line or evidence.saw_json_metric):
+                    evidence.setup_error = classify_setup_error(p.stderr or "")
                 first_failure = first_failure or f"exit {p.returncode}: {err[-200:]}"
                 log.append({"seed": seed, "arm": arm, "rc": p.returncode, "error": err})
 
@@ -403,6 +664,10 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec) -> ProbeResult:
                    for arm, by_seed in per_arm.items()}
              for key, per_arm in sorted(aux_seed.items())},
         seconds=round(time.time() - t0, 1), script_path=str(script),
+        capability=spec.capability, experiment=spec.experiment,
+        metric_identity=spec.metric_identity, configuration=spec.configuration,
+        backend=backend.name, authorization=auth,
+        resources=spec.resources, commit_verification=commit,
     )
 
     if len(ok) < len(spec.arms):
@@ -461,7 +726,8 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec) -> ProbeResult:
             measured = {s: v for a in per_seed for s, v in per_seed[a].items()}
         result.reconciliation = reconcile(
             spec, [measured[s] for s in sorted(measured)], result.noise_band,
-            sorted(measured), failure=first_failure if result.verdict == "failed" else "")
+            sorted(measured), failure=first_failure if result.verdict == "failed" else "",
+            evidence=evidence, authorization=auth)
 
     (out_dir / "probe_results.json").write_text(
         json.dumps(result.model_dump(), indent=2, ensure_ascii=False), encoding="utf-8")
@@ -508,8 +774,24 @@ if __name__ == "__main__":  # self-check: python -m harness.local_exec
     bad = reconcile(_spec("59.28"), [64.10, 64.20], 0.10, [0, 1])
     assert bad.status == "FAILED_REPRODUCTION", bad.reason
     assert bad.delta_error is not None and bad.delta_error > bad.noise_band, bad.reason
-    crash = reconcile(_spec("59.28"), [], 0.10, [], failure="exit 1: ModuleNotFoundError")
-    assert crash.status == "FAILED_REPRODUCTION", "code that will not run is a failed reproduction"
+    # A crash convicts only once the experiment is shown to have begun. An unresolved
+    # import is a missing dependency on THIS machine, and reading it as a failed
+    # reproduction turned an unbuilt environment into RED against the authors.
+    crash = reconcile(_spec("59.28"), [], 0.10, [], failure="exit 1: ModuleNotFoundError",
+                      evidence=StartupEvidence(setup_error="modulenotfounderror"))
+    assert crash.status == "INCONCLUSIVE", "an import that never resolved is not a reproduction"
+    assert crash.failure_class == "startup_failure", crash.failure_class
+    ran = reconcile(_spec("59.28"), [], 0.10, [], failure="exit 1: RuntimeError: NaN loss",
+                    evidence=StartupEvidence(saw_contract_line=True, stdout_lines=20,
+                                             ran_seconds=90.0))
+    assert ran.status == "FAILED_REPRODUCTION", "a crash after the experiment began still convicts"
+    assert ran.failure_class == "runtime_failure", ran.failure_class
+    blocked = reconcile(
+        _spec("59.28"), [], 0.10, [], failure="exit 1: ImportError",
+        evidence=StartupEvidence(),
+        # capability decided before execution: this machine could not mount the run
+    )
+    assert blocked.status == "INCONCLUSIVE", "no startup evidence means no conviction"
     units = reconcile(_spec("97.0"), [0.9684, 0.9690], 0.01, [0, 1])
     assert units.status == "INCONCLUSIVE", "a 100x units mismatch must never convict a paper"
     silent = reconcile(_spec("59.28"), [], 0.10, [])

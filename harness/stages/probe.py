@@ -28,7 +28,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .. import code_audit, probe_synth, repo as repo_mod, state
+from .. import (backends, code_audit, experiment_id, probe_synth, repo as repo_mod,
+                resources as resources_mod, state)
 from ..artifacts import CodeAudit, Finding, PaperDoc, ProbeSpec, RepoAcquisition
 from ..config import Config
 from ..local_exec import run_probe as _run
@@ -117,6 +118,18 @@ def build_spec(cfg: Config, pid: str, doc: PaperDoc) -> ProbeSpec:
     return spec
 
 
+def _caption(doc: PaperDoc, ref: str) -> str:
+    """The cited table's caption. E1 reads the model scale out of it, so the requirement
+    is about the experiment under audit rather than about the paper's largest one."""
+    m = re.fullmatch(r"T(\d+):r\d+:c\d+", (ref or "").strip())
+    if not m:
+        return ""
+    for table in doc.tables:
+        if table.table_idx == int(m.group(1)):
+            return table.caption or ""
+    return ""
+
+
 def cell_contents(doc: PaperDoc, ref: str) -> str:
     """The verbatim contents of an addressed cell, or '' if the address does not resolve."""
     m = re.fullmatch(r"T(\d+):r(\d+):c(\d+)", (ref or "").strip())
@@ -136,19 +149,51 @@ def acquire_and_audit(cfg: Config, root: Path, pid: str, doc: PaperDoc,
     gate is shut — reading code that is already on disk needs no permission, and it is
     the half of this stage that produces findings.
     """
-    acq = repo_mod.acquire(cfg, root, pid, doc)
+    # E2 — if a previous run recorded which commit it audited, acquisition must land on
+    # THAT commit rather than on wherever the default branch has since moved. Passing it
+    # is what turns a fetch into a pin.
+    acq = repo_mod.acquire(cfg, root, pid, doc, revision=audited_commit(root, pid))
     if acq.status in ("cloned", "cached"):
-        acq = repo_mod.build_env(cfg, root, pid, acq)
+        # Provisioning is the backend's job, because an environment is only meaningful
+        # relative to the machine that will run in it: a venv built here is not the
+        # environment a container would present. The install gate still decides whether
+        # anything is built at all — the backend decides where.
+        try:
+            acq = backends.select_backend(cfg).provision(cfg, root, pid, acq)
+        except backends.UnknownBackend as e:
+            acq.env_status, acq.reason = "blocked", str(e)
     elif acq.status == "unavailable":
         acq = repo_mod.synthesize_standalone(
             root, pid, spec.claim, spec.table_ref, spec.claimed_cell_value)
 
     if acq.status in ("cloned", "cached") and acq.path:
         audit = code_audit.audit_repo(acq.path, cfg.max_audit_files)
+        # THE audited commit, stamped at the moment the audit read the tree. Everything
+        # downstream — identity, execution, reconciliation — is about this SHA or about
+        # nothing, and a later run that finds a different HEAD must refuse rather than
+        # carry these findings over onto code they were not derived from.
+        audit.commit = repo_mod.head_commit(Path(acq.path))
     else:
         audit = CodeAudit(repo_path=acq.path, skipped=(
             f"no checkout to inspect (acquisition status '{acq.status}'): {acq.reason}"))
     return acq, audit
+
+
+def audited_commit(root: Path, pid: str) -> str:
+    """The commit a previous run's audit recorded, if there was one.
+
+    Read from the persisted probe result rather than recomputed, because the point is to
+    pin to what was audited BEFORE, not to whatever is on disk now.
+    """
+    path = root / "runs" / pid / "probe_results.json"
+    if not path.exists():
+        return ""
+    try:
+        data = state.read_json(path)
+    except (OSError, ValueError):
+        return ""
+    audit = (data or {}).get("code_audit") or {}
+    return str(audit.get("commit") or "").strip().lower()
 
 
 def synthesize_probe(cfg: Config, doc: PaperDoc, spec: ProbeSpec,
@@ -186,20 +231,84 @@ def synthesize_probe(cfg: Config, doc: PaperDoc, spec: ProbeSpec,
     return spec
 
 
-def plan_execution(cfg: Config, spec: ProbeSpec, acq: RepoAcquisition) -> ProbeSpec:
+def plan_execution(cfg: Config, spec: ProbeSpec, acq: RepoAcquisition,
+                   doc: PaperDoc | None = None, audit: CodeAudit | None = None) -> ProbeSpec:
     """Point the spec at the repository's own entrypoint, if every gate allows it.
 
-    Three conditions, all required: the execution gate is open, a checkout exists, and
-    an entrypoint was found. Failing any of them the spec is left alone and the probe
-    runs the local template, which is honest about measuring only this machine.
+    Four conditions now, all required: the execution gate is open, a checkout exists, an
+    entrypoint was found, and — the addition — this machine is CAPABLE of giving that
+    entrypoint a fair run. Failing any of them the spec is left alone and the probe runs
+    the local template, which is honest about measuring only this machine.
+
+    The capability requirement exists because of what happens downstream. A repo_exec
+    spec that crashes reconciles to FAILED_REPRODUCTION, which drives RED on its own with
+    the sentence "the paper's own code does not reproduce the number it prints". That
+    sentence must never be produced by an environment this harness failed to build. So
+    capability is assessed here, before anything executes, and a spec that cannot be run
+    fairly is never promoted to `repo_exec` at all — the capability record is attached to
+    the spec either way, so the report can say why execution was not attempted.
+
+    The interpreter fallback is also gone. `acq.env_path or cfg.python` silently ran a
+    third-party repository under the harness's own venv, which by construction lacks that
+    repository's dependencies — guaranteeing an import crash whenever the install gate is
+    shut, which is the default. There is no longer a path that substitutes an interpreter.
     """
     if not cfg.allow_repo_exec:
         return spec
     if acq.status not in ("cloned", "cached") or not acq.path or not acq.entrypoint:
         return spec
-    spec.command = ["python", acq.entrypoint, "--seed", "{seed}"]
+    # BOTH preconditions are assessed, and only then is promotion decided. Recording the
+    # capability even when identity already failed keeps the report able to say "we could
+    # not have run it either" rather than leaving that unknown — two independent blockers
+    # are more useful to a reader than the first one encountered.
+    try:
+        backend = backends.select_backend(cfg)
+    except backends.UnknownBackend:
+        # An operator typo must not become a substitution. Nothing is promoted, the
+        # synthesized/template probe still runs, and the report says why.
+        return spec
+    spec.backend = backend.name
+    # Capability is asked of the BACKEND, so it is judged against the platform the run
+    # would actually see rather than against whatever platform this process is on.
+    spec.capability = backend.capability(acq, acq.env_path, cfg.python)
+    # E2 — the commit the static audit read. Carried on the spec so execution has
+    # something to verify against that is not "whatever is on disk".
+    spec.commit = (audit.commit if audit is not None else "") or acq.commit
+    if doc is not None:
+        spec.experiment, spec.metric_identity, spec.configuration = experiment_id.resolve(
+            doc, Path(acq.path), spec.table_ref, spec.finding_id, harness_seeds=len(spec.seeds))
+        # E1 — what the CITED experiment costs, against what this backend has. Assessed
+        # here, before promotion, because the answer cannot be obtained by trying: an
+        # experiment three times larger than the card starts fine and dies minutes in.
+        spec.resources = resources_mod.assess_resources(
+            resources_mod.require_resources(
+                doc, spec.table_ref, spec.claimed_cell_value,
+                caption=_caption(doc, spec.table_ref)),
+            backend.resources(), backend=backend.name,
+            walltime_budget_s=cfg.probe_timeout_s * max(1, len(spec.seeds)))
+    proven, _cls, _why = experiment_id.identities_established(
+        spec.experiment, spec.metric_identity, spec.configuration)
+
+    # Identity is the more fundamental of the two: a capable run of the wrong program is
+    # worse than a crash, because nothing about it looks wrong.
+    fits = spec.resources is not None and spec.resources.established
+    commit_ok = repo_mod.verify_commit(acq.path, spec.commit).established
+    if not proven or not spec.capability.established or not fits or not commit_ok:
+        # Any one of these is disqualifying, and none of them is fixed by trying anyway.
+        # Note what is NOT here: no branch that reduces the requirement, picks a smaller
+        # variant, or accepts a nearby commit. An altered experiment is not a reproduction
+        # and adjacent code is not the audited code.
+        return spec                              # keep the synthesized/template probe
+
+    # The command comes from what the repository advertises, never from a filename plus
+    # an invented flag. `--seed` is used only where the repo itself defines one.
+    command = list(spec.experiment.command.argv) if spec.experiment.command else []
+    seed_flag = spec.experiment.command.seed_flag if spec.experiment.command else ""
+    if seed_flag:
+        command += [seed_flag, "{seed}"]
+    spec.command = command
     spec.cwd = acq.path
-    spec.interpreter = acq.env_path or cfg.python
+    spec.interpreter = acq.env_path
     spec.arms = ["reproduction"]
     # The authors' own code outranks anything this harness could author, so it replaces a
     # synthesized script and takes the provenance that is allowed to reconcile a cell.
@@ -224,7 +333,7 @@ def run(cfg: Config, pid: str) -> dict:
     # S3c runs after acquisition so the planner can see the checkout, and before
     # execution planning so the authors' own entrypoint still wins when it is available.
     spec = synthesize_probe(cfg, doc, spec, acq)
-    spec = plan_execution(cfg, spec, acq)
+    spec = plan_execution(cfg, spec, acq, doc, audit)
 
     state.write_json(root / "runs" / pid / "spec.json", spec.model_dump())
     result = _run(cfg, root, spec)

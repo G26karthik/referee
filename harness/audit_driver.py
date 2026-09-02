@@ -78,6 +78,23 @@ def parse_lens_json(text: str, lens: str) -> LensReport:
         raise AuditDriverError("output JSON has no 'findings' key")
     if not isinstance(data["findings"], list):
         raise AuditDriverError("'findings' is not a list")
+
+    # `Finding.evidence_ref` defaults to "", so a finding that arrives without one is
+    # accepted by the model and then written back out with an empty string — which reads
+    # downstream as "a reference was recorded and it is blank" rather than "the reference
+    # is missing". Catching it here keeps this module from laundering an unlocatable
+    # finding into a well-formed lens file. Refusing the whole lens rather than dropping
+    # the finding is deliberate: a reviewer that omits references is malfunctioning, and
+    # silently keeping its other findings would hide that.
+    for i, f in enumerate(data["findings"]):
+        if not isinstance(f, dict):
+            raise AuditDriverError(f"findings[{i}] is not an object")
+        if (f.get("evidence_quote") or "").strip() and not (f.get("evidence_ref") or "").strip():
+            raise AuditDriverError(
+                f"findings[{i}] ({f.get('finding_id') or 'unnamed'}) carries an "
+                f"evidence_quote but no evidence_ref; a quote with no location cannot be "
+                f"verified and must not be persisted")
+
     data["lens"] = lens
     try:
         return LensReport(**data)

@@ -23,14 +23,17 @@ repositories, and cloning one of those would audit the wrong project entirely.
 """
 from __future__ import annotations
 
+import ast
+import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
-from .artifacts import PaperDoc, RepoAcquisition
+from .artifacts import CommitVerification, ExecCapability, PaperDoc, RepoAcquisition
 from .config import Config
 
 # Hosts worth cloning. Anything else (project pages, personal sites) is not a repo.
@@ -48,6 +51,9 @@ _CUES = (
     "source code", "codebase is", "released at", "available at", "available here", "code:",
 )
 _CUE_WINDOW = 140          # chars before the URL searched for a cue
+# Section headings whose contents are citations to other people's work, never this
+# paper's own artifacts.
+_REFERENCE_HEADING = re.compile(r"^(?:\d+\.?\s+)?(references|bibliography|works cited)\b", re.I)
 _DEP_FILES = ("requirements.txt", "environment.yml", "environment.yaml", "pyproject.toml",
               "setup.py", "setup.cfg", "requirements-dev.txt", "requirements/base.txt")
 # Import name -> the framework label the report shows. Order is significance, not preference.
@@ -103,6 +109,27 @@ def _score(text: str, start: int, host: str, url: str) -> int:
     return score
 
 
+def _cued(text: str, start: int) -> bool:
+    """Does an availability phrase precede this URL — 'our code is available at', etc.?"""
+    return any(c in text[max(0, start - _CUE_WINDOW):start].lower() for c in _CUES)
+
+
+def _reference_spans(doc: PaperDoc, joiner: int = 1) -> list[tuple[int, int]]:
+    """Character ranges of the bibliography, in the same concatenation `find_repo_urls` scans.
+
+    A URL inside the reference list is a citation to somebody else's artifact by
+    construction, however official it looks. Locating those spans is what lets the
+    harness tell "the code for THIS paper" from "the code for a model this paper used".
+    """
+    spans, pos = [], 0
+    for s in doc.sections:
+        end = pos + len(s.text)
+        if _REFERENCE_HEADING.match((s.title or "").strip()):
+            spans.append((pos, end))
+        pos = end + joiner
+    return spans
+
+
 def find_repo_urls(doc: PaperDoc) -> list[str]:
     """Every candidate repository URL in the paper, most-likely-official first."""
     text = "\n".join(s.text for s in doc.sections)
@@ -115,6 +142,45 @@ def find_repo_urls(doc: PaperDoc) -> list[str]:
         if url not in best or rank > best[url]:
             best[url] = rank
     return [u for u, _ in sorted(best.items(), key=lambda kv: kv[1], reverse=True)]
+
+
+def official_repo_url(doc: PaperDoc) -> str:
+    """The repository THIS paper advertises as its own, or '' when it advertises none.
+
+    Separate from `find_repo_urls` because the two questions are different. That function
+    answers "what repository URLs appear in this paper", which is a useful diagnostic and
+    should stay complete. This one answers "which repository may the harness clone and
+    audit AS THIS PAPER'S CODE", and the burden of proof runs the other way: absent
+    positive evidence of authorship, the answer is none.
+
+    Two requirements, both necessary:
+
+      - an availability cue must precede the URL. A bare link is not a claim of
+        authorship, and treating it as one is how a paper that ships no code acquires a
+        repository belonging to somebody else.
+      - the URL must not sit in the reference list, where every link is a citation.
+
+    The failure this prevents is not hypothetical. A paper whose only GitHub URL was the
+    bibliography entry for the third-party model it evaluated ("Ben Wang and Aran
+    Komatsuzaki. GPT-J-6B ... github.com/kingoflolz/mesh-transformer-jax") had that
+    repository recorded as its own, which would have produced a static code audit of a
+    stranger's codebase filed against these authors — and, with the execution gate open,
+    would have run it.
+    """
+    text = "\n".join(s.text for s in doc.sections)
+    refs = _reference_spans(doc)
+    best: dict[str, tuple[int, int]] = {}
+    for m in _URL.finditer(text):
+        url = _normalize(m.group(1), m.group(2), m.group(3))
+        if not url or not _cued(text, m.start()):
+            continue
+        if any(lo <= m.start() < hi for lo, hi in refs):
+            continue
+        rank = (_score(text, m.start(), m.group(1), m.group(0)), -m.start())
+        if url not in best or rank > best[url]:
+            best[url] = rank
+    ranked = sorted(best.items(), key=lambda kv: kv[1], reverse=True)
+    return ranked[0][0] if ranked else ""
 
 
 # --------------------------------------------------------------------------- #
@@ -223,28 +289,156 @@ def _git(args: list[str], cwd: Path | None, timeout: int) -> subprocess.Complete
                           errors="replace", timeout=timeout)
 
 
-def acquire(cfg: Config, root: Path, pid: str, doc: PaperDoc) -> RepoAcquisition:
+_SHA = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+def head_commit(repo: Path) -> str:
+    """The full 40-character SHA at HEAD, or '' if the directory is not a checkout."""
+    p = _git(["rev-parse", "HEAD"], repo, 30)
+    sha = (p.stdout or "").strip()
+    return sha if p.returncode == 0 and _SHA.fullmatch(sha) else ""
+
+
+def is_shallow(repo: Path) -> bool:
+    p = _git(["rev-parse", "--is-shallow-repository"], repo, 30)
+    return (p.stdout or "").strip() == "true"
+
+
+def dirty_files(repo: Path) -> list[str]:
+    """Paths that differ from HEAD. A clean SHA over a modified tree is not the audited code."""
+    p = _git(["status", "--porcelain", "--untracked-files=no"], repo, 60)
+    if p.returncode != 0:
+        return []
+    return sorted(line[3:].strip() for line in (p.stdout or "").splitlines() if line.strip())
+
+
+def fetch_revision(cfg: Config, dest: Path, url: str, sha: str) -> tuple[bool, str]:
+    """Bring one specific commit into an existing checkout and stand on it.
+
+    A depth-1 clone holds exactly the tip of the default branch, so the audited commit is
+    usually absent from it. `fetch --depth 1 origin <sha>` asks the server for that one
+    object graph, which GitHub and GitLab both allow; failing that there is nothing to
+    check out, and the honest answer is that the audited code could not be obtained.
+    """
+    if not cfg.allow_network:
+        return False, ("network gate closed, so the audited commit cannot be fetched; only "
+                       "whatever is already on disk is available")
+    try:
+        p = _git(["fetch", "--depth", "1", "origin", sha], dest, cfg.clone_timeout_s)
+        if p.returncode != 0:
+            return False, (f"git fetch of {sha[:12]} exited {p.returncode}: "
+                           f"{(p.stderr or '').strip()[-200:]}")
+        c = _git(["checkout", "--force", sha], dest, 120)
+        if c.returncode != 0:
+            return False, (f"git checkout of {sha[:12]} exited {c.returncode}: "
+                           f"{(c.stderr or '').strip()[-200:]}")
+    except subprocess.TimeoutExpired:
+        return False, f"fetching {sha[:12]} timed out after {cfg.clone_timeout_s}s"
+    return True, ""
+
+
+def verify_commit(repo: str | Path, expected: str) -> CommitVerification:
+    """Is the checkout about to run the one that was audited? Fresh, at the point of use.
+
+    Not a comparison of two recorded strings. `acq.commit` says what arrived when git last
+    ran; this reads the disk NOW, because the whole failure being closed is that the two
+    diverge — a default branch moves, a cached checkout is refreshed, and the next run
+    executes different code while still carrying the old commit through its findings.
+
+    Four outcomes, and only `verified` permits execution:
+
+      verified   HEAD equals the audited SHA and the tree is clean
+      mismatch   HEAD is some other commit
+      dirty      HEAD matches but files have been modified since
+      unknown    no audited SHA was recorded, or HEAD could not be read
+
+    `unknown` blocks. "We never wrote down which commit we audited" is not evidence that
+    this is that commit, and the cost of guessing wrong is a reproduction verdict about
+    code the audit never read.
+    """
+    ver = CommitVerification(expected=(expected or "").strip().lower())
+    path = Path(repo) if repo else None
+    if not path or not path.is_dir():
+        ver.state, ver.reason = "unknown", "there is no checkout on disk to verify"
+        return ver
+
+    ver.actual = head_commit(path)
+    ver.shallow = is_shallow(path)
+    if not ver.actual:
+        ver.state = "unknown"
+        ver.reason = f"'{path}' is not a git checkout, so its commit cannot be established"
+        return ver
+    if not ver.expected:
+        ver.state = "unknown"
+        ver.reason = (f"no audited commit was recorded, so the checkout now at "
+                      f"{ver.actual[:12]} cannot be shown to be the code that was audited")
+        return ver
+
+    # A recorded value may legitimately be abbreviated — artifacts written before full SHAs
+    # were stored hold 12 characters. Git's own abbreviation semantics apply: a prefix of
+    # at least 12 hex characters identifies a commit. Shorter than that is not accepted,
+    # because loosening the comparison is the one way this check is not allowed to pass.
+    matched = (ver.actual == ver.expected
+               or (len(ver.expected) >= 12 and ver.actual.startswith(ver.expected)))
+    if not matched:
+        ver.state = "mismatch"
+        ver.reason = (
+            f"the checkout is at {ver.actual[:12]} but the audit, the experiment identity and "
+            f"the cited findings are all about {ver.expected[:12]}. Executing this would "
+            f"reconcile a number produced by one commit against reasoning done on another"
+            + (". The clone is shallow, so the audited commit is not present locally"
+               if ver.shallow else "."))
+        return ver
+
+    ver.dirty_files = dirty_files(path)
+    if ver.dirty_files:
+        ver.state = "dirty"
+        ver.reason = (
+            f"HEAD is the audited commit {ver.actual[:12]}, but {len(ver.dirty_files)} tracked "
+            f"file(s) differ from it: {', '.join(ver.dirty_files[:5])}. The SHA no longer "
+            f"describes the code that would run.")
+        return ver
+
+    ver.state = "verified"
+    ver.reason = (f"the checkout is exactly the audited commit {ver.actual[:12]} with a clean "
+                  f"working tree")
+    return ver
+
+
+def acquire(cfg: Config, root: Path, pid: str, doc: PaperDoc,
+            revision: str = "") -> RepoAcquisition:
     """Clone the paper's repository into `runs/<pid>/repo`, if we are allowed to.
 
     Returns a populated `RepoAcquisition` in every path, including the ones where
     nothing happened, because "we did not look" and "we looked and there is nothing"
     are different facts and the report has to be able to tell them apart.
+
+    `revision` is the audited commit, when a previous run recorded one. Passing it makes
+    acquisition a PIN rather than a fetch: the checkout is moved onto that SHA, or the
+    acquisition says it could not be. Without it the default branch is taken, which is
+    reproducible only until someone pushes.
     """
-    urls = [doc.repo_url] if doc.repo_url else []
-    urls += [u for u in (doc.repo_urls or []) if u not in urls]
-    if not urls:
-        urls = find_repo_urls(doc)
-    url = urls[0] if urls else ""
+    # ONLY the authorship-qualified URL, never the raw candidate list. `repo_urls` holds
+    # every repository link the paper mentions, most of which belong to other people —
+    # falling back to it here reopened the hole that `official_repo_url` exists to close,
+    # because this is the line that decides what gets cloned and handed to the auditor.
+    # Recomputed when the stored field is empty so a document ingested before that rule
+    # existed is judged by it too, rather than inheriting a citation as its own code.
+    url = doc.repo_url or official_repo_url(doc)
     dest = root / "runs" / pid / "repo"
 
     if not url:
-        return RepoAcquisition(status="unavailable",
-                               reason="the paper advertises no repository URL in its text")
+        return RepoAcquisition(
+            status="unavailable",
+            reason=("the paper advertises no repository of its own. "
+                    + (f"{len(doc.repo_urls)} repository URL(s) appear in the text but none is "
+                       f"introduced by an availability cue outside the reference list, so none "
+                       f"can be attributed to these authors: {', '.join(doc.repo_urls[:3])}"
+                       if doc.repo_urls else "No repository URL appears in its text.")))
     if dest.exists() and (dest / ".git").exists():
         acq = RepoAcquisition(url=url, status="cached", path=str(dest),
                               reason="clone already present; not re-fetched")
-        head = _git(["rev-parse", "HEAD"], dest, 30)
-        acq.commit = (head.stdout or "").strip()[:12] if head.returncode == 0 else ""
+        acq.commit = head_commit(dest)
     elif not cfg.allow_network:
         return RepoAcquisition(
             url=url, status="blocked",
@@ -265,8 +459,26 @@ def acquire(cfg: Config, root: Path, pid: str, doc: PaperDoc) -> RepoAcquisition
                 url=url, status="failed",
                 reason=f"git clone exited {p.returncode}: {(p.stderr or '').strip()[-300:]}")
         acq = RepoAcquisition(url=url, status="cloned", path=str(dest))
-        head = _git(["rev-parse", "HEAD"], dest, 30)
-        acq.commit = (head.stdout or "").strip()[:12] if head.returncode == 0 else ""
+        acq.commit = head_commit(dest)
+
+    # --- pin to the audited commit ----------------------------------------------------
+    # Recording what arrived is not pinning. When a revision was asked for and the
+    # checkout is not on it, move onto it or say plainly that the audited code could not
+    # be obtained — never carry on with the default branch under the audited SHA's name.
+    acq.requested_revision = (revision or "").strip().lower()
+    acq.shallow = is_shallow(dest)
+    if acq.requested_revision and acq.commit != acq.requested_revision:
+        ok, why = fetch_revision(cfg, dest, url, acq.requested_revision)
+        if ok:
+            acq.commit = head_commit(dest)
+            acq.shallow = is_shallow(dest)
+            acq.reason = f"checked out the audited commit {acq.requested_revision[:12]}"
+        else:
+            acq.status = "failed"
+            acq.reason = (f"the audited commit {acq.requested_revision[:12]} could not be "
+                          f"obtained, so nothing here is the code that was audited: {why}")
+            return acq
+    acq.pinned = bool(acq.requested_revision) and acq.commit == acq.requested_revision
 
     acq.dependency_files, acq.dependencies, acq.frameworks = inspect_dependencies(dest)
     acq.entrypoint = find_entrypoint(dest)
@@ -327,6 +539,186 @@ def build_env(cfg: Config, root: Path, pid: str, acq: RepoAcquisition) -> RepoAc
     if not installed:
         acq.reason = "no pip requirements file to install; the bare venv is what ran"
     return acq
+
+
+# --------------------------------------------------------------------------- #
+# Execution capability — decided before anything runs
+# --------------------------------------------------------------------------- #
+# Markers that only appear in a conda environment pinned to Linux. A repository whose
+# declared environment is Linux-only cannot be faithfully constructed on Windows, and a
+# crash under a substitute environment is a fact about the substitute.
+_LINUX_ENV_MARKERS = ("linux-64", "libgcc-ng", "libstdcxx-ng", "ld_impl_linux", "libgomp")
+_ENV_DECL_FILES = ("environment.yml", "environment.yaml")
+
+
+def entrypoint_imports(repo: Path, entrypoint: str) -> list[str]:
+    """Top-level module names the entrypoint imports, by PARSING it — never importing it.
+
+    Only the roots of absolute imports are returned, and only from module level: a
+    conditional import inside a function is not a startup requirement, and importing the
+    file to find out would execute the very code this check exists to avoid running.
+    """
+    path = repo / entrypoint
+    if not path.is_file():
+        return []
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (SyntaxError, OSError):
+        return []
+    roots: list[str] = []
+    for node in tree.body:                       # module level only
+        if isinstance(node, ast.Import):
+            roots += [a.name.split(".")[0] for a in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            roots.append(node.module.split(".")[0])
+    seen: list[str] = []
+    for r in roots:
+        if r not in seen:
+            seen.append(r)
+    return seen
+
+
+def missing_imports(interpreter: str, repo: Path, modules: list[str], timeout: int = 120) -> list[str]:
+    """Which of `modules` the TARGET interpreter cannot resolve.
+
+    Runs `importlib.util.find_spec` in a subprocess of that interpreter. This executes
+    the interpreter's own import machinery, not the repository: `find_spec` locates a
+    module without running it. Modules that live in the checkout itself resolve because
+    the repo root is on the path, which is why `repo` is passed rather than assumed.
+    """
+    if not modules:
+        return []
+    probe = (
+        "import importlib.util, json, sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "out = []\n"
+        "for m in sys.argv[2:]:\n"
+        "    try:\n"
+        "        if importlib.util.find_spec(m) is None: out.append(m)\n"
+        "    except Exception: out.append(m)\n"
+        "print(json.dumps(out))\n"
+    )
+    try:
+        p = subprocess.run([interpreter, "-c", probe, str(repo), *modules],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return list(modules)                     # cannot ask: treat as unresolved, not as fine
+    if p.returncode != 0:
+        return list(modules)
+    try:
+        return list(json.loads((p.stdout or "[]").strip().splitlines()[-1]))
+    except (json.JSONDecodeError, ValueError, IndexError):
+        return list(modules)
+
+
+def accepts_argument(repo: Path, entrypoint: str, flag: str = "seed") -> bool:
+    """Does the repository plausibly accept `--<flag>` on this entrypoint?
+
+    Statically, and deliberately generously: argparse `add_argument("--seed"...)`, a
+    dataclass/attrs field named `seed`, or a HuggingFace-style argument class. Searched
+    across the entrypoint and the modules it imports from the checkout, because argument
+    definitions are routinely factored into an `args.py`. Generous because a false
+    "invalid" would suppress a legitimate reproduction; the cost of a false "valid" is
+    only that the run fails and lands in `startup_failure`, which is still INCONCLUSIVE.
+    """
+    pattern = re.compile(rf"(--{flag}\b)|(^\s*{flag}\s*:)", re.M)
+    candidates = [repo / entrypoint] + sorted(repo.glob("*.py")) + sorted(repo.glob("*/*_args.py"))
+    for path in candidates[:60]:
+        if not path.is_file():
+            continue
+        try:
+            if pattern.search(path.read_text(encoding="utf-8", errors="replace")):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def declared_platform(repo: Path) -> str:
+    """'linux' when the repo's environment file pins a Linux-only stack, else ''."""
+    for name in _ENV_DECL_FILES:
+        path = repo / name
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace").lower()
+        except OSError:
+            continue
+        if any(marker in text for marker in _LINUX_ENV_MARKERS):
+            return "linux"
+    return ""
+
+
+def assess_capability(acq: RepoAcquisition, interpreter: str, harness_python: str,
+                      flag: str = "seed", platform: str = "") -> ExecCapability:
+    """Can this machine give the repository a fair run? Decided before anything executes.
+
+    Ordered from the most fundamental blocker outward, so the reported reason is the root
+    cause rather than a downstream symptom: a Linux-only environment explains missing
+    dependencies, and missing dependencies explain an import crash.
+
+    `established` False never accuses the paper of anything. It records that this runner
+    could not mount the experiment, which is the fact the reconciliation needs in order
+    to refuse to convict.
+    """
+    # The platform compared against is the one the RUN will see, supplied by the execution
+    # backend, not the one this process happens to be on. They coincide under the local
+    # backend and diverge the moment a Linux container backend exists — at which point a
+    # `linux-64` repository becomes capable there without a line of this function changing.
+    platform = platform or sys.platform
+    cap = ExecCapability(
+        env_status=acq.env_status or "", interpreter=interpreter or "",
+        entrypoint=acq.entrypoint or "", current_platform=platform,
+        interpreter_is_repo_env=bool(interpreter) and interpreter == (acq.env_path or None),
+    )
+    repo_path = Path(acq.path) if acq.path else None
+
+    if not repo_path or not repo_path.is_dir():
+        cap.reason_code, cap.detail = "not_attempted", "no checkout on disk to execute"
+        return cap
+    if not acq.entrypoint:
+        cap.reason_code = "invalid_invocation"
+        cap.detail = "no runnable entrypoint was identified in the checkout"
+        return cap
+
+    cap.declared_platform = declared_platform(repo_path)
+    if cap.declared_platform and cap.declared_platform not in platform:
+        cap.reason_code = "environment_incompatible"
+        cap.detail = (f"the repository declares a {cap.declared_platform}-only environment and the "
+                      f"execution backend offers {platform}; it cannot be constructed faithfully there")
+        return cap
+
+    if acq.env_status != "ready" or not acq.env_path:
+        cap.reason_code = "environment_incompatible"
+        cap.detail = (f"no environment was built for this repository (env_status "
+                      f"'{acq.env_status or 'not_attempted'}'), so the only interpreter available is "
+                      f"the harness's own, which does not carry the repository's dependencies")
+        return cap
+    if interpreter == harness_python or not cap.interpreter_is_repo_env:
+        cap.reason_code = "environment_incompatible"
+        cap.detail = ("the run would use the harness's own interpreter rather than the environment "
+                      "built for the repository")
+        return cap
+
+    cap.checked_imports = entrypoint_imports(repo_path, acq.entrypoint)
+    cap.missing_dependencies = missing_imports(interpreter, repo_path, cap.checked_imports)
+    if cap.missing_dependencies:
+        cap.reason_code = "dependency_missing"
+        cap.detail = ("the entrypoint imports modules the built environment cannot resolve: "
+                      + ", ".join(cap.missing_dependencies[:8]))
+        return cap
+
+    cap.accepts_seed_argument = accepts_argument(repo_path, acq.entrypoint, flag)
+    if not cap.accepts_seed_argument:
+        cap.reason_code = "invalid_invocation"
+        cap.detail = (f"this harness would pass --{flag}, which does not appear anywhere in the "
+                      f"repository's argument definitions; the command is ours, not theirs")
+        return cap
+
+    cap.established, cap.reason_code = True, "established"
+    cap.detail = "environment built, dependencies resolvable, and the invocation is one the repo accepts"
+    return cap
 
 
 # --------------------------------------------------------------------------- #

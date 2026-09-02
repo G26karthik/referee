@@ -61,7 +61,10 @@ def run_ingest(cfg: Config, paper_path: str) -> dict:
     # marks it as the authors' own. Recorded at ingest so S3 never re-opens the PDF, and
     # so a reader can see which URL the harness would clone before anything is fetched.
     doc.repo_urls = repo.find_repo_urls(doc)
-    doc.repo_url = doc.repo_urls[0] if doc.repo_urls else ""
+    # NOT repo_urls[0]. The candidate list is every repository URL the paper mentions;
+    # `repo_url` is the one it advertises as its own, and a paper that advertises none
+    # must end up with "" rather than with the top-ranked link it happened to cite.
+    doc.repo_url = repo.official_repo_url(doc)
     state.write_json(doc_path, doc.model_dump())
     state.append_log(
         cfg, pid, artifact_type="paper_ingested", phase="ingest",

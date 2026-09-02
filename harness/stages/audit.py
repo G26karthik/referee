@@ -28,6 +28,10 @@ LENSES = tuple(P.LENSES)
 SECTION_BUDGET_CHARS = int(os.environ.get("SH_AUDIT_BUDGET_CHARS", "70000"))
 _SEVERITIES = ("FATAL", "MAJOR", "MINOR")
 _CELL_REF = re.compile(r"T(\d+):r(\d+):c(\d+)")
+# The only two admissible shapes for `evidence_ref`. Anything else — empty, "figure 3",
+# "section 5", a bare page number — names no location a reader can check, so a finding
+# carrying it is not substantiated. See `_substantiated`.
+_PAGE_REF = re.compile(r"p\d+", re.I)
 _QUOTE_MIN = 8
 _WS = re.compile(r"\s+")
 
@@ -147,14 +151,28 @@ def _substantiated(quote: str, ref: str, corpus: str, by_idx: dict) -> bool:
     coordinates, so "0.0001" at T1:r0:c1 is the most checkable evidence there is —
     and rejecting it would throw away precisely the table numbers this harness exists
     to audit.
+
+    A MISSING OR MALFORMED `ref` IS NOT SUBSTANTIATED. This is the load-bearing line.
+    Earlier the reference was optional: an absent `evidence_ref` fell through to the
+    prose branch, so a finding that cited a table cell and then lost its reference in
+    serialization was re-checked as a free-floating substring against the whole paper —
+    and passed, because the cell's own text does appear somewhere in the corpus. The
+    finding survived with its provenance deleted, silently demoted from "this exact cell
+    says X" to "these characters occur somewhere", which is the difference between
+    evidence an editor can check in seconds and no evidence at all. Requiring the
+    reference to be present and well-formed means a lost one is DROPPED and counted,
+    where the report already prints the count, instead of quietly downgraded.
     """
     q = _flat(quote)
     if not q:
         return False
-    m = _CELL_REF.fullmatch((ref or "").strip())
+    ref = (ref or "").strip()
+    m = _CELL_REF.fullmatch(ref)
     if m:
         t = by_idx.get(int(m.group(1)))
         return t is not None and _flat(t.cell(int(m.group(2)), int(m.group(3)))) == q
+    if not _PAGE_REF.fullmatch(ref):
+        return False
     return len(q) >= _QUOTE_MIN and q in corpus
 
 

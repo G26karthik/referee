@@ -79,11 +79,22 @@ def test_paper_id_is_a_stable_slug():
 # S2 — the harness does not trust the driver
 # --------------------------------------------------------------------------- #
 def test_quote_present_in_the_prose_is_substantiated():
-    assert _substantiated("a 4.2% improvement over the ResNet-18 baseline", "", CORPUS, BY_IDX)
+    assert _substantiated("a 4.2% improvement over the ResNet-18 baseline", "p3", CORPUS, BY_IDX)
 
 
 def test_invented_quote_is_rejected():
-    assert not _substantiated("the model achieves state of the art", "", CORPUS, BY_IDX)
+    assert not _substantiated("the model achieves state of the art", "p3", CORPUS, BY_IDX)
+
+
+def test_a_prose_quote_with_no_reference_is_no_longer_substantiated():
+    """Tightened contract: `evidence_ref` is required, not optional.
+
+    These two cases previously passed an empty ref and relied on the prose branch. That
+    was the hole a lost reference fell through — see tests/test_caption_and_evidence_ref.py.
+    The quote below is genuinely in the corpus and must still be refused for want of a
+    location.
+    """
+    assert not _substantiated("a 4.2% improvement over the ResNet-18 baseline", "", CORPUS, BY_IDX)
 
 
 def test_cell_citation_must_match_the_real_cell():

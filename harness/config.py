@@ -71,6 +71,14 @@ class Config:
     audit_cmd: str = field(default_factory=lambda: os.environ.get("SH_AUDIT_CMD", ""))
     audit_timeout_s: int = field(default_factory=lambda: int(os.environ.get("SH_AUDIT_TIMEOUT", "900")))
 
+    # Which execution backend runs THIRD-PARTY repository code. Not a gate — `local` is
+    # the only registered backend, and selecting one grants nothing on its own: the
+    # repo-exec gate, the identity chain and the capability check all still apply. It
+    # exists so that adding a Linux/WSL/container backend later is a name here rather
+    # than a change to anything that decides what a verdict means. An unknown name is
+    # refused rather than substituted (see backends.select_backend).
+    exec_backend: str = field(default_factory=lambda: os.environ.get("SH_EXEC_BACKEND", "local"))
+
     allow_network: bool = field(default_factory=lambda: _flag("SH_ALLOW_NETWORK", True))
     allow_install: bool = field(default_factory=lambda: _flag("SH_ALLOW_INSTALL"))
     allow_repo_exec: bool = field(default_factory=lambda: _flag("SH_ALLOW_REPO_EXEC"))

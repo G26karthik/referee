@@ -124,6 +124,36 @@ build hooks, and running their entrypoint is running their code. Set them per in
 Synthesis is not a risk gate: the code it runs is generated here, from the paper, and is
 readable at `runs/<pid>/probe.py` before it executes.
 
+**Where execution happens** is `harness/backends.py`. `SH_EXEC_BACKEND` (default `local`)
+names the backend that runs third-party repository code; harness-authored probes always
+run locally, because they measure this machine. Selecting a backend grants nothing — an
+unknown name is refused rather than substituted, and `backends.authorize()` is the single
+place that may permit a repository to run. It requires all of: the repo-exec gate open, a
+usable backend, `repo_exec` provenance, experiment + metric + configuration identity, and
+established capability. A refusal produces `verdict: blocked` and an INCONCLUSIVE
+reconciliation classed `execution_unauthorized`; nothing about the paper follows from it.
+This check is applied at the point of execution as well as at planning, because a
+hand-written `runs/<pid>/spec.json` never passes through `plan_execution`.
+
+Two of those preconditions are about the experiment rather than the code.
+
+**Does it fit** (`harness/resources.py`). The requirement for the CITED experiment is read
+from the paper — a stated memory cost, the accelerator named, and a floor derived from the
+model scale in the cited table's caption — each carrying a verbatim quote that is
+re-verified against the parsed corpus exactly like an S2 finding. It is compared against
+the backend's measured VRAM/RAM/CPU/disk. Only `satisfied` permits: `unknown` blocks too,
+because a paper's silence about its own cost is not evidence that the cost is small.
+There is deliberately no function that shrinks a model, batch, precision, sequence length,
+schedule or seed count to make something fit — an altered experiment is not a reproduction,
+and its number is more dangerous than a crash because nothing about it looks wrong.
+
+**Is it the audited code** (`repo.verify_commit`). The SHA the static audit read is stamped
+on `CodeAudit.commit` and carried to `ProbeSpec.commit`; acquisition is asked for that
+revision rather than handed whatever the default branch points at. Verification happens
+against the disk at the moment of execution, not against a value stored during planning —
+a moving branch, a refreshed cache, or an edited working tree each yield `mismatch`,
+`dirty` or `unknown`, all of which refuse.
+
 - **S3a acquisition** (`harness/repo.py`). `PaperDoc.repo_url` is extracted at ingest and
   ranked by proximity to an availability cue, so a footnote pointing at someone else's
   repository does not get cloned instead. No URL → a scaffold is written to
@@ -169,5 +199,6 @@ standing caveat that it is evidence about the mechanism, not about the paper's t
 - Tests: `python -m pytest tests -q`. Self-checks: `python -m harness.pdf <pdf>`,
   `python -m harness.local_exec`, `python -m harness.stages.report`,
   `python -m harness.repo`, `python -m harness.code_audit`, `python -m harness.probe_synth`,
-  `python -m harness.dossier`, `python -m harness.audit_driver`.
+  `python -m harness.dossier`, `python -m harness.audit_driver`, `python -m harness.backends`,
+  `python -m harness.resources`.
 - Never edit `projects/<pid>/audit/prompts/*.md` — they are regenerated every run.

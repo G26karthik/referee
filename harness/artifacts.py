@@ -199,6 +199,35 @@ class ProbeSpec(_Base):
     aux_metrics: list[str] = Field(
         default_factory=list, description="secondary quantities the script reports via SH_AUX"
     )
+    capability: ExecCapability | None = Field(
+        default=None,
+        description="whether this machine can give the repository a fair run. Decided before "
+                    "execution; gates whether a crash may be read as a failed reproduction.",
+    )
+    experiment: ExperimentIdentity | None = Field(
+        default=None, description="which repository command produces the cited cell")
+    metric_identity: MetricIdentity | None = Field(
+        default=None, description="that the executed number is the cell's quantity, on its basis")
+    configuration: ConfigurationIdentity | None = Field(
+        default=None, description="dataset/model/schedule/seed policy, matched or explicitly not")
+    backend: str = Field(
+        default="local",
+        description="the execution backend this spec was planned against. Recorded on the spec "
+                    "because capability was assessed against THAT backend's platform, so a spec "
+                    "planned for one backend and run on another is not the spec that was checked.",
+    )
+    resources: ResourceCapability | None = Field(
+        default=None,
+        description="E1 — whether the published experiment fits this backend's hardware. A "
+                    "requirement is a fact about the paper, so it is stored on the spec; the "
+                    "hardware it was compared against is recorded alongside it.",
+    )
+    commit: str = Field(
+        default="",
+        description="E2 — the audited commit. The SHA the static audit read and the identity "
+                    "layer reasoned over. Execution is verified against THIS, not against "
+                    "whatever the checkout happens to hold when the run starts.",
+    )
 
 
 class RepoAcquisition(_Base):
@@ -215,7 +244,28 @@ class RepoAcquisition(_Base):
         description="cloned | cached | synthesized | unavailable | blocked | failed | not_attempted",
     )
     path: str = Field(default="", description="runs/<pid>/repo or runs/<pid>/standalone_probe.py")
-    commit: str = Field(default="", description="resolved HEAD, so a rerun is pinned")
+    commit: str = Field(
+        default="",
+        description="the FULL 40-character SHA on disk. Full, not abbreviated, because this is "
+                    "the value execution is verified against and a 12-character prefix cannot "
+                    "be compared for equality with a real HEAD without loosening the check.",
+    )
+    requested_revision: str = Field(
+        default="",
+        description="the commit acquisition was ASKED for. Empty means the default branch was "
+                    "taken, which is not a pin: the branch moves and the next clone is different "
+                    "code under the same reasoning.",
+    )
+    pinned: bool = Field(
+        default=False,
+        description="the checkout is at an explicitly requested revision, not at whatever the "
+                    "default branch pointed to when git was run",
+    )
+    shallow: bool = Field(
+        default=False,
+        description="a depth-1 clone. It holds one commit and cannot check out another without "
+                    "a further fetch, which matters when the audited SHA is not the one present.",
+    )
     reason: str = ""
     dependency_files: list[str] = Field(default_factory=list)
     dependencies: list[str] = Field(default_factory=list)
@@ -250,11 +300,361 @@ class CodeAudit(_Base):
     """The static pass. Runs with no execution, so it is safe on an untrusted clone."""
 
     repo_path: str = ""
+    commit: str = Field(
+        default="",
+        description="the checkout's HEAD at the moment this audit read it. THE audited commit: "
+                    "everything downstream — identity, execution, reconciliation — must be about "
+                    "this SHA or about nothing.",
+    )
     files_scanned: int = 0
     lines_scanned: int = 0
     findings: list[CodeAuditFinding] = Field(default_factory=list)
     unparseable: list[str] = Field(default_factory=list, description="files whose AST would not build")
     skipped: str = Field(default="", description="why the audit did not run, if it did not")
+
+
+# --------------------------------------------------------------------------- #
+# Execution capability — the precondition on convicting a paper with its own code
+# --------------------------------------------------------------------------- #
+# Why a crash is not automatically a failed reproduction. "The code was run and did not
+# work" is only true if the code was, in fact, run. A repository can exit non-zero
+# because its declared environment cannot exist on this machine, because its
+# dependencies were never installed, or because this harness invented an argv the
+# entrypoint does not accept — none of which is evidence about the paper. Those are
+# facts about the runner. Distinguishing them requires deciding, BEFORE execution and
+# from structured state rather than from a stderr tail, whether a fair attempt is even
+# possible.
+CAPABILITY_CODES = (
+    "established",              # a fair attempt is possible
+    "not_attempted",            # repo execution was never planned
+    "environment_incompatible", # the declared environment cannot be built or was not built
+    "dependency_missing",       # the target interpreter cannot import what the entrypoint needs
+    "invalid_invocation",       # the command this harness would issue is not one the repo accepts
+    "resources_insufficient",   # the declared experiment does not fit this backend's hardware
+    "commit_mismatch",          # the checkout on disk is not the commit that was audited
+)
+# How a non-zero exit is accounted for. Only `runtime_failure` may convict.
+FAILURE_CLASSES = (
+    "none",
+    "environment_incompatible",
+    "dependency_missing",
+    "invalid_invocation",
+    "startup_failure",          # capable environment, but the process died before the experiment
+    "runtime_failure",          # the experiment was reached and then failed
+    "timeout",
+    "experiment_unidentified",  # no proven mapping from the cited cell to a repo command
+    "metric_unbound",           # the executed number is not the cell's quantity/basis
+    "configuration_unmatched",  # the run's settings are not the cell's settings
+    "execution_unauthorized",   # the harness refused to run it — a fact about us, not them
+    "resources_insufficient",   # the experiment as published does not fit the hardware here
+    "commit_mismatch",          # the code that would run is not the code that was audited
+)
+
+# How an execution request was decided. `allowed` is the whole decision; the code names
+# WHICH condition settled it, so a report can say "the gate was shut" rather than the
+# undifferentiated "we did not run it".
+EXEC_DECISIONS = (
+    "authorized",
+    "not_repo_execution",       # our own generated probe; repository gates do not apply
+    "gate_closed",              # SH_ALLOW_REPO_EXEC is not set
+    "no_backend",               # no usable execution backend
+    "provenance_insufficient",  # a command was set, but the code is not the authors'
+    "identity_unproven",        # experiment / metric / configuration not established
+    "capability_unproven",      # this machine cannot give the code a fair run
+    "resources_unproven",       # the experiment's resource demand is unmet or unestablished
+    "commit_unverified",        # the checkout is not provably the audited commit
+)
+
+# Both new decisions above are refusals with the same shape as the others: they name a
+# fact about this harness or this host, never about the paper. `resources_unproven`
+# covers "the experiment is bigger than the machine" AND "we could not establish how big
+# it is" — because permitting on the strength of the second would be permitting on the
+# strength of the paper's silence.
+
+
+# --------------------------------------------------------------------------- #
+# Identity — WHICH experiment, WHICH quantity, WHICH configuration
+# --------------------------------------------------------------------------- #
+# Capability answers "can this machine run the code". It does not answer "is this the
+# right program, emitting the right quantity, under the right settings". A repository can
+# execute perfectly and still say nothing about the cited cell — which is worse than a
+# crash, because a crash is visible and a confident irrelevant number is not.
+#
+# States are CATEGORICAL on purpose. A numeric confidence invites a threshold, and a
+# threshold turns "we are not sure which experiment this is" into an execution
+# authorization. Abstention has to be a state, not a low score.
+IDENTITY_STATES = (
+    "established",   # proven, with re-verifiable evidence
+    "ambiguous",     # several candidates fit equally well; picking one would be a guess
+    "no_candidate",  # nothing in the repository can produce this
+    "unmapped",      # not yet assessed
+    "unsupported",   # the repository cannot express what the cell requires
+)
+
+
+class IdentityEvidence(_Base):
+    """One quoted justification for an identity claim, checkable the way S2 evidence is.
+
+    The mapping from a paper cell to a repository command is judgement, and this harness
+    does not accept judgement without provenance anywhere else. `source_ref` names a
+    file and line in the checkout ("scripts/x.sh:93"), a paper cell ("T2:r3:c11") or a
+    page ("p7"), so a reader can re-check the inference rather than trust it.
+    """
+
+    quote: str = ""
+    source_ref: str = ""
+    note: str = ""
+
+
+class CandidateCommand(_Base):
+    """A command the REPOSITORY advertises, discovered rather than invented."""
+
+    argv: list[str] = Field(default_factory=list)
+    source: str = Field(default="", description="readme | run_script | scripts_dir | makefile")
+    source_ref: str = Field(default="", description="file:line the command was read from")
+    declared_args: dict[str, str] = Field(default_factory=dict)
+    seed_flag: str = Field(default="", description="the seed flag the repo itself uses, if any")
+    seed_values: list[str] = Field(default_factory=list, description="seeds the repo passes")
+    emits: list[str] = Field(default_factory=list, description="output keys/files this command writes")
+    label: str = Field(default="", description="what the command actually does")
+
+
+class _Identity(_Base):
+    state: str = Field(default="unmapped", description=" | ".join(IDENTITY_STATES))
+    evidence: list[IdentityEvidence] = Field(default_factory=list)
+    reason: str = ""
+
+    @property
+    def established(self) -> bool:
+        return self.state == "established"
+
+
+class ExperimentIdentity(_Identity):
+    """Which repository command produces the cited cell — or that none does."""
+
+    command: CandidateCommand | None = None
+    finding_id: str = ""
+    table_ref: str = ""
+    row_method: str = Field(default="", description="the method the cited row names, e.g. 'LLMPruner'")
+    considered: int = Field(default=0, description="candidate commands examined")
+    rejected: list[str] = Field(default_factory=list, description="candidate + why it was refused")
+
+
+class MetricIdentity(_Identity):
+    """That the executed number is the SAME quantity, on the same basis, as the cell.
+
+    `basis` is as load-bearing as `quantity`. A cell reading 253.6% is a ratio against a
+    baseline run; peak memory in MB is not that number no matter how correctly it is
+    measured, and reconciling them would be a units error dressed as a reproduction.
+    """
+
+    cell_quantity: str = Field(default="", description="accuracy|memory|latency|flops|macs|loss|params")
+    cell_basis: str = Field(default="", description="absolute | relative_to_baseline")
+    cell_unit: str = ""
+    output_key: str = Field(default="", description="the repo output key that carries the quantity")
+    output_quantity: str = ""
+    output_basis: str = ""
+    requires_arms: list[str] = Field(
+        default_factory=list, description="a relative cell needs its baseline arm too")
+
+
+class ConfigurationIdentity(_Identity):
+    """Dataset, model, sparsity, schedule and seed policy, matched or explicitly not."""
+
+    matched: dict[str, str] = Field(default_factory=dict)
+    unrecoverable: list[str] = Field(default_factory=list)
+    seed_policy_paper: str = ""
+    seed_policy_repo: str = ""
+    seed_policy_match: bool | None = None
+
+
+class ExecCapability(_Base):
+    """Whether this machine can give the paper's own code a fair run.
+
+    Recorded whether or not execution is attempted, because "we did not try" and "we
+    tried and the environment was wrong" and "we tried and their code broke" are three
+    different facts and only the last one is about the paper.
+    """
+
+    established: bool = False
+    reason_code: str = Field(default="not_attempted", description=" | ".join(CAPABILITY_CODES))
+    detail: str = Field(default="", description="one human-readable sentence naming the blocker")
+    env_status: str = Field(default="", description="RepoAcquisition.env_status at planning time")
+    interpreter: str = Field(default="", description="the python that would run the repo")
+    interpreter_is_repo_env: bool = Field(
+        default=False,
+        description="False means the harness's own venv, which by construction lacks the "
+                    "repository's dependencies — never a capable configuration",
+    )
+    entrypoint: str = ""
+    checked_imports: list[str] = Field(default_factory=list)
+    missing_dependencies: list[str] = Field(default_factory=list)
+    accepts_seed_argument: bool | None = Field(
+        default=None, description="does the repo actually take the --seed this harness would pass?"
+    )
+    declared_platform: str = Field(default="", description="platform the repo's env file declares")
+    current_platform: str = Field(
+        default="",
+        description="the platform the run would actually SEE. Equal to sys.platform under the "
+                    "local backend, but it is the backend's answer rather than this process's: a "
+                    "Linux container reports 'linux', which is what makes a linux-64 repository "
+                    "capable there without changing any of the logic that decides capability.",
+    )
+    backend: str = Field(default="", description="the execution backend that answered these checks")
+
+
+# --------------------------------------------------------------------------- #
+# Resources — DOES THE PUBLISHED EXPERIMENT FIT, decided before anything runs
+# --------------------------------------------------------------------------- #
+# Capability asks "can this machine run the code". Identity asks "is this the right
+# program". Neither asks "does the experiment the paper published fit in the hardware
+# present" — and that question cannot be answered by trying, because trying produces a
+# CUDA OOM some minutes in, which looks exactly like the authors' code failing.
+#
+# The temptation this type exists to remove is the obvious one: shrink the batch, drop to
+# int8, cut the sequence length, run fewer seeds, use the smaller model — and the run
+# completes. What completed is a different experiment, and reporting its number against
+# the paper's cell would be the most damaging thing this harness could do, because unlike
+# a crash it produces a confident figure with nothing wrong on its face.
+#
+# So resources are a PRE-execution precondition with categorical states, and there is
+# deliberately no knob anywhere that adapts a requirement downward to fit a backend.
+RESOURCE_STATES = (
+    "satisfied",     # every established requirement fits, with evidence for each
+    "insufficient",  # at least one requirement exceeds what the backend offers
+    "unknown",       # the demand could not be established from paper or repository
+    "unassessed",    # not yet examined
+)
+
+GIB = 1024 ** 3
+
+
+class ResourceEvidence(_Base):
+    """One quoted justification for a resource requirement, re-checkable like S2 evidence.
+
+    A requirement without a quote is a guess, and a guess that BLOCKS is as unaccountable
+    as a guess that permits — a reader has to be able to see why the harness decided an
+    experiment did not fit, and disagree with it.
+    """
+
+    quote: str = Field(default="", description="verbatim from the paper or the repository")
+    source_ref: str = Field(default="", description="'p7' | 'T2:r3:c11' | 'scripts/x.sh:12'")
+    kind: str = Field(
+        default="",
+        description="declared_requirement = the authors state what the method costs; "
+                    "declared_hardware = the authors state what they ran on, an upper bound "
+                    "on the machine and not a statement of need; "
+                    "derived_floor = computed from a model scale the cell itself names",
+    )
+    note: str = ""
+
+
+class ResourceRequirement(_Base):
+    """What the CITED experiment demands, in bytes and counts, each with its evidence.
+
+    Every field is optional because most papers state few of them. An unstated demand is
+    `None` and is reported as unknown — never as zero, which would read as "needs
+    nothing" and would authorize execution on the strength of the paper's silence.
+    """
+
+    vram_bytes: int | None = None
+    ram_bytes: int | None = None
+    disk_bytes: int | None = None
+    cpu_count: int | None = None
+    gpu_count: int | None = None
+    gpu_model: str = Field(default="", description="the accelerator the paper names, e.g. 'A100'")
+    walltime_s: int | None = Field(default=None, description="declared runtime / execution budget")
+    model_scale: str = Field(default="", description="the model the cited cell reports, e.g. 'LLaMA 2 7B'")
+    evidence: list[ResourceEvidence] = Field(default_factory=list)
+    unstated: list[str] = Field(
+        default_factory=list, description="requirement fields the sources did not establish")
+
+    @property
+    def stated(self) -> bool:
+        """Did any source establish any demand at all?"""
+        return any(v is not None for v in (self.vram_bytes, self.ram_bytes, self.disk_bytes,
+                                           self.cpu_count, self.gpu_count, self.walltime_s))
+
+
+class ResourceCapability(_Base):
+    """Whether the backend satisfies the requirement. `satisfied` is the only green light.
+
+    `unknown` blocks, and that is the deliberate half. The alternative reading — "nothing
+    was established, so nothing is in the way" — is exactly the inference the docstring on
+    ResourceRequirement refuses: it converts a paper's silence about its own cost into
+    permission to run it. The asymmetry is the same one that governs the rest of S3: a
+    wrongly blocked run is INCONCLUSIVE and accuses nobody, while a wrongly permitted one
+    OOMs and reconciles as the authors' code failing.
+    """
+
+    state: str = Field(default="unassessed", description=" | ".join(RESOURCE_STATES))
+    reason: str = ""
+    backend: str = ""
+    requirement: ResourceRequirement | None = None
+    shortfalls: list[str] = Field(
+        default_factory=list, description="one line per requirement the backend cannot meet")
+    available_vram_bytes: int | None = None
+    available_ram_bytes: int | None = None
+    available_disk_bytes: int | None = None
+    available_cpu_count: int | None = None
+    available_gpu_count: int | None = None
+    available_gpu_model: str = ""
+
+    @property
+    def established(self) -> bool:
+        return self.state == "satisfied"
+
+
+# --------------------------------------------------------------------------- #
+# Commit identity — the code that runs must be the code that was audited
+# --------------------------------------------------------------------------- #
+COMMIT_STATES = (
+    "verified",    # HEAD equals the audited commit and the tree is clean
+    "mismatch",    # HEAD is a different commit — a moving branch, or a re-clone
+    "dirty",       # HEAD matches but the working tree has been modified
+    "unknown",     # no audited commit recorded, or HEAD could not be read
+    "unassessed",
+)
+
+
+class CommitVerification(_Base):
+    """That the checkout about to run is the one the static audit and identity layer read.
+
+    Recording a SHA after cloning proves nothing: it says what arrived, not what was
+    asked for. A default branch moves, a cached checkout is refreshed, and the next run
+    executes different code under the same reasoning — with the audit findings, the
+    experiment identity and the reconciliation all still labelled with the old commit.
+    """
+
+    state: str = Field(default="unassessed", description=" | ".join(COMMIT_STATES))
+    expected: str = Field(default="", description="the audited commit, from the audit artifact")
+    actual: str = Field(default="", description="`git rev-parse HEAD` in the checkout now")
+    dirty_files: list[str] = Field(default_factory=list)
+    shallow: bool = Field(default=False, description="a depth-1 clone cannot reach another commit")
+    reason: str = ""
+
+    @property
+    def established(self) -> bool:
+        return self.state == "verified"
+
+
+class ExecAuthorization(_Base):
+    """Whether an execution request may proceed. The record of a refusal, not just a bool.
+
+    Every path that does not execute has to be able to say which condition stopped it,
+    because the alternatives are not interchangeable: "the operator did not open the
+    gate", "we could not identify which experiment this is" and "their code will not run
+    here" are three different sentences and none of them is about the paper being wrong.
+    """
+
+    allowed: bool = False
+    decision: str = Field(default="gate_closed", description=" | ".join(EXEC_DECISIONS))
+    backend: str = Field(default="", description="the backend that would have run it")
+    failure_class: str = Field(
+        default="execution_unauthorized",
+        description="how a refusal is accounted for downstream: " + " | ".join(FAILURE_CLASSES),
+    )
+    detail: str = Field(default="", description="one sentence naming the condition that decided it")
 
 
 class Reconciliation(_Base):
@@ -284,6 +684,20 @@ class Reconciliation(_Base):
         description="the ProbeSpec.provenance that produced this. Only 'driver' and 'repo_exec' "
                     "may reach a verdict: a synthesized probe is our reimplementation on a toy "
                     "problem, and it is not entitled to convict a paper's printed number.",
+    )
+    failure_class: str = Field(
+        default="none",
+        description="how a non-zero exit was accounted for: " + " | ".join(FAILURE_CLASSES) +
+                    ". Only 'runtime_failure' — the experiment was reached and then failed — may "
+                    "produce FAILED_REPRODUCTION from a crash.",
+    )
+    experiment_state: str = Field(default="unmapped", description="ExperimentIdentity.state")
+    metric_state: str = Field(default="unmapped", description="MetricIdentity.state")
+    configuration_state: str = Field(default="unmapped", description="ConfigurationIdentity.state")
+    reached_experiment: bool | None = Field(
+        default=None,
+        description="did the process get past setup into the experiment? None means not assessed. "
+                    "The burden of proof is on establishing this, not on disproving it.",
     )
     reason: str = ""
 
@@ -343,6 +757,26 @@ class ProbeResult(_Base):
     )
     mechanism: str = Field(default="", description="the planner template that authored the script")
     rationale: str = Field(default="", description="why this probe was chosen")
+    capability: ExecCapability | None = Field(
+        default=None, description="mirrors ProbeSpec.capability — S3's execution precondition"
+    )
+    backend: str = Field(default="local", description="the backend that ran, or would have run, this probe")
+    resources: ResourceCapability | None = Field(
+        default=None, description="mirrors ProbeSpec.resources — E1's pre-execution fit check")
+    commit_verification: CommitVerification | None = Field(
+        default=None,
+        description="E2 — the checkout's identity CHECKED AT EXECUTION TIME, not at planning. "
+                    "A stored SHA proves what arrived once; this proves what would run now.",
+    )
+    authorization: ExecAuthorization | None = Field(
+        default=None,
+        description="whether execution was permitted, and which condition decided it. Present "
+                    "even when the answer was yes, so a report never has to infer a refusal from "
+                    "the absence of numbers.",
+    )
+    experiment: ExperimentIdentity | None = None
+    metric_identity: MetricIdentity | None = None
+    configuration: ConfigurationIdentity | None = None
     aux: dict[str, dict[str, ArmStats]] = Field(
         default_factory=dict,
         description="secondary measurements from SH_AUX lines, as aux[key][arm]. These answer the "

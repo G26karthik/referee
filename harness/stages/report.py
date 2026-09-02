@@ -153,6 +153,15 @@ def _probe_heading(p: ProbeResult) -> str:
 
 def _probe_block(p: ProbeResult) -> list[str]:
     """The measured numbers, stated plainly. Every figure comes from the probe JSON."""
+    if p.verdict == "blocked":
+        # Deliberately worded as a fact about this harness. "The probe did not produce
+        # measurements" would read, next to a paper, as though the paper's code had been
+        # tried and found wanting; nothing was tried.
+        auth = p.authorization
+        why = auth.detail if auth else p.reason
+        return [f"⛔ **The repository was not executed** — this harness declined to run it "
+                f"(`{auth.decision if auth else 'unauthorized'}`). {why} "
+                f"Nothing about the paper follows from this."]
     if p.verdict == "failed":
         return [f"The reproduction probe did not produce usable measurements. {p.reason}"]
     if p.verdict == "degenerate":
