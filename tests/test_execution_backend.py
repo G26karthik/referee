@@ -281,14 +281,26 @@ def test_no_backend_means_no_execution():
     assert not auth.allowed and auth.decision == "no_backend"
 
 
-def test_an_unavailable_backend_is_the_same_as_none():
+def test_an_unavailable_backend_refuses_but_is_not_an_absent_one():
+    """A runner that is down and no runner at all are both refusals, and not the same one.
+
+    This test previously asserted they were identical, which is what the collapse looked
+    like from inside: both reported `no_backend`. An operator reading that goes looking
+    for a backend to add, when the registry already holds one that would have run the
+    experiment and was merely unreachable — the only refusal in this module that a later
+    attempt can resolve without anything about the paper changing.
+    """
     class Down(LinuxStubBackend):
         def available(self):
             return BackendAvailability(False, "the daemon is not running")
 
     auth = authorize(_cfg(allow_repo_exec=True), _qualified(), Down(), commit=_verified())
-    assert not auth.allowed and auth.decision == "no_backend"
+    assert not auth.allowed and auth.decision == "backend_offline"
     assert "daemon" in auth.detail
+    # Both are INCONCLUSIVE-shaped, and neither convicts the paper.
+    absent = authorize(_cfg(allow_repo_exec=True), _qualified(), None, commit=_verified())
+    assert auth.failure_class == absent.failure_class == "backend_unavailable"
+    assert auth.decision != absent.decision
 
 
 def test_every_condition_together_is_what_authorizes():
@@ -464,3 +476,73 @@ def test_cleanup_removes_only_what_the_backend_built(tmp_path):
 
 def test_cleanup_is_a_no_op_when_nothing_was_provisioned(tmp_path):
     assert LocalBackend().cleanup(tmp_path, "p") == []
+
+
+# --------------------------------------------------------------------------- #
+# The provider-neutral contract
+# --------------------------------------------------------------------------- #
+# What a future Kaggle, Colab, container or VM backend must satisfy, asserted against
+# every backend the registry holds rather than against the one that happens to run here.
+# The point is that a new provider is a class and a profile, and nothing above this seam
+# changes: no test below names `local`, and none of them executes third-party code.
+def test_every_registered_backend_satisfies_the_interface():
+    from harness import backends as b
+
+    for name in registered_backends():
+        backend = b._REGISTRY[name]()
+        assert isinstance(backend, ExecutionBackend), name
+        assert backend.name == name, "a backend's registered key is its own name"
+        r, p = backend.resources(), backend.profile()
+        assert r.name and r.platform, f"{name} must say what platform it presents"
+        assert p.name == name and isinstance(p.can_execute, bool)
+        assert backend.environment(), f"{name} must be able to say where a run happens"
+        assert isinstance(backend.available(), BackendAvailability)
+        for op in ("capability", "provision", "execute", "cleanup"):
+            assert callable(getattr(backend, op)), f"{name}.{op}"
+
+
+def test_can_execute_and_availability_are_separate_questions():
+    """Permanent incapacity and a transient outage are different facts.
+
+    A declaration will never run anything; a real runner whose provider is down will run
+    something later. Both make `available()` false, so `can_execute` is what tells them
+    apart — and it is `can_execute` that `authorize` consults first.
+    """
+    class Down(LocalBackend):
+        name = "down"
+
+        def available(self):
+            return BackendAvailability(False, "the provider API returned 503")
+
+    down = Down()
+    assert down.profile().can_execute is True and not down.available().usable
+    from harness.backends import KaggleBackend
+    declared = KaggleBackend()
+    assert declared.profile().can_execute is False and not declared.available().usable
+
+
+def test_an_execution_record_says_where_it_ran():
+    """`backend: "kaggle"` names a provider, not a machine.
+
+    On this host the hardware is implicit — there is only one. A remote run's is not, and
+    a reproduction verdict from hardware nobody can identify afterwards is not evidence.
+    So the backend stamps its own account of the environment onto every outcome, and
+    `run_probe` copies it verbatim onto the record.
+    """
+    backend = local_backend()
+    out = backend.execute(ExecRequest([_cfg().python, "-c", "print('x')"], "", 60))
+    assert out.environment == backend.environment()
+    assert out.backend in out.environment, "the environment names the backend that ran it"
+    assert sys.platform in out.environment
+
+
+def test_the_environment_stamp_survives_into_the_execution_log(tmp_path):
+    spec = ProbeSpec(paper_id="p", seeds=[0], arms=["a"], provenance="template",
+                     script="print('SH_METRIC arm=a seed=0 value=1.0')")
+    result = run_probe(_cfg(), tmp_path, spec)
+    assert result.executions == 1 and result.execution_log
+    import json
+
+    rec = json.loads(Path(result.execution_log).read_text(encoding="utf-8").splitlines()[0])
+    assert rec["environment"] and rec["backend"] == "local"
+    assert rec["environment"] == local_backend().environment()

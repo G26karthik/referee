@@ -82,6 +82,19 @@ _MEM_COST_ALT = re.compile(
     r"(\d+(?:\.\d+)?)\s*(GB|GiB|TB|MB)\b[^.]{0,80}?\bmemor\w+", re.IGNORECASE)
 _UNIT = {"mb": 1024 ** 2, "gb": GIB, "gib": GIB, "tb": 1024 ** 4}
 
+# A sentence that structurally signals "this figure is about a DIFFERENT method" — the
+# paper contrasting its own cost against a baseline's, in either order. Matched by
+# STRUCTURE (a comparison connective), never by any method's name, so it generalizes to
+# every paper rather than the one it was found on.
+_CONTRAST_CUE = re.compile(
+    r"\b(in\s+contrast|compared\s+(?:to|with)|by\s+contrast|whereas|unlike|"
+    r"on\s+the\s+other\s+hand|while\s+\w+\s+(?:costs?|requires?|uses?|needs?))\b",
+    re.IGNORECASE)
+# "30% of the 24GB" or "24GB (12%)" — the number carries a unit, but a percent sign in
+# its immediate context means the sentence is stating a RATIO, not a standalone cost, and
+# reading the absolute figure alone drops exactly the qualifier that made it a ratio.
+_PERCENT_NEARBY = re.compile(r"%")
+
 # A model scale named in a caption or a row label. Parameter counts are the published
 # ones; the fp16 floor is 2 bytes each, which is the least any implementation can hold.
 _MODEL_SCALE = re.compile(
@@ -202,19 +215,45 @@ def declared_memory_cost(doc: PaperDoc) -> tuple[int | None, ResourceEvidence | 
     contrasting its own cost against a baseline's — "APT costs less than 24GB ... LLM-Pruner
     costs about 80GB" — and charging the method with the baseline's number would block on
     a figure the authors were arguing against.
+
+    Two figures are excluded from consideration entirely, rather than merely risked:
+
+      - a sentence a CONTRAST connective marks as being about a different method
+        ("in contrast", "compared to", "unlike", ...). Smallest-of-everything used to
+        pick whichever number was numerically least, including a contrasted baseline's,
+        when that baseline happened to be cheaper than the method under audit — "smallest"
+        is a tbreak for THIS paper's ordering, not a rule that holds in general.
+      - a figure with a '%' immediately around it: "30% of the 24GB budget" states a
+        RATIO, and reading the absolute number out of it drops exactly the qualifier that
+        made it one. The window is local to the number, not the whole sentence, so an
+        unrelated percentage elsewhere in the same sentence ("... 24GB of memory when
+        pruning 30% parameters ...") does not disqualify a genuine declared cost.
+
+    If every remaining candidate is contrast-flagged — the paper states costs for other
+    methods but never states its own — nothing is returned. Attributing a comparison
+    figure to the method under audit would be the exact misattribution this function
+    exists to avoid; silence is not evidence the true cost is small.
     """
     corpus = normalize("\n".join(s.text or "" for s in doc.sections))
-    best: tuple[int, str] | None = None
+    clean: list[tuple[int, str]] = []
+    contrasted: list[tuple[int, str]] = []
     for rx in (_MEM_COST, _MEM_COST_ALT):
         for m in rx.finditer(corpus):
             unit = _UNIT.get(m.group(2).lower())
             if not unit:
                 continue
+            window = corpus[max(0, m.start(1) - 15):m.end(2) + 15]
+            if _PERCENT_NEARBY.search(window):
+                continue
             value = int(float(m.group(1)) * unit)
-            if best is None or value < best[0]:
-                best = (value, _sentence(corpus, m.start()))
-    if best is None:
+            sentence = _sentence(corpus, m.start())
+            bucket = contrasted if _CONTRAST_CUE.search(sentence) else clean
+            if not any(value == v for v, _ in bucket):
+                bucket.append((value, sentence))
+    candidates = clean or None
+    if not candidates:
         return None, None
+    best = min(candidates, key=lambda t: t[0])
     return best[0], ResourceEvidence(
         quote=best[1][:400], source_ref=_section_ref(doc, best[1][:40]) or "p?",
         kind="declared_requirement",
@@ -320,9 +359,14 @@ def require_resources(doc: PaperDoc, table_ref: str = "",
         req.evidence.append(floor_ev)
         # The floor RAISES a stated cost but never lowers it: a paper claiming 24 GB for a
         # model whose weights alone are 26 GB has been misread, and the larger figure is
-        # the one that cannot be wrong.
+        # the one that cannot be wrong. But a floor that is the ONLY basis for the number —
+        # no declared cost ever anchored it — is not a requirement, it is a lower bound:
+        # weights only, no activations, no optimizer state, no gradients, no KV cache. That
+        # distinction is recorded so `assess_resources` can refuse to call a floor alone
+        # "satisfied" just because it happens to fit.
         if floor is not None:
             req.vram_bytes = floor if req.vram_bytes is None else max(req.vram_bytes, floor)
+            req.vram_is_floor_only = req.vram_bytes == floor
 
     wall, wall_ev = declared_walltime(doc)
     if wall_ev:
@@ -430,10 +474,40 @@ def assess_resources(req: ResourceRequirement | None, resources, backend: str = 
               "precision, sequence length, schedule or seed count would produce a different "
               "experiment, and its number would not be a reproduction of the cited cell.")
         return cap
+    if not req.memory_stated:
+        # AFTER the shortfall check on purpose: a demand that provably exceeds the backend
+        # is a definite refusal and names itself, which is more useful than "we could not
+        # establish the memory". This branch catches only the case where nothing ruled the
+        # backend out — and where the reason nothing did is that the deciding quantity was
+        # never established. `stated` was satisfied by some other field, which says
+        # nothing at all about whether the experiment fits in memory.
+        cap.state = "unknown"
+        cap.reason = (
+            "the sources establish some of this experiment's demands but not its memory: "
+            f"{', '.join(n for n in req.unstated if n in ('vram', 'ram')) or 'vram, ram'} "
+            "were never stated. Every other declared quantity fitting is not evidence that "
+            "the experiment fits — an unstated memory demand is not a small one, and it is "
+            "the demand that decides whether a run reaches its own first measurement.")
+        return cap
     if unmeasured:
         cap.state = "unknown"
         cap.reason = ("the backend could not report the resources this experiment declares: "
                       + "; ".join(unmeasured))
+        return cap
+    if req.vram_bytes is not None and req.vram_is_floor_only:
+        # C7 — a lower bound is not a requirement. The only number established is what the
+        # model's weights occupy at fp16; everything else an actual run needs — activations,
+        # optimizer state, gradients, a KV cache — was never stated, and fitting the floor
+        # proves nothing about fitting THAT. Reported `unknown`, the same state an unstated
+        # memory demand gets, because that is what this effectively is: a demand nobody
+        # measured, with a minimum nobody can go under standing in its place.
+        cap.state = "unknown"
+        cap.reason = (
+            f"only a lower bound was established for VRAM — {_gib(req.vram_bytes)}, the "
+            f"weights of {req.model_scale or 'the cited model'} at fp16 — with no declared "
+            f"cost to anchor it. The backend meeting that floor is not evidence the actual "
+            f"experiment fits: activations, optimizer state, gradients and any KV cache are "
+            f"not counted in it, and are not stated anywhere.")
         return cap
 
     cap.state = "satisfied"

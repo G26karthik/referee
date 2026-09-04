@@ -189,10 +189,18 @@ def test_a_fixed_repo_seed_against_a_multi_seed_harness_is_unsupported():
 
 
 def test_unrecoverable_configuration_fields_are_named_not_guessed():
+    """`sparsity` moved from REQUIRED to REPORTED in the correction pass.
+
+    It exists only in pruning papers, and requiring it made every paper outside that
+    domain `unmapped` on a field its caption could not carry — a domain vocabulary
+    promoted into a universal gate. Model and dataset are what identify a configuration
+    in general; a sparsity that IS stated still lands in `matched` as evidence.
+    """
     cmd = CandidateCommand(argv=["bash", "s.sh"], seed_flag="--seed", seed_values=["1", "2", "3"])
     ident = resolve_configuration(_doc(ABSOLUTE), "T1:r1:c1", cmd, harness_seeds=3)
-    assert ident.state == "unmapped"
-    assert "sparsity" in ident.unrecoverable and ident.matched.get("dataset")
+    assert ident.matched.get("dataset"), "what IS recoverable is still recovered"
+    assert "sparsity" not in ident.unrecoverable, "pruning vocabulary is not universal"
+    assert set(ident.unrecoverable) <= {"model", "dataset"}
 
 
 def test_a_repo_with_no_seed_argument_is_recorded_as_such():
@@ -274,10 +282,27 @@ def test_synthesized_provenance_still_cannot_reach_a_verdict():
     assert r.status == "INCONCLUSIVE" and "not the paper's own code" in r.reason
 
 
-def test_a_generated_probe_needs_no_identity_chain():
-    """Identity gates REPOSITORY runs. A driver script with no command is unaffected."""
+def test_a_driver_script_with_no_command_still_needs_an_identity_chain():
+    """C4 — a driver spec can carry a hand-written `script` with no `command` at all,
+    since a human wrote spec.json and pointed it at real code. Gating the identity check
+    on `spec.command` (the old condition) let exactly that spec reconcile with ZERO
+    identity established: not the experiment, not the metric, not the configuration.
+    `driver` is trusted as to WHO wrote the code, never as a substitute for showing the
+    executed output answers the cited cell — the same bar `repo_exec` has to clear.
+    """
     spec = ProbeSpec(paper_id="p", table_ref="T1:r0:c1", claimed_cell_value="59.28",
                      provenance="driver", script="print(1)")
+    r = reconcile(spec, [59.30, 59.26], 0.10, [0, 1])
+    assert r.status == "INCONCLUSIVE", "an arbitrary driver spec must not acquit"
+    assert r.failure_class == "experiment_unidentified"
+    convict = reconcile(spec, [1.0, 1.1], 0.10, [0, 1])
+    assert convict.status == "INCONCLUSIVE", "nor may an arbitrary driver spec convict"
+
+    e, m, c = _established()
+    spec.experiment, spec.metric_identity, spec.configuration = e, m, c
+    # Once the SAME chain a repo_exec spec needs is actually established, the trusted
+    # channel still works — this is the "legitimate trusted-channel semantics" that
+    # must survive the fix, not a blanket ban on driver reconciliation.
     assert reconcile(spec, [59.30, 59.26], 0.10, [0, 1]).status == "RESOLVED_VERIFIED"
 
 

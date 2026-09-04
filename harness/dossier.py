@@ -55,9 +55,17 @@ def load(cfg: Config, pid: str) -> dict | None:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def counted_severity(f: dict) -> str:
+    """The severity `stages.report.counted()` actually counted — falls back to the
+    lens's own `severity` when `counted_severity` is unset, exactly like the report-time
+    function this mirrors. Reading the raw field here (not re-deriving it) is what
+    'reads only, re-derives nothing' (see module docstring) actually means in practice."""
+    return f.get("counted_severity") or f.get("severity") or ""
+
+
 def counts(report: dict) -> dict[str, int]:
     findings = report.get("findings") or []
-    return {s: sum(1 for f in findings if f.get("severity") == s) for s in SEVERITIES}
+    return {s: sum(1 for f in findings if counted_severity(f) == s) for s in SEVERITIES}
 
 
 def probe_status(report: dict) -> str:
@@ -119,13 +127,34 @@ def provenance_caveat(report: dict) -> str:
     """The standing caveat for a probe that is not entitled to a reproduction verdict."""
     p = report.get("probe") or {}
     prov = p.get("provenance")
-    if prov == "repo_exec":
-        return ("This probe ran the authors' own checkout, so its reconciliation against "
-                "the cited cell is a real reproduction verdict.")
-    if prov == "driver":
-        return ("This probe ran a hand-written reproduction of the paper's setup, so its "
-                "reconciliation against the cited cell is a real reproduction verdict.")
+    rec_status = ((p.get("reconciliation") or {}) or {}).get("status")
+    # Provenance alone says WHOSE code would be entitled to a real verdict; it says
+    # nothing about whether a process actually ran and reached one. A `repo_exec`/`driver`
+    # spec refused by `authorize` (verdict `blocked`, no seeds run) or one whose run ended
+    # INCONCLUSIVE still had the right provenance — asserting "a real reproduction verdict"
+    # for either would claim an execution, or a resolution, that did not happen.
+    executed = bool(p.get("seeds_run"))
+    resolved = rec_status in ("RESOLVED_VERIFIED", "FAILED_REPRODUCTION")
+    if prov in ("repo_exec", "driver") and executed and resolved:
+        whose = ("the authors' own checkout" if prov == "repo_exec"
+                else "a hand-written reproduction of the paper's setup")
+        return (f"This probe ran {whose}, so its reconciliation against "
+                f"the cited cell is a real reproduction verdict.")
+    if prov in ("repo_exec", "driver"):
+        why = (f"verdict `{p.get('verdict') or '?'}`, no process executed" if not executed
+              else f"reconciliation `{rec_status or 'not recorded'}`")
+        return (f"⚠️ This probe's provenance ({prov}) would admit a real reproduction "
+                f"verdict, but none was reached ({why}). Nothing about the paper's own "
+                f"code follows from this.")
     if prov == "synthesized":
+        if p.get("mechanism") == "placebo":
+            # The placebo is the only synthesized template — probe_synth.plan has no
+            # mechanism dispatch — and it is paper-independent BY CONSTRUCTION.
+            return ("⚠️ This probe is a generic, paper-independent placebo control — it "
+                    "was NOT derived from this paper's formulation. It measures how much "
+                    "an auxiliary term with no hypothesis moves the metric, and it may "
+                    "neither convict nor acquit a printed cell, and it cannot drive this "
+                    "paper's verdict.")
         return ("⚠️ This probe was written by the harness from the paper's own published "
                 "formulation and run at toy scale. It is evidence about the MECHANISM, "
                 "not about the paper's tables — it may neither convict nor acquit a "
@@ -165,15 +194,17 @@ def _finding_lines(report: dict) -> list[str]:
     that order rather than re-sorting and risking a different answer to "what is worst".
     """
     critical = [f for f in (report.get("findings") or [])
-                if f.get("severity") in ("FATAL", "MAJOR")]
+                if counted_severity(f) in ("FATAL", "MAJOR")]
     if not critical:
         return ["No FATAL or MAJOR findings were raised.", ""]
 
     out = []
     for f in critical[:CRITICAL_LIMIT]:
         ref = f.get("evidence_ref") or "—"
+        sev = counted_severity(f)
+        sev_label = f"{sev} (lens asserted {f.get('severity')})" if f.get("counted_severity") else sev
         out += [
-            f"- **{f.get('severity')} · {f.get('lens')}** — {f.get('title')}",
+            f"- **{sev_label} · {f.get('lens')}** — {f.get('title')}",
             f"  {f.get('statement')}",
             f"  Evidence `{ref}`: “{f.get('evidence_quote')}”",
             "",
@@ -391,6 +422,26 @@ def build(cfg: Config, pids: list[str], out_dir: Path | None = None,
             missing.append(pid)
 
     out_dir = out_dir or (cfg.projects_dir.parent / "reports")
+
+    if not reports:
+        # A dossier over nothing is not a small dossier; it is a document asserting that a
+        # corpus was reviewed and found to contain no findings. Written to the fixed path
+        # `reports/Executive_Review_Dossier.md`, it replaced the real one: a batch of two
+        # papers that both stopped at S2 turned a finished three-paper dossier into
+        # "0 paper(s) reviewed ... Corpus totals: 0 FATAL, 0 MAJOR, 0 MINOR". Nothing about
+        # that output is true of the papers named in it, and nothing recoverable is gained
+        # by writing it, so it is not written and whatever is on disk is left alone.
+        #
+        # Only the EMPTY case is refused. A one-paper dossier still overwrites a
+        # three-paper one — that is the documented `--out` limitation and it is a
+        # judgement about what an operator meant, not a correctness bug.
+        return {
+            "papers": [], "missing": missing, "markdown": None, "pdf": None,
+            "pdf_error": None, "totals": {s: 0 for s in SEVERITIES}, "dropped": 0,
+            "skipped": f"no finished report among {len(missing)} paper(s), so no dossier was "
+                       f"written; any existing dossier is left as it was",
+        }
+
     out_dir.mkdir(parents=True, exist_ok=True)
     md = render_markdown(reports, missing)
     md_path = out_dir / f"{stem}.md"
@@ -405,6 +456,7 @@ def build(cfg: Config, pids: list[str], out_dir: Path | None = None,
         "markdown": str(md_path),
         "pdf": None if pdf_error else str(pdf_path),
         "pdf_error": pdf_error or None,
+        "skipped": "",
         "totals": {s: sum(counts(r)[s] for r in reports) for s in SEVERITIES},
         "dropped": sum(r.get("dropped_findings", 0) for r in reports),
     }

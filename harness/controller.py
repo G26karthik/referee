@@ -40,18 +40,22 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import audit_driver, state
+from . import audit_driver, grade_driver, state
 from .artifacts import (PHASES, CaseState, PaperDoc, PhaseEvent, ProbeResult)
 from .config import Config
 from .stages import audit as audit_stage
+from .stages import grade as grade_stage
 from .stages import ingest as ingest_stage
 from .stages import probe as probe_stage
 from .stages import report as report_stage
 
-# Only this phase may be re-attempted, and only up to `cfg.audit_retries`. See the module
-# docstring: everything else that can refuse is deterministic, and retrying a deterministic
-# refusal is asking a gate the same question until it changes its mind.
-RETRYABLE = ("audit",)
+# Only these phases may be re-attempted, and only up to their own retry budget
+# (`cfg.audit_retries` / `cfg.grade_retries`). See the module docstring: everything
+# else that can refuse is deterministic, and retrying a deterministic refusal is asking
+# a gate the same question until it changes its mind. A reviewer whose delegate timed
+# out or hit a transient failure is not that — the same prompt run again may well
+# succeed, whether it is auditing a lens or independently grading a candidate.
+RETRYABLE = ("audit", "grade")
 
 
 @dataclass(frozen=True)
@@ -187,13 +191,38 @@ def _phase_audit(cfg: Config, case: CaseState, *, auto_audit: bool = False, **_)
         return PhaseOutcome("waiting", f"cannot delegate the audit: {why}",
                             {"awaiting": case.awaiting})
 
-    filled = audit_driver.fill(cfg, case.paper_id, case.awaiting, res["prompts"])
+    meta = state.load_meta(cfg, case.paper_id)
+    pdf_path = meta.get("paper_path") or ""
+    pdf_dir = str(Path(pdf_path).resolve().parent) if pdf_path else ""
+    filled = audit_driver.fill(cfg, case.paper_id, case.awaiting, res["prompts"], pdf_dir=pdf_dir)
     after = audit_stage.run_audit(cfg, case.paper_id)
     case.awaiting = list(after.get("awaiting", []))
     detail = {"filled": filled["filled"], "failed": filled["failed"],
-              "awaiting": case.awaiting}
+              "rate_limited": filled["rate_limited"], "awaiting": case.awaiting}
     if not case.awaiting:
         return PhaseOutcome("ok", f"delegated and filled {len(filled['filled'])} lens(es)", detail)
+
+    if filled["rate_limited"]:
+        # An account-level rate limit is not evidence that THIS attempt was flawed — the
+        # same prompt run again in nine seconds fails identically, so treating it as an
+        # ordinary transient failure burns the whole retry budget in seconds and stalls
+        # the paper permanently. `step` already incremented `attempts["audit"]` before
+        # this handler ran; undoing that is what "does not consume an attempt" means in
+        # a loop where the increment happens unconditionally, before the handler is
+        # even invoked, and this handler is the only place that can know a failure was
+        # deterministic-until-a-clock-turns-over rather than reviewer-quality noise.
+        case.attempts["audit"] = max(0, case.attempts.get("audit", 1) - 1)
+        hints = [v.split("resets ", 1)[1].split(": ", 1)[0].strip() if "resets " in v else ""
+                for v in filled["rate_limited"].values()]
+        case.resume_after = next((h for h in hints if h), "") or case.resume_after
+        why = "; ".join(f"{k}: {v}" for k, v in filled["rate_limited"].items())
+        return PhaseOutcome(
+            "waiting",
+            f"rate-limited on {len(filled['rate_limited'])} lens(es), not a reviewer "
+            f"quality failure — re-run once available"
+            + (f" ({case.resume_after})" if case.resume_after else "") + f": {why}",
+            detail)
+
     # `step` increments the counter BEFORE calling this handler, so `attempts` already
     # includes the attempt that just failed. `audit_retries` counts RE-attempts, so the
     # budget is exhausted once `attempts` exceeds it: retries=2 yields three tries in
@@ -224,10 +253,21 @@ def _phase_collect(cfg: Config, case: CaseState, **_) -> PhaseOutcome:
     if not doc_path.exists():
         return PhaseOutcome("error", "no ingested paper to verify findings against")
     doc = PaperDoc(**state.read_json(doc_path))
-    reports, dropped = audit_stage.load_reports(cfg, case.paper_id, doc)
+    reports, dropped, invalid = audit_stage.load_reports(cfg, case.paper_id, doc)
     if not reports:
         return PhaseOutcome("error", "no audit lens produced a result, so there is nothing "
                                      "to review; the paper has not been audited")
+    if invalid:
+        # C9 — missing, unparseable, empty, `null`, or wrongly-shaped lens output must
+        # never be read as "this lens ran and found nothing". `waiting`, not `error`: the
+        # fix is the same as a pending lens always was — write (or rewrite) a well-formed
+        # audit/<lens>.json — so the case stays resumable rather than terminally failed.
+        return PhaseOutcome(
+            "waiting",
+            f"{len(invalid)} lens(es) produced no usable result and cannot be counted as "
+            f"run: {', '.join(invalid)}. A verdict may not be drawn over an incomplete or "
+            f"invalid panel.",
+            {"invalid": invalid, "lenses": [r.lens for r in reports]})
     kept = sum(len(r.findings) for r in reports)
     return PhaseOutcome("ok", f"{len(reports)} lens(es), {kept} substantiated finding(s), "
                               f"{dropped} dropped as unsubstantiated",
@@ -255,6 +295,77 @@ def _reproduction_class(result: ProbeResult | None) -> str:
     return result.verdict or "inconclusive"
 
 
+def _phase_grade(cfg: Config, case: CaseState, *, auto_grade: bool = False, **_) -> PhaseOutcome:
+    """Independently grade whatever candidates are in scope. Mirrors `_phase_audit`
+    closely — same retry/rate-limit shape — with one deliberate difference: an
+    unavailable, exhausted, or never-requested grader returns `ok`, not `waiting`. A
+    paper must still reach a complete report without independent grading; findings
+    simply count at their lens-asserted severity (`stages.report.counted`'s fallback).
+    `SH_REQUIRE_GRADES` is the escape hatch for an operator who wants the stricter
+    behaviour `_phase_audit` already has by default for the audit lenses themselves.
+    """
+    res = grade_stage.run_grade(cfg, case.paper_id)
+    if "error" in res:
+        # Should not normally be reachable — `collect` already gates on exactly the
+        # precondition (`load_reports` returning no invalid lens) this needs, so this
+        # phase never runs against an incomplete panel in the ordinary flow. Degrade
+        # rather than stall a paper on a precondition enforced one phase earlier.
+        return PhaseOutcome("ok", res["error"])
+    awaiting = list(res["awaiting"])
+    if not awaiting:
+        return PhaseOutcome("ok", f"{res['candidates']} candidate(s) in scope, all graded",
+                            {"complete": res["complete"], "candidates": res["candidates"]})
+
+    if not auto_grade:
+        if cfg.require_grades:
+            return PhaseOutcome(
+                "waiting",
+                f"{len(awaiting)} candidate(s) ungraded and SH_REQUIRE_GRADES is set: run "
+                f"with --auto-grade to delegate them.", {"awaiting": awaiting})
+        return PhaseOutcome(
+            "ok", f"grading not requested; {len(awaiting)} candidate(s) will count at "
+                 f"their lens-asserted severity", {"awaiting": awaiting})
+
+    ok, why = grade_driver.available(cfg)
+    if not ok:
+        if cfg.require_grades:
+            return PhaseOutcome("waiting", f"cannot delegate grading: {why}", {"awaiting": awaiting})
+        return PhaseOutcome(
+            "ok", f"grader unavailable ({why}); {len(awaiting)} candidate(s) will count "
+                 f"at their lens-asserted severity", {"awaiting": awaiting})
+
+    filled = grade_driver.fill(cfg, case.paper_id, awaiting, res["prompts"])
+    after = grade_stage.run_grade(cfg, case.paper_id)
+    still_awaiting = list(after.get("awaiting", []))
+    detail = {"filled": filled["filled"], "failed": filled["failed"],
+              "rate_limited": filled["rate_limited"], "awaiting": still_awaiting}
+    if not still_awaiting:
+        return PhaseOutcome("ok", f"delegated and graded {len(filled['filled'])} candidate(s)", detail)
+
+    if filled["rate_limited"]:
+        # Same reasoning as `_phase_audit`: a rate limit is not a quality failure of
+        # this attempt, so it must not consume the retry budget.
+        case.attempts["grade"] = max(0, case.attempts.get("grade", 1) - 1)
+        why = "; ".join(f"{k}: {v}" for k, v in filled["rate_limited"].items())
+        outcome = "waiting" if cfg.require_grades else "ok"
+        return PhaseOutcome(outcome, f"rate-limited on {len(filled['rate_limited'])} "
+                                     f"candidate(s), not a grader quality failure: {why}", detail)
+
+    attempts = case.attempts.get("grade", 1)
+    why = "; ".join(f"{k}: {v}" for k, v in filled["failed"].items())
+    if attempts <= max(0, cfg.grade_retries):
+        return PhaseOutcome(
+            "retry", f"{len(still_awaiting)} candidate(s) still pending after attempt "
+                    f"{attempts} of {cfg.grade_retries + 1}: {why}", detail)
+    if cfg.require_grades:
+        return PhaseOutcome(
+            "waiting", f"{len(still_awaiting)} candidate(s) could not be graded in "
+                      f"{attempts} attempt(s): {why}", detail)
+    return PhaseOutcome(
+        "ok", f"{len(still_awaiting)} candidate(s) ungraded after {attempts} attempt(s); "
+             f"they will count at their lens-asserted severity", detail)
+
+
 def _phase_probe(cfg: Config, case: CaseState, *, force_probe: bool = False,
                  skip_probe: bool = False, **_) -> PhaseOutcome:
     """Request reproduction. Whether anything runs is settled below this function.
@@ -278,7 +389,7 @@ def _phase_probe(cfg: Config, case: CaseState, *, force_probe: bool = False,
         return PhaseOutcome("ok", "reproduction already ran for this paper",
                             {"cached": True}, _reproduction_class(existing))
 
-    reports, _ = audit_stage.load_reports(cfg, case.paper_id, doc)
+    reports, _, _ = audit_stage.load_reports(cfg, case.paper_id, doc)
     verifiable = [f for r in reports for f in r.findings if f.verifiable_by_experiment]
     if not verifiable and not force_probe:
         return PhaseOutcome("abstain", "no lens marked a finding as settleable by reproduction",
@@ -312,6 +423,7 @@ _HANDLERS = {
     "ingest": _phase_ingest,
     "audit": _phase_audit,
     "collect": _phase_collect,
+    "grade": _phase_grade,
     "probe": _phase_probe,
     "report": _phase_report,
 }
@@ -419,7 +531,7 @@ def drive_all(cfg: Config, sources: list[str], **opts) -> list[CaseState]:
     PDF.
     """
     cases = [open_case(cfg, s) for s in sources]
-    for _ in range(len(PHASES) * (2 + max(0, cfg.audit_retries)) + 4):
+    for _ in range(len(PHASES) * (2 + max(0, cfg.audit_retries, cfg.grade_retries)) + 4):
         active = [c for c in cases if not c.terminal and c.status != "waiting"]
         if not active:
             break
@@ -487,7 +599,8 @@ def as_result(cfg: Config, case: CaseState) -> dict:
             "dropped_unsubstantiated": synth.get("dropped_unsubstantiated",
                                                  collected.get("dropped", 0)),
             "probe": synth.get("probe"), "reproduction": case.reproduction_class or None,
-            "report_md": case.report_path, "steps": steps}
+            "report_md": case.report_path, "steps": steps,
+            "verdict_contested": bool(synth.get("verdict_contested"))}
 
 
 def review(cfg: Config, paper: str, **opts) -> dict:
@@ -528,9 +641,11 @@ if __name__ == "__main__":  # self-check: python -m harness.controller
     from .artifacts import Reconciliation
 
     # --- phase ordering -----------------------------------------------------------------
-    assert PHASES == ("ingest", "audit", "collect", "probe", "report", "done")
+    assert PHASES == ("ingest", "audit", "collect", "grade", "probe", "report", "done")
     assert _next_phase("ingest") == "audit" and _next_phase("done") == "done"
-    assert RETRYABLE == ("audit",), "only a delegated lens may be re-attempted"
+    assert _next_phase("collect") == "grade" and _next_phase("grade") == "probe"
+    assert RETRYABLE == ("audit", "grade"), \
+        "only a delegated lens or a delegated grade may be re-attempted"
 
     # --- reproduction class is READ from the artifact, never decided here ---------------
     assert _reproduction_class(None) == "not_attempted"

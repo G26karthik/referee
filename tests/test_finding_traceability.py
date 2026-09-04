@@ -46,7 +46,7 @@ def _ctx():
 
 def _coerced(raw: dict) -> tuple[list[Finding], int]:
     corpus, by_idx = _ctx()
-    report, dropped = _coerce("overclaim", {"findings": [raw]}, corpus, by_idx)
+    report, dropped, _valid = _coerce("overclaim", {"findings": [raw]}, corpus, by_idx)
     return report.findings, dropped
 
 
@@ -59,6 +59,29 @@ def test_a_matched_cell_is_classified_and_described_by_the_harness():
     assert klass == "cell_verified"
     assert "T0:r1:c1" in observation and CELL in observation
     assert "match" in observation.lower()
+
+
+@pytest.mark.parametrize("symbol", ["⇑", "⇓", "-", "—", "*", "†", ".", ",", "()"])
+def test_a_trivial_symbol_cell_never_earns_cell_verified(symbol):
+    """C8 — a one-character symbol matching a cell exactly used to earn `cell_verified`,
+    this harness's STRONGEST evidence class, for evidence that says nothing about any
+    claim. A cell whose contents ARE the symbol must not verify, whatever it cites."""
+    doc = PaperDoc(paper_id="p", title="T",
+                   sections=[Section(section_idx=0, title="Results", text="x")],
+                   tables=[Table(table_idx=0, page=1, caption="Table 1",
+                                 rows=[["method", "trend"], ["ours", symbol]])])
+    corpus = "".join(s.text for s in doc.sections).lower().replace(" ", "")
+    by_idx = {t.table_idx: t for t in doc.tables}
+    klass, obs = verify_evidence(symbol, "T0:r1:c1", corpus, by_idx)
+    assert klass == "unverified" and obs == ""
+
+
+def test_a_short_numeric_cell_still_verifies_despite_the_trivial_quote_guard():
+    """The guard must not regress the case it exists beside: a short but genuinely
+    numeric cell value is exactly the evidence this harness is built to check."""
+    corpus, by_idx = _ctx()
+    klass, obs = verify_evidence(CELL, "T0:r1:c1", corpus, by_idx)
+    assert klass == "cell_verified" and obs
 
 
 def test_a_matched_prose_quote_is_classified_separately_from_a_cell():
@@ -231,6 +254,16 @@ def test_an_earlier_break_outranks_a_later_one(field, value, expected):
     assert chain.broken_link == expected
 
 
+def test_executed_is_false_when_no_seed_ever_ran():
+    """Mutation guarantee: `ExperimentalChain.executed` must be DERIVED from
+    `probe.seeds_run`, never hardcoded True. A blocked/refused probe — the default
+    `_probe()` fixture, whose gates never opened — ran nothing, and the chain has to say
+    so; a report claiming `executed: yes` over zero executions is exactly the "authors'
+    code ran when the probe did not" overstatement this field exists to prevent."""
+    chain = build_chain([], _probe())
+    assert chain.executed is False
+
+
 def test_a_fully_established_chain_reports_no_break():
     est = dict(state="established", established=True)
     chain = build_chain([], _probe(
@@ -299,3 +332,152 @@ def test_no_caveat_when_every_serious_finding_cites_a_cell():
                                        verdict_reason="one FATAL", findings=[f],
                                        lenses_run=["overclaim"]))
     assert "Severity caveat" not in md
+
+
+# --------------------------------------------------------------------------- #
+# How much a verdict leans on the one link the harness cannot check
+# --------------------------------------------------------------------------- #
+def _graded(sev: str, klass: str, lens: str, n: int) -> list[Finding]:
+    return [Finding(finding_id=f"{lens}-{i}", lens=lens, severity=sev, statement="s",
+                    evidence_class=klass) for i in range(n)]
+
+
+def test_the_same_threshold_table_is_applied_to_the_cell_backed_subset():
+    """Not a second grader. `overall_verdict` over a subset chosen by `evidence_class`.
+
+    On the pilot corpus this is load-bearing: 15 of 29 MAJOR findings are prose-backed,
+    and for two of the three papers RED becomes YELLOW without them. "Severity is not
+    machine-verified" and "this RED depends on grades that are not machine-verified" are
+    different things to tell an editor.
+    """
+    from harness.stages.report import overall_verdict, verdict_sensitivity
+
+    findings = _graded("MAJOR", "prose_verified", "overclaim", 3)
+    assert overall_verdict(findings, None)[0] == "RED"
+    assert verdict_sensitivity(findings, None) == "GREEN", "no cell-verified finding survives"
+
+    backed = _graded("MAJOR", "cell_verified", "overclaim", 3)
+    assert overall_verdict(backed, None)[0] == "RED"
+    assert verdict_sensitivity(backed, None) == "RED", "a cell-backed RED does not move"
+
+
+def test_the_sensitivity_never_changes_the_verdict_itself():
+    """It reports. It does not demote — demoting would decide, on evidence the harness
+    cannot assess, exactly the thing it exists to flag as undecided."""
+    from harness.stages.report import overall_verdict, verdict_sensitivity
+
+    findings = _graded("MAJOR", "prose_verified", "overclaim", 3)
+    verdict, _ = overall_verdict(findings, None)
+    rep = EvalReport(paper_id="p", title="T", verdict=verdict, findings=findings,
+                     verdict_if_cell_backed_only=verdict_sensitivity(findings, None))
+    assert rep.verdict == "RED" and rep.verdict_if_cell_backed_only == "GREEN"
+    md = render_eval_report(rep)
+    assert "RED" in md.split("\n")[0] or "RED" in md[:400]
+    assert "This verdict depends on them." in md
+
+
+def test_a_failed_reproduction_is_not_sensitive_to_severity():
+    """It is arithmetic against a cell, not a graded finding. Dropping it would report a
+    dependence on severity for a verdict that never had one."""
+    from harness.stages.report import verdict_sensitivity
+
+    rec = Reconciliation(status="FAILED_REPRODUCTION", table_ref="T1:r0:c1",
+                         reason="reproduced 40.0 against the cell's 91.4.")
+    assert verdict_sensitivity(_graded("MAJOR", "prose_verified", "overclaim", 3), rec) == "RED"
+
+
+# --------------------------------------------------------------------------- #
+# Pass-B: falsification/steelman, recomputed arithmetic, evidence origin
+# --------------------------------------------------------------------------- #
+def test_pass_b_state_reaches_the_finding():
+    """A lens writing `schema_version: 2` with a real falsification/steelman triple is
+    marked `complete`; the SAME fields are lens-authored and kept verbatim, unlike
+    `evidence_class`/`verified_observation` which the harness overwrites."""
+    kept, _ = _coerced({
+        "finding_id": "overclaim-01", "severity": "MAJOR", "statement": "a defect",
+        "schema_version": 2,
+        "evidence_quote": CELL, "evidence_ref": "T0:r1:c1",
+        "alternative_interpretation": "x" * 41, "why_alternative_fails": "y" * 41,
+        "steelman": "z" * 41,
+    })
+    f = kept[0]
+    assert f.verification_state == "complete"
+    assert f.alternative_interpretation == "x" * 41
+    assert f.steelman == "z" * 41
+
+
+def test_a_pre_schema_version_file_is_legacy_not_incomplete():
+    """The pilot corpus predates `schema_version: 2` entirely. Marking those files
+    `incomplete` (as an absent falsification/steelman triple otherwise would) rather
+    than `legacy` would be exactly the silent evidence-erasure
+    `test_a_lens_file_written_before_the_split_still_loads` already guards against for
+    an earlier schema change."""
+    kept, _ = _coerced({
+        "finding_id": "overclaim-01", "severity": "MAJOR", "statement": "old-format finding",
+        "evidence_quote": CELL, "evidence_ref": "T0:r1:c1",
+    })
+    assert kept[0].verification_state == "legacy"
+
+
+def test_a_thin_falsification_is_incomplete():
+    kept, _ = _coerced({
+        "finding_id": "overclaim-01", "severity": "MAJOR", "statement": "a defect",
+        "schema_version": 2,
+        "evidence_quote": CELL, "evidence_ref": "T0:r1:c1",
+        "alternative_interpretation": "n/a", "why_alternative_fails": "n/a",
+    })
+    assert kept[0].verification_state == "incomplete"
+
+
+def test_a_lens_cannot_write_its_own_verification_state_or_calc_class():
+    """The pass-B analogue of `test_a_lens_cannot_certify_its_own_reasoning` — these are
+    harness-written for the same reason `evidence_class` is: a lens cannot certify that
+    its own falsification work, or its own arithmetic, was checked."""
+    kept, _ = _coerced({
+        "finding_id": "overclaim-01", "severity": "MAJOR", "statement": "a defect",
+        "schema_version": 2,
+        "evidence_quote": CELL, "evidence_ref": "T0:r1:c1",
+        "verification_state": "complete", "calc_class": "recomputed_ok",
+    })
+    f = kept[0]
+    assert f.verification_state == "incomplete", "not the lens's self-declared 'complete'"
+    assert f.calc_class == "not_applicable", "no independent_calculation was actually supplied"
+
+
+def test_independent_calculation_is_recomputed_by_the_harness():
+    """A lens's disputed arithmetic is redone by machine, not trusted."""
+    kept, _ = _coerced({
+        "finding_id": "overclaim-01", "severity": "MAJOR", "statement": "a defect",
+        "schema_version": 2,
+        "evidence_quote": CELL, "evidence_ref": "T0:r1:c1",
+        "independent_calculation": {
+            "applies": True,
+            "operands": [{"quote": CELL, "ref": "T0:r1:c1"}],
+            "expression": "91.4 * 2", "result": "182.8", "method": "doubled",
+        },
+    })
+    assert kept[0].calc_class == "recomputed_ok"
+
+    kept2, _ = _coerced({
+        "finding_id": "overclaim-01", "severity": "MAJOR", "statement": "a defect",
+        "schema_version": 2,
+        "evidence_quote": CELL, "evidence_ref": "T0:r1:c1",
+        "independent_calculation": {
+            "applies": True,
+            "operands": [{"quote": CELL, "ref": "T0:r1:c1"}],
+            "expression": "91.4 * 2", "result": "9999", "method": "wrong on purpose",
+        },
+    })
+    assert kept2[0].calc_class == "recomputed_mismatch"
+
+
+def test_evidence_origin_is_derived_from_the_ref_shape_not_trusted():
+    kept, _ = _coerced({
+        "finding_id": "overclaim-01", "severity": "MAJOR", "statement": "a defect",
+        "schema_version": 2,
+        "evidence_quote": CELL, "evidence_ref": "T0:r1:c1",
+        "evidence_origin": "EXTERNAL_LITERATURE",  # a lens's mislabel of its own citation
+    })
+    f = kept[0]
+    assert f.evidence_origin == "PAPER_TABLE", "derived from the T0:r1:c1 shape, not trusted"
+    assert f.origin_consistency == "corrected"

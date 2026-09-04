@@ -18,7 +18,8 @@ import sys
 
 import pytest
 
-from harness.artifacts import ExecCapability, ProbeSpec, RepoAcquisition
+from harness.artifacts import (ConfigurationIdentity, ExecCapability, ExperimentIdentity,
+                               MetricIdentity, ProbeSpec, RepoAcquisition)
 from harness.config import Config
 from harness.local_exec import (StartupEvidence, classify_setup_error, reached_experiment,
                                 reconcile)
@@ -31,8 +32,15 @@ CELL = "59.28"
 
 
 def _spec(provenance: str = "repo_exec", capability: ExecCapability | None = None) -> ProbeSpec:
+    """Identity is established by default: this file tests the CAPABILITY precondition,
+    which `reconcile` checks only after identity (C4) — so every case here needs identity
+    already established, the same way a real `repo_exec` spec would once `plan_execution`
+    promoted it. Identity itself is tested in `test_experiment_identity.py`."""
     return ProbeSpec(paper_id="p", table_ref="T1:r0:c1", claimed_cell_value=CELL,
-                     provenance=provenance, capability=capability)
+                     provenance=provenance, capability=capability,
+                     experiment=ExperimentIdentity(state="established", reason="fixture"),
+                     metric_identity=MetricIdentity(state="established", reason="fixture"),
+                     configuration=ConfigurationIdentity(state="established", reason="fixture"))
 
 
 def _capable() -> ExecCapability:
@@ -111,10 +119,19 @@ def test_a_crash_after_the_experiment_began_is_a_failed_reproduction():
     assert overall_verdict([], r)[0] == "RED", "a genuine runtime failure must still escalate"
 
 
-def test_a_long_timeout_after_real_work_counts_as_reaching_the_experiment():
+def test_a_long_timeout_is_our_clock_and_convicts_nobody():
+    """SUPERSEDED by the pre-release correction pass. This asserted the opposite.
+
+    It read a timeout after real work as proof the experiment was reached, which made
+    `cfg.probe_timeout_s` — a number in this harness's own config — sufficient to return
+    FAILED_REPRODUCTION and drive RED against a paper whose code was alive and printing
+    when we killed it. Nothing about whether the experiment would have completed was
+    established, so the honest class is `timeout`, which is INCONCLUSIVE.
+    """
     r = reconcile(_spec(capability=_capable()), [], 0.10, [], failure="timeout after 1800s",
                   evidence=StartupEvidence(timed_out=True, ran_seconds=1800.0, stdout_lines=400))
-    assert r.status == "FAILED_REPRODUCTION" and r.failure_class == "runtime_failure"
+    assert r.status == "INCONCLUSIVE" and r.failure_class == "timeout"
+    assert not r.reached_experiment
 
 
 # --------------------------------------------------------------------------- #

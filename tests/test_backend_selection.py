@@ -244,3 +244,219 @@ def test_the_local_backend_declares_itself_executable():
     p = LocalBackend().profile()
     assert p.can_execute is True and p.requires_credentials is False
     assert p.name == "local" and p.cpu_count
+
+
+# --------------------------------------------------------------------------- #
+# The seven states, and why none of them may share a code
+# --------------------------------------------------------------------------- #
+class _Offline(LocalBackend):
+    """A real runner, big enough for anything, that is not reachable at this moment.
+
+    Nothing in the registry behaves this way today — `local` is always up and the
+    declarations can never run — so this is the shape of the first genuinely remote
+    backend, tested before one exists.
+    """
+
+    name = "offline-runner"
+
+    def profile(self) -> BackendProfile:
+        return BackendProfile(
+            name=self.name, platform="linux", vram_bytes=80 * GIB, ram_bytes=200 * GIB,
+            disk_bytes=2000 * GIB, cpu_count=64, gpu_count=8, can_execute=True,
+            detail="a real runner, currently unreachable")
+
+    def available(self):
+        from harness.backends import BackendAvailability
+        return BackendAvailability(False, "the provider API returned 503")
+
+
+def _only(name, cls, req, **kw):
+    """Run `select_for` against a registry holding exactly one backend."""
+    from harness import backends as b
+
+    saved = dict(b._REGISTRY)
+    try:
+        b._REGISTRY.clear()
+        b._REGISTRY[name] = cls
+        return select_for(req, _cfg(), **kw)
+    finally:
+        b._REGISTRY.clear()
+        b._REGISTRY.update(saved)
+
+
+def test_a_backend_that_is_merely_offline_is_not_a_backend_that_is_too_small():
+    """The collapse this closes, stated exactly.
+
+    An unreachable runner fell through every terminal branch of `select_for` and landed in
+    `resources_insufficient` — whose reason is built by joining the candidates rejected for
+    size, of which there were none. So the harness reported "no registered environment is
+    large enough for the experiment as published: " with nothing after the colon, about a
+    backend with 80 GiB that had not been rejected for size at all.
+
+    They must not share a code because the right response differs: retry later for one,
+    and never for the other.
+    """
+    sel = _only("offline-runner", _Offline, _req(vram_bytes=8 * GIB))
+    assert sel.reason_code == "backend_unavailable" and sel.chosen is None
+    assert "503" in sel.reason, "the reason names what was actually wrong"
+    assert sel.reason_code in SELECTION_CODES
+
+    small = _only("local", LocalBackend, _req(vram_bytes=500 * GIB))
+    assert small.reason_code == "resources_insufficient"
+    assert sel.reason_code != small.reason_code
+
+
+def test_an_unreachable_runner_outranks_a_declaration_in_the_report():
+    """Both are "somewhere else could run this". The reachable-later one is the useful one."""
+    from harness import backends as b
+
+    b._REGISTRY["offline-runner"] = _Offline
+    try:
+        sel = select_for(_req(vram_bytes=12 * GIB), _cfg(), declared_platform="linux")
+        assert sel.reason_code == "backend_unavailable", sel.reason_code
+        verdicts = {n: v for n, v, _ in sel.considered}
+        assert verdicts["kaggle"] == "credentials_unavailable"
+        assert verdicts["offline-runner"] == "unavailable"
+    finally:
+        b._REGISTRY.pop("offline-runner", None)
+
+
+def test_selection_and_the_resource_check_agree_about_gpu_count():
+    """They did not, and selection was the optimistic one.
+
+    An experiment declaring 8 GPUs selected `local` — one card — because `select_for`
+    matched VRAM, RAM, disk and CPU but not the count, while `assess_resources` had always
+    checked it. The result was `backend_selection: selected` written onto the same spec as
+    `resources: insufficient`: two components disagreeing about one experiment on one host,
+    with the optimistic one recorded as the choice.
+    """
+    from harness import resources as resources_mod
+
+    req = _req(vram_bytes=1 * GIB, gpu_count=8)
+    sel = select_for(req, _cfg())
+    assert sel.reason_code == "resources_insufficient", sel.reason_code
+    assert any("GPU count" in w for _, _, w in sel.considered)
+
+    assessed = resources_mod.assess_resources(req, LocalBackend().resources(), backend="local")
+    assert assessed.state == "insufficient"
+    assert (sel.reason_code == "selected") == (assessed.state == "satisfied")
+
+
+def test_selection_is_not_authorization():
+    """`select_for` returning a backend permits nothing. `authorize` is the only yes.
+
+    Selection answers "where could this run"; authorization answers "may it". A spec that
+    selects the local backend cleanly and has established nothing else must still refuse,
+    and the refusal must name the missing precondition rather than the backend.
+    """
+    sel = select_for(_req(vram_bytes=2 * GIB), _cfg())
+    assert sel.selected and sel.chosen is not None
+
+    naked = ProbeSpec(paper_id="p", command=["python", "eval.py"], provenance="repo_exec")
+    auth = authorize(_cfg(allow_repo_exec=True), naked, sel.chosen, commit=_verified())
+    assert not auth.allowed and auth.decision == "identity_unproven"
+
+    # And with the gate shut, a perfectly selected backend still runs nothing.
+    assert not authorize(_cfg(allow_repo_exec=False), _qualified(), sel.chosen,
+                         commit=_verified()).allowed
+
+
+def test_provisioning_failure_is_inconclusive_and_never_a_failed_reproduction():
+    """A venv that could not be built is a fact about this runner.
+
+    `env_status` keeps `failed` distinct from `blocked` and `not_attempted`, and all three
+    reach the reconciliation as `environment_incompatible` — which cannot convict.
+    """
+    from harness.artifacts import RepoAcquisition
+    from harness.repo import assess_capability
+
+    for status in ("failed", "blocked", "not_attempted"):
+        acq = RepoAcquisition(status="cached", path=".", entrypoint="eval.py",
+                              env_status=status, reason="fixture")
+        cap = assess_capability(acq, "", "py")
+        assert not cap.established and cap.reason_code == "environment_incompatible", status
+        assert status in cap.detail
+
+    from harness.artifacts import ConfigurationIdentity, ExperimentIdentity, MetricIdentity
+
+    spec = ProbeSpec(paper_id="p", provenance="repo_exec", table_ref="T1:r0:c1",
+                     claimed_cell_value="59.28",
+                     experiment=ExperimentIdentity(state="established", reason="fixture"),
+                     metric_identity=MetricIdentity(state="established", reason="fixture"),
+                     configuration=ConfigurationIdentity(state="established", reason="fixture"),
+                     capability=ExecCapability(reason_code="environment_incompatible",
+                                               detail="the venv could not be built"))
+    rec = reconcile(spec, [999.0], 0.10, [0], failure="environment_incompatible")
+    assert rec.status == "INCONCLUSIVE" and rec.failure_class == "environment_incompatible"
+
+
+def test_each_of_the_seven_backend_states_has_its_own_name():
+    """No two of them may report the same pair of codes.
+
+    1 can execute · 2 exists but offline · 3 cannot satisfy the experiment ·
+    4 needs credentials · 5 provisioning failed · 6 execution failed · 7 executed.
+    """
+    fits = _req(vram_bytes=2 * GIB)
+    seen = {
+        "can execute": ("selected",
+                        authorize(_cfg(allow_repo_exec=True), _qualified(),
+                                  local_backend(), commit=_verified()).decision),
+        "offline": (_only("offline-runner", _Offline, fits).reason_code,
+                    authorize(_cfg(allow_repo_exec=True), _qualified(), _Offline(),
+                              commit=_verified()).decision),
+        "too small": (select_for(_req(vram_bytes=500 * GIB), _cfg()).reason_code, "-"),
+        "credentials": (select_for(_req(vram_bytes=12 * GIB), _cfg(),
+                                   declared_platform="linux").reason_code,
+                        authorize(_cfg(allow_repo_exec=True), _qualified(), KaggleBackend(),
+                                  commit=_verified()).decision),
+        "provisioning failed": ("environment_incompatible", "capability_unproven"),
+        "execution failed": ("runtime_failure", "authorized"),
+        "executed": ("none", "authorized"),
+    }
+    assert len(set(seen.values())) == len(seen), seen
+
+
+def test_the_selected_backend_is_the_one_that_provisions(tmp_path):
+    """Provisioning used to run before selection, against whichever backend the config
+    named. With `local` the only runnable one that was always the same answer; a second
+    runnable backend would have had its capability judged against an interpreter another
+    backend built. So the environment now carries the name of the backend that made it,
+    and it must match the backend the spec was planned for.
+    """
+    from harness.artifacts import CodeAudit, PaperDoc, RepoAcquisition
+    from harness.stages.probe import plan_execution
+
+    repo = tmp_path / "runs" / "p" / "repo"
+    repo.mkdir(parents=True)
+    (repo / "eval.py").write_text("print(1)\n", encoding="utf-8")
+    acq = RepoAcquisition(status="cached", path=str(repo), entrypoint="eval.py")
+
+    spec = plan_execution(_cfg(), ProbeSpec(paper_id="p"), acq,
+                          PaperDoc(paper_id="p", title="t"), CodeAudit(), root=tmp_path)
+    assert acq.env_backend == spec.backend, (acq.env_backend, spec.backend)
+    assert acq.env_backend, "provisioning must record which backend built the environment"
+
+
+def test_selection_refuses_to_choose_when_the_memory_demand_is_unknown():
+    """A candidate met everything stated, and memory was not among it.
+
+    Reporting `selected` here would put a contradiction on the spec: selection saying
+    yes and `assess_resources` saying `unknown` about the same experiment on the same
+    host. Neither is wrong — the honest answer is that nothing can be SHOWN to host it.
+    """
+    thin = _req(cpu_count=2)
+    assert thin.stated and not thin.memory_stated
+    sel = select_for(thin, _cfg())
+    assert sel.reason_code == "requirement_unknown" and sel.chosen is None
+    assert "memory demand was never established" in sel.reason
+
+
+def test_a_specific_rejection_still_beats_reporting_ignorance():
+    """Checked after the candidate loop, not before it: an experiment ruled out on
+    platform keeps that reason rather than being flattened into `requirement_unknown`."""
+    import sys
+    if sys.platform.startswith("linux"):
+        pytest.skip("needs a non-Linux host")
+    sel = select_for(_req(cpu_count=2), _cfg(), declared_platform="linux")
+    assert sel.reason_code in ("platform_incompatible", "credentials_unavailable")
+    assert sel.reason_code != "requirement_unknown"

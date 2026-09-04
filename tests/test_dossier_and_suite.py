@@ -113,16 +113,53 @@ def test_synthesized_probe_keeps_its_caveat_in_the_executive_summary():
     assert "cannot drive this paper's verdict" in md
 
 
+def test_a_placebo_probe_is_not_claimed_to_be_from_the_papers_formulation():
+    """Major #5 — probe_synth.plan has no mechanism dispatch; the placebo is the only
+    synthesized template and is paper-independent by construction. The dossier must not
+    say it was written from the paper's own published formulation."""
+    r = _report("x", provenance="synthesized")
+    r["probe"]["mechanism"] = "placebo"
+    md = dossier.render_markdown([r], [])
+    assert "NOT derived from this paper's formulation" in md
+    assert "written by the harness from the paper's own published" not in md
+
+
 def test_template_probe_is_labelled_as_measuring_the_machine():
     md = dossier.render_markdown([_report("x", provenance="template")], [])
     assert "reproduces no claim" in md
 
 
 def test_driver_and_repo_exec_probes_are_allowed_a_real_verdict():
+    """Provenance alone is not enough — a real verdict also requires that a process
+    actually ran and the reconciliation actually resolved. See the next two tests."""
     for prov in ("driver", "repo_exec"):
-        md = dossier.render_markdown([_report("x", provenance=prov)], [])
+        md = dossier.render_markdown(
+            [_report("x", provenance=prov, reconciliation="RESOLVED_VERIFIED")], [])
         assert "real reproduction verdict" in md
         assert "neither convict nor acquit" not in md
+
+
+def test_a_refused_probe_is_not_claimed_as_a_real_verdict():
+    """Major #2 — `repo_exec`/`driver` provenance is what a real verdict needs, not what
+    it IS. A spec refused before anything ran (verdict `blocked`, no seeds) must not be
+    described as having reconciled against the cited cell."""
+    for prov in ("driver", "repo_exec"):
+        r = _report("x", provenance=prov, reconciliation=None)
+        r["probe"]["verdict"] = "blocked"
+        r["probe"]["seeds_run"] = []
+        md = dossier.render_markdown([r], [])
+        assert "is a real reproduction verdict" not in md
+        assert "Nothing about the paper's own code follows" in md
+
+
+def test_an_inconclusive_reconciliation_is_not_claimed_as_a_real_verdict():
+    """The other half of #2: a process CAN run under the right provenance and still not
+    resolve (INCONCLUSIVE) — that is not a real reproduction verdict either."""
+    for prov in ("driver", "repo_exec"):
+        md = dossier.render_markdown(
+            [_report("x", provenance=prov, reconciliation="INCONCLUSIVE")], [])
+        assert "is a real reproduction verdict" not in md
+        assert "reconciliation `INCONCLUSIVE`" in md
 
 
 def test_evidence_quotes_are_reproduced_verbatim():
@@ -270,3 +307,41 @@ def test_a_stale_output_file_cannot_be_mistaken_for_success(tmp_path: Path):
     with pytest.raises(AuditDriverError):
         audit_driver.run_lens(cfg, "p", "overclaim", prompt, out)
     assert not out.exists(), "the stale file must have been removed, not reused"
+
+
+def test_a_batch_with_no_finished_report_does_not_overwrite_a_real_dossier(projects: Config):
+    """Found in the pre-release audit, reproduced against the real tree.
+
+    `review --paper a b` on two papers that both stopped at S2 called `build` with zero
+    finished reports, and `build` wrote unconditionally. The completed three-paper dossier
+    at the fixed path `reports/Executive_Review_Dossier.md` became:
+
+        0 paper(s) reviewed ... Corpus totals: 0 FATAL, 0 MAJOR, 0 MINOR across 0 paper(s)
+
+    Nothing in that document is true of the papers it names, and it silently replaced one
+    that was. A dossier over nothing is not a small dossier — it is an assertion that a
+    corpus was reviewed and found empty — so it is not written at all.
+
+    Only the EMPTY case is refused here. A one-paper dossier still replaces a three-paper
+    one; that is the documented `--out` limitation, a judgement about what an operator
+    meant rather than a correctness bug.
+    """
+    out = projects.projects_dir / "out"
+    out.mkdir(parents=True)
+    real = out / "Executive_Review_Dossier.md"
+    real.write_text("# REAL DOSSIER\n3 papers, 29 MAJOR findings.\n", encoding="utf-8")
+    before = real.read_text(encoding="utf-8")
+
+    res = dossier.build(projects, ["never-reviewed", "also-never-reviewed"], out)
+
+    assert real.read_text(encoding="utf-8") == before, "an existing dossier must survive"
+    assert res["markdown"] is None and res["papers"] == []
+    assert res["missing"] == ["never-reviewed", "also-never-reviewed"]
+    assert res["skipped"], "the refusal must say why, not fail silently"
+
+
+def test_one_finished_report_is_still_written(projects: Config):
+    """The guard must not have stopped the dossier from working at all."""
+    _write(projects, _report("acl"))
+    res = dossier.build(projects, ["acl", "never-reviewed"], projects.projects_dir / "out2")
+    assert res["markdown"] and res["papers"] == ["acl"] and not res["skipped"]

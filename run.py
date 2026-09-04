@@ -1,16 +1,18 @@
 #!/usr/bin/env python
 """single-harness CLI — an autonomous replication auditor for ML papers.
 
-    python run.py review --paper a.pdf b.pdf c.pdf [--auto-audit]
+    python run.py review --paper a.pdf b.pdf c.pdf [--auto-audit] [--auto-grade]
     python run.py dossier [<paper-id> ...]
-    python run.py stage <ingest|audit|probe|report> --paper <pdf-or-id>
+    python run.py stage <ingest|audit|grade|probe|report> --paper <pdf-or-id>
     python run.py list
     python run.py status <paper-id>
 
 `review` is the entrypoint. Everything else is a way to look at what it did, or to
 re-run one stage by hand while debugging.
 
-Exit codes:  0 complete · 2 waiting on lens evidence · 1 error.
+Exit codes:  0 complete · 2 waiting on lens evidence · 1 error ·
+             3 complete but CONTESTED (the independent substantive read disagrees
+             sharply with the deterministic verdict — see `EvalReport.verdict_contested`).
 
 This file formats; `harness/controller.py` decides. Run with the repo venv:
     ../.venv/Scripts/python.exe run.py ...
@@ -25,12 +27,14 @@ from pathlib import Path
 from harness import controller, dossier, state
 from harness.config import Config
 from harness.stages import audit as audit_stage
+from harness.stages import grade as grade_stage
 from harness.stages import ingest as ingest_stage
 from harness.stages import probe as probe_stage
 from harness.stages import report as report_stage
 
 STAGES = {"ingest": ingest_stage.run_ingest, "audit": audit_stage.run_audit,
-          "probe": probe_stage.run, "report": report_stage.run_report}
+          "grade": grade_stage.run_grade, "probe": probe_stage.run,
+          "report": report_stage.run_report}
 
 
 def _echo_steps(prefix: str, res: dict) -> None:
@@ -43,8 +47,10 @@ def _echo_steps(prefix: str, res: dict) -> None:
 def cmd_review(args: argparse.Namespace) -> int:
     """Review one or many papers. More than one runs the batch and writes a dossier."""
     cfg = Config.load()
+    if args.require_grades:
+        cfg.require_grades = True
     opts = dict(force_probe=args.force_probe, skip_probe=args.skip_probe,
-                auto_audit=args.auto_audit)
+                auto_audit=args.auto_audit, auto_grade=args.auto_grade)
 
     if len(args.paper) == 1:
         res = controller.review(cfg, args.paper[0], **opts)
@@ -59,9 +65,14 @@ def cmd_review(args: argparse.Namespace) -> int:
                 print(f"  {lens:<14} {path}")
             print(f"\n{res['next']}")
             return 2
+        if res.get("verdict_contested"):
+            print("\n🚩 CONTESTED — the independent substantive read disagrees sharply "
+                 "with this verdict; see the report.")
         print(f"\n=== {res['verdict']} — {res['title']} ===")
         print(f"{res['reason']}\n")
         print(Path(res["report_md"]).read_text(encoding="utf-8"))
+        if res.get("verdict_contested"):
+            return 3
         return 0
 
     out = Path(args.out) if args.out else None
@@ -77,17 +88,24 @@ def cmd_review(args: argparse.Namespace) -> int:
         print(f"error       : {pid:<28} {err}")
     for pid, why in res.get("reproduction", {}).items():
         print(f"reproduction: {pid:<28} {why}")
+    contested = [r.get("paper_id") or r.get("input") for r in res["results"]
+                if r.get("verdict_contested")]
+    for pid in contested:
+        print(f"🚩 contested : {pid:<28} independent read disagrees sharply with the verdict")
 
     if d := res.get("dossier"):
-        print(f"\ndossier     : {d['markdown']}")
-        pdf_line = d["pdf"] or f"(PDF not written - {d['pdf_error']})"
-        print(f"              {pdf_line}")
-        print(f"totals      : {d['totals']['FATAL']} FATAL / {d['totals']['MAJOR']} MAJOR / "
-              f"{d['totals']['MINOR']} MINOR · {d['dropped']} dropped as unsubstantiated")
+        if d.get("skipped"):
+            print(f"\ndossier     : not written — {d['skipped']}")
+        else:
+            print(f"\ndossier     : {d['markdown']}")
+            pdf_line = d["pdf"] or f"(PDF not written - {d['pdf_error']})"
+            print(f"              {pdf_line}")
+            print(f"totals      : {d['totals']['FATAL']} FATAL / {d['totals']['MAJOR']} MAJOR / "
+                  f"{d['totals']['MINOR']} MINOR · {d['dropped']} dropped as unsubstantiated")
         if d["missing"]:
             print(f"not in matrix: {', '.join(d['missing'])}")
 
-    return 1 if res["errors"] else (2 if res["needs_audit"] else 0)
+    return 1 if res["errors"] else (2 if res["needs_audit"] else (3 if contested else 0))
 
 
 def cmd_dossier(args: argparse.Namespace) -> int:
@@ -161,6 +179,14 @@ def main() -> int:
     rv.add_argument("--auto-audit", action="store_true",
                     help="delegate the four lenses to a reviewer instead of pausing "
                          "(needs SH_ALLOW_AUTO_AUDIT=1; spends tokens)")
+    rv.add_argument("--auto-grade", action="store_true",
+                    help="independently grade FATAL/MAJOR findings with a second, blinded "
+                         "reviewer instead of counting them as asserted (needs "
+                         "SH_ALLOW_GRADING=1; spends tokens)")
+    rv.add_argument("--require-grades", action="store_true",
+                    help="block the report (waiting, not partial) until every in-scope "
+                         "candidate is graded, instead of falling back to lens-asserted "
+                         "severity for whatever could not be graded this run")
     rv.add_argument("--force-probe", action="store_true",
                     help="run the reproduction probe even with nothing settleable")
     rv.add_argument("--skip-probe", action="store_true", help="never run the probe")

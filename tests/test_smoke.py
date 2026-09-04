@@ -25,7 +25,7 @@ from harness.stages import audit as audit_stage
 def test_every_cli_stage_exists_and_is_callable():
     import run
 
-    assert sorted(run.STAGES) == ["audit", "ingest", "probe", "report"]
+    assert sorted(run.STAGES) == ["audit", "grade", "ingest", "probe", "report"]
     for fn in run.STAGES.values():
         assert callable(fn)
 
@@ -61,9 +61,24 @@ def test_every_lens_prompt_carries_the_shared_discipline():
         prompt = audit_prompts.build(lens, "T", "sections", "tables", "claims", "numbers")
         assert audit_prompts.SECURITY in prompt, "missing prompt-injection guard"
         assert audit_prompts.PROVENANCE in prompt, "missing provenance rule"
-        assert audit_prompts.CALIBRATION in prompt, "missing severity calibration"
+        assert audit_prompts.GRADING in prompt, "missing severity-earned-by-impact rule"
+        assert audit_prompts.TWO_PASS in prompt, "missing discovery/verification discipline"
+        assert audit_prompts.RECOMPUTE in prompt, "missing recompute-before-claiming rule"
         assert audit_prompts.FIRST_PRINCIPLES in prompt, "missing first-principles check"
+        assert '"schema_version": 2' in prompt
         assert f'"lens": "{lens}"' in prompt
+
+
+def test_no_lens_prompt_carries_a_mechanical_severity_floor():
+    """The old CALIBRATION block hard-coded rules like "no variance = MAJOR" — exactly
+    what the reviewer spec forbids ("Do not use simplistic rules such as: 'No standard
+    deviation = MAJOR.'"). GRADING replaces every one of them with an impact judgement;
+    this pins that none crept back in."""
+    banned = ("that is a FATAL finding", "that is a MAJOR finding", "that is at least MAJOR")
+    for lens in audit_prompts.LENSES:
+        prompt = audit_prompts.build(lens, "T", "sections", "tables", "claims", "numbers")
+        for phrase in banned:
+            assert phrase not in prompt, f"{lens}: mechanical severity floor reappeared: {phrase!r}"
 
 
 def test_lens_prompt_embeds_the_paper_rather_than_a_path():

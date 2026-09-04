@@ -150,6 +150,79 @@ def test_a_soft_hyphenated_cost_is_still_read():
     assert verify_requirement(require_resources(real), real) == []
 
 
+# --------------------------------------------------------------------------- #
+# C7 — three concrete underestimation defects
+# --------------------------------------------------------------------------- #
+def test_a_cheaper_baseline_is_never_chosen_over_the_methods_own_larger_cost():
+    """C7.1 — smallest-anywhere used to be the whole rule, so a baseline's cost winning
+    only worked when it happened to be numerically larger than the method's own. Reverse
+    the ordering — a CHEAPER baseline stated first, the method's own larger cost second —
+    and the picked figure must still be the method's, not the smaller baseline's."""
+    doc = PaperDoc(paper_id="p", title="P", sections=[Section(
+        section_idx=0, text=(
+            "In contrast, the baseline needs only about 8GB of memory to run. "
+            "Our method costs less than 24GB of memory when training the full model."))])
+    value, ev = declared_memory_cost(doc)
+    assert value is not None and abs(value - 24 * GIB) < GIB, value
+    assert ev is not None and "8GB" not in ev.quote
+
+
+def test_a_paper_stating_only_a_baselines_cost_yields_no_declared_cost():
+    """C7.1, the abstention half — if every memory-cost sentence in the paper is
+    contrast-flagged (about some OTHER method), nothing is returned. Attributing a
+    comparison figure to the method under audit would be exactly the misattribution
+    this function exists to avoid; it must abstain, not guess."""
+    doc = PaperDoc(paper_id="p", title="P", sections=[Section(
+        section_idx=0, text="Compared to ours, the prior baseline requires 8GB of memory.")])
+    value, ev = declared_memory_cost(doc)
+    assert value is None and ev is None
+
+
+def test_the_fp16_floor_alone_does_not_satisfy_the_resource_check():
+    """C7.2 — a lower bound (weights only, fp16) is not a requirement. A backend meeting
+    the floor with no declared cost to anchor it must not be reported `satisfied`; the
+    true demand (activations, optimizer state, gradients, KV cache) was never stated."""
+    doc = PaperDoc(paper_id="p", title="P", tables=[Table(
+        table_idx=0, page=1, caption="Table 1: LLaMA 2 7B results", rows=[["ours", "1"]])])
+    req = require_resources(doc, "T0:r0:c0", caption=doc.tables[0].caption)
+    assert req.vram_is_floor_only is True
+    huge = BigMachine()
+    cap = assess_resources(req, huge, backend="stub")
+    assert cap.state == "unknown", cap.reason
+    assert not cap.established
+    assert "lower bound" in cap.reason
+
+
+def test_a_declared_cost_still_satisfies_even_when_a_floor_also_applies():
+    """The floor-only refusal must not swallow a genuinely DECLARED cost — APT's own
+    fixture states 24GB, which is a real requirement, not a bare weight-count floor."""
+    doc = _apt()
+    req = require_resources(doc, "T2:r3:c11", caption=doc.tables[0].caption)
+    assert req.vram_is_floor_only is False
+    assert assess_resources(req, BigMachine(), backend="stub").state == "satisfied"
+
+
+@pytest.mark.parametrize("sentence", [
+    "Our method uses only 30% of the 24GB memory the baseline needs.",
+    "This reduces memory to 24GB (12% of the original footprint).",
+])
+def test_a_percent_qualified_figure_is_not_read_as_an_absolute_cost(sentence):
+    """C7.3 — a number immediately qualified by a percent sign states a RATIO, not a
+    standalone cost. Reading the absolute figure out of it drops the qualifier that made
+    it a ratio, silently inflating or deflating the actual demand."""
+    doc = PaperDoc(paper_id="p", title="P", sections=[Section(section_idx=0, text=sentence)])
+    value, ev = declared_memory_cost(doc)
+    assert value is None and ev is None
+
+
+def test_an_unrelated_percent_elsewhere_in_the_sentence_does_not_disqualify_a_real_cost():
+    """The percent guard is LOCAL to the number, not sentence-wide — APT's own sentence
+    ("24GB of memory when pruning 30% parameters") has a percent sign nowhere near the
+    memory figure, and must still be read."""
+    value, ev = declared_memory_cost(_apt())
+    assert value is not None and abs(value - 24 * GIB) < GIB, value
+
+
 def test_normalization_is_symmetric_between_quote_and_corpus():
     """The stored quote is dehyphenated, so verification must dehyphenate the corpus too.
     A one-sided normalization would make every recovered quote unverifiable."""
@@ -333,6 +406,44 @@ def test_there_is_no_path_that_shrinks_an_experiment_to_fit():
         assert not hasattr(R, banned), f"{banned} must not exist"
 
 
+def test_plan_execution_cannot_promote_when_only_resources_are_short(tmp_path, monkeypatch):
+    """Mutation guarantee: `plan_execution`'s `not fits` condition is load-bearing on its
+    own, isolated from identity, capability and commit — every OTHER precondition is
+    stubbed to succeed here, so only the resource check stands between this spec and
+    `repo_exec`. If it were ever dropped from the `or` chain, this is the one test that
+    would still catch it; the existing end-to-end APT fixture cannot, because on this
+    host identity/capability/commit fail right alongside resources and mask the mutation.
+    """
+    from harness import repo as repo_mod
+    from harness.artifacts import CandidateCommand
+    from harness.stages import probe as probe_stage
+
+    repo = tmp_path / "r"
+    repo.mkdir()
+    (repo / "eval.py").write_text('import os\np.add_argument("--seed")\n', encoding="utf-8")
+    monkeypatch.setattr(probe_stage.repo_mod, "assess_capability",
+                        lambda *a, **k: ExecCapability(established=True, reason_code="established"))
+    monkeypatch.setattr(probe_stage.experiment_id, "resolve", lambda *a, **k: (
+        ExperimentIdentity(state="established",
+                           command=CandidateCommand(argv=["python", "eval.py"],
+                                                    source_ref="README.md:1")),
+        MetricIdentity(state="established"), ConfigurationIdentity(state="established")))
+    monkeypatch.setattr(probe_stage.repo_mod, "verify_commit",
+                        lambda *a, **k: CommitVerification(state="verified", expected="a" * 40,
+                                                           actual="a" * 40))
+    # The ONE precondition under test: resources insufficient, everything else established.
+    monkeypatch.setattr(probe_stage.resources_mod, "assess_resources",
+                        lambda *a, **k: ResourceCapability(state="insufficient", reason="stub"))
+
+    cfg = Config(projects_dir=tmp_path, allow_repo_exec=True)
+    acq = RepoAcquisition(url="u", status="cloned", path=str(repo), entrypoint="eval.py",
+                          env_status="ready", env_path="/tmp/env/python")
+    spec = plan_execution(cfg, ProbeSpec(paper_id="p"), acq, PaperDoc(paper_id="p", title="T"))
+    assert spec.provenance != "repo_exec", "resources insufficient must block promotion alone"
+    assert not spec.command
+    assert repo_mod is not None
+
+
 def test_a_resource_refusal_leaves_the_experiment_exactly_as_published(tmp_path):
     """The seeds, arms and schedule after a refusal are the ones that went in. Nothing is
     quietly trimmed on the way to producing the INCONCLUSIVE."""
@@ -405,3 +516,55 @@ def test_a_resource_refusal_cannot_drive_the_paper_red():
     rec = reconcile(spec, [999.0, 999.0], 0.10, [0, 1], authorization=auth)
     verdict, _ = overall_verdict([], rec)
     assert verdict == "GREEN", "an 8 GB card says nothing about a paper"
+
+
+# --------------------------------------------------------------------------- #
+# The demand that decides — and the leak that let five unstated ones ride on one
+# --------------------------------------------------------------------------- #
+def _one(**kw) -> ResourceRequirement:
+    return ResourceRequirement(
+        evidence=[ResourceEvidence(quote="q", kind="declared_requirement")], **kw)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("cpu_count", 2), ("disk_bytes", 1 * GIB), ("walltime_s", 60), ("gpu_count", 1),
+])
+def test_a_stated_non_memory_demand_does_not_vouch_for_an_unstated_memory_one(field, value):
+    """The leak, closed. `stated` is an OR over six fields and gated the whole check.
+
+    A requirement naming only `cpu_count=2` reached `satisfied`, because every unstated
+    field matched vacuously — `need is None` reads as "fits" — and the reason string said
+    so out loud: "every declared requirement fits the backend: CPU 2 <= 16". The one
+    quantity that decides whether a run reaches its first measurement had never been
+    compared with anything. SAPG is a real instance: a scraped "60 hours" makes
+    `stated` true with vram, ram, disk and cpu all unestablished.
+    """
+    req = _one(**{field: value})
+    assert req.stated and not req.memory_stated
+    cap = assess_resources(req, ThisMachine(), backend="local", walltime_budget_s=3600)
+    assert cap.state == "unknown", cap.reason
+    assert "memory" in cap.reason
+
+
+@pytest.mark.parametrize("field,value", [("vram_bytes", 2 * GIB), ("ram_bytes", 2 * GIB)])
+def test_either_memory_figure_is_enough_to_assess(field, value):
+    """A CPU-only experiment's binding constraint is host RAM. Demanding a VRAM number
+    from it would block runs that fit, which is the opposite failure."""
+    req = _one(**{field: value})
+    assert req.memory_stated
+    assert assess_resources(req, ThisMachine(), backend="local").state == "satisfied"
+
+
+def test_a_definite_shortfall_still_outranks_an_unknown_memory_demand():
+    """Ordering matters. An experiment declaring 128 CPUs on a 16-core host is refused,
+    and naming that is more useful than reporting that its memory was never stated."""
+    req = _one(cpu_count=128)
+    cap = assess_resources(req, ThisMachine(), backend="local")
+    assert cap.state == "insufficient" and any("CPU" in s for s in cap.shortfalls)
+
+
+def test_authorization_refuses_a_requirement_with_no_memory_figure():
+    spec = _spec(assess_resources(_one(cpu_count=2), ThisMachine(), backend="local"))
+    auth = authorize(_cfg(allow_repo_exec=True), spec, local_backend(), commit=_verified())
+    assert not auth.allowed and auth.decision == "resources_unproven"
+    assert auth.failure_class == "resources_insufficient"

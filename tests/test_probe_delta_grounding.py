@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import json
+
 import pytest
 
 from harness import state
@@ -57,14 +59,15 @@ def make_doc(delta: str = "", table_ref: str = CELL) -> PaperDoc:
 
 def write_lens(cfg: Config, evidence_ref: str, statement: str) -> None:
     """One verifiable finding, so build_spec has a target to aim at."""
-    state.write_json(
-        state.project_dir(cfg, PID) / "audit" / "overclaim.json",
+    from harness.stages import audit as audit_stage
+
+    audit_stage.accept_lens(cfg, PID, "overclaim", json.dumps(
         {"lens": "overclaim", "findings": [{
             "finding_id": "overclaim-01", "severity": "MAJOR", "title": "t",
             "statement": statement, "target": statement,
             "evidence_quote": "59.28", "evidence_ref": evidence_ref,
             "verifiable_by_experiment": True}],
-            "unasked_question": "", "notes": ""})
+            "unasked_question": "", "notes": ""}))
 
 
 def write_spec(cfg: Config, **fields) -> None:
@@ -141,6 +144,66 @@ def test_a_bare_unitless_delta_is_refused_rather_than_guessed(cfg: Config):
     assert spec.claimed_delta is None, "only %/pp deltas carry an unambiguous scale"
 
 
+# --------------------------------------------------------------------------- #
+# 3. Major #6 — a spec.json this stage wrote must not freeze a stale target
+# --------------------------------------------------------------------------- #
+def _doc_with_two_cells() -> PaperDoc:
+    return PaperDoc(
+        paper_id=PID, title="t", n_pages=1,
+        tables=[Table(table_idx=0, page=1, caption="Table 0", header=["method", "acc"],
+                      rows=[["ours", "11.11"]]),
+                Table(table_idx=1, page=2, caption="Table 1", header=["method", "acc"],
+                      rows=[["ours", "22.22"]])])
+
+
+def _lens_finding(cfg: Config, finding_id: str, ref: str, quote: str) -> None:
+    from harness.stages import audit as audit_stage
+
+    audit_stage.accept_lens(cfg, PID, "overclaim", json.dumps(
+        {"lens": "overclaim", "findings": [{
+            "finding_id": finding_id, "severity": "MAJOR", "title": "t",
+            "statement": "s", "target": "s",
+            "evidence_quote": quote, "evidence_ref": ref,
+            "verifiable_by_experiment": True}],
+            "unasked_question": "", "notes": ""}))
+
+
+def test_a_harness_written_spec_is_re_derived_against_the_current_audit(cfg: Config):
+    """The exact regression: run N-1 targets one finding; the audit is re-run and the
+    only verifiable finding moves elsewhere; a `spec.json` this stage persisted at the
+    end of run N-1 must not freeze run N onto the finding, cell and value that no longer
+    exist in the current audit."""
+    doc = _doc_with_two_cells()
+    _lens_finding(cfg, "overclaim-01", "T0:r0:c1", "11.11")
+    spec1 = probe_stage.build_spec(cfg, PID, doc)
+    assert (spec1.finding_id, spec1.table_ref, spec1.claimed_cell_value) == (
+        "overclaim-01", "T0:r0:c1", "11.11")
+    assert spec1.written_by == "harness"
+    # Exactly what `stages/probe.run` does at the end of a run.
+    state.write_json(state.project_dir(cfg, PID) / "runs" / PID / "spec.json",
+                     spec1.model_dump())
+
+    # The audit is re-run; the target has moved to a different finding and cell.
+    _lens_finding(cfg, "overclaim-02", "T1:r0:c1", "22.22")
+    spec2 = probe_stage.build_spec(cfg, PID, doc)
+
+    assert spec2.finding_id == "overclaim-02", "must not stay on a finding that no longer exists"
+    assert spec2.table_ref == "T1:r0:c1"
+    assert spec2.claimed_cell_value == "22.22"
+
+
+def test_a_genuine_human_override_survives_across_runs(cfg: Config):
+    """The fix must not cost the driver override its whole purpose: a hand-written
+    spec.json (no `written_by`) must still be honoured verbatim, run after run, even
+    after `stages/probe.run` would have persisted a spec of its own in its place."""
+    _lens_finding(cfg, "overclaim-01", "T0:r0:c1", "11.11")
+    write_spec(cfg, script="print('driver script')\n", finding_id="overclaim-01",
+              table_ref="T0:r0:c1", claimed_cell_value="11.11")
+    spec = probe_stage.build_spec(cfg, PID, _doc_with_two_cells())
+    assert spec.script == "print('driver script')\n"
+    assert spec.written_by == ""
+
+
 def test_grounded_delta_helper_reads_percent_and_pp(cfg: Config):
     doc = make_doc(delta="+2.1 pp")
     f = Finding(finding_id="x", evidence_ref=CELL)
@@ -191,6 +254,27 @@ def test_a_real_reproduction_still_gets_its_verdict_headline(cfg: Config):
     assert "🔴 **The measured effect sits inside the noise band.**" in body
     assert "| **claimed delta** | **+0.0420** |" in body
     assert "Hardware Noise-Floor Calibration" not in body
+
+
+def test_a_placebo_probe_is_not_rendered_as_from_the_papers_formulation():
+    """Major #5 — `probe_synth.plan` has no mechanism dispatch; the placebo is the ONLY
+    synthesized template and is paper-independent by construction. The per-paper report
+    must not claim it was written from the paper's own published formulation, and its
+    🔴/🟢 markers must not be the (inverted) ones a genuine mechanism probe would use."""
+    result = ProbeResult(
+        paper_id=PID, finding_id="overclaim-01", device="cuda", provenance="synthesized",
+        mechanism="placebo", rationale="fallback control", seeds_run=[0, 1, 2, 3, 4],
+        arms={"baseline": ArmStats(values=[0.98] * 5, mean=0.98, std=0.004, n=5),
+              "placebo": ArmStats(values=[0.98] * 5, mean=0.98, std=0.004, n=5)},
+        measured_delta=0.0, measured_std=0.004, noise_band=0.008,
+        calibration=False, claimed_delta=0.042, verdict="within_noise",
+        reason="measured delta +0.0000 vs 2-sigma noise band 0.0080", seconds=57.0,
+    )
+    body = "\n".join(_probe_block(result))
+    assert "written by the harness from the paper's own published" not in body
+    assert "NOT derived from this paper's formulation" in body
+    assert "🔴 **Synthesized mechanism probe" not in body
+    assert "🟢 **Placebo control" in body
 
 
 def test_legacy_results_without_the_flag_fall_back_to_the_old_inference(cfg: Config):

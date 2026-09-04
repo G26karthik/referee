@@ -304,12 +304,73 @@ def is_shallow(repo: Path) -> bool:
     return (p.stdout or "").strip() == "true"
 
 
+class TreeUninspectable(RuntimeError):
+    """`git status` did not run, so nothing is known about the working tree."""
+
+
 def dirty_files(repo: Path) -> list[str]:
-    """Paths that differ from HEAD. A clean SHA over a modified tree is not the audited code."""
-    p = _git(["status", "--porcelain", "--untracked-files=no"], repo, 60)
+    """Paths that differ from HEAD. A clean SHA over a modified tree is not the audited code.
+
+    RAISES rather than returning [] when `git status` fails. It used to return the empty
+    list, which reads as "no files differ" — so a corrupt index, a held `index.lock` or a
+    permissions failure produced `verify_commit(...) -> state='verified'` with the sentence
+    "the checkout is exactly the audited commit <sha> with a clean working tree", about a
+    tree that was never inspected. That is not a missing refusal, it is a positive false
+    attestation, and it was persisted into probe_results.json and rendered in the report as
+    a satisfied evidence-chain link. Every other unverifiable condition in this module
+    blocks; this one certified.
+
+    `--untracked-files=no` used to be passed here, on purpose, and it was the hole: a new
+    file added to the checkout — a patched module dropped in beside the real ones, an
+    `__init__.py` that shadows an import — is not a TRACKED file, so it never showed up,
+    and the tree it sat in still reported "clean". `--untracked-files=all` closes that
+    (individual paths inside a new directory, not just the directory name).
+    `--ignore-submodules=none` closes the companion hole: a submodule can carry
+    `submodule.<name>.ignore` in `.gitmodules` or the local config, which makes plain
+    `git status` silently stop reporting that submodule's own modifications.
+    """
+    p = _git(["status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"],
+             repo, 60)
+    if p.returncode != 0:
+        raise TreeUninspectable(
+            f"`git status` exited {p.returncode} in {repo}: {(p.stderr or '').strip()[:200]}")
+    return sorted(line[3:].strip() for line in (p.stdout or "").splitlines() if line.strip())
+
+
+def linked_git_dir(repo: Path) -> bool:
+    """True when `repo/.git` is a FILE — a worktree/submodule redirect — not a directory.
+
+    `acquire()` only ever produces a real `git clone`, whose `.git` is always a directory.
+    A `.git` FILE there (`gitdir: <elsewhere>`) means this path is not its own independent
+    checkout: it shares object storage and possibly working-tree state with whatever it
+    points at, which the commands run against `repo` do not account for. Whether that is
+    tampering or an unexpected acquisition path, the tree cannot be certified clean from
+    here, so this counts as uninspectable rather than as evidence either way.
+    """
+    return (repo / ".git").is_file()
+
+
+def locked_index_paths(repo: Path) -> list[str]:
+    """Tracked paths marked assume-unchanged or skip-worktree.
+
+    Both bits exist to make git STOP reporting a path's modifications in `status` — that
+    is their entire purpose — so a file carrying one can be edited on disk and `dirty_files`
+    will never see it. A commit verification that only reads `git status` is trusting the
+    exact mechanism designed to hide this from it, so their presence at all makes the tree
+    uninspectable rather than clean.
+    """
+    p = _git(["ls-files", "-v"], repo, 30)
     if p.returncode != 0:
         return []
-    return sorted(line[3:].strip() for line in (p.stdout or "").splitlines() if line.strip())
+    out = []
+    for line in (p.stdout or "").splitlines():
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        tag, _, path = line.partition(" ")
+        if tag and (tag.islower() or tag == "S"):
+            out.append(path.strip())
+    return out
 
 
 def fetch_revision(cfg: Config, dest: Path, url: str, sha: str) -> tuple[bool, str]:
@@ -390,7 +451,43 @@ def verify_commit(repo: str | Path, expected: str) -> CommitVerification:
                if ver.shallow else "."))
         return ver
 
-    ver.dirty_files = dirty_files(path)
+    # C5 — a redirected `.git` or a locked index path is not the same failure `dirty_files`
+    # detects (git status running and reporting nothing), so both are checked BEFORE it,
+    # fail-closed, for the same reason: neither leaves this harness able to say the tree it
+    # is about to certify is the tree `git status` actually inspected.
+    if linked_git_dir(path):
+        ver.state = "unknown"
+        ver.reason = (
+            f"HEAD is the audited commit {ver.actual[:12]}, but '{path}/.git' is a file, not "
+            f"a directory — a linked worktree or submodule redirect this acquisition never "
+            f"produces on its own. The checkout cannot be shown to be an independent tree, so "
+            f"it cannot be certified clean.")
+        return ver
+    locked = locked_index_paths(path)
+    if locked:
+        ver.state = "unknown"
+        ver.reason = (
+            f"HEAD is the audited commit {ver.actual[:12]}, but {len(locked)} tracked path(s) "
+            f"carry assume-unchanged or skip-worktree: {', '.join(locked[:5])}. Both bits exist "
+            f"to make `git status` stop reporting a path's own modifications, so their presence "
+            f"means the tree cannot be shown to be clean, not that it is.")
+        return ver
+
+    try:
+        ver.dirty_files = dirty_files(path)
+    except TreeUninspectable as e:
+        # Fails CLOSED. Not knowing whether the tree is clean is not the same as knowing
+        # it is, and this is the branch that used to certify: `dirty_files` returned [] on
+        # any `git status` failure, so a corrupt index or a held lock produced
+        # state="verified" and the sentence "with a clean working tree" for a tree nobody
+        # had looked at. `unknown` is the state every other unverifiable condition here
+        # already uses.
+        ver.state = "unknown"
+        ver.reason = (
+            f"HEAD is the audited commit {ver.actual[:12]}, but the working tree could not be "
+            f"inspected, so it cannot be shown to match it: {e}. An uninspectable tree is not "
+            f"a clean tree.")
+        return ver
     if ver.dirty_files:
         ver.state = "dirty"
         ver.reason = (
@@ -535,7 +632,7 @@ def build_env(cfg: Config, root: Path, pid: str, acq: RepoAcquisition) -> RepoAc
             return acq
         installed = True
     acq.env_path = str(py)
-    acq.env_status = "ready" if installed else "ready"
+    acq.env_status = "ready"
     if not installed:
         acq.reason = "no pip requirements file to install; the bare venv is what ran"
     return acq

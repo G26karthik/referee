@@ -132,23 +132,70 @@ def test_coerce_keeps_substantiated_findings_and_counts_the_rest():
                          finding(statement=" "),                  # no statement
                          "not a dict"],
             "unasked_question": "why no baseline?", "notes": "checked cells"}
-    report, dropped = _coerce("contradiction", data, CORPUS, BY_IDX)
+    report, dropped, valid = _coerce("contradiction", data, CORPUS, BY_IDX)
     assert len(report.findings) == 1 and dropped == 3
     assert report.findings[0].lens == "contradiction"
     assert report.unasked_question == "why no baseline?"
+    assert valid is True, "a well-formed lens file, whatever its findings survived"
 
 
 def test_coerce_assigns_ids_and_clamps_unknown_severity():
-    report, _ = _coerce("protocol", {"findings": [finding(severity="CATASTROPHIC")]},
-                        CORPUS, BY_IDX)
+    report, _, valid = _coerce("protocol", {"findings": [finding(severity="CATASTROPHIC")]},
+                               CORPUS, BY_IDX)
     assert report.findings[0].finding_id == "protocol-01"
     assert report.findings[0].severity == "MINOR", "unknown severity must not inflate"
+    assert valid is True
 
 
-def test_coerce_survives_garbage_input():
-    for junk in (None, [], "text", {"findings": "nope"}):
-        report, _ = _coerce("protocol", junk, CORPUS, BY_IDX)
-        assert report.findings == []
+# --------------------------------------------------------------------------- #
+# C9 — an invalid or missing lens must never look like a clean audit
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("junk", [None, [], "text", {"findings": "nope"}, {}])
+def test_coerce_survives_garbage_input_and_flags_it_invalid(junk):
+    """Every shape here used to coerce to zero findings with no distinction from a lens
+    that genuinely ran clean — `{}` most of all, since it IS a dict, just with no
+    `findings` key. `valid=False` is what lets `load_reports` refuse to treat any of
+    these as a completed lens."""
+    report, dropped, valid = _coerce("protocol", junk, CORPUS, BY_IDX)
+    assert report.findings == []
+    assert valid is False, junk
+
+
+def test_coerce_accepts_a_genuinely_empty_findings_list():
+    """The one shape that IS valid with zero findings: `{"findings": []}`, a lens that
+    actually ran and actually found nothing. This must not be flagged invalid."""
+    report, dropped, valid = _coerce("protocol", {"findings": []}, CORPUS, BY_IDX)
+    assert report.findings == [] and dropped == 0
+    assert valid is True
+
+
+# --------------------------------------------------------------------------- #
+# C1 — a venue banner repeated on every page must not be read as the title
+# --------------------------------------------------------------------------- #
+def test_guess_title_skips_a_running_venue_banner():
+    banner = "38th Conference on Neural Information Processing Systems (NeurIPS 2024)."
+    pages = [f"{banner}\nImproving Robustness Through Adaptive Regularization\nAbstract\nbody",
+             f"{banner}\nsome page 2 text",
+             f"{banner}\nsome page 3 text"]
+    assert pdf.guess_title(pages) == "Improving Robustness Through Adaptive Regularization"
+
+
+def test_guess_title_still_works_with_no_banner():
+    pages = ["Improving Robustness Through Adaptive Regularization\nAbstract\nbody"]
+    assert pdf.guess_title(pages) == "Improving Robustness Through Adaptive Regularization"
+
+
+def test_two_different_papers_sharing_a_venue_banner_get_different_titles():
+    """The concrete failure: two unrelated papers from the same venue print the
+    identical banner on every page. If `guess_title` returned the banner, both papers
+    would report the SAME title and a legacy-project content match (`_same_paper_by_content`)
+    would wrongly treat them as one paper."""
+    banner = "Proceedings of the 41st International Conference on Machine Learning."
+    paper_a = [f"{banner}\nFirst Unrelated Paper On Pruning\nAbstract", f"{banner}\nbody"]
+    paper_b = [f"{banner}\nSecond Unrelated Paper On Diffusion\nAbstract", f"{banner}\nbody"]
+    title_a, title_b = pdf.guess_title(paper_a), pdf.guess_title(paper_b)
+    assert title_a != title_b
+    assert banner not in (title_a, title_b)
 
 
 # --------------------------------------------------------------------------- #
@@ -246,9 +293,16 @@ def test_a_slug_collision_allocates_a_new_case_rather_than_merging(tmp_path):
     assert pid_b != pid_a and same_b is False and sha_b[:6] in pid_b
 
 
-def test_a_document_ingested_before_content_hashing_is_not_forked(tmp_path):
-    """An empty recorded hash means the project predates the field. Treating it as a
-    mismatch would fork every existing case on upgrade."""
+def test_a_legacy_project_is_reused_only_when_content_agrees(tmp_path):
+    """NARROWED by the correction pass. This asserted that ANY legacy project absorbs a
+    same-slug document, which is how one paper came to be reviewed against another's
+    doc.json, lens files and findings.
+
+    An absent hash is the absence of evidence, not evidence of sameness. A legacy project
+    is still reused — never overwritten, never deleted — but only when identity can be
+    established from the paper's own content. A legacy artifact carrying no title cannot
+    establish it, so this document gets its own id and the legacy case is left intact.
+    """
     from harness import state
     from harness.artifacts import PaperDoc
     from harness.config import Config
@@ -259,5 +313,19 @@ def test_a_document_ingested_before_content_hashing_is_not_forked(tmp_path):
     old.write_bytes(b"%PDF legacy")
     pid, _ = allocate_paper_id(cfg, old, content_sha(old))
     state.write_json(cfg.projects_dir / pid / "paper" / "doc.json",
-                     PaperDoc(paper_id=pid).model_dump())          # no content_sha
-    assert allocate_paper_id(cfg, old, content_sha(old)) == (pid, True)
+                     PaperDoc(paper_id=pid).model_dump())          # no content_sha, no title
+    again, same = allocate_paper_id(cfg, old, content_sha(old))
+    assert same is False, "with no title and no hash, nothing identifies the legacy case"
+    assert again != pid, "so the document gets its own id"
+    assert (cfg.projects_dir / pid / "paper" / "doc.json").exists(), "legacy case preserved"
+
+    # A legacy artifact that DOES record a title is still reused for the same document,
+    # which is the case that actually exists on disk — every real project.json carries one.
+    titled = tmp_path / "titled.pdf"
+    titled.write_bytes(b"%PDF titled")
+    tpid, _ = allocate_paper_id(cfg, titled, content_sha(titled))
+    from harness.stages.ingest import _same_paper_by_content
+    doc_path = cfg.projects_dir / tpid / "paper" / "doc.json"
+    state.write_json(doc_path, PaperDoc(paper_id=tpid, title="A Recorded Title").model_dump())
+    assert _same_paper_by_content(doc_path, titled) is False, \
+        "an unparseable PDF still establishes nothing — the check is content, not filename"

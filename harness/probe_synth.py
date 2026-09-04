@@ -49,13 +49,11 @@ class Plan:
     keeps_finding: bool = True
     """Whether the probe actually tests the audit finding it was dispatched from.
 
-    A mechanism template tests the paper's CORE ALGORITHM, which is usually not the
-    finding that happened to rank first — LDReg's probe measures intrinsic
-    dimensionality, and the top-ranked settleable finding for that paper is about
-    wall-clock hours. Carrying the finding id through anyway would file a measurement
-    of one thing under a claim about another, which is a provenance error of exactly
-    the kind these reports exist to catch. The placebo template is the opposite case:
-    it calibrates the claimed gain in the finding, so it keeps it.
+    Kept as a field because a probe that measures the paper's core algorithm is usually
+    not measuring the finding that happened to rank first, and filing one under the other
+    is a provenance error of exactly the kind these reports exist to catch. Every probe
+    the planner now emits is the placebo control, which calibrates the claimed gain in the
+    finding it came from — so it keeps it.
     """
 
 
@@ -74,182 +72,7 @@ def corpus(doc: PaperDoc, acq: RepoAcquisition | None = None, limit: int = 40) -
 
 
 # --------------------------------------------------------------------------- #
-# Template 1 — LDReg (ICLR 2024), Algorithms 1 and 2
-# --------------------------------------------------------------------------- #
-LDREG_SCRIPT = '''\
-"""Auto-synthesized mechanism probe — LDReg, Algorithms 1 and 2.
-
-Reimplements, from the paper's own formulation:
-
-  Algorithm 1  lid_mom_est(data, reference, k)  — method-of-moments LID estimator,
-               LID = m / (w - m), where m is the mean of the k nearest neighbour
-               distances and w is the k-th (largest of those) distance.
-  Algorithm 2  L_L1 = -beta * (1/N) * sum_i ln LID_i, added to the NT-Xent objective
-               and applied to the REPRESENTATION, not the projector output.
-
-Question under test (two parts, both answered on stdout):
-  1. Does LDReg actually prevent local intrinsic dimensionality collapse?
-     -> arm `ldreg` mean LID vs arm `baseline` mean LID, on held-out data.
-  2. Is that shift larger than this machine's 2-sigma seed noise?
-     -> the harness computes the paired seed spread and answers it.
-
-WHAT THIS IS NOT: this is a toy contrastive setup on synthetic data. It cannot and does
-not reproduce any ImageNet number in the paper. It tests whether the stated mechanism
-does the thing the paper says it does.
-
-Every constant below is pre-registered from the paper. Nothing was tuned against the
-output of this script.
-
-Contract (parsed by harness/local_exec.py — keep these lines):
-    SH_DEVICE <cuda|mps|cpu>
-    SH_METRIC arm=<name> seed=<int> value=<float>
-    SH_AUX key=<name> arm=<name> seed=<int> value=<float>
-"""
-import argparse
-
-ap = argparse.ArgumentParser()
-ap.add_argument("--seed", type=int, required=True)
-ap.add_argument("--arm", type=str, required=True)
-args = ap.parse_args()
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-DEVICE = ("cuda" if torch.cuda.is_available()
-          else "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
-          else "cpu")
-print(f"SH_DEVICE {DEVICE}", flush=True)
-
-# --- pre-registered constants ---------------------------------------------------
-BETA        = __BETA__   # paper's LDReg strength for SimCLR
-K_NN        = __K__      # paper sweeps k in {32,64,128,256}; 32 is the smallest, and the
-                         # only one a 256-sample batch can support
-TEMP        = 0.5        # NT-Xent temperature, SimCLR default
-BATCH       = 256
-STEPS       = __STEPS__
-D_INTRINSIC = 12         # the true manifold dimension the estimator should recover
-D_AMBIENT   = 64
-N_TRAIN     = 4096
-N_EVAL      = 1024
-N_CLASS     = 8
-
-torch.manual_seed(args.seed)
-if DEVICE == "cuda":
-    torch.cuda.manual_seed_all(args.seed)
-gen = torch.Generator().manual_seed(args.seed)
-
-# --- data: a D_INTRINSIC manifold embedded nonlinearly in D_AMBIENT dims ----------
-W1 = torch.randn(D_INTRINSIC, 32, generator=gen)
-W2 = torch.randn(32, D_AMBIENT, generator=gen)
-centers = torch.randn(N_CLASS, D_INTRINSIC, generator=gen) * 2.5
-
-
-def manifold(n):
-    y = torch.randint(0, N_CLASS, (n,), generator=gen)
-    z = centers[y] + torch.randn(n, D_INTRINSIC, generator=gen)
-    return (torch.tanh(z @ W1) @ W2).to(DEVICE), y.to(DEVICE)
-
-
-x_train, y_train = manifold(N_TRAIN)
-x_eval, y_eval = manifold(N_EVAL)
-
-
-def augment(x):
-    """Positive-pair view: additive noise plus random feature dropout."""
-    return (x + torch.randn_like(x) * 0.35) * (torch.rand_like(x) > 0.15).float()
-
-
-# --- Algorithm 1 -----------------------------------------------------------------
-def lid_mom_est(data, reference, k):
-    """Method-of-moments LID. `data` and `reference` equal => column 0 is the self
-    distance and is skipped, which is what the paper's batch-as-reference does."""
-    k = min(k, reference.shape[0] - 2)
-    dist = torch.cdist(torch.flatten(data, 1), torch.flatten(reference, 1), p=2)
-    a, _ = torch.sort(dist, dim=1)
-    m = a[:, 1:k].mean(dim=1)
-    w = a[:, k]
-    return m / (w - m + 1e-12)
-
-
-# --- Algorithm 2 -----------------------------------------------------------------
-def ldreg_loss(h, k, beta):
-    """L_L1 = -beta * (1/N) * sum ln LID. Minimizing it pushes LID up."""
-    return -beta * torch.log(lid_mom_est(h, h, k).clamp_min(1e-6)).mean()
-
-
-def nt_xent(z1, z2, temp):
-    b = z1.shape[0]
-    z = F.normalize(torch.cat([z1, z2], 0), dim=1)
-    sim = z @ z.t() / temp
-    sim.fill_diagonal_(-1e9)
-    target = torch.cat([torch.arange(b, 2 * b), torch.arange(0, b)]).to(z.device)
-    return F.cross_entropy(sim, target)
-
-
-backbone = nn.Sequential(nn.Linear(D_AMBIENT, 256), nn.ReLU(),
-                         nn.Linear(256, 256), nn.ReLU(),
-                         nn.Linear(256, 128)).to(DEVICE)
-projector = nn.Sequential(nn.Linear(128, 128), nn.ReLU(), nn.Linear(128, 64)).to(DEVICE)
-
-USE_LDREG = args.arm.strip().lower() in ("ldreg", "treatment")
-opt = torch.optim.Adam(list(backbone.parameters()) + list(projector.parameters()), lr=1e-3)
-
-last_ntx = 0.0
-for step in range(STEPS):
-    idx = torch.randint(0, N_TRAIN, (BATCH,), device=DEVICE)
-    xb = x_train[idx]
-    h1, h2 = backbone(augment(xb)), backbone(augment(xb))
-    loss_ntx = nt_xent(projector(h1), projector(h2), TEMP)
-    loss = loss_ntx + (ldreg_loss(torch.cat([h1, h2], 0), K_NN, BETA) if USE_LDREG else 0.0)
-    opt.zero_grad()
-    loss.backward()
-    opt.step()
-    last_ntx = float(loss_ntx.detach())
-
-# --- evaluation: LID of the held-out REPRESENTATION -------------------------------
-backbone.eval()
-with torch.no_grad():
-    h_eval = backbone(x_eval)
-    h_train_f = backbone(x_train)
-    lid = lid_mom_est(h_eval, h_eval, K_NN)
-    lid_mean = float(lid.mean())
-    lid_median = float(lid.median())
-
-# --- linear probe on the frozen representation ------------------------------------
-probe = nn.Linear(h_train_f.shape[1], N_CLASS).to(DEVICE)
-popt = torch.optim.Adam(probe.parameters(), lr=1e-2)
-for _ in range(300):
-    popt.zero_grad()
-    F.cross_entropy(probe(h_train_f.detach()), y_train).backward()
-    popt.step()
-with torch.no_grad():
-    acc = float((probe(h_eval).argmax(1) == y_eval).float().mean())
-
-print(f"SH_METRIC arm={args.arm} seed={args.seed} value={lid_mean:.6f}", flush=True)
-print(f"SH_AUX key=lid_median arm={args.arm} seed={args.seed} value={lid_median:.6f}", flush=True)
-print(f"SH_AUX key=nt_xent_loss arm={args.arm} seed={args.seed} value={last_ntx:.6f}", flush=True)
-print(f"SH_AUX key=linear_probe_acc arm={args.arm} seed={args.seed} value={acc:.6f}", flush=True)
-print(f"SH_AUX key=true_intrinsic_dim arm={args.arm} seed={args.seed} value={float(D_INTRINSIC):.6f}",
-      flush=True)
-'''
-
-LDREG_RATIONALE = (
-    "The paper's central mechanism is that maximizing the geometric mean of local "
-    "intrinsic dimensionality prevents dimensional collapse in self-supervised "
-    "representations. That is a claim about the ALGORITHM, and it is separable from the "
-    "ImageNet linear-probe numbers the paper reports: it can be tested at toy scale in "
-    "seconds by implementing Algorithm 1 and Algorithm 2 as printed and running the "
-    "regularized objective against the unregularized one on a manifold whose true "
-    "intrinsic dimension is known by construction. This probe therefore answers the "
-    "mechanistic question the paper's tables cannot, precisely because the tables report "
-    "single runs with no seed spread: it measures the LID shift AND the seed noise on "
-    "that shift, so the effect can be graded against a real detectability band."
-)
-
-
-# --------------------------------------------------------------------------- #
-# Template 2 — the placebo control, for any paper claiming a small gain
+# The placebo control — the only template, and paper-independent by construction
 # --------------------------------------------------------------------------- #
 PLACEBO_SCRIPT = '''\
 """Auto-synthesized mechanism probe — placebo-controlled auxiliary term.
@@ -361,16 +184,6 @@ PLACEBO_RATIONALE = (
 # --------------------------------------------------------------------------- #
 # Matching and planning
 # --------------------------------------------------------------------------- #
-def _ldreg_match(text: str) -> str:
-    """A conservative match. Two independent signals, not one keyword."""
-    if "ldreg" in text:
-        return "the paper names LDReg"
-    lid = ("local intrinsic dimension" in text or "intrinsic dimensionality" in text)
-    if lid and "dimensional collapse" in text:
-        return "local intrinsic dimensionality + dimensional collapse"
-    return ""
-
-
 def plan(doc: PaperDoc, claim: str = "", acq: RepoAcquisition | None = None,
          steps: int = 0) -> Plan:
     """Choose a template and render it. Always returns a runnable plan.
@@ -381,20 +194,19 @@ def plan(doc: PaperDoc, claim: str = "", acq: RepoAcquisition | None = None,
     """
     text = corpus(doc, acq)
 
-    if why := _ldreg_match(text):
-        script = LDREG_SCRIPT
-        for key, value in (("__BETA__", "0.01"), ("__K__", "32"),
-                           ("__STEPS__", str(steps or 3000))):
-            script = script.replace(key, value)
-        return Plan(mechanism="ldreg", script=script, rationale=LDREG_RATIONALE,
-                    arms=["baseline", "ldreg"], metric="mean_lid",
-                    aux_metrics=["lid_median", "nt_xent_loss", "linear_probe_acc",
-                                 "true_intrinsic_dim"],
-                    matched_on=why, keeps_finding=False,
-                    claim=("LDReg's stated mechanism: does adding L_L1 = -beta*(1/N)*sum ln LID "
-                           "to NT-Xent raise the local intrinsic dimensionality of the learned "
-                           "representation, and is that shift larger than seed noise?"))
-
+    # There is deliberately no mechanism dispatch here any more. A hardcoded template for
+    # one pilot paper used to be selected by matching that paper's method name — or two of
+    # its topic keywords — anywhere in a 40-section corpus, which for a short paper is the
+    # whole text, so a single related-work citation of someone else's method was enough to
+    # trigger it. That is paper-specific logic in executable production code: the harness
+    # behaved differently for one paper in the evaluation corpus than for any other, which
+    # is exactly what invariant 10 forbids, and a template written from one paper cannot be
+    # evidence about a different one.
+    #
+    # The generic control is what remains. It measures what an auxiliary term with no
+    # hypothesis buys, which is a real and paper-independent quantity, and the provenance
+    # ceiling caps whatever it produces at INCONCLUSIVE regardless. Abstaining is the
+    # correct outcome for a mechanism this harness cannot author from the paper alone.
     script = PLACEBO_SCRIPT.replace("__STEPS__", str(steps or 4000))
     script = script.replace("__CLAIM__", (claim or "(none supplied)").replace('"""', "'''")[:500])
     return Plan(mechanism="placebo", script=script, rationale=PLACEBO_RATIONALE,
@@ -407,6 +219,7 @@ def plan(doc: PaperDoc, claim: str = "", acq: RepoAcquisition | None = None,
 
 if __name__ == "__main__":  # self-check: python -m harness.probe_synth
     import ast
+    import pathlib
 
     from .artifacts import Section
 
@@ -414,26 +227,26 @@ if __name__ == "__main__":  # self-check: python -m harness.probe_synth
         return PaperDoc(paper_id="t", title=title, source_path="x", n_pages=1,
                         sections=[Section(section_idx=0, title="Intro", text=body)])
 
-    ld = plan(_doc("LDReg: Local Dimensionality Regularized SSL", "we regularize LID"))
-    assert ld.mechanism == "ldreg", ld.matched_on
-    assert ld.arms == ["baseline", "ldreg"]
-    assert "lid_mom_est" in ld.script and "ln LID" in ld.script
+    # No paper-specific dispatch exists any more, so EVERY paper gets the generic
+    # control. A template selected by one paper's method name made the harness behave
+    # differently for one member of its own evaluation corpus than for any other.
+    for title, body in (("LDReg: Local Dimensionality Regularized SSL", "we regularize LID"),
+                        ("APT: Adaptive Pruning and Tuning", "we prune language models"),
+                        ("SAPG: Split and Aggregate Policy Gradients", "we split and aggregate"),
+                        ("Something else", "intrinsic dimensionality and dimensional collapse"),
+                        ("A Unified Diverse Weather Generator", "we generate LiDAR point clouds")):
+        p_ = plan(_doc(title, body))
+        assert p_.mechanism == "placebo", (title, p_.mechanism)
+        assert p_.arms == ["baseline", "placebo"]
 
-    two = plan(_doc("Something else", "we study intrinsic dimensionality and dimensional collapse"))
-    assert two.mechanism == "ldreg", "two independent signals should match without the name"
+    src = pathlib.Path(__file__).read_text(encoding="utf-8")
+    for token in ("ldreg", "LDReg", "SAPG", "CoFi"):
+        assert token not in src.split('if __name__')[0], f"{token} in production code"
 
     gen = plan(_doc("A Unified Diverse Weather Generator", "we generate LiDAR point clouds"))
-    assert gen.mechanism == "placebo", gen.matched_on
-    assert gen.arms == ["baseline", "placebo"]
-
-    near = plan(_doc("On intrinsic dimensionality", "we measure intrinsic dimensionality only"))
-    assert near.mechanism == "placebo", "one signal alone must not match a specific template"
-
-    assert not ld.keeps_finding, "the LID probe does not test whichever finding ranked first"
     assert gen.keeps_finding, "the placebo probe calibrates the finding's own claimed gain"
-    assert "LID" in ld.claim and ld.claim != "", "a mechanism probe states its own claim"
 
-    for candidate in (ld, gen):
+    for candidate in (gen,):
         ast.parse(candidate.script)              # every emitted script must be valid Python
         assert "SH_DEVICE" in candidate.script and "SH_METRIC" in candidate.script
         assert "__STEPS__" not in candidate.script, "every placeholder must be substituted"

@@ -70,9 +70,11 @@ print(f"SH_METRIC arm=reproduction seed={a.seed} value={59.28 + a.seed * 0.01:.4
 
 EMITS_MISMATCH = EMITS_MATCH.replace("59.28 +", "71.40 +")
 
-# Emits a seed-varying metric that WOULD match the cell, then dies. This fixture found a
-# real defect: the run reconciled as RESOLVED_VERIFIED because `run_probe` counted metrics
-# EMITTED rather than processes that succeeded.
+# Emits a seed-varying metric that matches the cell, THEN dies — a post-measurement
+# condition (here, a stray exception after the result line; in the wild, a telemetry
+# client failing to flush or a sync barrier timing out). C3: the measurement for this
+# (seed, arm) is already complete once SH_METRIC is printed, and an exit code arriving
+# after it must not override a scientific result that was already captured.
 FAILS_AFTER_STARTING = """import argparse
 p = argparse.ArgumentParser()
 p.add_argument("--seed", type=int, default=0)
@@ -80,6 +82,28 @@ a = p.parse_args()
 print("SH_DEVICE cpu", flush=True)
 print(f"SH_METRIC arm=reproduction seed={a.seed} value={59.28 + a.seed * 0.01:.4f}", flush=True)
 raise RuntimeError("loss became NaN at step 4000")
+"""
+
+# The other half of C3: a genuine failure that strikes BEFORE the experiment ever
+# produces ITS measurement. The fix above must not become a blanket amnesty for a
+# non-zero exit code — this must still convict.
+CRASHES_BEFORE_MEASURING = """import argparse
+p = argparse.ArgumentParser()
+p.add_argument("--seed", type=int, default=0)
+a = p.parse_args()
+print("SH_DEVICE cpu", flush=True)
+raise RuntimeError("loss became NaN at step 4000")
+"""
+
+# C2: an infrastructure failure — here, a CUDA OOM — must never become FAILED_REPRODUCTION,
+# however it reads at the stderr and however far the process got.
+FAILS_WITH_CUDA_OOM = """import argparse, sys
+p = argparse.ArgumentParser()
+p.add_argument("--seed", type=int, default=0)
+a = p.parse_args()
+print("SH_DEVICE cuda", flush=True)
+sys.stderr.write("RuntimeError: CUDA out of memory. Tried to allocate 2.00 GiB\\n")
+sys.exit(1)
 """
 
 FAILS_AT_IMPORT = """\
@@ -176,22 +200,80 @@ def test_a_qualified_execution_that_mismatches_fails_reproduction(tmp_path):
     assert verdict == "RED", "a real failed reproduction is the one thing that drives RED alone"
 
 
-def test_a_crash_after_the_experiment_started_is_a_failed_reproduction(tmp_path):
-    """It printed a metric that WOULD have matched the cell, then died.
-
-    Every process exited non-zero. A number printed by a process that then crashed is not
-    a completed measurement, and reconciling only the seeds that survived would be
-    reconciling a smaller experiment than the one specified.
+def test_a_metric_captured_before_a_nonzero_exit_still_resolves(tmp_path):
+    """C3 — the concrete failure the red-team found: a process prints the correct result
+    for every requested seed and THEN exits non-zero for a reason unrelated to the
+    measurement itself. Exit-code semantics must not override a scientific result that
+    was already captured — this used to reconcile as FAILED_REPRODUCTION solely because
+    `run_probe` counted processes that exited zero rather than measurements emitted.
     """
     repo, commit = _repo(tmp_path, FAILS_AFTER_STARTING)
     cfg = _cfg(tmp_path, allow_repo_exec=True)
     result = run_probe(cfg, tmp_path / "projects" / "fixture", _spec(repo, commit, cfg))
 
-    assert result.seeds_failed == [0, 1, 2], "every seed exits non-zero"
+    assert result.seeds_run == [0, 1, 2], "every seed's metric was captured before it died"
+    assert result.seeds_failed == [], "a post-completion exit is not a failed seed"
+    rec = result.reconciliation
+    assert rec.status == "RESOLVED_VERIFIED", rec.reason
+    assert rec.failure_class in ("", "none")
+
+
+def test_a_crash_before_any_measurement_is_still_a_failed_reproduction(tmp_path):
+    """The other half of C3: the fix above must not become a blanket amnesty for a
+    non-zero exit code. A genuine failure that strikes BEFORE the experiment produces
+    its measurement still convicts."""
+    repo, commit = _repo(tmp_path, CRASHES_BEFORE_MEASURING)
+    cfg = _cfg(tmp_path, allow_repo_exec=True)
+    result = run_probe(cfg, tmp_path / "projects" / "fixture", _spec(repo, commit, cfg))
+
+    assert result.seeds_failed == [0, 1, 2], "no seed ever produced a measurement"
     rec = result.reconciliation
     assert rec.status == "FAILED_REPRODUCTION", rec.reason
     assert rec.failure_class == "runtime_failure"
     assert rec.reached_experiment is True, "it did start — that is why this convicts"
+
+
+def test_a_cuda_oom_is_infrastructure_not_a_failed_reproduction(tmp_path):
+    """C2 — an infrastructure failure must never become FAILED_REPRODUCTION, however it
+    reads at the stderr and however far the process got before it happened."""
+    repo, commit = _repo(tmp_path, FAILS_WITH_CUDA_OOM)
+    cfg = _cfg(tmp_path, allow_repo_exec=True)
+    result = run_probe(cfg, tmp_path / "projects" / "fixture", _spec(repo, commit, cfg))
+
+    assert result.seeds_failed == [0, 1, 2]
+    rec = result.reconciliation
+    assert rec.status == "INCONCLUSIVE", rec.reason
+    assert rec.failure_class == "infrastructure_failure"
+    assert overall_verdict([], rec)[0] == "GREEN", "an infrastructure failure accuses nobody"
+
+
+def test_a_checkout_modified_mid_run_retracts_the_whole_result(tmp_path):
+    """Major #16 — one commit verification, made before the seed loop starts, does not
+    describe every attempt inside it. Here the FIRST seed's own process tampers with the
+    tracked script on disk, simulating the checkout changing while later seeds still run
+    against it. The commit is re-verified once the loop ends; finding it no longer clean
+    must retract the whole run to INCONCLUSIVE rather than reconcile the seeds gathered
+    under a commit that stopped being the audited one partway through."""
+    body = ("import argparse\n"
+            "ap = argparse.ArgumentParser()\n"
+            "ap.add_argument('--seed', type=int, required=True)\n"
+            "ap.add_argument('--arm', default='reproduction')\n"
+            "a = ap.parse_args()\n"
+            "print('SH_DEVICE cpu', flush=True)\n"
+            "print(f'SH_METRIC arm={a.arm} seed={a.seed} value=59.28', flush=True)\n"
+            "if a.seed == 0:\n"
+            "    with open('run.py', 'a') as f:\n"
+            "        f.write('\\n# tampered while the run was still in progress\\n')\n")
+    repo, commit = _repo(tmp_path, body)
+    cfg = _cfg(tmp_path, allow_repo_exec=True)
+    result = run_probe(cfg, tmp_path / "projects" / "fixture", _spec(repo, commit, cfg, seeds=(0, 1)))
+
+    assert result.seeds_run == [0, 1], "both seeds still reported a metric"
+    rec = result.reconciliation
+    assert rec is not None and rec.status == "INCONCLUSIVE", rec.reason
+    assert rec.failure_class == "commit_mismatch"
+    assert result.authorization.decision == "commit_changed_during_execution"
+    assert overall_verdict([], rec)[0] == "GREEN"
 
 
 def test_an_import_failure_is_infrastructure_not_the_paper(tmp_path):

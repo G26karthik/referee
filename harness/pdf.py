@@ -16,7 +16,7 @@ import re
 from collections.abc import Sequence
 from pathlib import Path
 
-from .artifacts import QuantFinding, Section, Table
+from .artifacts import Equation, Figure, QuantFinding, Section, Table
 
 # ponytail: bounds sized for conference ML papers (8-10pp + appendix). A 400-page
 # thesis is truncated, not crashed; raise these if that ever becomes the workload.
@@ -44,6 +44,17 @@ _SECNO = r"(?:\d+|[A-Z])(?:\.\d+)*"
 _NAMED_HEADING = re.compile(rf"^(?:{_SECNO}\.?\s+)?({_KNOWN_HEADINGS})\b.{{0,40}}$", re.I)
 _NUMBERED_HEADING = re.compile(rf"^({_SECNO})\.?\s+([A-Z][^.!?]{{1,68}})$")
 _TABLE_CAPTION = re.compile(r"^\s*(?:table|tab\.)\s*([IVXLC]+|\d+)\s*[:.—-]?\s*(.{0,200})", re.I)
+# Mirrors `_TABLE_CAPTION` exactly, substituting "figure"/"fig." — same reasoning, same
+# shape. `MAX_FIGURES` bounds it the way `MAX_TABLES` bounds table extraction.
+_FIGURE_CAPTION = re.compile(r"^\s*(?:figure|fig\.)\s*([IVXLC]+|\d+)\s*[:.—-]?\s*(.{0,300})", re.I)
+# A display equation, text-extracted: a line carrying a relational operator, ending in a
+# parenthesized number the way LaTeX numbers equations. Deliberately lossy — this is a
+# text-line heuristic, not layout geometry, so it catches the common "y = mx + b   (7)"
+# shape and nothing more exotic; `SOURCE_FIDELITY` in the audit prompt tells the reviewer
+# equation extraction is lossy for exactly this reason.
+_EQUATION_LINE = re.compile(r"^(.{1,220}?[=≤≥∝≈].{0,220}?)\s*\((\d{1,3}[a-z]?)\)\s*$")
+MAX_FIGURES = 40
+MAX_EQUATIONS = 60
 _WS = re.compile(r"\s+")
 
 
@@ -75,11 +86,31 @@ def page_texts(path: str | Path, max_pages: int = MAX_PAGES) -> list[str]:
         return [str(doc[i].get_text("text")) for i in range(min(doc.page_count, max_pages))]
 
 
+def _running_boilerplate(pages: list[str]) -> frozenset[str]:
+    """Lines that repeat verbatim across multiple pages: running headers, footers, venue
+    banners ("34th Conference on ... 2024", "Proceedings of ..."). These describe the
+    VENUE, not the paper, and every paper from that venue prints the same one — so a
+    title guess that lands on a banner line makes two different papers look identical.
+    Detected structurally (repetition), never by matching specific venue names, because
+    a fixed phrase list would be paper/venue-specific and would miss the next venue.
+    """
+    if len(pages) < 2:
+        return frozenset()
+    counts: dict[str, int] = {}
+    for p in pages:
+        for line in {_norm(raw) for raw in p.splitlines() if _norm(raw)}:
+            counts[line] = counts.get(line, 0) + 1
+    return frozenset(line for line, n in counts.items() if n >= 2)
+
+
 def guess_title(pages: list[str]) -> str:
-    """First substantial line of page 1 that is not a header/arXiv stamp."""
+    """First substantial line of page 1 that is not a header/arXiv stamp/venue banner."""
+    boilerplate = _running_boilerplate(pages)
     for raw in (pages[0] if pages else "").splitlines()[:25]:
         line = _norm(raw)
         if len(line) < 8 or line.lower().startswith(("arxiv:", "preprint", "under review")):
+            continue
+        if line in boilerplate:
             continue
         if _NAMED_HEADING.match(line):  # hit "Abstract" before finding a title
             break
@@ -111,6 +142,40 @@ def split_sections(pages: list[str]) -> list[Section]:
                 buf.append(_norm(raw))
     flush(len(pages) or 1)
     return sections
+
+
+def extract_figures(pages: list[str], max_figures: int = MAX_FIGURES) -> list[Figure]:
+    """Every 'Figure N: ...' caption line, in reading order. NOT the figure's plotted
+    content — this harness has no way to read that — only its caption text, which is
+    all `_FIGURE_CAPTION` can see. See `harness.artifacts.Figure` for why that ceiling
+    matters downstream."""
+    out: list[Figure] = []
+    for pno, text in enumerate(pages, start=1):
+        for raw in text.splitlines():
+            m = _FIGURE_CAPTION.match(_norm(raw))
+            if not m:
+                continue
+            label, caption = f"Figure {m.group(1)}", _norm(m.group(2))
+            out.append(Figure(figure_idx=len(out), page=pno, label=label, caption=caption))
+            if len(out) >= max_figures:
+                return out
+    return out
+
+
+def extract_equations(pages: list[str], max_equations: int = MAX_EQUATIONS) -> list[Equation]:
+    """Every display-equation line the text-line heuristic recognises. Lossy by
+    construction — see `_EQUATION_LINE` and `harness.artifacts.Equation`."""
+    out: list[Equation] = []
+    for pno, text in enumerate(pages, start=1):
+        for raw in text.splitlines():
+            m = _EQUATION_LINE.match(_norm(raw))
+            if not m:
+                continue
+            out.append(Equation(equation_idx=len(out), page=pno,
+                                number=m.group(2), text=_norm(m.group(1))))
+            if len(out) >= max_equations:
+                return out
+    return out
 
 
 def _clean_rows(raw: Sequence[Sequence[str | None]]) -> list[list[str]]:
@@ -430,6 +495,20 @@ def render_tables(tables: list[Table]) -> str:
     return "\n".join(out)
 
 
+def render_figures(figures: list[Figure]) -> str:
+    """Figure captions as text an auditor can cite by `F<n>` address. Never the plotted
+    content — a caption names a figure, it does not report the values in it."""
+    return "\n".join(f"[F{fig.figure_idx}] page {fig.page} — {fig.label}: {fig.caption}"
+                     for fig in figures)
+
+
+def render_equations(equations: list[Equation]) -> str:
+    """Extracted display equations as text an auditor can cite by `E<n>` address."""
+    return "\n".join(
+        f"[E{eq.equation_idx}] page {eq.page}{f' ({eq.number})' if eq.number else ''} — {eq.text}"
+        for eq in equations)
+
+
 def render_sections(sections: list[Section], budget_chars: int) -> str:
     """Sections as text, each allotted an equal slice of the context budget.
 
@@ -454,7 +533,9 @@ if __name__ == "__main__":  # self-check: python -m harness.pdf <file.pdf>
     src = Path(sys.argv[1])
     pg = page_texts(src)
     secs, tbls = split_sections(pg), extract_tables(src, pg)
-    print(f"{src.name}: {len(pg)} pages, {len(secs)} sections, {len(tbls)} tables")
+    figs, eqs = extract_figures(pg), extract_equations(pg)
+    print(f"{src.name}: {len(pg)} pages, {len(secs)} sections, {len(tbls)} tables, "
+         f"{len(figs)} figure caption(s), {len(eqs)} equation(s)")
     print(f"title: {guess_title(pg)!r}")
     assert pg, "no pages extracted"
     assert secs, "no sections extracted"
@@ -463,3 +544,7 @@ if __name__ == "__main__":  # self-check: python -m harness.pdf <file.pdf>
         print(f"  §{s.section_idx} p{s.page_start}-{s.page_end} {s.title!r} ({len(s.text)} chars)")
     for t in tbls[:5]:
         print(f"  [T{t.table_idx}] p{t.page} {len(t.rows)}x{len(t.rows[0])} {t.caption[:60]!r}")
+    for fig in figs[:5]:
+        print(f"  [F{fig.figure_idx}] p{fig.page} {fig.label!r} {fig.caption[:60]!r}")
+    for eq in eqs[:5]:
+        print(f"  [E{eq.equation_idx}] p{eq.page} ({eq.number}) {eq.text[:60]!r}")

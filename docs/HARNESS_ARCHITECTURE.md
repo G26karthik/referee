@@ -152,8 +152,57 @@ provenance is invented past that point.
 ## 5. The execution boundary
 
 Everything above the boundary reasons about *whether* something should run. Below it,
-`ExecutionBackend` is six operations — `resources`, `profile`, `capability`, `provision`,
-`execute`, `cleanup` — and knows nothing about papers.
+`ExecutionBackend` knows nothing about papers.
+
+```
+                          ExecutionBackend
+              MUST  resources · capability · provision · execute · cleanup
+              MAY   profile · available · environment
+                                 │
+             ┌───────────────────┼───────────────────┐
+             ↓                   ↓                   ↓
+          Local               Kaggle               Colab
+        runnable              future               future
+```
+
+**Four operations, and they are not the same operation.** Conflating any adjacent pair is
+how a refusal becomes a verdict.
+
+| operation | function | asks | may it permit execution |
+|---|---|---|---|
+| **select** | `backends.select_for` | where *could* this run | no — matching only |
+| **authorize** | `backends.authorize` | *may* it run | **yes, and only this** |
+| **execute** | `backend.execute` | start it, collect it | no — it is handed a decision |
+| **reconcile** | `local_exec.reconcile` | does the number agree | no — arithmetic under a ceiling |
+
+The controller may request a selection. A backend may report its own capability. Neither
+may authorize, and `authorize` is a free function rather than a method for exactly that
+reason.
+
+**Seven backend states, seven names.** A generic failure here would turn a fact about the
+runner into a fact about the paper, so none of them shares a code.
+
+| state | reported as | outcome |
+|---|---|---|
+| exists and can execute | `select_for → selected`, `authorize → authorized` | may run |
+| exists, currently unreachable | `backend_unavailable` / `backend_offline` | INCONCLUSIVE — *retryable* |
+| cannot satisfy the experiment | `resources_insufficient`, `platform_incompatible` | INCONCLUSIVE |
+| needs external credentials | `credentials_unavailable` | INCONCLUSIVE |
+| provisioning failed | `env_status: failed` → `environment_incompatible` | INCONCLUSIVE |
+| the experiment ran and failed | `runtime_failure`, gated by `reached_experiment` | FAILED_REPRODUCTION |
+| the experiment ran and agreed | `failure_class: none` | RESOLVED_VERIFIED |
+
+Only the second is worth retrying, which is why it cannot share a code with the others:
+`can_execute` is a permanent property of a backend and `available()` is a property of the
+moment, and a runner that is merely down is the closest thing to a yes the registry holds.
+
+**Provisioning belongs to the backend that will run.** Acquisition happens first,
+selection second, provisioning third — because which backend will run cannot be known
+until the experiment's demand has been matched against the registry, and that needs the
+checkout. `RepoAcquisition.env_backend` records which backend built the environment, and
+it is the same one whose platform capability is then judged. An environment is only
+meaningful relative to the machine that will run in it: a venv built on this host is not
+the environment a container or a remote session would present.
 
 **`backends.authorize()` is the only function that may permit repository execution.** It
 is a free function, not a method, so a backend cannot authorize itself, and it requires
@@ -182,7 +231,9 @@ from here"* rather than a bare "no backend".
 
 Adding a real backend is registering a class and a profile. `authorize`, `reconcile`, the
 identity layer and the thresholds do not change — `assess_capability` already compares
-against the platform the *backend* reports, not the one this process runs on.
+against the platform the *backend* reports, not the one this process runs on, and
+`select_for` matches VRAM, RAM, disk, CPU, GPU count and walltime against whatever that
+profile declares.
 
 ---
 
@@ -193,6 +244,14 @@ Every process the harness starts is recorded whole, one JSON object per line, in
 anything is parsed out of it. Each `ExecutionRecord` carries the command as the backend
 received it, the working directory, the audited commit, start and end timestamps, the
 exit code, untruncated stdout and stderr, and the metric parsed from that attempt.
+
+It also carries `environment`, the backend's own account of where the process ran —
+platform, interpreter and accelerator, plus whatever session identity a remote backend
+has. On this host the hardware is implicit because there is only one; a remote run's is
+not, and a reproduction verdict from hardware nobody can identify afterwards is not
+evidence. Experiment, metric and configuration identity are NOT copied onto each record:
+they are on `spec.json`, in the same directory, and duplicating them per attempt would
+create two places for one fact to be wrong.
 
 The point is re-derivability. A reviewer who doubts a `RESOLVED_VERIFIED` can read the
 same bytes the parser read and redo the extraction by hand. Before this file existed,
@@ -224,3 +283,7 @@ experiment than the one specified.
 | an unparseable lens file counts as a lens that ran | contributes zero findings. The driver can no longer create one, but a hand-written corrupt file still reads as "this lens found nothing". |
 | the dossier writes one global path | a later smaller batch overwrites a larger earlier one unless `--out` is given. |
 | `backend.cleanup()` has no caller | provisioned environments are never removed automatically. |
+| the same paper under two filenames gets two cases | the readable id is a filename slug, so `a.pdf` and `copy-of-a.pdf` are reviewed twice rather than once. Errs toward duplicated work, never toward one paper inheriting another's evidence — the direction that matters. Detecting it needs a content-hash index across all projects. |
+| `Plan.keeps_finding` has no producer for `False` | the only synthesis template is the paper-independent placebo, which calibrates the finding it came from. The field and its guard are kept as the thing that would stop a measurement of one quantity being filed under a claim about another if a mechanism template were ever reintroduced deliberately. |
+| no backend executes remotely | the contract admits one — `provision` may return remote paths, `execute` may block on a remote job — but nothing implements it. There is no asynchronous resume: a session that dies mid-execution loses the run rather than reattaching to it. |
+| provisioning is pip inside `provision()` | a remote backend would have to stage the checkout there too. The signature allows it; no code does it. |

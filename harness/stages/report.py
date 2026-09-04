@@ -27,8 +27,10 @@ from ..artifacts import (CodeAudit, CodeAuditFinding, EvalReport, ExperimentalCh
 from ..config import Config
 from . import audit as audit_stage
 
-# Severity → rank. Also the display order of the findings table.
-_SEVERITY_RANK = {"FATAL": 2, "MAJOR": 1, "MINOR": 0}
+# Severity → rank. Also the display order of the findings table. NOTE ranks below
+# MINOR and, deliberately, is not one of the keys `overall_verdict` sums over — a NOTE
+# can be displayed but can never cross a threshold (see `harness.artifacts.SEVERITIES`).
+_SEVERITY_RANK = {"FATAL": 2, "MAJOR": 1, "MINOR": 0, "NOTE": -1}
 
 # Tiebreak only, applied AFTER severity and evidence strength. Lenses that cite the
 # paper against itself sort above lenses that argue about methodology, because an
@@ -73,17 +75,31 @@ def parse_magnitude(text: str) -> float:
         return 0.0
 
 
+def counted(f: Finding) -> str:
+    """The severity `overall_verdict` actually counts for `f`.
+
+    Falls back to the lens's own `severity` whenever `counted_severity` is empty —
+    which is exactly what makes turning grading off (or never running it) reproduce
+    the pre-grading verdict byte for byte: nothing capped it, so there is nothing to
+    fall back FROM. See `harness/grading.py:derive` for what can set it, and its one
+    safety property (`RANK[counted_severity] <= RANK[severity]` always) for why this
+    fallback can never be a promotion in disguise.
+    """
+    return f.counted_severity or f.severity
+
+
 def finding_key(f: Finding) -> tuple:
     """Lexicographic sort key, most-severe-first under `reverse=True`.
 
-    Order: severity, then evidence strength (a cited table cell beats a page
-    reference beats nothing), then whether a reproduction could settle it, then the
-    lens tiebreak, then the id so the sort is total and therefore reproducible.
+    Order: COUNTED severity (so display order matches what the verdict actually used),
+    then evidence strength (a cited table cell beats a page reference beats nothing),
+    then whether a reproduction could settle it, then the lens tiebreak, then the id so
+    the sort is total and therefore reproducible.
     """
     ref = (f.evidence_ref or "").strip()
     evidence = 2 if _CELL_REF.match(ref) else (1 if ref else 0)
     return (
-        _SEVERITY_RANK.get(f.severity, 0),
+        _SEVERITY_RANK.get(counted(f), 0),
         evidence,
         1 if f.verifiable_by_experiment else 0,
         _LENS_RANK.get(f.lens, 0),
@@ -111,12 +127,47 @@ def overall_verdict(findings: list[Finding],
     """
     if reconciliation is not None and reconciliation.status == "FAILED_REPRODUCTION":
         where = f" at {reconciliation.table_ref}" if reconciliation.table_ref else ""
-        return "RED", (f"Failed code reproduction{where}: {reconciliation.reason} The paper's own "
-                       f"code does not reproduce the number it prints, so the central claim does "
-                       f"not stand on the evidence the authors supplied.")
+        # WHO ran decides what the failure means, so the sentence is derived from
+        # provenance rather than asserted. Only `repo_exec` is the authors' own checkout;
+        # this used to claim "the paper's own code does not reproduce the number it prints"
+        # for a `driver` script the operator wrote — which the harness's own vocabulary
+        # defines as NOT the authors' code, and which `authorize` reports as
+        # `not_repo_execution`. Attributing our script's failure to them is the one
+        # accusation this system must never make by accident.
+        if reconciliation.provenance == "repo_exec":
+            blame = ("The audited repository's own code does not reproduce the number it "
+                     "prints, so the central claim does not stand on the evidence the "
+                     "authors supplied.")
+        elif reconciliation.provenance == "driver":
+            # `driver` is a human-written faithful reproduction, which the provenance ceiling
+            # deliberately admits in BOTH directions — so this verdict stands, and the
+            # sentence has to say what stands rather than disclaim it. The first version of
+            # this fix said "not established as a failure of the paper's code" while still
+            # returning RED, so the report contradicted its own verdict.
+            blame = ("The program that ran was a human-written reproduction of the paper's "
+                     "method, not the authors' checkout. Whether it is faithful is not "
+                     "machine-checked, so read the script before relying on this verdict.")
+        else:
+            blame = (f"The program that ran was '{reconciliation.provenance}', which the "
+                     f"provenance ceiling does not admit as a reproduction of a printed cell, "
+                     f"so this status should not have been reachable — treat it as a harness "
+                     f"defect rather than as evidence about the paper.")
+        return "RED", f"Failed code reproduction{where}: {reconciliation.reason} {blame}"
 
-    n = {s: sum(1 for f in findings if f.severity == s) for s in _SEVERITY_RANK}
-    per_lens = Counter(f.lens for f in findings if f.severity == "MAJOR")
+    # COUNTED severity, not the lens's raw assertion — see `counted()`. This is the
+    # whole mechanism by which independent grading can soften an over-escalated verdict:
+    # a MAJOR that a blinded second reviewer could not confirm, or that failed its own
+    # falsification check, has `counted_severity` capped below MAJOR by
+    # `harness.grading.derive`, and so does not reach these counters at all. No
+    # SEPARATE escalation precondition is layered on top of that — a second mechanism
+    # requiring, say, "the MAJORs behind a RED must be graded-confirmed" would either do
+    # nothing (when grading is off, which is the default) or silently suppress RED on
+    # every ungraded run, contradicting the one guarantee this subsystem exists to keep:
+    # turning grading off must reproduce the pre-grading verdict exactly. `counted()`
+    # already gives graded evidence the power to soften a verdict and gives ungraded
+    # evidence none — that IS the brake.
+    n = {s: sum(1 for f in findings if counted(f) == s) for s in _SEVERITY_RANK}
+    per_lens = Counter(f.lens for f in findings if counted(f) == "MAJOR")
     worst_lens, worst_n = per_lens.most_common(1)[0] if per_lens else ("", 0)
 
     if n["FATAL"] >= RED_FATAL:
@@ -135,25 +186,68 @@ def overall_verdict(findings: list[Finding],
 
 
 def severity_review(findings: list[Finding]) -> list[str]:
-    """FATAL/MAJOR findings whose evidence is not a checkable cell citation.
+    """Currently-COUNTED FATAL/MAJOR findings whose evidence is not a checkable cell
+    citation — i.e. this looks at `counted(f)`, not the lens's raw `severity`, so a
+    finding graded down below MAJOR before this runs no longer appears here even if the
+    lens itself asserted MAJOR. What remains is exactly what still carries weight in the
+    verdict on prose alone.
 
-    Severity is the one link in the chain the harness cannot check. The quote behind a
-    finding is re-verified against the parsed paper, the reasoning is labelled as
-    inference — but the GRADE is a model's word, and the grade is what `overall_verdict`
-    counts. A lens that quotes accurately and grades generously can move a paper to RED.
-
-    This FLAGS and does not demote. Demoting would change verdicts on evidence the
-    harness cannot itself assess, which is the same unearned inference it exists to catch.
-    Flagging gives an editor the list to check first and leaves the call with them.
-
-    ponytail: the ceiling is that this is advisory. Making severity earned rather than
-    asserted needs a second independent grader over the same evidence — a real subsystem,
-    and not one to build speculatively. Until then the report states the limitation.
+    This FLAGS and does not demote further. `harness.grading.derive` is where earning
+    happens now — a real subsystem, not a speculative one (see `harness/grading.py` and
+    `harness/prompts/grade.py`) — but even a blinded second reviewer is still a model,
+    and what IS machine-checked is only its citation and the derivation table, not its
+    judgement. This list is what remains for a human to check first.
     """
-    return [f"[{f.severity}] {f.finding_id or f.title[:40]} ({f.lens}) — evidence is "
+    return [f"[{counted(f)}] {f.finding_id or f.title[:40]} ({f.lens}) — evidence is "
             f"{f.evidence_class.replace('_', ' ')}, not a cited table cell"
             for f in findings
-            if f.severity in ("FATAL", "MAJOR") and f.evidence_class != "cell_verified"]
+            if counted(f) in ("FATAL", "MAJOR") and f.evidence_class != "cell_verified"]
+
+
+def grading_review(findings: list[Finding]) -> list[str]:
+    """Every finding where grading actually changed what counts — `counted(f) !=
+    f.severity`. The direct answer to "where did grading move this verdict", one line
+    per finding, naming the cap that bound it."""
+    return [f"{f.finding_id or f.title[:40]} ({f.lens}): lens asserted {f.severity}, "
+            f"counted as {counted(f)} — capped by `{f.binding_cap or 'unknown'}` "
+            f"({f.finding_class})"
+            for f in findings if f.counted_severity and f.counted_severity != f.severity]
+
+
+def verdict_sensitivity(findings: list[Finding],
+                        reconciliation: Reconciliation | None = None) -> str:
+    """The same verdict, over only the findings whose evidence is a verified table cell.
+
+    NOT a second grader and not a second opinion. It is `overall_verdict` — the identical
+    threshold table — applied to a subset of the identical findings, chosen by
+    `evidence_class`, which the harness wrote. Nothing here judges anything.
+
+    What it answers is the question `severity_review` could only gesture at. That function
+    lists the FATAL/MAJOR findings resting on prose; it cannot say whether they MATTER. On
+    the pilot corpus they do: 15 of 29 MAJOR findings are prose-backed, and for two of the
+    three papers the RED verdict becomes YELLOW without them. "Severity is not
+    machine-verified" and "this RED depends on grades that are not machine-verified" are
+    very different statements to hand an editor, and only the second is actionable.
+
+    A reproduction failure is passed through unchanged, because it is not a graded finding
+    at all — it is arithmetic against a cell, and dropping it here would report a
+    sensitivity to severity for a verdict that never depended on severity.
+    """
+    cell_backed = [f for f in findings if f.evidence_class == "cell_verified"]
+    return overall_verdict(cell_backed, reconciliation)[0]
+
+
+def verdict_if_lens_severity_only(findings: list[Finding],
+                                  reconciliation: Reconciliation | None = None) -> str:
+    """The verdict this paper would have received before independent grading existed —
+    the mirror of `verdict_sensitivity`, chosen by `counted_severity` instead of
+    `evidence_class`. Not a second opinion: `overall_verdict`, the identical threshold
+    table, over the identical findings with `counted_severity` erased so every count
+    falls back to the lens's own raw assertion. The only way a reader can see WHERE
+    grading moved a verdict, same as `verdict_if_cell_backed_only` already shows where
+    the evidence class does."""
+    lens_only = [f.model_copy(update={"counted_severity": ""}) for f in findings]
+    return overall_verdict(lens_only, reconciliation)[0]
 
 
 def build_chain(findings: list[Finding], probe: ProbeResult | None) -> ExperimentalChain | None:
@@ -245,9 +339,19 @@ def _chain_block(c: ExperimentalChain) -> list[str]:
         out += ["", f"⛔ The chain breaks at **{c.broken_link}**. Nothing after that link was "
                     f"established, so no reproduction verdict follows — this is a limit of "
                     f"what could be proven here, not a finding about the paper."]
+    elif c.reconciliation in ("RESOLVED_VERIFIED", "FAILED_REPRODUCTION"):
+        out += ["", f"🟢 Every link established, and the reconciliation reached "
+                    f"**{c.reconciliation}** — a real reproduction verdict."]
     else:
-        out += ["", "🟢 Every link established, so the reconciliation above is a real "
-                    "reproduction verdict."]
+        # No broken link is not the same as a verdict. `reconcile` refuses for reasons that
+        # break no chain link at all — a units mismatch, a zero noise band, an unparseable
+        # cell — and this branch used to print "the reconciliation above is a real
+        # reproduction verdict" over an INCONCLUSIVE, which the same file defines as
+        # "no reproduction verdict can be drawn". Complete-chain does not imply verdict.
+        out += ["", f"⚪ Every link was established, but the reconciliation is "
+                    f"**{c.reconciliation or 'not recorded'}**, so no reproduction verdict "
+                    f"follows. The chain shows the attempt was legitimate; the arithmetic "
+                    f"did not settle the cell."]
     return out
 
 
@@ -296,10 +400,23 @@ def _probe_block(p: ProbeResult) -> list[str]:
         head = (f"⚪ **Hardware Noise-Floor Calibration** (σ = {p.measured_std:.4f}, "
                 f"2σ = {p.noise_band:.4f}) — No paper-specific script evaluated.")
     elif synthesized:
-        head = {"within_noise": (f"🔴 **Synthesized mechanism probe (`{p.mechanism}`) — the effect "
-                                 f"sits INSIDE the noise band.**"),
-                "detectable": (f"🟢 **Synthesized mechanism probe (`{p.mechanism}`) — the effect "
-                               f"CLEARS the noise band.**")}.get(p.verdict, "")
+        placebo = p.mechanism == "placebo"
+        if placebo:
+            # Inverted on purpose relative to a genuine mechanism probe below: a placebo
+            # arm has no hypothesis, so its clearing the noise band is the CONCERNING
+            # result — an arbitrary perturbation moves the metric as much as the paper's
+            # claimed mechanism did — and its staying inside the band is the benign,
+            # expected one. Marking "detectable" 🟢 here read as the harness endorsing an
+            # auxiliary term with no hypothesis as if it were a positive finding.
+            head = {"within_noise": ("🟢 **Placebo control — an auxiliary term with no "
+                                     "hypothesis did NOT clear the noise band.**"),
+                    "detectable": ("⚠️ **Placebo control — an auxiliary term with no "
+                                   "hypothesis ALSO clears the noise band.**")}.get(p.verdict, "")
+        else:
+            head = {"within_noise": (f"🔴 **Synthesized mechanism probe (`{p.mechanism}`) — the effect "
+                                     f"sits INSIDE the noise band.**"),
+                    "detectable": (f"🟢 **Synthesized mechanism probe (`{p.mechanism}`) — the effect "
+                                   f"CLEARS the noise band.**")}.get(p.verdict, "")
     else:
         head = {"within_noise": "🔴 **The measured effect sits inside the noise band.**",
                 "detectable": "🟢 **The measured effect clears the noise band.**"}.get(p.verdict, "")
@@ -336,14 +453,31 @@ def _probe_block(p: ProbeResult) -> list[str]:
             out.append(f"| `{key}` | " + " | ".join(cells) + f" | {delta} |")
 
     if synthesized:
-        out += ["", f"**What authored this probe.** {p.rationale}", "",
-                f"⚠️ **This is a reimplementation, not a reproduction.** `runs/{p.paper_id}/probe.py` "
-                f"was written by the harness from the paper's own published formulation and run at "
-                f"toy scale on synthetic data. It is evidence about whether the stated mechanism "
-                f"behaves as described, and it is **not** evidence about any number printed in the "
-                f"paper's tables — those were produced at a scale and on datasets this probe does "
-                f"not touch." + (" The reconciliation below is capped at INCONCLUSIVE for that "
-                                 "reason." if p.reconciliation else "")]
+        if p.mechanism == "placebo":
+            # The placebo is the ONLY synthesized template — probe_synth.plan has no
+            # mechanism dispatch — and it is paper-independent BY CONSTRUCTION: the same
+            # script runs for every paper. Calling it "written from the paper's own
+            # published formulation" was false for every synthesized probe this harness
+            # has ever produced against a real paper.
+            out += ["", f"**What authored this probe.** {p.rationale}", "",
+                    f"⚠️ **This is a generic control, not a reproduction of the paper's "
+                    f"mechanism.** `runs/{p.paper_id}/probe.py` is a paper-independent "
+                    f"placebo control this harness runs whenever no mechanism-specific "
+                    f"template matches — it was NOT derived from this paper's formulation. "
+                    f"It measures how much an auxiliary term with no hypothesis moves the "
+                    f"metric under the same budget, and it is **not** evidence about any "
+                    f"number printed in the paper's tables, nor about the paper's own "
+                    f"claimed mechanism specifically." + (" The reconciliation below is "
+                    f"capped at INCONCLUSIVE for that reason." if p.reconciliation else "")]
+        else:
+            out += ["", f"**What authored this probe.** {p.rationale}", "",
+                    f"⚠️ **This is a reimplementation, not a reproduction.** `runs/{p.paper_id}/probe.py` "
+                    f"was written by the harness from the paper's own published formulation and run at "
+                    f"toy scale on synthetic data. It is evidence about whether the stated mechanism "
+                    f"behaves as described, and it is **not** evidence about any number printed in the "
+                    f"paper's tables — those were produced at a scale and on datasets this probe does "
+                    f"not touch." + (" The reconciliation below is capped at INCONCLUSIVE for that "
+                                     "reason." if p.reconciliation else "")]
     if calibration:
         out += ["", f"Read this as a detectability floor: on this hardware and metric, any claimed "
                     f"gain below {p.noise_band:.4f} could not be distinguished from run-to-run "
@@ -399,6 +533,39 @@ def _repo_block(a: RepoAcquisition) -> list[str]:
     out += [f"| {k} | {v} |" for k, v in rows]
     if a.reason:
         out += ["", a.reason]
+    return out
+
+
+def _runtime_block(c: CodeAudit) -> list[str]:
+    """What the checkout says it needs. Observations with citations, and nothing more.
+
+    Deliberately separate from the findings block above it, and worded so it cannot be read
+    as an accusation: these are requirements, not defects, and not one of them gates
+    execution. Six detection rules were designed for this and each was attacked; all six
+    came back saying the evidence supports an observation rather than a conclusion, so what
+    is printed is a file, a line and a verbatim token for a human to judge.
+    """
+    if c.skipped or not c.declarations_scanned:
+        return []
+    if not c.runtime:
+        return [f"⚪ **No runtime demand declared** in {len(c.declarations_scanned)} "
+                f"declaration file(s). Absence of a declaration, not evidence that the "
+                f"experiment needs nothing."]
+    by_kind: dict[str, list] = {}
+    for d in c.runtime:
+        by_kind.setdefault(d.kind, []).append(d)
+    out = [f"Read out of {len(c.declarations_scanned)} declaration file(s) and "
+           f"{c.files_scanned} Python file(s). **None of this gates execution** — a demand "
+           f"here can neither permit a reproduction nor refuse one.", ""]
+    for kind in sorted(by_kind):
+        rows = by_kind[kind]
+        out.append(f"- **{kind.replace('_', ' ')}** ({len(rows)})")
+        for d in rows[:4]:
+            where = f"`{d.file}:{d.line}`" if d.line else f"`{d.file}`"
+            value = f" `{_cell(d.value, 70)}`" if d.value else ""
+            out.append(f"  - {d.state} · {d.scope} · {where}{value}")
+        if len(rows) > 4:
+            out.append(f"  - _…and {len(rows) - 4} more._")
     return out
 
 
@@ -469,32 +636,48 @@ def render_eval_report(r: EvalReport) -> str:
     badge = {"RED": "🔴 REJECT / RED FLAG",
              "YELLOW": "🟡 BORDERLINE",
              "GREEN": "🟢 PASS"}.get(r.verdict, r.verdict)
-    counts = {s: sum(1 for f in r.findings if f.severity == s) for s in _SEVERITY_RANK}
+    counts = {s: sum(1 for f in r.findings if counted(f) == s) for s in _SEVERITY_RANK}
+    lens_counts = {s: sum(1 for f in r.findings if f.severity == s) for s in _SEVERITY_RANK}
+    graded_delta = counts != lens_counts
 
     L = [
         f"# First-Round Review — {r.title or r.paper_id}",
         "",
         f"**Verdict: {badge}**",
+    ]
+    if r.verdict_contested:
+        L += ["", f"🚩 **CONTESTED** — the independent substantive read below "
+                 f"(`{r.substantive_verdict.verdict if r.substantive_verdict else ''}`) disagrees "
+                 f"sharply with this deterministic verdict. Neither is overruled; this needs a "
+                 f"human look before the verdict above is relied on as-is."]
+    L += [
         "",
         f"> {r.verdict_reason}",
         "",
         f"`{r.paper_id}` · {r.n_pages} pages · {r.n_sections} sections · {r.n_tables} tables · "
         f"{r.n_numbers} reported numbers",
         f"Lenses run: {', '.join(r.lenses_run) or '(none)'} · "
-        f"Findings: {counts['FATAL']} FATAL / {counts['MAJOR']} MAJOR / {counts['MINOR']} MINOR"
+        f"Counted: {counts['FATAL']} FATAL / {counts['MAJOR']} MAJOR / {counts['MINOR']} MINOR"
+        + (f" · lens-asserted: {lens_counts['FATAL']} FATAL / {lens_counts['MAJOR']} MAJOR / "
+           f"{lens_counts['MINOR']} MINOR" if graded_delta else "")
         + (f" · {r.dropped_findings} dropped as unsubstantiated" if r.dropped_findings else ""),
         "",
         "## Critical validity threats",
         "",
     ]
 
-    threats = [f for f in ranked if f.severity in ("FATAL", "MAJOR")]
+    # COUNTED, not asserted — a MAJOR a grader could not confirm no longer belongs among
+    # "critical" threats even though the lens still says MAJOR on its own file.
+    threats = [f for f in ranked if counted(f) in ("FATAL", "MAJOR")]
     if not threats:
         L.append("None. No finding rises above MINOR.")
     else:
         for f in threats[:MAX_THREAT_BULLETS]:
             where = f" — `{f.evidence_ref}`" if f.evidence_ref else ""
-            L.append(f"- **[{f.severity}] {f.title}**{where}")
+            conf = f" ({f.confidence} confidence)" if f.confidence else ""
+            sev_label = (f"{counted(f)} (lens asserted {f.severity})"
+                        if f.counted_severity and f.counted_severity != f.severity else f.severity)
+            L.append(f"- **[{sev_label}] {f.title}**{conf}{where}")
             # Evidence and inference are printed as separate, labelled lines. They are
             # different kinds of thing: the quote and the observation were checked by the
             # harness against the parsed paper, and the reasoning is a model's argument
@@ -505,6 +688,13 @@ def render_eval_report(r: EvalReport) -> str:
                          f"{_cell(f.verified_observation, 260)}")
             L.append(f"  🧠 *Inference (model reasoning, not verified):* "
                      f"{_cell(f.as_reasoning(), 400)}")
+            if f.alternative_interpretation:
+                L.append(f"  🔍 *Falsification attempted (not verified):* "
+                         f"{_cell(f.alternative_interpretation, 300)}"
+                         + (f" — did not resolve it: {_cell(f.why_alternative_fails, 200)}"
+                            if f.why_alternative_fails else ""))
+            if f.steelman:
+                L.append(f"  🛡 *Steelman (not verified):* {_cell(f.steelman, 300)}")
             if f.counter_explanations:
                 L.append(f"  Alternative explanation: {_cell(f.counter_explanations[0], 200)}")
         if len(threats) > MAX_THREAT_BULLETS:
@@ -512,12 +702,85 @@ def render_eval_report(r: EvalReport) -> str:
                      f"FATAL/MAJOR finding(s) — see the table below._")
     L.append("")
 
+    questions = [f for f in ranked if f.finding_class == "OPEN_QUESTION"
+                or (f.finding_class == "UNGRADED" and f.candidate_class == "OPEN_QUESTION")]
+    if questions:
+        L += ["## Open review questions", "",
+              "Questions a reviewer should ask, not evidence of a flaw — these count "
+              "toward no threshold.", ""]
+        for f in questions[:MAX_THREAT_BULLETS]:
+            L.append(f"- {_cell(f.title or f.statement, 200)}")
+        L.append("")
+
+    refuted = [f for f in ranked if f.finding_class == "REFUTED"]
+    if refuted:
+        L += ["## Refuted candidates", "",
+              "A blinded second reviewer specifically refuted these — withdrawn, not "
+              "deleted, so the accusation and its refutation both stay visible.", ""]
+        for f in refuted[:MAX_THREAT_BULLETS]:
+            reason = f.grade.falsification if f.grade else ""
+            L.append(f"- **{f.title}** (lens asserted {f.severity}) — "
+                     f"{_cell(reason, 240) or 'no reason recorded'}")
+        L.append("")
+
+    if r.grade_coverage.get("candidates"):
+        graded_findings = [f for f in ranked if f.grade_state == "graded"]
+        L += ["## Independent grading", "",
+              f"{r.grade_coverage.get('graded', 0)} of {r.grade_coverage.get('candidates', 0)} "
+              f"serious candidate(s) independently graded by a second, blinded reviewer that saw "
+              f"none of: the lens's severity, the lens's name, any other finding, or how findings "
+              f"are counted (see `harness/prompts/grade.py`).", ""]
+        if r.verdict_if_lens_severity_only and r.verdict_if_lens_severity_only != r.verdict:
+            L += [f"**Grading moved this verdict.** On the lenses' own asserted severities alone, "
+                  f"the same threshold table would have yielded "
+                  f"**{r.verdict_if_lens_severity_only}** rather than **{r.verdict}**.", ""]
+        moved = grading_review(r.findings)
+        for line in moved[:MAX_THREAT_BULLETS]:
+            L.append(f"- {line}")
+        if moved:
+            L.append("")
+        for f in graded_findings[:MAX_THREAT_BULLETS]:
+            g = f.grade
+            if g is None:
+                continue
+            L.append(f"- `{f.finding_id}` grader verdict **{g.verdict}** / {g.severity} / "
+                     f"{g.confidence} confidence → counted {counted(f)}")
+            if g.falsification:
+                L.append(f"  🔍 *Grader falsification (not verified):* {_cell(g.falsification, 260)}")
+            if g.steelman:
+                L.append(f"  🛡 *Grader steelman (not verified):* {_cell(g.steelman, 260)}")
+            if g.impact_statement:
+                L.append(f"  🧠 *Grader impact statement (not verified):* {_cell(g.impact_statement, 260)}")
+            if g.independent_evidence_quote:
+                label = "✅ *Verified*" if f.grader_evidence_class != "unverified" else "⚠️ *Unverified*"
+                L.append(f"  {label} ({f.grader_evidence_class}): grader cited "
+                         f"`{g.independent_evidence_ref}` — {_cell(f.grader_verified_observation or g.independent_evidence_quote, 220)}")
+        L.append("")
+    elif r.grade_coverage:
+        L += ["## Independent grading", "",
+              "Grading is off (`SH_ALLOW_GRADING`). Severity is lens-asserted and is what "
+              "this verdict counts.", ""]
+
+    if r.substantive_verdict:
+        sv = r.substantive_verdict
+        L += ["## Substantive read (model opinion, not counted)", "",
+              f"**{sv.verdict}** ({sv.weaknesses_are or 'scope unstated'}) — agreement with the "
+              f"deterministic verdict: `{r.verdict_agreement}`.", "",
+              f"> {_cell(sv.reason, 500)}", ""]
+        if sv.strongest_contribution:
+            L.append(f"- Strongest contribution: {_cell(sv.strongest_contribution, 200)}")
+        if sv.weakest_link:
+            L.append(f"- Weakest link: {_cell(sv.weakest_link, 200)}")
+        L.append("")
+
     if r.probe:
         L += [f"## {_probe_heading(r.probe)}", "", *_probe_block(r.probe), ""]
         if r.probe.repo is not None:
             L += ["## Code acquisition", "", *_repo_block(r.probe.repo), ""]
         if r.probe.code_audit is not None:
             L += ["## Static code audit", "", *_code_audit_block(r.probe.code_audit), ""]
+            if runtime := _runtime_block(r.probe.code_audit):
+                L += ["## Declared runtime demands", "", *runtime, ""]
         if r.probe.reconciliation is not None:
             L += ["## Table-cell reconciliation", "",
                   *_reconciliation_block(r.probe.reconciliation), ""]
@@ -534,16 +797,38 @@ def render_eval_report(r: EvalReport) -> str:
               f"counts \u2014 check these first:", ""]
         L += [f"- {u}" for u in ungraded]
         L += [""]
+        # How much the verdict actually leans on those grades. The same threshold table
+        # over the cell-verified findings alone — no second judgement, no demotion.
+        if r.verdict_if_cell_backed_only and r.verdict_if_cell_backed_only != r.verdict:
+            L += [f"**This verdict depends on them.** Counting only findings whose evidence is a "
+                  f"verified table cell, the same threshold table yields "
+                  f"**{r.verdict_if_cell_backed_only}** rather than **{r.verdict}**. The "
+                  f"difference is carried entirely by grades the harness cannot check.", ""]
+        elif r.verdict_if_cell_backed_only:
+            L += [f"The verdict does not depend on them: counting only cell-verified findings, the "
+                  f"same threshold table still yields **{r.verdict_if_cell_backed_only}**.", ""]
 
-    L += ["## The unasked obvious question", "",
-          r.unasked_question or "_No lens identified a conspicuously missing comparison._", ""]
+    # Blockquoted, not interpolated bare: this is the one lens-supplied field the schema
+    # invites to be a paragraph or two, so it cannot be collapsed to one line the way
+    # `title` and `finding_id` are — but a bare embed lets a line starting with '#' forge
+    # a heading, or a stray ``` open an unclosed code fence that swallows the rest of the
+    # report. A blockquote renders every line as quoted prose regardless of what it starts
+    # with, which neutralises both without touching legitimate multi-paragraph text.
+    L += ["## The unasked obvious question", ""]
+    if r.unasked_question.strip():
+        L += ["> " + ln for ln in r.unasked_question.strip().splitlines()]
+    else:
+        L.append("_No lens identified a conspicuously missing comparison._")
+    L.append("")
 
     L += ["## Audit lens findings", "",
           "| Severity | Lens | Target | Finding | Evidence |",
           "|---|---|---|---|---|"]
     for f in ranked[:MAX_TABLE_ROWS]:
+        sev_cell = (f"{counted(f)} (was {f.severity})"
+                   if f.counted_severity and f.counted_severity != f.severity else f.severity)
         L.append(
-            f"| {f.severity} | {f.lens} | {_cell(f.target, 60) or '—'} | "
+            f"| {sev_cell} | {f.lens} | {_cell(f.target, 60) or '—'} | "
             f"{_cell(f.title, 110)} | {_cell(f.evidence_ref, 24) or '—'} |"
         )
     if not ranked:
@@ -571,24 +856,75 @@ def run_report(cfg: Config, pid: str) -> dict:
 
     # Verified load: a finding whose evidence is not really in the paper is dropped
     # here, whoever wrote it. The driver is a language model; the harness checks.
-    reports, dropped = audit_stage.load_reports(cfg, pid, doc)
+    reports, dropped, invalid = audit_stage.load_reports(cfg, pid, doc)
     if not reports:
         return {"error": f"no audit lenses have run for '{pid}' — run audit_paper first, "
                          f"then write audit/<lens>.json for each prompt"}
+    if invalid:
+        # C9 — a missing, unparseable, empty, `null`, or malformed lens file must never
+        # render as "ran clean, zero findings". Refused the same way `not reports` is:
+        # no report is written, and the caller is told exactly which lens(es) to redo.
+        # This guard stands even when `run_report` is invoked directly (the CLI path, or
+        # a script), independent of whether the controller's own `collect` gate ran first.
+        return {"error": f"{len(invalid)} lens(es) produced no usable result for '{pid}' and "
+                         f"cannot be counted as run: {', '.join(invalid)}. Write a valid "
+                         f"audit/<lens>.json for each, then re-run synthesize_report."}
     state.set_phase(cfg, pid, "report")
 
     probe_path = root / "runs" / pid / "probe_results.json"
     probe = ProbeResult(**state.read_json(probe_path)) if probe_path.exists() else None
 
+    # Local import: `stages.grade` imports `rank` from this module, so a module-level
+    # import here would be a cycle. By the time `run_report` is actually CALLED both
+    # modules are fully loaded, so the cycle only exists at parse time, not at call time.
+    from . import grade as grade_stage
+    grade_stage.attach(cfg, pid, doc, reports)     # in-place: sets counted_severity etc.
+    coverage = grade_stage.coverage(cfg, pid)
+    if "error" in coverage:
+        coverage = {"paper_id": pid, "candidates": 0, "graded": 0, "pending": 0}
+
     findings = rank([f for r in reports for f in r.findings])
-    verdict, reason = overall_verdict(findings, probe.reconciliation if probe else None)
+    rec = probe.reconciliation if probe else None
+    verdict, reason = overall_verdict(findings, rec)
+
+    substantive = None
+    from .. import verdict_driver
+    ok, _why = verdict_driver.available(cfg)
+    if ok:
+        findings_summary = "\n".join(
+            f"- [{counted(f)}] ({f.lens}) {f.title}: {f.statement}" for f in findings[:30])
+        grading_summary = (f"{coverage['graded']} of {coverage['candidates']} candidate(s) "
+                           f"independently graded.")
+        probe_summary = probe.reason if probe else ""
+        from ..prompts import verdict as verdict_prompts
+        substantive = verdict_driver.run(
+            cfg, verdict_prompts.build(doc.title, findings_summary, grading_summary, probe_summary),
+            timeout_s=cfg.verdict_timeout_s)
+
+    agreement, contested = "unavailable", False
+    if substantive is not None:
+        soft = verdict in ("GREEN", "YELLOW")
+        if substantive.verdict == "CENTRAL_CLAIM_NOT_ESTABLISHED" and soft:
+            agreement, contested = "contested", True
+        elif substantive.verdict in ("STRONG", "SOUND_WITH_MINOR_CONCERNS") and verdict == "RED":
+            agreement = "harness_harsher"
+        elif substantive.verdict in ("SUBSTANTIAL_CONCERNS", "CENTRAL_CLAIM_NOT_ESTABLISHED") \
+                and verdict == "GREEN":
+            agreement = "model_harsher"
+        else:
+            agreement = "agree"
+
     report = EvalReport(
         paper_id=pid, title=doc.title, verdict=verdict, verdict_reason=reason,
+        verdict_if_cell_backed_only=verdict_sensitivity(findings, rec),
+        verdict_if_lens_severity_only=verdict_if_lens_severity_only(findings, rec),
         findings=findings, unasked_question=pick_unasked_question(reports),
         n_pages=doc.n_pages, n_sections=len(doc.sections), n_tables=len(doc.tables),
         n_numbers=len(doc.reported_numbers),
         lenses_run=[r.lens for r in reports], dropped_findings=dropped, probe=probe,
         experimental_chain=build_chain(findings, probe),
+        grade_coverage={k: v for k, v in coverage.items() if k != "paper_id"},
+        substantive_verdict=substantive, verdict_agreement=agreement, verdict_contested=contested,
     )
 
     md_path, json_path = root / "reports" / f"{pid}.md", root / "reports" / f"{pid}.json"
@@ -598,14 +934,16 @@ def run_report(cfg: Config, pid: str) -> dict:
     state.append_log(
         cfg, pid, artifact_type="eval_report", phase="report",
         headers={"verdict": verdict, "findings": len(findings), "dropped": dropped,
-                 "severities": {s: sum(1 for f in findings if f.severity == s) for s in _SEVERITY_RANK},
-                 "lenses": report.lenses_run, "probe": probe.verdict if probe else None},
+                 "severities": {s: sum(1 for f in findings if counted(f) == s) for s in _SEVERITY_RANK},
+                 "lenses": report.lenses_run, "probe": probe.verdict if probe else None,
+                 "grade_coverage": report.grade_coverage, "verdict_contested": contested},
         path=str(md_path),
     )
     return {"paper_id": pid, "verdict": verdict, "reason": reason,
             "findings": len(findings), "dropped_unsubstantiated": dropped,
             "lenses": report.lenses_run, "probe": probe.verdict if probe else None,
-            "report_md": str(md_path), "report": f"reports/{pid}.json"}
+            "report_md": str(md_path), "report": f"reports/{pid}.json",
+            "verdict_contested": contested}
 
 
 if __name__ == "__main__":  # self-check: python -m harness.stages.report

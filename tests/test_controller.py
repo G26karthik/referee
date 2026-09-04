@@ -67,12 +67,15 @@ def _plant(cfg: Config, pid: str = PID, doc: PaperDoc | None = None) -> str:
 
 def _lens(cfg: Config, pid: str, lens: str, *, quote="91.4", ref="T0:r1:c1",
           severity="MINOR", verifiable=False, findings=None) -> None:
-    from harness import state
+    """Writes a lens result the way a HAND-WRITTEN one is expected to arrive: through
+    `accept_lens`, which is the only path that leaves the `.driver.json` provenance
+    sidecar `lens_is_accepted` now requires — see that function's docstring for why a
+    file dropped directly onto disk must not be picked up as a completed lens."""
     body = {"lens": lens, "findings": findings if findings is not None else [{
         "finding_id": f"{lens}-01", "severity": severity, "title": f"{lens} title",
         "statement": "a defect", "evidence_quote": quote, "evidence_ref": ref,
         "verifiable_by_experiment": verifiable}]}
-    state.write_json(cfg.projects_dir / pid / "audit" / f"{lens}.json", body)
+    audit_stage.accept_lens(cfg, pid, lens, json.dumps(body))
 
 
 def _all_lenses(cfg: Config, pid: str, **kw) -> None:
@@ -89,13 +92,15 @@ def cfg(tmp_path: Path) -> Config:
 # The machine
 # --------------------------------------------------------------------------- #
 def test_the_phase_order_is_the_pipeline():
-    assert PHASES == ("ingest", "audit", "collect", "probe", "report", "done")
+    assert PHASES == ("ingest", "audit", "collect", "grade", "probe", "report", "done")
 
 
 def test_only_a_delegated_lens_may_be_retried():
     """The retry policy IS the safety property. Re-running a deterministic refusal is
-    asking a gate the same question until it answers differently."""
-    assert RETRYABLE == ("audit",)
+    asking a gate the same question until it answers differently. A delegated GRADE
+    joins a delegated lens for the identical reason: a rate-limited or transiently
+    failed grader may well succeed on the same candidate a second time."""
+    assert RETRYABLE == ("audit", "grade")
 
 
 def test_a_case_persists_its_position(cfg: Config):
@@ -152,7 +157,8 @@ def test_the_pipeline_runs_to_a_report_once_every_lens_has_a_result(cfg: Config)
     _all_lenses(cfg, PID)
     case = drive(cfg, open_case(cfg, PID), skip_probe=True)
     assert case.status == "complete"
-    assert [e.phase for e in case.history] == ["ingest", "audit", "collect", "probe", "report"]
+    assert [e.phase for e in case.history] == [
+        "ingest", "audit", "collect", "grade", "probe", "report"]
     assert case.verdict in ("RED", "YELLOW", "GREEN")
     assert Path(case.report_path).is_file()
 
@@ -182,7 +188,7 @@ def test_zero_lens_output_is_an_error_not_a_clean_paper(cfg: Config, monkeypatch
     """An empty panel must never reach the report stage. A review with no findings and no
     lenses is indistinguishable in the output from a paper nobody could fault."""
     _plant(cfg)
-    monkeypatch.setattr(audit_stage, "load_reports", lambda *a, **k: ([], 0))
+    monkeypatch.setattr(audit_stage, "load_reports", lambda *a, **k: ([], 0, []))
     _all_lenses(cfg, PID)
     case = drive(cfg, open_case(cfg, PID), skip_probe=True)
     assert case.status == "error"
@@ -192,14 +198,40 @@ def test_zero_lens_output_is_an_error_not_a_clean_paper(cfg: Config, monkeypatch
 # --------------------------------------------------------------------------- #
 # Audit collection, malformed output, retries
 # --------------------------------------------------------------------------- #
-def test_a_malformed_lens_file_does_not_sink_the_panel(cfg: Config):
+def test_a_malformed_lens_file_blocks_collection_rather_than_faking_a_clean_run(cfg: Config):
+    """C9 — SUPERSEDED by the correction pass. This asserted the opposite: that a
+    malformed lens file "does not sink the panel" and the case still reaches `complete`.
+
+    That let a `{not json` file — indistinguishable from a lens that ran and found
+    nothing — flow straight into a GREEN report. `collect` now refuses to advance while
+    any lens is missing or invalid, the same resumable `waiting` state a pending lens
+    already used; nothing here is a hard failure, because rewriting the one bad file is
+    exactly what lets the case proceed.
+    """
     _plant(cfg)
     _all_lenses(cfg, PID)
-    (cfg.projects_dir / PID / "audit" / "protocol.json").write_text("{not json",
-                                                                    encoding="utf-8")
+    lens_path = cfg.projects_dir / PID / "audit" / "protocol.json"
+    lens_path.write_text("{not json", encoding="utf-8")
+    # Keep the provenance sidecar's content hash in sync with the corrupted bytes, so
+    # `lens_is_accepted` still passes and it is `load_reports`'s OWN json.loads guard
+    # under test here — not the (separate, earlier) provenance seal, which a byte
+    # corrupted after real acceptance would otherwise trip first.
+    import hashlib
+    sidecar = lens_path.with_suffix(".driver.json")
+    rec = json.loads(sidecar.read_text(encoding="utf-8"))
+    rec["content_sha256"] = hashlib.sha256(lens_path.read_bytes()).hexdigest()
+    sidecar.write_text(json.dumps(rec), encoding="utf-8")
     case = drive(cfg, open_case(cfg, PID), skip_probe=True)
-    assert case.status == "complete", case.blocked_reason
+    assert case.status == "waiting", case.blocked_reason
+    assert "protocol" in case.blocked_reason
     collect = next(e for e in case.history if e.phase == "collect")
+    assert collect.detail["invalid"] == ["protocol"]
+
+    # Rewriting the bad file with a valid one and re-driving completes the review.
+    _lens(cfg, PID, "protocol")
+    case = drive(cfg, case, skip_probe=True)
+    assert case.status == "complete", case.blocked_reason
+    collect = next(e for e in reversed(case.history) if e.phase == "collect")
     assert "protocol" in collect.detail["lenses"], "the lens is reported as having run"
 
 
@@ -218,9 +250,10 @@ def test_a_reviewer_that_fails_is_retried_up_to_the_bound(cfg: Config, monkeypat
     cfg.allow_auto_audit, cfg.audit_cmd, cfg.audit_retries = True, "x {prompt} {out}", 2
     calls = {"n": 0}
 
-    def always_fails(cfg_, pid, awaiting, prompts):
+    def always_fails(cfg_, pid, awaiting, prompts, **kw):
         calls["n"] += 1
-        return {"filled": [], "failed": {ln: "reviewer exploded" for ln in awaiting}}
+        return {"filled": [], "failed": {ln: "reviewer exploded" for ln in awaiting},
+                "rate_limited": {}}
 
     monkeypatch.setattr(audit_driver, "fill", always_fails)
     case = drive(cfg, open_case(cfg, PID), auto_audit=True)
@@ -233,7 +266,7 @@ def test_retry_exhaustion_is_recorded_rather_than_silent(cfg: Config, monkeypatc
     _plant(cfg)
     cfg.allow_auto_audit, cfg.audit_cmd, cfg.audit_retries = True, "x {prompt} {out}", 1
     monkeypatch.setattr(audit_driver, "fill", lambda *a, **k: {
-        "filled": [], "failed": {"overclaim": "timed out after 900s"}})
+        "filled": [], "failed": {"overclaim": "timed out after 900s"}, "rate_limited": {}})
     case = drive(cfg, open_case(cfg, PID), auto_audit=True)
     assert "timed out" in case.blocked_reason
     outcomes = [e.outcome for e in case.history if e.phase == "audit"]
@@ -244,10 +277,10 @@ def test_a_reviewer_that_partly_succeeds_keeps_what_worked(cfg: Config, monkeypa
     _plant(cfg)
     cfg.allow_auto_audit, cfg.audit_cmd, cfg.audit_retries = True, "x {prompt} {out}", 0
 
-    def fills_all(cfg_, pid, awaiting, prompts):
+    def fills_all(cfg_, pid, awaiting, prompts, **kw):
         for lens in awaiting:
             _lens(cfg_, pid, lens)
-        return {"filled": list(awaiting), "failed": {}}
+        return {"filled": list(awaiting), "failed": {}, "rate_limited": {}}
 
     monkeypatch.setattr(audit_driver, "fill", fills_all)
     case = drive(cfg, open_case(cfg, PID), auto_audit=True, skip_probe=True)
@@ -401,7 +434,7 @@ def test_a_non_retryable_phase_asking_to_retry_is_refused(cfg: Config):
     try:
         out = step(cfg, case)
         assert out.status == "waiting"
-        assert "only audit may be re-attempted" in out.blocked_reason.replace(", ", " ")
+        assert "only audit, grade may be re-attempted" in out.blocked_reason
     finally:
         controller._HANDLERS["collect"] = controller._phase_collect
 

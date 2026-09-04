@@ -75,11 +75,48 @@ class Section(_Base):
     text: str = ""
 
 
-class PaperDoc(_Base):
-    """The ONLY representation of the paper that crosses into the audit stage.
+class Figure(_Base):
+    """One extracted figure CAPTION — never the figure's plotted content, which this
+    harness has no way to read. `ref()` is what `verify_evidence` matches against; the
+    evidence class it earns (`caption_verified`) is capped at NOTE in
+    `harness.grading.EVIDENCE_CEILING` for exactly that reason: a caption NAMES a
+    figure, it does not report the values in it."""
 
-    Nothing downstream re-opens the PDF, which is exactly what lets every auditor
-    run with `allowed_tools=[]`.
+    figure_idx: int
+    page: int = 0
+    label: str = ""
+    caption: str = ""
+
+    def ref(self) -> str:
+        return f"F{self.figure_idx}"
+
+
+class Equation(_Base):
+    """One extracted display equation. Text-only and lossy by construction — symbols,
+    sub/superscripts and inline math routinely survive PDF extraction mangled or
+    missing — so its evidence class (`equation_verified`) is capped at MINOR, not
+    trusted the way a table cell is."""
+
+    equation_idx: int
+    page: int = 0
+    number: str = ""
+    text: str = ""
+
+    def ref(self) -> str:
+        return f"E{self.equation_idx}"
+
+
+class PaperDoc(_Base):
+    """The parsed representation of the paper — sections, tables, numbers — and the
+    ONLY thing a finding's evidence can be verified against.
+
+    `source_path` is also handed to the reviewer, which MAY open the original PDF to
+    settle a table/figure/equation-dependent ambiguity extraction can lose (see
+    `SOURCE_FIDELITY` in `harness/prompts/audit.py`). That is deliberately admissible
+    only to KILL a candidate or point at the right unit to cite — never to BE the
+    evidence: `verify_evidence` still only accepts a quote it can re-check against this
+    parsed document, so what the reviewer merely SAW in the PDF can never earn a
+    verdict-moving severity on its own.
     """
 
     paper_id: str
@@ -95,6 +132,8 @@ class PaperDoc(_Base):
     n_pages: int = 0
     sections: list[Section] = Field(default_factory=list)
     tables: list[Table] = Field(default_factory=list)
+    figures: list[Figure] = Field(default_factory=list)
+    equations: list[Equation] = Field(default_factory=list)
     reported_numbers: list[QuantFinding] = Field(default_factory=list)
     repo_url: str = Field(
         default="", description="the official code repository the paper advertises ('' = none found)"
@@ -108,19 +147,113 @@ class PaperDoc(_Base):
 # --------------------------------------------------------------------------- #
 # ② AUDIT (S2)
 # --------------------------------------------------------------------------- #
-SEVERITIES = ("FATAL", "MAJOR", "MINOR")
+# NOTE is not a defect grade. It exists so a candidate that survived verification but
+# carries no threat to any claim (an open question, a figure-only observation, a
+# non-degenerate-but-inconsequential concern) can be PRINTED without being COUNTED —
+# `_SEVERITY_RANK` in `stages/report.py` deliberately has no "NOTE" key in the counting
+# dict, so it can never cross a threshold, only display below MINOR.
+SEVERITIES = ("FATAL", "MAJOR", "MINOR", "NOTE")
 
+# Confidence is a SEPARATE axis from severity — "how sure am I", not "how bad is it".
+# A HIGH-confidence MINOR and a LOW-confidence FATAL are both coherent; the ceiling a
+# grader's confidence places on `counted_severity` lives in `harness/grading.py`.
+CONFIDENCES = ("HIGH", "MEDIUM", "LOW")
+
+# The three-way, non-collapsible bucket a lens must sort its own candidate into. Only
+# CONFIRMED_FINDING is eligible to carry FATAL/MAJOR once graded; a PLAUSIBLE_CONCERN or
+# OPEN_QUESTION is printed but counts toward no threshold. See `FINDING_CLASSES` below
+# for the harness-derived analogue, which additionally distinguishes REFUTED/UNGRADED.
+CANDIDATE_CLASSES = ("CONFIRMED_FINDING", "PLAUSIBLE_CONCERN", "OPEN_QUESTION")
+
+# What KIND of numeric discrepancy this is, once recomputed — these are not equivalent,
+# and only GENUINE_CONTRADICTION is evidence of a defect; the others are usually not.
+DISCREPANCY_TYPES = ("ARITHMETIC_ERROR", "DEFINITIONAL_MISMATCH", "DIFFERENT_DENOMINATOR",
+                     "UNCLEAR_REPORTING", "GENUINE_CONTRADICTION", "NOT_A_DISCREPANCY",
+                     "NOT_APPLICABLE")
+
+# Where a finding's evidence comes FROM — derived by the harness from the shape of
+# `evidence_ref`, never trusted from the lens (a lens calling its own citation
+# PAPER_TABLE when it cited a page is confused about what it cited, not authoritative
+# about it). EXTERNAL_LITERATURE and REVIEWER_INFERENCE never anchor a finding's
+# primary evidence — invariant #1 already drops any finding with no in-paper quote.
+EVIDENCE_ORIGINS = ("PAPER_TABLE", "PAPER_TEXT", "PAPER_FIGURE", "PAPER_EQUATION",
+                    "EXTERNAL_LITERATURE", "REVIEWER_INFERENCE")
 
 # How strongly a finding's evidence was checked. Computed by the harness in
 # `stages/audit._substantiated` — NEVER read from the lens file. The distinction this
 # encodes is the one the report has to preserve: a cell citation is checkable in seconds
-# by anyone holding the paper, a prose quote is checkable with a search, and everything
-# else is a model's word for it.
+# by anyone holding the paper, a prose quote is checkable with a search, a caption names
+# a figure without reporting its plotted values, an equation is lossy-extracted, and
+# everything else is a model's word for it.
 EVIDENCE_CLASSES = (
-    "cell_verified",   # evidence_ref named a cell and that cell's contents match the quote
-    "prose_verified",  # the quote was found verbatim in the parsed section text at a page ref
-    "unverified",      # neither — such findings are dropped, so this should never reach a report
+    "cell_verified",     # evidence_ref named a cell and that cell's contents match the quote
+    "prose_verified",    # the quote was found verbatim in the parsed section text at a page ref
+    "caption_verified",  # the quote was found verbatim in a figure caption
+    "equation_verified",  # the quote was found verbatim in an extracted display equation
+    "unverified",        # none of the above — such findings are dropped, never reach a report
 )
+
+# Whether the lens's own falsification/steelman work is present and non-degenerate.
+# "legacy" is not a defect either — it means the file predates `schema_version: 2`, so
+# capping it would silently erase evidence a schema change should never be able to erase
+# (see `tests/test_finding_traceability.py:170-183` for the identical guarantee made
+# about an earlier split). Computed by `harness.grading.pass_b_state`.
+VERIFICATION_STATES = ("complete", "incomplete", "legacy")
+
+# The outcome of independently re-doing a lens's own arithmetic (`independent_calculation`)
+# through `harness.grading.recheck_calculation`. Distinguishes "the lens's math is wrong"
+# from "the lens's math is right but its operands are not really in the paper" from
+# "the lens made no calculation to check" — these are not equivalent conclusions.
+CALC_CLASSES = ("recomputed_ok", "recomputed_mismatch", "operands_unverified",
+                "unparseable", "not_applicable", "not_attempted")
+
+# --- the independent grader (Stage 3) ---------------------------------------------- #
+# A grader's verdict on ONE candidate finding it was shown blinded — no lens name, no
+# severity, no other finding, no threshold. See `harness/grading.py` for how these
+# combine into `Finding.counted_severity`, the field the verdict actually counts.
+GRADE_VERDICTS = ("CONFIRMED", "PLAUSIBLE", "REFUTED", "INSUFFICIENT")
+GRADE_SEVERITIES = ("FATAL", "MAJOR", "MINOR", "NONE")
+RESOLUTIONS = ("COUNT_AS_FINDING", "REPORT_AS_CONCERN", "REPORT_AS_QUESTION", "DROP")
+
+# The harness-derived, five-way analogue of `CANDIDATE_CLASSES`: REFUTED and UNGRADED are
+# facts about the GRADING PROCESS, not buckets a lens could ever put itself in.
+FINDING_CLASSES = ("CONFIRMED_FINDING", "PLAUSIBLE_CONCERN", "OPEN_QUESTION",
+                   "REFUTED", "UNGRADED")
+
+
+class Grade(_Base):
+    """A second, blinded reviewer's independent read of ONE candidate finding.
+
+    Every field here is a MODEL'S CLAIM, exactly as `Finding.severity` is — nothing on
+    this model is harness-written, which is what makes the invariant-#2 test for the
+    grader trivial to state: a `Grade` that round-trips through `_coerce` unchanged is
+    correct behaviour, because nothing on it needs overwriting. What the harness DOES
+    write, from this plus the candidate's own evidence, lives back on `Finding`:
+    `finding_class`, `counted_severity`, `grade_state`, `binding_cap`, `derivation`,
+    `grader_evidence_class`, `grader_verified_observation` — see `harness/grading.py`.
+    """
+
+    verdict: str = Field(default="", description=" | ".join(GRADE_VERDICTS))
+    severity: str = Field(default="", description="the GRADER's own impact grade: "
+                                                   + " | ".join(GRADE_SEVERITIES))
+    confidence: str = Field(default="", description=" | ".join(CONFIDENCES))
+    impact_statement: str = Field(default="", description="what breaks in the paper's argument if "
+                                                           "this candidate is right")
+    falsification: str = Field(default="", description="the most reasonable reading under which "
+                                                        "this is NOT a problem")
+    falsification_survived: bool = False
+    steelman: str = Field(default="", description="the strongest good-faith reading of the "
+                                                   "authors' choice")
+    independent_evidence_ref: str = Field(default="", description="the cell/page/figure/equation "
+                                                                   "the GRADER would cite")
+    independent_evidence_quote: str = ""
+    reached_independently: bool = Field(
+        default=False, description="from the paper itself, or from the first reader's argument?")
+    resolution: str = Field(
+        default="", description="ADVISORY ONLY, never obeyed: " + " | ".join(RESOLUTIONS))
+    open_question: str = Field(default="", description="if this is really a question, the "
+                                                        "question to print")
+    notes: str = ""
 
 
 class Finding(_Base):
@@ -185,6 +318,61 @@ class Finding(_Base):
                     "grade is what `overall_verdict` counts.",
     )
 
+    # --- pass-B: the lens's own falsification/steelman work, and its own arithmetic ---
+    # All lens-authored. Non-degeneracy is checked, not trusted — `verification_state`
+    # below is the harness's verdict on whether this triple shows real work.
+    candidate_class: str = Field(default="", description=" | ".join(CANDIDATE_CLASSES))
+    confidence: str = Field(default="", description="separate from severity: " + " | ".join(CONFIDENCES))
+    discrepancy_type: str = Field(default="", description=" | ".join(DISCREPANCY_TYPES))
+    what_the_paper_says: str = Field(default="", description="the claim restated plainly, before argument")
+    alternative_interpretation: str = Field(
+        default="", description="the reasonable reading under which this is NOT a problem")
+    why_alternative_fails: str = Field(
+        default="", description="why that reading does not resolve the issue, or '' if it does "
+                                "(in which case this should not be a finding at all)")
+    steelman: str = Field(default="", description="the strongest good-faith defense of the authors' choice")
+    effect_on_claim: str = Field(default="", description="what follows for the paper's central claim")
+    recommended_resolution: str = Field(default="", description="what would settle this")
+    independent_calculation: dict = Field(
+        default_factory=dict,
+        description="{applies, operands:[{quote,ref}], expression, result, method} — STRUCTURED "
+                    "so `harness.grading.recheck_calculation` can re-verify the operands and "
+                    "re-evaluate the expression by machine instead of trusting the lens's math.",
+    )
+
+    # --- harness-written, joining the machine half above; never trusted from a lens file --
+    verification_state: str = Field(default="", description="WRITTEN BY THE HARNESS: "
+                                                             + " | ".join(VERIFICATION_STATES))
+    calc_class: str = Field(default="", description="WRITTEN BY THE HARNESS: " + " | ".join(CALC_CLASSES))
+    evidence_origin: str = Field(default="", description="WRITTEN BY THE HARNESS from the shape of "
+                                                          "evidence_ref: " + " | ".join(EVIDENCE_ORIGINS))
+    origin_consistency: str = Field(
+        default="", description="WRITTEN BY THE HARNESS: 'consistent' or 'corrected' against "
+                                "whatever origin the lens itself claimed")
+
+    # --- the independent grader (Stage 3/4) --------------------------------------------
+    grade: Grade | None = Field(default=None, description="the blinded second reviewer's claim, "
+                                                           "or None if this candidate was not graded")
+    finding_class: str = Field(default="UNGRADED", description="WRITTEN BY THE HARNESS: "
+                                                                + " | ".join(FINDING_CLASSES))
+    counted_severity: str = Field(
+        default="",
+        description="WRITTEN BY THE HARNESS: the severity `overall_verdict` actually counts. '' "
+                    "means ungraded — the verdict falls back to `severity` unchanged, which is "
+                    "what makes turning grading off reproduce the pre-grading verdict exactly.",
+    )
+    grade_state: str = Field(default="not_graded", description="WRITTEN BY THE HARNESS: coverage "
+                                                                "diagnostic for why this is or is not graded")
+    binding_cap: str = Field(default="", description="WRITTEN BY THE HARNESS: which cap in "
+                                                      "harness.grading actually bound counted_severity")
+    derivation: str = Field(default="", description="WRITTEN BY THE HARNESS: one-line human-readable "
+                                                     "explanation of the derivation above")
+    grader_evidence_class: str = Field(default="unverified", description="WRITTEN BY THE HARNESS: "
+                                                                          "the grader's OWN citation, "
+                                                                          "verified the same way the "
+                                                                          "lens's was")
+    grader_verified_observation: str = Field(default="", description="WRITTEN BY THE HARNESS")
+
     def as_reasoning(self) -> str:
         return (self.reasoning or self.statement or "").strip()
 
@@ -218,8 +406,15 @@ SELECTION_CODES = (
     "resources_insufficient",   # every candidate is too small
     "platform_incompatible",    # every candidate runs the wrong OS
     "credentials_unavailable",  # a candidate fits but needs provisioning this host cannot do
+    "backend_unavailable",      # a candidate CAN execute and fits, but is not reachable now
     "requirement_unknown",      # the demand was never established, so nothing can be matched
 )
+# `backend_unavailable` is the one state that has no equivalent among the others: every
+# other code is a permanent property of the experiment or of the registry, and this one is
+# a transient property of the world. Before it existed, a runnable backend that was simply
+# down fell through to `resources_insufficient` — with an empty reason, because no
+# candidate had actually been rejected for size. A retry is the right response to one and
+# never to the others, which is why they must not share a code.
 
 
 class ProbeSpec(_Base):
@@ -256,6 +451,14 @@ class ProbeSpec(_Base):
     )
     claimed_cell_value: str = Field(
         default="", description="that cell's contents verbatim, carried so reconciliation can parse it"
+    )
+    written_by: str = Field(
+        default="",
+        description="'harness' when `stages/probe.run` persisted this spec.json itself, at the "
+                    "end of a run. Never set by a human-authored override, which is the whole "
+                    "point of the field: `build_spec` reads it to tell its OWN previous output "
+                    "apart from a genuine hand-written spec.json, so a stale target the audit has "
+                    "since moved past is never mistaken for an instruction to keep re-running it.",
     )
     provenance: str = Field(
         default="template",
@@ -360,6 +563,69 @@ class RepoAcquisition(_Base):
     entrypoint: str = Field(default="", description="the command the probe will run, if one was found")
     env_path: str = Field(default="", description="isolated interpreter built for this repo, if any")
     env_status: str = Field(default="not_attempted", description="ready | blocked | failed | not_attempted")
+    env_backend: str = Field(
+        default="",
+        description="which backend BUILT this environment. An environment is only meaningful "
+                    "relative to the machine that will run in it, so a run planned for one "
+                    "backend against an interpreter another backend created is running under a "
+                    "substitute environment — the thing capability assessment exists to catch.",
+    )
+
+
+# What a checkout says it NEEDS in order to run, as opposed to what it does wrong. The
+# static audit already reads the tree; these are the demands it can read out of the same
+# pass, and they are requirements rather than defects — so they carry a state and a value
+# instead of a severity. Nothing here is a finding about the paper.
+#
+# The kinds are exactly the ones for which real repository evidence exists in a rigid,
+# checkable grammar. There is deliberately no kind for a demand that would have to be
+# inferred: no "requires a GPU because it calls .cuda()", no "needs 40 GB because it
+# mentions an A100", no "needs the network because it imports requests". A demand that
+# cannot be read off a declaration is UNKNOWN, and UNKNOWN is not permission.
+RUNTIME_KINDS = (
+    "python_version",        # conda `python=`, `python_requires`, `requires-python`
+    "cuda_runtime",          # a CUDA-tagged wheel or an nvidia-*-cuNN runtime pin
+    "external_download",     # an explicit wget/curl/hf_hub_download/urlopen CALL
+    "model_artifact",        # a checkpoint the code names as a string literal
+    "dataset_artifact",      # a dataset the code names as a string literal
+    "absolute_path",         # a POSIX path literal that only exists on the authors' host
+    "scheduler_allocation",  # what the authors' own #SBATCH block asked the cluster for
+)
+
+# The same four words the identity and resource layers use. A fifth state would be a fifth
+# way to be uncertain, and the point of a categorical vocabulary is that there is one.
+RUNTIME_STATES = ("established", "ambiguous", "unknown", "not_applicable")
+
+# Whether a demand is known to belong to the experiment under audit, or merely to the
+# repository that contains it. A repository holds many experiments: APT ships 74 shell
+# scripts carrying `#SBATCH` blocks whose `--mem` is 32G, 40G or 64G and whose `--time`
+# ranges from 24 to 500 hours. Aggregating those into one number describes no experiment
+# that was ever run, so a demand is `experiment` scope ONLY when it was found in the file
+# the established experiment identity names, and `repository` otherwise.
+RUNTIME_SCOPES = ("experiment", "repository")
+
+
+class RuntimeDemand(_Base):
+    """One runtime demand read out of the checkout, located the way every quote here is.
+
+    `state` and `value` are separate on purpose. A demand can be established with a value
+    ("python 3.9.19"), established as conflicting with no single value ("ambiguous: the
+    requirements file pins a CUDA 11.3 wheel and the environment file pins both cu11 and
+    cu12 runtimes"), or absent. Collapsing them would make "no value" indistinguishable
+    from "several values", which is the difference between not knowing and being misled.
+    """
+
+    kind: str = Field(default="", description=" | ".join(RUNTIME_KINDS))
+    state: str = Field(default="unknown", description=" | ".join(RUNTIME_STATES))
+    value: str = Field(
+        default="",
+        description="the demand itself, verbatim where possible: '3.9.19', '11.3', a URL, a "
+                    "hub id, a path. Empty when the state is ambiguous or unknown.")
+    scope: str = Field(default="repository", description=" | ".join(RUNTIME_SCOPES))
+    file: str = Field(default="", description="repo-relative path the evidence lives in")
+    line: int = Field(default=0, description="1-based line, so a reader can open it directly")
+    code_quote: str = Field(default="", description="verbatim source or config line")
+    note: str = Field(default="", description="what this establishes, and what it does not")
 
 
 class CodeAuditFinding(_Base):
@@ -395,7 +661,19 @@ class CodeAudit(_Base):
     )
     files_scanned: int = 0
     lines_scanned: int = 0
+    declarations_scanned: list[str] = Field(
+        default_factory=list,
+        description="non-Python declaration files read for runtime demands — environment.yml, "
+                    "requirements.txt, pyproject.toml, setup.py/cfg, *.sh, *.sbatch. Listed "
+                    "separately because `files_scanned` counts the Python AST pass only, and a "
+                    "reader has to be able to tell 'no demand found' from 'nothing was read'.")
     findings: list[CodeAuditFinding] = Field(default_factory=list)
+    runtime: list[RuntimeDemand] = Field(
+        default_factory=list,
+        description="runtime/environment demands read out of the checkout. Recorded whether or "
+                    "not anything can act on them: the capability comparison stops at its first "
+                    "blocker, so a demand recorded here is still reportable when an earlier "
+                    "blocker short-circuited the comparison that would have used it.")
     unparseable: list[str] = Field(default_factory=list, description="files whose AST would not build")
     skipped: str = Field(default="", description="why the audit did not run, if it did not")
 
@@ -453,6 +731,8 @@ EXEC_DECISIONS = (
     "resources_unproven",       # the experiment's resource demand is unmet or unestablished
     "commit_unverified",        # the checkout is not provably the audited commit
     "backend_cannot_execute",   # the selected backend is a declaration, not a runner
+    "backend_mismatch",         # assessed against one backend, asked to run on another
+    "backend_offline",          # a real runner, temporarily unreachable — retry may succeed
 )
 
 
@@ -657,6 +937,14 @@ class ResourceRequirement(_Base):
     gpu_model: str = Field(default="", description="the accelerator the paper names, e.g. 'A100'")
     walltime_s: int | None = Field(default=None, description="declared runtime / execution budget")
     model_scale: str = Field(default="", description="the model the cited cell reports, e.g. 'LLaMA 2 7B'")
+    vram_is_floor_only: bool = Field(
+        default=False,
+        description="`vram_bytes` came ONLY from the fp16 weight lower bound, with no "
+                    "declared cost to anchor it. A lower bound is a hard minimum, not a "
+                    "requirement: it counts the weights and nothing else — no activations, "
+                    "no optimizer state, no gradients, no KV cache. `assess_resources` must "
+                    "not report `satisfied` on the strength of a floor alone.",
+    )
     evidence: list[ResourceEvidence] = Field(default_factory=list)
     unstated: list[str] = Field(
         default_factory=list, description="requirement fields the sources did not establish")
@@ -666,6 +954,27 @@ class ResourceRequirement(_Base):
         """Did any source establish any demand at all?"""
         return any(v is not None for v in (self.vram_bytes, self.ram_bytes, self.disk_bytes,
                                            self.cpu_count, self.gpu_count, self.walltime_s))
+
+    @property
+    def memory_stated(self) -> bool:
+        """Is the demand that actually decides whether an experiment fits established?
+
+        `stated` is an OR over six fields, and it was the only thing gating both backend
+        selection and the resource check. So a paper that stated nothing but "trained for
+        60 hours" — SAPG does exactly this — produced `stated=True`, and every unstated
+        field then matched vacuously because `need is None` reads as "fits". A requirement
+        naming only `cpu_count=2` reached `resources: satisfied` and `authorize: allowed`
+        on a machine whose VRAM had never been compared with anything.
+
+        Memory is singled out because it is the quantity the whole check exists for:
+        `evaluate.py --seed 0` launches happily on an 8 GiB card and dies loading a 7B
+        checkpoint, twenty minutes in, with a stderr indistinguishable from broken code.
+        Disk and CPU shortfalls announce themselves; an unstated memory demand does not.
+
+        Either figure counts. A CPU-only experiment's binding constraint is host RAM, and
+        demanding a VRAM number from it would block runs that fit.
+        """
+        return self.vram_bytes is not None or self.ram_bytes is not None
 
 
 class ResourceCapability(_Base):
@@ -749,6 +1058,13 @@ class ExecutionRecord(_Base):
     argv: list[str] = Field(default_factory=list, description="the command as the backend received it")
     cwd: str = Field(default="", description="working directory the process actually ran in")
     interpreter: str = Field(default="", description="the python that ran it, when one did")
+    environment: str = Field(
+        default="",
+        description="the backend's own identification of WHERE this ran — platform, python and "
+                    "accelerator, plus whatever session identity a remote backend has. Locally "
+                    "this is implicit in the host; remotely it is the only record of the hardware "
+                    "a verdict came from, and a reproduction nobody can locate is not evidence.",
+    )
     commit: str = Field(default="", description="the audited commit this execution is about")
     started_at: str = ""
     ended_at: str = ""
@@ -800,6 +1116,14 @@ class Reconciliation(_Base):
     reproduced_std: float | None = None
     seeds_run: list[int] = Field(default_factory=list)
     delta_error: float | None = Field(default=None, description="|reproduced - claimed|")
+    claimed_precision: float | None = Field(
+        default=None,
+        description="half the rounding interval implied by how many digits the paper printed "
+                    "for the claimed cell, e.g. 0.05 for '59.3'. Subtracted from delta_error "
+                    "before comparing to the noise band, so the same underlying result does not "
+                    "flip between RESOLVED_VERIFIED and FAILED_REPRODUCTION solely because the "
+                    "paper printed one extra decimal.",
+    )
     noise_band: float = Field(default=0.0, description="2 * seed-to-seed sigma")
     status: str = Field(
         default="NOT_ATTEMPTED",
@@ -943,11 +1267,60 @@ class EvalReport(_Base):
     dropped_findings: int = Field(
         default=0, description="findings discarded because their evidence could not be substantiated"
     )
+    verdict_if_cell_backed_only: str = Field(
+        default="",
+        description="the SAME threshold table applied to only those findings whose evidence is a "
+                    "verified table cell. Not a second opinion and not a grader — the identical "
+                    "rule over a subset of the identical findings. Where it differs from `verdict`, "
+                    "the verdict depends on grades resting on prose, which is the one link in the "
+                    "chain the harness cannot check.",
+    )
     probe: ProbeResult | None = Field(default=None, description="local reproduction result, if S3 ran")
     experimental_chain: "ExperimentalChain | None" = Field(
         default=None,
         description="the link from a finding to what execution did or did not establish about it",
     )
+    verdict_if_lens_severity_only: str = Field(
+        default="",
+        description="the SAME threshold table with `counted_severity` erased — the verdict grading "
+                    "would have produced no effect on. Mirrors `verdict_if_cell_backed_only`.",
+    )
+    grade_coverage: dict = Field(
+        default_factory=dict,
+        description="{candidates, graded, pending} from `stages.grade.coverage` — visible even "
+                    "when it is all zero, so a reader can tell 'not graded' from 'graded clean'.",
+    )
+    substantive_verdict: "SubstantiveVerdict | None" = Field(
+        default=None,
+        description="a model's whole-paper opinion, in the reviewer spec's own vocabulary. "
+                    "Printed, never counted — no threshold reads this field.",
+    )
+    verdict_agreement: str = Field(
+        default="", description="agree | harness_harsher | model_harsher | contested | "
+                                "unavailable — HARNESS-COMPUTED from `verdict` vs `substantive_verdict`")
+    verdict_contested: bool = Field(
+        default=False,
+        description="true when the model's substantive read is CENTRAL_CLAIM_NOT_ESTABLISHED "
+                    "while the deterministic table says GREEN/YELLOW. The one consequence of the "
+                    "dissent: it demands human attention (a contested banner, `run.py` exit 3), "
+                    "never a change of color.",
+    )
+
+
+SUBSTANTIVE_VERDICTS = ("STRONG", "SOUND_WITH_MINOR_CONCERNS", "SUBSTANTIAL_CONCERNS",
+                        "CENTRAL_CLAIM_NOT_ESTABLISHED", "INCONCLUSIVE")
+
+
+class SubstantiveVerdict(_Base):
+    """One model's whole-paper opinion — see `EvalReport.substantive_verdict`. Every
+    field here is a model's claim; none of it is harness-written, because none of it is
+    evidence — it is printed as an opinion, labelled as one, consumed by no threshold."""
+
+    verdict: str = Field(default="", description=" | ".join(SUBSTANTIVE_VERDICTS))
+    reason: str = ""
+    strongest_contribution: str = ""
+    weakest_link: str = ""
+    weaknesses_are: str = Field(default="", description="LOCAL | SYSTEMIC | MIXED")
 
 
 class ExperimentalChain(_Base):
@@ -1001,7 +1374,7 @@ class ExperimentalChain(_Base):
 # RETRIES; it does not JUDGE. It cannot authorize an execution, choose a backend, set an
 # identity state, or write a reconciliation status — every one of those stays in the
 # deterministic layer underneath, and the controller only records the answer it got.
-PHASES = ("ingest", "audit", "collect", "probe", "report", "done")
+PHASES = ("ingest", "audit", "collect", "grade", "probe", "report", "done")
 
 CASE_STATUSES = (
     "pending",    # created, nothing run yet
@@ -1054,6 +1427,12 @@ class CaseState(_Base):
     )
     verdict: str = Field(default="", description="the S4 verdict, once the report exists")
     report_path: str = ""
+    resume_after: str = Field(
+        default="",
+        description="best-effort hint (free text, e.g. 'resets 3:20pm (Asia/Kolkata)') for when "
+                    "re-running review is worth trying again after an account-level rate limit — "
+                    "advisory only, the controller does not sleep or poll on it.",
+    )
 
     @property
     def terminal(self) -> bool:

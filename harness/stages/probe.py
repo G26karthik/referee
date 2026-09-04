@@ -74,21 +74,36 @@ def build_spec(cfg: Config, pid: str, doc: PaperDoc) -> ProbeSpec:
     root = state.project_dir(cfg, pid)
     override = root / "runs" / pid / "spec.json"
 
-    reports, _ = audit_stage.load_reports(cfg, pid, doc)
+    reports, _, _ = audit_stage.load_reports(cfg, pid, doc)
     candidates = [f for f in report_stage.rank([f for r in reports for f in r.findings])
                   if f.verifiable_by_experiment]
     target = candidates[0] if candidates else None
 
-    if override.exists():
-        spec = ProbeSpec(**{**state.read_json(override), "paper_id": pid})
+    # `written_by == "harness"` marks OUR OWN previous output — set only at the bottom of
+    # `run()`, below, right before it persists the spec it just built. A human-authored
+    # override never carries it, since a human editing spec.json by hand has no reason to
+    # know the field exists. Without this distinction a stale run's finding_id/table_ref/
+    # claimed_cell_value — and `synthesize_probe`'s stale script, which skips regenerating
+    # once `spec.script` is already set — kept feeding back into every later run even after
+    # the audit moved its verifiable target elsewhere, so the report's chain named a
+    # finding the CURRENT findings table no longer contained, reconciled against a cell
+    # that was no longer the target. Treating a harness-written file as absent forces every
+    # run to re-derive its target from the CURRENT audit, which is what `else` already does.
+    override_data = state.read_json(override) if override.exists() else None
+    if override_data is not None and override_data.get("written_by") != "harness":
+        spec = ProbeSpec(**{**override_data, "paper_id": pid})
         # A spec.json a human wrote and pointed at real code is the one non-repo source
         # allowed to reconcile against a printed cell. A spec.json this stage wrote on a
         # previous run is not, and re-labelling it here would launder it.
         if spec.provenance == "template" and (spec.script or spec.command):
             spec.provenance = "driver"
     else:
+        # `written_by="harness"` here, not left blank: this is what makes the file this
+        # function is about to be re-read as (via `run()`'s persistence below) identify
+        # itself correctly on the NEXT call, so a fresh audit target keeps being honored
+        # run after run instead of freezing on whichever finding was verifiable first.
         spec = ProbeSpec(
-            paper_id=pid,
+            paper_id=pid, written_by="harness",
             finding_id=target.finding_id if target else "",
             claim=(target.target or target.statement) if target else "",
             seeds=list(range(max(3, min(cfg.seeds, 5)))),
@@ -157,16 +172,18 @@ def acquire_and_audit(cfg: Config, root: Path, pid: str, doc: PaperDoc,
     # THAT commit rather than on wherever the default branch has since moved. Passing it
     # is what turns a fetch into a pin.
     acq = repo_mod.acquire(cfg, root, pid, doc, revision=audited_commit(root, pid))
-    if acq.status in ("cloned", "cached"):
-        # Provisioning is the backend's job, because an environment is only meaningful
-        # relative to the machine that will run in it: a venv built here is not the
-        # environment a container would present. The install gate still decides whether
-        # anything is built at all — the backend decides where.
-        try:
-            acq = backends.select_backend(cfg).provision(cfg, root, pid, acq)
-        except backends.UnknownBackend as e:
-            acq.env_status, acq.reason = "blocked", str(e)
-    elif acq.status == "unavailable":
+    # Provisioning is deliberately NOT here. It belongs to the backend that will run, and
+    # which backend that is cannot be known until the experiment's demand has been matched
+    # against the registry — which needs this checkout. So acquisition happens first,
+    # selection second, and provisioning third, in `plan_execution`.
+    #
+    # It used to happen here, against `select_backend(cfg)`. With `local` the only runnable
+    # backend that was always the same answer, so nothing was observably wrong; register a
+    # second runnable backend and the environment is built by whichever one the config
+    # names while the run is planned for whichever one the experiment fits. Capability is
+    # then assessed against a foreign interpreter, and the first genuinely remote backend
+    # inherits a silent substitution — precisely what this harness refuses everywhere else.
+    if acq.status == "unavailable":
         acq = repo_mod.synthesize_standalone(
             root, pid, spec.claim, spec.table_ref, spec.claimed_cell_value)
 
@@ -236,7 +253,8 @@ def synthesize_probe(cfg: Config, doc: PaperDoc, spec: ProbeSpec,
 
 
 def plan_execution(cfg: Config, spec: ProbeSpec, acq: RepoAcquisition,
-                   doc: PaperDoc | None = None, audit: CodeAudit | None = None) -> ProbeSpec:
+                   doc: PaperDoc | None = None, audit: CodeAudit | None = None,
+                   root: Path | None = None) -> ProbeSpec:
     """Point the spec at the repository's own entrypoint, if every gate allows it.
 
     Four conditions now, all required: the execution gate is open, a checkout exists, an
@@ -288,6 +306,19 @@ def plan_execution(cfg: Config, spec: ProbeSpec, acq: RepoAcquisition,
     if doc is not None:
         spec.experiment, spec.metric_identity, spec.configuration = experiment_id.resolve(
             doc, Path(acq.path), spec.table_ref, spec.finding_id, harness_seeds=len(spec.seeds))
+        # Re-scope the runtime demands now that identity has run. The static audit reads the
+        # tree BEFORE any experiment is identified, so everything it found was labelled
+        # repository-scoped; only here is there a file to bind against. `source_ref` is the
+        # "file:line" the candidate command was read from, so the file it names is the one
+        # whose demands belong to this cell rather than to the checkout at large.
+        #
+        # A command that was never established leaves every demand repository-scoped, which
+        # is the honest label: this repository holds 74 submission scripts asking for 32G,
+        # 40G and 64G, and no aggregate of those describes an experiment anyone ran.
+        if audit is not None and spec.experiment is not None:
+            cmd = spec.experiment.command
+            ref = (cmd.source_ref if cmd and spec.experiment.established else "")
+            code_audit.scope_demands(audit.runtime, ref.split(":")[0] if ref else "")
         # E1 — what the CITED experiment costs. Established from the paper BEFORE a
         # backend is chosen, because the demand is a property of the experiment and the
         # supply is a property of the environment: matching them the other way round —
@@ -307,6 +338,18 @@ def plan_execution(cfg: Config, spec: ProbeSpec, acq: RepoAcquisition,
         backend = selection.chosen or backend
         spec.resources = resources_mod.assess_resources(
             requirement, backend.resources(), backend=backend.name, walltime_budget_s=budget)
+
+    # The SELECTED backend provisions, because an environment is only meaningful relative
+    # to the machine that will run in it: a venv built on this host is not the environment
+    # a container or a remote session would present. The install gate still decides whether
+    # anything is built at all — the backend decides where, and now it is the same backend
+    # whose platform capability is about to be judged against.
+    #
+    # `root` is a parameter rather than derived, so a caller that has no project directory
+    # provisions nothing instead of writing into one it did not name.
+    if root is not None and acq.status in ("cloned", "cached"):
+        acq = backend.provision(cfg, root, spec.paper_id, acq)
+        acq.env_backend = backend.name
 
     spec.backend = backend.name
     # Capability is asked of the BACKEND, so it is judged against the platform the run
@@ -367,7 +410,7 @@ def run(cfg: Config, pid: str) -> dict:
     # S3c runs after acquisition so the planner can see the checkout, and before
     # execution planning so the authors' own entrypoint still wins when it is available.
     spec = synthesize_probe(cfg, doc, spec, acq)
-    spec = plan_execution(cfg, spec, acq, doc, audit)
+    spec = plan_execution(cfg, spec, acq, doc, audit, root=root)
 
     state.write_json(root / "runs" / pid / "spec.json", spec.model_dump())
     result = _run(cfg, root, spec)

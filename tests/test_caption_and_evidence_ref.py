@@ -141,7 +141,19 @@ def test_a_cell_citation_to_a_missing_table_still_fails():
 
 
 def test_load_reports_drops_and_counts_a_ref_less_finding(tmp_path):
-    """End to end through the real loader: the drop is counted, not silent."""
+    """End to end through the real loader: the drop is counted, not silent.
+
+    Deliberately NOT `accept_lens` here — `accept_lens` runs the stricter
+    `parse_lens_json` gate, which refuses the WHOLE lens for a ref-less quote
+    (`test_audit_driver_refuses_a_lens_whose_findings_lost_their_refs` below). This test
+    is about `load_reports`'s own, more lenient behaviour: a file that IS on disk with a
+    sealed provenance record, where one FINDING inside it (not the file) loses its ref.
+    So the file and its `.driver.json` sidecar are written directly, matching what
+    `lens_is_accepted` checks for without going through the stricter validator.
+    """
+    import hashlib
+    import time
+
     from harness import state
     from harness.artifacts import PaperDoc, Section
     from harness.config import Config
@@ -153,7 +165,8 @@ def test_load_reports_drops_and_counts_a_ref_less_finding(tmp_path):
                                                    text="the table reports 12.196 ± 0.207 for arm B")])
     audit_dir = tmp_path / pid / "audit"
     audit_dir.mkdir(parents=True)
-    state.write_json(audit_dir / "overclaim.json", {
+    lens_path = audit_dir / "overclaim.json"
+    state.write_json(lens_path, {
         "lens": "overclaim",
         "findings": [
             {"finding_id": "keep", "severity": "MAJOR", "statement": "s",
@@ -162,10 +175,16 @@ def test_load_reports_drops_and_counts_a_ref_less_finding(tmp_path):
              "evidence_quote": "12.196 ± 0.207 for arm B", "evidence_ref": ""},
         ],
     })
-    reports, dropped = audit_stage.load_reports(cfg, pid, doc)
+    state.write_json(lens_path.with_suffix(".driver.json"), {
+        "lens": "overclaim", "paper_id": pid, "written_by": "audit_driver",
+        "content_sha256": hashlib.sha256(lens_path.read_bytes()).hexdigest(),
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
+    reports, dropped, invalid = audit_stage.load_reports(cfg, pid, doc)
     kept = [f.finding_id for r in reports for f in r.findings]
     assert kept == ["keep"]
     assert dropped == 1, "the finding whose reference was lost must be counted as dropped"
+    assert invalid == ["protocol", "confound", "contradiction"], invalid
 
 
 def test_audit_driver_refuses_a_lens_whose_findings_lost_their_refs():

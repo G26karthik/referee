@@ -18,8 +18,9 @@ from pathlib import Path
 import pytest
 
 from harness import code_audit, repo as repo_mod
-from harness.artifacts import (PaperDoc, ProbeSpec, Reconciliation,
-                               RepoAcquisition, Section, Table)
+from harness.artifacts import (ConfigurationIdentity, ExperimentIdentity, MetricIdentity,
+                               PaperDoc, ProbeSpec, Reconciliation, RepoAcquisition, Section,
+                               Table)
 from harness.config import Config
 from harness.local_exec import StartupEvidence, json_metric, parse_cell_number, reconcile, resolve_command
 from harness.stages.probe import cell_contents, plan_execution
@@ -232,8 +233,14 @@ def test_findings_are_uniquely_numbered_and_severity_ordered(tmp_path: Path):
 # 4. Reconciliation — arithmetic, with the guards that prevent a false conviction
 # --------------------------------------------------------------------------- #
 def _spec(cell: str = "59.28", provenance: str = "repo_exec") -> ProbeSpec:
+    """Identity established by default (C4): this section tests reconciliation
+    arithmetic and capability/startup classification, not identity resolution itself —
+    see test_experiment_identity.py for that gate."""
     return ProbeSpec(paper_id=PID, table_ref="T1:r0:c1", claimed_cell_value=cell,
-                     provenance=provenance)
+                     provenance=provenance,
+                     experiment=ExperimentIdentity(state="established", reason="fixture"),
+                     metric_identity=MetricIdentity(state="established", reason="fixture"),
+                     configuration=ConfigurationIdentity(state="established", reason="fixture"))
 
 
 def test_a_match_inside_the_noise_band_is_verified():

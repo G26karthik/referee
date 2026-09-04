@@ -26,23 +26,76 @@ paper is clean" once it reaches the report.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import shutil
+import signal
 import subprocess
+import sys
+import tempfile
 import time
 from pathlib import Path
 
 from . import state
 from .artifacts import LensReport
 from .config import Config
+from .prompts import audit as P
 
 
 class AuditDriverError(RuntimeError):
     """The configured command did not produce a usable lens report."""
 
 
-def default_cmd() -> str:
+# "You've hit your session limit · resets 3:20pm (Asia/Kolkata)" and similar Claude CLI
+# account-level messages. This is NOT a malformed response — the same prompt run again
+# in 9 seconds fails identically, and the previous behaviour (treating it as one more
+# transient parse failure) burned the whole `SH_AUDIT_RETRIES` budget in seconds and
+# left the paper permanently `waiting` with no path back to reviewing it.
+_RATE_LIMIT_RE = re.compile(r"(session|usage|rate)\s*limit", re.I)
+_RESET_RE = re.compile(r"resets?\s+([^\n\"'.]{0,40})", re.I)
+
+
+class RateLimited(AuditDriverError):
+    """The reviewer refused because the operator's OWN account hit a usage limit.
+
+    A subclass of `AuditDriverError` so every existing `except AuditDriverError` still
+    catches it, and a distinct class so `fill()` can route it away from `failed` (a
+    quality problem with the reviewer's output) into `rate_limited` (an account-level
+    fact that a retry cannot fix) for the controller to treat differently.
+    """
+
+
+def _reset_hint(text: str) -> str:
+    m = _RESET_RE.search(text or "")
+    return m.group(1).strip() if m else ""
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill the WHOLE process tree a `shell=True` command started, not just the shell.
+
+    `run_lens` launches the reviewer inside its own process group (POSIX) or process
+    group (Windows, via `CREATE_NEW_PROCESS_GROUP`) precisely so this can reach every
+    descendant: `taskkill /T` walks the tree by PID on Windows, `killpg` signals every
+    process sharing the session's process group ID on POSIX. `proc.kill()` alone reaches
+    only the immediate shell — the actual reviewer process is its CHILD, not it.
+    """
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       capture_output=True, text=True)
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass                                  # already gone
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def default_cmd(lens: str | None = None, pdf_dir: str = "") -> str:
     """The built-in reviewer invocation, or '' when no reviewer can be found.
 
     The harness still has no model of its own and still holds no key. What it can do is
@@ -54,7 +107,13 @@ def default_cmd() -> str:
     One process per lens is not incidental. It is stronger isolation than the convention
     it replaces: four lenses read by one session share a context and can echo each other,
     whereas four subprocesses cannot. `stages/audit.py` names that weakness explicitly;
-    this closes it.
+    this closes it. `--allowedTools`, restricted to exactly what `harness.prompts.audit`
+    grants each lens (`Read`, plus `WebSearch` for `overclaim` alone), makes that
+    isolation apply to the FILESYSTEM too — without it a lens can read its three
+    siblings' `audit/<lens>.json` files and the harness's own source, which is a real
+    hole today, not a hypothetical one. `--add-dir` grants read access to the paper's
+    own directory ONLY, so `SOURCE_FIDELITY` in the prompt (open the PDF to settle an
+    extraction ambiguity) is possible without opening the rest of the filesystem.
 
     Returns '' when the CLI is absent, so `available()` refuses with a reason and the
     pipeline falls back to the normal manual pause rather than inventing a reviewer.
@@ -73,12 +132,28 @@ def default_cmd() -> str:
     # exited without writing", so the pipeline degrades to the manual pause and the cause
     # is invisible.
     reader = "type" if os.name == "nt" else "cat"
-    return f'{reader} "{{prompt}}" | "{exe}" -p --output-format text > "{{out}}"'
+    # ponytail: no runtime `claude --help` preflight for the `--allowedTools` flag —
+    # verified present on the installed CLI at design time (`claude --help` lists
+    # `--allowedTools`, `--add-dir`). If a future CLI ever drops it, every lens fails
+    # identically with "exited without writing" (see `run_lens`), which is loud, not
+    # silent — an acceptable ceiling for one flag rather than a subprocess call on every
+    # single lens invocation to re-verify something that does not change between them.
+    tools = ",".join(P.LENSES.get(lens, {}).get("tools", ["Read"])) if lens else "Read"
+    extra = f' --allowedTools "{tools}"' if tools else ""
+    if pdf_dir:
+        extra += f' --add-dir "{pdf_dir}"'
+    return f'{reader} "{{prompt}}" | "{exe}" -p --output-format text{extra} > "{{out}}"'
 
 
-def resolve_cmd(cfg: Config) -> str:
-    """The command that would run: the operator's if set, otherwise the built-in one."""
-    return cfg.audit_cmd.strip() or default_cmd()
+def resolve_cmd(cfg: Config, lens: str | None = None, pdf_dir: str = "") -> str:
+    """The command that would run: the operator's if set, otherwise the built-in one.
+
+    An operator-supplied `SH_AUDIT_CMD` wins unconditionally and is NOT restricted by
+    this module — `run_lens` records which happened (`tool_policy` on the `.driver.json`
+    sidecar) rather than silently pretending a guarantee it cannot enforce over an
+    arbitrary command line.
+    """
+    return cfg.audit_cmd.strip() or default_cmd(lens, pdf_dir)
 
 
 def available(cfg: Config) -> tuple[bool, str]:
@@ -144,7 +219,8 @@ def parse_lens_json(text: str, lens: str) -> LensReport:
         raise AuditDriverError(f"output does not match the lens schema: {e}") from e
 
 
-def run_lens(cfg: Config, pid: str, lens: str, prompt: Path, out: Path) -> dict:
+def run_lens(cfg: Config, pid: str, lens: str, prompt: Path, out: Path, *,
+            pdf_dir: str = "") -> dict:
     """Run the configured reviewer for one lens. Returns a record; raises on failure.
 
     The reviewer writes to a STAGING path, never to `audit/<lens>.json`, and its output
@@ -158,6 +234,13 @@ def run_lens(cfg: Config, pid: str, lens: str, prompt: Path, out: Path) -> dict:
 
     The staged output of a rejected run is kept at `<lens>.rejected.txt` — diagnosable,
     and not a filename anything downstream mistakes for a result.
+
+    Runs with `cwd` an EMPTY scratch directory, deleted after — a lens started in the
+    repo root (the old behaviour) can `Read` its three sibling `audit/<lens>.json`
+    files and this harness's own source, which contradicts the "sealed session" the
+    module docstring in `harness/prompts/audit.py` already claims. Combined with
+    `--allowedTools` (see `default_cmd`), a lens now genuinely sees only what this
+    prompt gives it plus, through `--add-dir`, the one PDF `pdf_dir` names.
     """
     ok, why = available(cfg)
     if not ok:
@@ -173,67 +256,108 @@ def run_lens(cfg: Config, pid: str, lens: str, prompt: Path, out: Path) -> dict:
     for p_ in (staged, rejected):
         p_.unlink(missing_ok=True)
 
-    cmd = resolve_cmd(cfg).replace("{prompt}", str(prompt)).replace("{out}", str(staged))
+    cmd = resolve_cmd(cfg, lens, pdf_dir).replace("{prompt}", str(prompt)).replace("{out}", str(staged))
+    tool_policy = "operator_supplied" if cfg.audit_cmd.strip() else "restricted"
     started = time.time()
+    # Started in its own process group/session so a timeout can kill the WHOLE tree, not
+    # just the immediate shell. `shell=True` on either platform launches a shell that is
+    # itself the parent of the real work — `cmd.exe` for a pipeline, `sh -c` for one — and
+    # `Popen.kill()` alone only terminates that shell. The reviewer it launched keeps
+    # running as an orphan: it can still be writing to `staged` after this function has
+    # already declared the attempt timed out and unlinked that same path, and it can
+    # still be running when a retry starts a second reviewer over the same prompt.
+    group_kwargs: dict = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32"
+        else {"start_new_session": True})
+    sandbox = Path(tempfile.mkdtemp(prefix=f"sh-lens-{lens}-"))
     try:
-        p = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=cfg.audit_timeout_s)
-    except subprocess.TimeoutExpired as e:
+        try:
+            proc = subprocess.Popen(cmd, shell=True, cwd=str(sandbox),
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, encoding="utf-8", errors="replace", **group_kwargs)
+        except OSError as e:
+            staged.unlink(missing_ok=True)
+            raise AuditDriverError(f"could not start the command: {e}") from e
+        try:
+            stdout, stderr = proc.communicate(timeout=cfg.audit_timeout_s)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            proc.communicate()                   # reap the process now that it is dead
+            staged.unlink(missing_ok=True)
+            raise AuditDriverError(f"timed out after {cfg.audit_timeout_s}s") from None
+        p = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+        if not staged.exists():
+            tail = (p.stderr or p.stdout or "").strip()[-300:]
+            if _RATE_LIMIT_RE.search(tail):
+                raise RateLimited(f"reviewer account rate-limited{f' — resets {_reset_hint(tail)}' if _reset_hint(tail) else ''}: {tail}")
+            raise AuditDriverError(
+                f"the command exited {p.returncode} without writing {out.name}"
+                + (f" — {tail}" if tail else ""))
+
+        raw = staged.read_text(encoding="utf-8")
+        try:
+            report = parse_lens_json(raw, lens)
+        except AuditDriverError:
+            if _RATE_LIMIT_RE.search(raw):
+                # The reviewer's entire response WAS the rate-limit notice — `raw` is
+                # short, plain prose, not a lens report that merely failed to parse.
+                staged.replace(rejected)
+                raise RateLimited(f"reviewer account rate-limited{f' — resets {_reset_hint(raw)}' if _reset_hint(raw) else ''}: {raw.strip()[:200]}") from None
+            # Move the unusable output somewhere nothing reads as a lens result, and
+            # keep it, because "the reviewer said something and it was not a report" is
+            # worth seeing.
+            staged.replace(rejected)
+            raise
         staged.unlink(missing_ok=True)
-        raise AuditDriverError(f"timed out after {cfg.audit_timeout_s}s") from e
-    except OSError as e:
-        staged.unlink(missing_ok=True)
-        raise AuditDriverError(f"could not start the command: {e}") from e
+        # Written normalised, and only now: downstream reads this file, so what is on
+        # disk is exactly what was validated rather than whatever prose the command
+        # wrapped it in.
+        state.write_json(out, report.model_dump())
 
-    if not staged.exists():
-        tail = (p.stderr or p.stdout or "").strip()[-300:]
-        raise AuditDriverError(
-            f"the command exited {p.returncode} without writing {out.name}"
-            + (f" — {tail}" if tail else ""))
-
-    raw = staged.read_text(encoding="utf-8")
-    try:
-        report = parse_lens_json(raw, lens)
-    except AuditDriverError:
-        # Move the unusable output somewhere nothing reads as a lens result, and keep it,
-        # because "the reviewer said something and it was not a report" is worth seeing.
-        staged.replace(rejected)
-        raise
-    staged.unlink(missing_ok=True)
-    # Written normalised, and only now: downstream reads this file, so what is on disk is
-    # exactly what was validated rather than whatever prose the command wrapped it in.
-    state.write_json(out, report.model_dump())
-
-    record = {
-        "lens": lens, "paper_id": pid, "command": cmd, "returncode": p.returncode,
-        "seconds": round(time.time() - started, 1), "findings": len(report.findings),
-        "written_by": "audit_driver", "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-    state.write_json(out.with_suffix(".driver.json"), record)
-    return record
+        record = {
+            "lens": lens, "paper_id": pid, "command": cmd, "returncode": p.returncode,
+            "seconds": round(time.time() - started, 1), "findings": len(report.findings),
+            "written_by": "audit_driver", "tool_policy": tool_policy,
+            # The seal `stages.audit.lens_is_accepted` checks against the lens file's
+            # CURRENT bytes — without this, every lens this driver produces fails its
+            # own provenance check the moment `lens_is_accepted` starts requiring it.
+            "content_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        state.write_json(out.with_suffix(".driver.json"), record)
+        return record
+    finally:
+        shutil.rmtree(sandbox, ignore_errors=True)
 
 
-def fill(cfg: Config, pid: str, awaiting: list[str], prompts: dict[str, str]) -> dict:
-    """Attempt every pending lens. Partial success is success for the lenses that worked."""
-    filled, failed = [], {}
+def fill(cfg: Config, pid: str, awaiting: list[str], prompts: dict[str, str],
+        pdf_dir: str = "") -> dict:
+    """Attempt every pending lens. Partial success is success for the lenses that worked.
+
+    `rate_limited` is kept separate from `failed`: a malformed response might succeed on
+    retry, an account-level rate limit will not, and `controller._phase_audit` treats
+    the two differently — a rate limit must not consume a retry attempt.
+    """
+    filled, failed, rate_limited = [], {}, {}
     audit_dir = state.project_dir(cfg, pid) / "audit"
     for lens in awaiting:
         prompt = Path(prompts[lens])
         try:
-            rec = run_lens(cfg, pid, lens, prompt, audit_dir / f"{lens}.json")
+            rec = run_lens(cfg, pid, lens, prompt, audit_dir / f"{lens}.json", pdf_dir=pdf_dir)
             filled.append(lens)
             state.append_log(cfg, pid, artifact_type="audit_auto", phase="audit",
                              headers={"lens": lens, "findings": rec["findings"],
                                       "seconds": rec["seconds"]},
                              path=str(audit_dir / f"{lens}.json"))
+        except RateLimited as e:
+            rate_limited[lens] = str(e)
         except AuditDriverError as e:
             failed[lens] = str(e)
-    return {"filled": filled, "failed": failed}
+    return {"filled": filled, "failed": failed, "rate_limited": rate_limited}
 
 
 if __name__ == "__main__":       # self-check: python -m harness.audit_driver
-    import tempfile
-
     cfg = Config.load()
 
     # --- gate semantics ---------------------------------------------------------------
@@ -257,6 +381,14 @@ if __name__ == "__main__":       # self-check: python -m harness.audit_driver
     assert available(bad)[0] is False, "a template without {out} must be refused"
     good = Config(allow_auto_audit=True, audit_cmd="cp {prompt} {out}")
     assert available(good) == (True, "")
+
+    # --- per-lens tool restriction ------------------------------------------------------
+    if default_cmd():
+        assert "WebSearch" in default_cmd("overclaim"), "overclaim alone gets WebSearch"
+        assert "WebSearch" not in default_cmd("protocol")
+        assert '--allowedTools "Read"' in default_cmd("protocol")
+        assert "--add-dir" not in default_cmd("protocol"), "no pdf_dir given, no flag"
+        assert "--add-dir" in default_cmd("protocol", pdf_dir="C:/papers")
 
     # --- parsing ----------------------------------------------------------------------
     body = ('Here you go:\n```json\n{"lens":"overclaim","findings":[{"finding_id":"o-1",'
@@ -286,5 +418,31 @@ if __name__ == "__main__":       # self-check: python -m harness.audit_driver
             raise AssertionError("a command writing no output must raise")
         except AuditDriverError as e:
             assert "without writing" in str(e), str(e)
+
+    # --- an account rate limit is distinguished from an ordinary malformed response ----
+    # This is the confirmed `sanchez24a-icml` failure: the reviewer's ENTIRE response is
+    # "You've hit your session limit · resets 3:20pm (Asia/Kolkata)", printed to stdout,
+    # with no output file written. The old code raised a plain `AuditDriverError`
+    # identical in kind to a truncated JSON object, so the controller retried it three
+    # times in nine seconds against a limit that cannot possibly clear that fast.
+    with tempfile.TemporaryDirectory() as td:
+        prompt = Path(td) / "overclaim.md"
+        prompt.write_text("prompt", encoding="utf-8")
+        limiter = Path(td) / "limiter.py"
+        limiter.write_text(
+            "import sys\n"
+            "sys.stdout.write(\"You've hit your session limit \\u00b7 resets 3:20pm "
+            "(Asia/Kolkata)\")\n",
+            encoding="utf-8",
+        )
+        limited = Config(projects_dir=Path(td), allow_auto_audit=True,
+                         audit_cmd=f'"{sys.executable}" "{limiter}" {{prompt}} {{out}}')
+        try:
+            run_lens(limited, "p", "overclaim", prompt, Path(td) / "overclaim.json")
+            raise AssertionError("a rate-limit response must raise")
+        except RateLimited as e:
+            assert "3:20pm" in str(e), str(e)
+        except AuditDriverError as e:
+            raise AssertionError(f"raised the generic class, not RateLimited: {e}") from e
 
     print(json.dumps({"self_check": "ok", "gate_default": cfg.allow_auto_audit}, indent=2))

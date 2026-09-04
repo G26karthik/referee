@@ -368,7 +368,12 @@ def resolve_configuration(doc: PaperDoc, table_ref: str, cmd: CandidateCommand |
             ident.matched[field] = hit.group(1)
             ident.evidence.append(IdentityEvidence(quote=hit.group(1), source_ref=table_ref,
                                                    note=f"{field} recovered from the caption"))
-    for field in ("model", "dataset", "sparsity"):
+    # `sparsity` is REPORTED when the caption states it and never REQUIRED. It exists
+    # only in pruning papers, and requiring it made every paper outside that domain
+    # `unmapped` on a field its caption could not possibly carry — a domain vocabulary
+    # promoted into a universal gate. Model and dataset are what identify a configuration
+    # in general; a sparsity that IS stated still lands in `matched` as evidence.
+    for field in ("model", "dataset"):
         if field not in ident.matched:
             ident.unrecoverable.append(field)
 

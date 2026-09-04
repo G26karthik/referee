@@ -25,6 +25,7 @@ import json
 import re
 import statistics
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import time
 from pathlib import Path
 
@@ -193,15 +194,46 @@ def parse_cell_number(text: str) -> float | None:
     return float(m.group()) if m else None
 
 
-def json_metric(stdout: str, metric: str = "") -> float | None:
+def printed_precision_half_width(text: str) -> float:
+    """Half the rounding interval implied by how many digits were printed.
+
+    "59.3" was rounded to one decimal place, so the true value could be anywhere in
+    [59.25, 59.35) — a half-width of 0.05. "59.28" implies [59.275, 59.285), half-width
+    0.005. Standard significant-figures reasoning, not a tolerance invented for this
+    harness: a paper printing fewer digits is stating less precision, and a reproduction
+    must not be judged against precision the paper never claimed. `Decimal` reads the
+    digit count directly, from plain and scientific notation alike, and unlike a float
+    round-trip it never silently loses or invents trailing digits.
+    """
+    m = _LEADING_NUMBER.search((text or "").replace(",", ""))
+    if not m:
+        return 0.0
+    try:
+        exponent = Decimal(m.group()).as_tuple().exponent
+    except (InvalidOperation, ValueError, TypeError):
+        return 0.0
+    if not isinstance(exponent, int):          # 'n' or 'F' — not a finite decimal
+        return 0.0
+    return 0.5 * (10 ** exponent)
+
+
+def json_metric(stdout: str, metric: str = "", strict: bool = False) -> float | None:
     """Last JSON object on stdout that carries a usable metric, as a float.
 
     The fallback for repositories that do not implement the SH_METRIC contract. Scans
-    from the end so a final summary wins over per-epoch logging, and only accepts keys
-    that actually name a metric — a JSON blob full of hyperparameters must not be
-    mined for whichever number happens to parse.
+    from the end so a final summary wins over per-epoch logging.
+
+    `strict` is what a bound `MetricIdentity.output_key` means: ONLY that key is
+    accepted, because the whole point of establishing which output corresponds to the
+    cited metric is to stop here from mining a generic "value"/"score"/"mean" out of
+    whichever number happens to parse when the bound key is not the one present. Without
+    `strict` — no metric identity was established to bind a key at all — the generic
+    key list is the best-effort fallback this always was, for callers that never had a
+    binding to lose.
     """
-    keys = ([metric.lower()] if metric else []) + list(_JSON_METRIC_KEYS)
+    if strict and not metric:
+        return None
+    keys = ([metric.lower()] if metric else []) + ([] if strict else list(_JSON_METRIC_KEYS))
     for line in reversed((stdout or "").splitlines()):
         line = line.strip()
         if not (line.startswith("{") and line.endswith("}")):
@@ -238,6 +270,33 @@ _SETUP_FAILURE_SIGNATURES = (
     "no such file or directory", "can't open file", "syntaxerror",
     "command not found", "is not recognized as an internal or external command",
 )
+# Failures that are facts about the HOST, its drivers or its network — never about the
+# paper's code — and, unlike a setup failure, may strike well AFTER the experiment
+# demonstrably started: a CUDA OOM twenty minutes into training reads, at the stderr,
+# exactly like broken code, but convicting the paper on it is exactly the unearned
+# inference this harness exists to refuse. Matched by SIGNATURE (a fact about what
+# happened), never by paper or repository name.
+_INFRA_FAILURE_SIGNATURES = (
+    "out of memory", "cuda out of memory", "cuda error", "cublas", "cudnn", "nccl",
+    "no space left on device", "disk quota exceeded",
+    "segmentation fault", "core dumped", "access violation", "bus error",
+    "driver/library version mismatch", "cuda driver version is insufficient",
+    "the paging file is too small", "insufficient system resources",
+    "401 client error", "403 client error", "gated repo", "repository not found",
+    "you need to accept the license", "please log in", "authentication required",
+    "connection refused", "could not resolve host", "getaddrinfo failed",
+    "name or service not known", "temporary failure in name resolution",
+    "max retries exceeded", "network is unreachable", "connectionerror", "sslerror",
+)
+# The OS killed the process rather than the program exiting on its own — POSIX signal
+# termination (a negative returncode) and the Windows crash-status codes. An OOM-killed
+# or segfaulting process usually prints nothing at all, so the signature list above
+# cannot see it; the exit code is the only evidence left.
+_INFRA_FAILURE_RETURNCODES = frozenset({
+    -9, -11, -6, -8, -4, -7,                 # SIGKILL, SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGBUS
+    0xC0000005 - (1 << 32),                  # STATUS_ACCESS_VIOLATION, as a signed int32
+    0xC00000FD - (1 << 32),                  # STATUS_STACK_OVERFLOW
+})
 # A process that ran this long did something beyond importing and exiting. Used only as
 # corroboration alongside real output — never on its own.
 _STARTUP_WINDOW_S = 30.0
@@ -261,8 +320,11 @@ class StartupEvidence:
     ran_seconds: float = 0.0
     timed_out: bool = False
     setup_error: str = ""                  # a matched signature from _SETUP_FAILURE_SIGNATURES
+    infra_error: str = ""                  # a matched signature from _INFRA_FAILURE_SIGNATURES
 
     def describe(self) -> str:
+        if self.infra_error:
+            return f"the process reported '{self.infra_error}', an infrastructure failure"
         if self.setup_error:
             return f"the process reported '{self.setup_error}', a setup-phase failure"
         bits = []
@@ -287,6 +349,25 @@ def classify_setup_error(stderr: str) -> str:
     return ""
 
 
+def classify_infra_failure(stderr: str, returncode: int | None = None) -> str:
+    """The infrastructure-failure signature present, or '' if none is.
+
+    Distinct from `classify_setup_error`: a setup failure means the experiment was never
+    reached. An infrastructure failure can strike well AFTER it was — a CUDA OOM twenty
+    minutes into training, a segfault, a host that SIGKILLs the process for memory
+    pressure — and none of those is evidence the paper's code is broken, however far the
+    run had progressed when it happened. Checked by TEXT SIGNATURE, and — because an
+    OOM-killed or segfaulting process usually prints nothing — by the OS's own exit code.
+    """
+    low = (stderr or "").lower()
+    for sig in _INFRA_FAILURE_SIGNATURES:
+        if sig in low:
+            return sig
+    if returncode is not None and returncode in _INFRA_FAILURE_RETURNCODES:
+        return f"process terminated by the operating system (exit code {returncode})"
+    return ""
+
+
 def reached_experiment(evidence: StartupEvidence) -> bool:
     """Did the run get past setup into the experiment the paper describes?
 
@@ -297,11 +378,18 @@ def reached_experiment(evidence: StartupEvidence) -> bool:
     """
     if evidence.setup_error:
         return False                                        # decisive against
+    if evidence.timed_out:
+        # ALSO decisive against, and this is the correction. A timeout is THIS HARNESS'S
+        # wall clock, not the paper's failure: the process was alive and working when we
+        # killed it, so nothing about whether the experiment would have completed was
+        # established. Treating it as a reach convicted papers for `cfg.probe_timeout_s`
+        # — a run that printed progress for 1800s and was killed reconciled as
+        # FAILED_REPRODUCTION and drove RED. `reconcile` maps this to `timeout`, which is
+        # INCONCLUSIVE, and INCONCLUSIVE accuses nobody.
+        return False
     if evidence.saw_contract_line or evidence.saw_json_metric:
         return True                                         # decisive for
     long_enough = evidence.ran_seconds >= _STARTUP_WINDOW_S
-    if evidence.timed_out and long_enough:
-        return True                                         # killed while working
     return long_enough and evidence.stdout_lines >= _MIN_OUTPUT_LINES
 
 
@@ -384,21 +472,29 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
     # number, which is more dangerous than a crash because nothing looks wrong. This gate
     # applies to success and failure alike, and sits after the provenance ceiling so a
     # synthesized probe still reports the ceiling rather than an identity class.
+    #
+    # Applied to BOTH provenances the ceiling above admits, not only `spec.command`. A
+    # `driver` spec can carry a hand-written `script` with no `command` at all — a human
+    # wrote `spec.json` and pointed it at real code — and gating this check on
+    # `spec.command` let exactly that spec skip straight to the arithmetic below with
+    # experiment/metric/configuration identity never assessed. Provenance says WHOSE code
+    # ran; identity says whether running it answers the cited cell, and a driver script is
+    # not exempt from the second question just because a human, not the planner, wrote it.
+    # The scientific prerequisites are the same regardless of who authored the probe.
     rec.experiment_state = spec.experiment.state if spec.experiment else "unmapped"
     rec.metric_state = spec.metric_identity.state if spec.metric_identity else "unmapped"
     rec.configuration_state = spec.configuration.state if spec.configuration else "unmapped"
-    if spec.command:                       # only a repository run needs an identity chain
-        proven, failure_class, why = identities_established(
-            spec.experiment, spec.metric_identity, spec.configuration)
-        if not proven:
-            rec.status = "INCONCLUSIVE"
-            rec.failure_class = failure_class
-            rec.reason = (
-                f"the executed program was not bound to the cited cell, so its output cannot "
-                f"be compared with {spec.table_ref or 'it'}: {why}. A run that succeeds without "
-                f"this binding has measured something, but not the thing the paper printed."
-            )
-            return rec
+    proven, failure_class, why = identities_established(
+        spec.experiment, spec.metric_identity, spec.configuration)
+    if not proven:
+        rec.status = "INCONCLUSIVE"
+        rec.failure_class = failure_class
+        rec.reason = (
+            f"the executed program was not bound to the cited cell, so its output cannot "
+            f"be compared with {spec.table_ref or 'it'}: {why}. A run that succeeds without "
+            f"this binding has measured something, but not the thing the paper printed."
+        )
+        return rec
 
     # --- the capability precondition ----------------------------------------------
     # A crash is a failed reproduction only if the code was actually run. Three things
@@ -421,16 +517,49 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
             )
             return rec
 
+        # --- infrastructure failures never convict ---------------------------------
+        # Checked before `reached_experiment`, and independent of it: a CUDA OOM, a
+        # segfault, a killed process, a driver mismatch, a blocked dataset download, or a
+        # gated-repo auth failure is a fact about this host, not about the paper's code —
+        # whether or not the experiment had visibly started when it happened. A crash
+        # twenty minutes into training reads, at the stderr, exactly like broken code;
+        # convicting on it is the unearned inference this harness exists to refuse.
+        if evidence.infra_error:
+            rec.status = "INCONCLUSIVE"
+            rec.failure_class = "infrastructure_failure"
+            rec.reached_experiment = reached_experiment(evidence)
+            rec.reason = (
+                f"the run failed for an infrastructure reason ('{evidence.infra_error}'), a "
+                f"fact about this host, its drivers or its network — not about the paper's "
+                f"code: {failure}. Startup evidence: {evidence.describe()}. An infrastructure "
+                f"failure is never read as a failed reproduction, however far the experiment "
+                f"had progressed when it happened."
+            )
+            return rec
+
         reached = reached_experiment(evidence)
         rec.reached_experiment = reached
         if not reached:
             rec.status = "INCONCLUSIVE"
             rec.failure_class = "timeout" if evidence.timed_out else "startup_failure"
+            # Three different situations land here and the sentence has to name the right
+            # one. It used to say "exited before any sign that the experiment itself began"
+            # for all of them, which is simply false when a setup signature appeared AFTER
+            # the process had printed contract lines, or when our own clock killed a run
+            # that had been working for half an hour.
+            if evidence.timed_out:
+                why = (f"this harness stopped the run at its own wall-clock limit, so whether "
+                       f"the experiment would have completed was never established")
+            elif evidence.setup_error:
+                why = (f"at least one attempt failed for a setup reason "
+                       f"('{evidence.setup_error}'), so the run was not a fair attempt at the "
+                       f"experiment even where other attempts produced output")
+            else:
+                why = ("the process exited before any sign that the experiment itself began")
             rec.reason = (
-                f"the process exited before any sign that the experiment itself began "
-                f"({evidence.describe()}): {failure}. The environment was capable, so this may yet "
-                f"be a defect in the paper's code — but nothing here distinguishes that from a "
-                f"setup failure, and the burden of showing the experiment ran is on this harness."
+                f"{why} ({evidence.describe()}): {failure}. Nothing here distinguishes a defect "
+                f"in the paper's code from a failure of the runner, and the burden of showing "
+                f"the experiment ran is on this harness."
             )
             return rec
 
@@ -460,21 +589,37 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
                       f"would be dishonest to score it as a failed reproduction.")
         return rec
 
+    # The paper printed the claimed value to some number of digits, and that is a
+    # statement of PRECISION, not just of magnitude: "59.3" could be anywhere in
+    # [59.25, 59.35), and a reproduction landing inside that interval has not
+    # disagreed with the cell at all. Without this, the identical measurement flips
+    # between RESOLVED_VERIFIED and FAILED_REPRODUCTION solely because the paper printed
+    # one extra decimal — the raw delta shrinks by construction as the claimed value
+    # trades precision for the appearance of agreement, and rounding precision is not a
+    # magic tolerance, it is a property of what the paper actually asserted.
+    assert rec.delta_error is not None  # claimed_value and reproduced_value are both set above
+    rec.claimed_precision = round(printed_precision_half_width(spec.claimed_cell_value), 6)
+    effective_delta = max(0.0, rec.delta_error - rec.claimed_precision)
+    precision_note = (
+        f" (the cell's printed precision of ±{rec.claimed_precision:g} is credited first, "
+        f"leaving an effective |delta| of {effective_delta:.4f})"
+        if rec.claimed_precision else "")
+
     if noise_band <= 0:
         rec.status = "INCONCLUSIVE"
         rec.reason = (f"seed-to-seed noise measured as zero over {len(rec.seeds_run)} seeds, so "
                       f"the `<= 2 sigma` test has no band to test against. Delta was "
-                      f"{rec.delta_error:.4f}.")
-    elif rec.delta_error <= noise_band:
+                      f"{rec.delta_error:.4f}{precision_note}.")
+    elif effective_delta <= noise_band:
         rec.status = "RESOLVED_VERIFIED"
         rec.reason = (f"reproduced {rec.reproduced_value:g} against the cell's "
-                      f"{rec.claimed_value:g}: |delta| {rec.delta_error:.4f} is within the "
-                      f"2-sigma band {noise_band:.4f}. The printed number stands.")
+                      f"{rec.claimed_value:g}: |delta| {rec.delta_error:.4f}{precision_note} is "
+                      f"within the 2-sigma band {noise_band:.4f}. The printed number stands.")
     else:
         rec.status = "FAILED_REPRODUCTION"
         rec.reason = (f"reproduced {rec.reproduced_value:g} against the cell's "
-                      f"{rec.claimed_value:g}: |delta| {rec.delta_error:.4f} exceeds the "
-                      f"2-sigma band {noise_band:.4f} over {len(rec.seeds_run)} seeds.")
+                      f"{rec.claimed_value:g}: |delta| {rec.delta_error:.4f}{precision_note} "
+                      f"exceeds the 2-sigma band {noise_band:.4f} over {len(rec.seeds_run)} seeds.")
     return rec
 
 
@@ -583,6 +728,7 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
     out_dir = script.parent
 
     records: list[ExecutionRecord] = []
+    mislabelled: list[str] = []
     per_seed: dict[str, dict[int, float]] = {a: {} for a in spec.arms}
     aux_seed: dict[str, dict[str, dict[int, float]]] = {}
     device, failed, log = "unknown", [], []
@@ -603,7 +749,7 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
             # the one question a reproduction verdict has to survive.
             record = ExecutionRecord(
                 seed=seed, arm=arm, backend=p.backend, argv=p.argv, cwd=p.cwd,
-                interpreter=spec.interpreter, commit=spec.commit,
+                environment=p.environment, interpreter=spec.interpreter, commit=spec.commit,
                 started_at=p.started_at, ended_at=p.ended_at, seconds=p.seconds,
                 launched=p.launched, completed=p.completed, timed_out=p.timed_out,
                 returncode=p.returncode, stdout=p.stdout, stderr=p.stderr, error=p.error)
@@ -629,38 +775,113 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
                     device = d.group(1)
                     evidence.saw_contract_line = True
                 elif m := _METRIC.match(line):
-                    per_seed.setdefault(m.group(1), {})[int(m.group(2))] = float(m.group(3))
+                    # Keyed by what the HARNESS passed, and accepted only when the process
+                    # echoes it back. Keying on the asserted values let ONE process fill
+                    # every seed slot: a script ignoring --seed and printing three
+                    # seed=/value= lines produced seeds_run=[0,1,2] and a fabricated
+                    # spread of 0.01, which then passed the `std <= 0` guard that exists
+                    # precisely to catch a pipeline the seed does not perturb, and earned
+                    # RESOLVED_VERIFIED from a single execution.
+                    #
+                    # A mismatch is recorded rather than silently dropped: a repository
+                    # that labels its output differently is a metric-binding problem to
+                    # report, not a measurement to accept.
+                    if m.group(1) != arm or int(m.group(2)) != seed:
+                        # NOT reach evidence either. Setting `saw_contract_line` before this
+                        # check let a line the harness had just refused as "not a
+                        # measurement to accept" still satisfy `reached_experiment`, so the
+                        # same fabricated output that could no longer fill a seed slot could
+                        # still license a FAILED_REPRODUCTION.
+                        mislabelled.append(
+                            f"seed={seed} arm={arm} was passed, but the process reported "
+                            f"seed={m.group(2)} arm={m.group(1)}")
+                        continue
+                    per_seed.setdefault(arm, {})[seed] = float(m.group(3))
                     record.metric = float(m.group(3))
                     saw_metric = True
                     evidence.saw_contract_line = True
                 elif x := _AUX.match(line):
+                    # Same rule as SH_METRIC, for the same reason: an auxiliary series keyed
+                    # on the arm and seed the PROCESS asserts let one process fill the whole
+                    # aux table, and the report renders those numbers.
+                    if x.group(2) != arm or int(x.group(3)) != seed:
+                        mislabelled.append(
+                            f"seed={seed} arm={arm} was passed, but an SH_AUX line reported "
+                            f"seed={x.group(3)} arm={x.group(2)}")
+                        continue
                     aux_seed.setdefault(x.group(1), {}).setdefault(
-                        x.group(2), {})[int(x.group(3))] = float(x.group(4))
+                        arm, {})[seed] = float(x.group(4))
                     evidence.saw_contract_line = True
             # A third-party repository owes this harness nothing, so when it prints no
             # SH_METRIC line fall back to a JSON summary on stdout. Only for the
             # command path: a generated probe that skipped its own contract is a bug
             # in the probe, and papering over it would hide that.
+            metric_captured = saw_metric
             if spec.command and not saw_metric:
-                # The key comes from MetricIdentity when one was established. Scanning the
-                # generic key list would re-open the hole this gate closes: it would pick
-                # whichever number happened to parse, regardless of what it measures.
+                # The key comes from MetricIdentity, and ONLY from it — `strict=True`
+                # means no generic key list. Without a bound key there is nothing here:
+                # falling back to a "value"/"score"/"mean" scan is exactly the guess C6
+                # forbids, because it can silently mine a DIFFERENT quantity than the one
+                # the cited cell reports and the reconciler is authorized to compare.
                 bound_key = (spec.metric_identity.output_key
                              if spec.metric_identity and spec.metric_identity.established else "")
-                if (v := json_metric(p.stdout or "", bound_key or spec.metric)) is not None:
+                if bound_key and (v := json_metric(p.stdout or "", bound_key, strict=True)) is not None:
                     per_seed.setdefault(arm, {})[seed] = v
                     record.metric = v
                     evidence.saw_json_metric = True
+                    metric_captured = True
             if p.returncode != 0:
-                failed.append(seed)
                 err = (p.stderr or "").strip()[-400:]
-                # Only the FIRST attempt's signature is kept, and only if no attempt has
-                # already shown the experiment running: one seed crashing on an import
-                # after another produced metrics is a runtime failure, not a setup one.
-                if not evidence.setup_error and not (evidence.saw_contract_line or evidence.saw_json_metric):
-                    evidence.setup_error = classify_setup_error(p.stderr or "")
-                first_failure = first_failure or f"exit {p.returncode}: {err[-200:]}"
-                log.append({"seed": seed, "arm": arm, "rc": p.returncode, "error": err})
+                if metric_captured:
+                    # The experiment already reported its result for this (seed, arm)
+                    # before the process exited non-zero — a post-measurement condition
+                    # (cleanup, telemetry, a sync barrier), not a failed run. Exit-code
+                    # semantics must not override a scientific result that was already
+                    # captured; the exit code itself still lives on `record.returncode`
+                    # for anyone auditing this attempt.
+                    log.append({"seed": seed, "arm": arm, "rc": p.returncode, "error": err,
+                               "note": "metric captured before this non-zero exit; not "
+                                       "counted as a failed attempt"})
+                else:
+                    failed.append(seed)
+                    # Classified PER ATTEMPT, and unconditionally. The suppression that used
+                    # to live here — skip the classifier once any attempt had emitted a
+                    # contract line — made the verdict depend on the order the seed loop
+                    # happened to run in. Same repository, same missing package, same seeds:
+                    # succeed-then-fail gave FAILED_REPRODUCTION and RED, fail-then-succeed
+                    # gave INCONCLUSIVE and GREEN. No principle makes both right, so it was
+                    # not encoding a judgement about the failure; it was encoding which seed
+                    # came first. A dependency, an argv or a platform failure on ANY attempt
+                    # means the run was not a fair attempt, whichever seed hit it. Infra
+                    # failures (OOM, driver, disk, a killed process) are classified the same
+                    # way, independent of order, and independent of `setup_error` — either
+                    # can be present without the other.
+                    sig = classify_setup_error(p.stderr or "")
+                    infra_sig = classify_infra_failure(p.stderr or "", p.returncode)
+                    evidence.setup_error = evidence.setup_error or sig
+                    evidence.infra_error = evidence.infra_error or infra_sig
+                    first_failure = first_failure or f"exit {p.returncode}: {err[-200:]}"
+                    log.append({"seed": seed, "arm": arm, "rc": p.returncode, "error": err})
+
+    # One commit verification, made before this loop started, does not describe every
+    # attempt inside it: a multi-seed run against a real repository can run for minutes,
+    # and nothing above prevents the checkout from being modified underneath it while it
+    # does. Re-verified once more now that every attempt has finished; if the commit no
+    # longer verifies, the whole run is retracted to INCONCLUSIVE rather than reconciled
+    # as though every measurement gathered under it came from one unchanging commit —
+    # reusing the authorization precondition `reconcile` already enforces, rather than a
+    # second, separate refusal path.
+    if spec.command and records:
+        commit_after = verify_execution_commit(spec)
+        if commit_after is not None and commit_after.state != "verified":
+            auth = ExecAuthorization(
+                allowed=False, decision="commit_changed_during_execution", backend=auth.backend,
+                failure_class="commit_mismatch",
+                detail=(f"the checkout no longer verifies as the audited commit after "
+                        f"execution ({commit_after.reason}); the repository changed while "
+                        f"{len(records)} process(es) ran against it, so nothing gathered "
+                        f"under this run can be attributed to one unchanging commit"))
+            commit = commit_after
 
     arms = {a: _stats([per_seed.get(a, {})[s] for s in sorted(per_seed.get(a, {}))])
             for a in spec.arms}
@@ -689,8 +910,10 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
 
     if len(ok) < len(spec.arms):
         result.verdict = "failed"
+        extra = (f" {len(mislabelled)} metric line(s) were discarded for naming a seed or arm "
+                 f"the harness did not request: {mislabelled[0]}." if mislabelled else "")
         result.reason = (f"only {len(ok)}/{len(spec.arms)} arms produced >=2 seeds; "
-                         f"{len(set(failed))} seed-run(s) failed. See probe_log.json.")
+                         f"{len(set(failed))} seed-run(s) failed.{extra} See probe_log.json.")
     else:
         std, how = _noise(per_seed, spec.arms)
         delta = arms[spec.arms[-1]].mean - arms[spec.arms[0]].mean
@@ -743,15 +966,15 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
             measured = {s: v for a in per_seed for s, v in per_seed[a].items()}
         result.reconciliation = reconcile(
             spec, [measured[s] for s in sorted(measured)], result.noise_band,
-            # `first_failure` is passed whenever ANY process exited non-zero, not only when
-            # the run produced too few metrics to aggregate. A seed loop where every
-            # process printed a plausible number and then died reconciled as
-            # RESOLVED_VERIFIED — "the printed number stands" — because `verdict` counts
-            # metrics EMITTED, not processes that succeeded. A metric printed by a process
-            # that then crashed is not a completed measurement, and reconciling the subset
-            # that survived would be reconciling a smaller experiment than the one
-            # specified. `reconcile` already gates a failure through capability and
-            # startup evidence; it simply has to be told there was one.
+            # `first_failure` is passed whenever some (seed, arm) attempt exited non-zero
+            # WITHOUT having already reported its metric — a genuine gap in the measured
+            # set, before or during the experiment. An attempt that printed its metric and
+            # THEN exited non-zero (cleanup, telemetry, a sync barrier) is excluded from
+            # this by `run_probe`'s own loop, on purpose: the measurement it reported is
+            # already in `measured`, so a post-completion exit code never overrides a
+            # scientific result that was already captured. `reconcile` already gates a
+            # genuine failure through capability and startup evidence; it simply has to be
+            # told there was one.
             sorted(measured), failure=first_failure,
             evidence=evidence, authorization=auth)
 
@@ -795,9 +1018,23 @@ if __name__ == "__main__":  # self-check: python -m harness.local_exec
         assert res.reconciliation is None, "no cell was cited, so nothing may be reconciled"
 
     # --- S3d reconciliation arithmetic ------------------------------------------------
-    def _spec(cell: str, provenance: str = "repo_exec") -> ProbeSpec:
-        return ProbeSpec(paper_id="r", table_ref="T1:r0:c1", claimed_cell_value=cell,
+    from .artifacts import ConfigurationIdentity, ExperimentIdentity, MetricIdentity
+
+    _EST = dict(state="established", reason="self-check fixture")
+
+    def _spec(cell: str, provenance: str = "repo_exec", identity: bool = True) -> ProbeSpec:
+        """`identity=True` mirrors what `plan_execution` actually produces: it only ever
+        sets provenance to 'repo_exec' once experiment/metric/configuration identity is
+        established, so that is the realistic fixture for testing the ARITHMETIC below in
+        isolation. `identity=False` is the C4 adversarial case — see the provenance-ceiling
+        block further down."""
+        spec = ProbeSpec(paper_id="r", table_ref="T1:r0:c1", claimed_cell_value=cell,
                          provenance=provenance)
+        if identity:
+            spec.experiment = ExperimentIdentity(**_EST)
+            spec.metric_identity = MetricIdentity(**_EST)
+            spec.configuration = ConfigurationIdentity(**_EST)
+        return spec
 
     assert parse_cell_number("12.196 ± 0.207") == 12.196, "the reported value leads the cell"
     assert parse_cell_number("80.5%(161)") == 80.5
@@ -847,7 +1084,34 @@ if __name__ == "__main__":  # self-check: python -m harness.local_exec
     tmpl = reconcile(_spec("59.28", "template"), [59.30, 59.26], 0.10, [0, 1])
     assert tmpl.status == "INCONCLUSIVE", "the identical-arms template reconciles nothing"
     drv = reconcile(_spec("59.28", "driver"), [59.30, 59.26], 0.10, [0, 1])
-    assert drv.status == "RESOLVED_VERIFIED", "a human-written faithful repro still counts"
+    assert drv.status == "RESOLVED_VERIFIED", "a human-written repro still counts, once identity holds"
+
+    # --- C4: provenance alone is not enough — identity must be established too ---------
+    # A driver spec.json can carry a `script` with no `command` at all, so gating the
+    # identity check on `spec.command` (the old condition) let it skip straight past this
+    # check. Neither direction is trusted without the same chain a repo_exec spec needs.
+    naive = reconcile(_spec("59.28", "driver", identity=False), [59.30, 59.26], 0.10, [0, 1])
+    assert naive.status == "INCONCLUSIVE", "a driver spec with no identity chain may not acquit"
+    assert naive.failure_class in ("experiment_unidentified", "metric_unbound",
+                                   "configuration_unmatched"), naive.failure_class
+    naive_bad = reconcile(_spec("59.28", "driver", identity=False), [64.10, 64.20], 0.10, [0, 1])
+    assert naive_bad.status == "INCONCLUSIVE", "a driver spec with no identity chain may not convict either"
+    naive_repo = reconcile(_spec("59.28", "repo_exec", identity=False), [59.30, 59.26], 0.10, [0, 1])
+    assert naive_repo.status == "INCONCLUSIVE", "repo_exec without identity established may not reconcile"
+
+    # --- C10: printed precision, not raw digits, decides whether a delta agrees --------
+    # The same underlying reproduced value must not flip status solely because the paper
+    # printed one extra decimal place for the claimed cell.
+    coarse = reconcile(_spec("59.3"), [59.2787, 59.2787], 0.001, [0, 1])
+    fine = reconcile(_spec("59.28"), [59.2787, 59.2787], 0.001, [0, 1])
+    assert coarse.status == "RESOLVED_VERIFIED", coarse.reason
+    assert fine.status == "RESOLVED_VERIFIED", fine.reason
+    assert coarse.claimed_precision == 0.05 and fine.claimed_precision == 0.005
+    integer_cell = reconcile(_spec("59"), [59.2787, 59.2787], 0.001, [0, 1])
+    assert integer_cell.status == "RESOLVED_VERIFIED", integer_cell.reason
+    # A genuinely wrong reproduction is not rescued by precision credit.
+    wrong = reconcile(_spec("59.3"), [70.0, 70.0], 0.001, [0, 1])
+    assert wrong.status == "FAILED_REPRODUCTION", wrong.reason
 
     # --- SH_AUX contract ---------------------------------------------------------------
     m = _AUX.match("SH_AUX key=linear_probe_acc arm=ldreg seed=3 value=0.914000")

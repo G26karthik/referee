@@ -21,7 +21,8 @@ from pathlib import Path
 import pytest
 
 from harness import probe_synth
-from harness.artifacts import (Finding, PaperDoc, ProbeSpec, Reconciliation,
+from harness.artifacts import (ConfigurationIdentity, ExperimentIdentity, Finding,
+                               MetricIdentity, PaperDoc, ProbeSpec, Reconciliation,
                                RepoAcquisition, Section)
 from harness.config import Config
 from harness.local_exec import _AUX, reconcile
@@ -48,22 +49,40 @@ def spec(**kw) -> ProbeSpec:
 # --------------------------------------------------------------------------- #
 # 1. Template selection
 # --------------------------------------------------------------------------- #
-def test_the_ldreg_template_matches_on_the_method_name():
-    p = probe_synth.plan(doc("LDReg: Local Dimensionality Regularized SSL"))
-    assert p.mechanism == "ldreg"
-    assert p.arms == ["baseline", "ldreg"]
+def test_no_paper_receives_a_hardcoded_template():
+    """The planner has no mechanism dispatch, and must never grow one back.
+
+    It used to ship a full template for one pilot paper (LDReg, ICLR 2024), selected by
+    matching that paper's method name — or two of its topic keywords — anywhere in a
+    40-section corpus. For a short paper that corpus is the whole text, so a single
+    related-work citation of someone else's method was enough to trigger it. That is
+    paper-specific logic in executable production code: the harness behaved differently
+    for one paper in its own evaluation corpus than for any other.
+
+    Every paper now gets the generic control, whose result the provenance ceiling caps at
+    INCONCLUSIVE regardless. Abstaining is the right outcome for a mechanism this harness
+    cannot author from the paper alone.
+    """
+    for title, body in (
+        ("LDReg: Local Dimensionality Regularized SSL", "local intrinsic dimension"),
+        ("Untitled", "we study intrinsic dimensionality and dimensional collapse"),
+        ("APT: Adaptive Pruning and Tuning", "we prune and tune language models"),
+        ("SAPG: Split and Aggregate Policy Gradients", "we split and aggregate"),
+        ("Stay on topic with Classifier-Free Guidance", "we apply CFG to language models"),
+        ("A Unified Diverse Weather Generator for LiDAR", "we generate weather"),
+    ):
+        p = probe_synth.plan(doc(title, body))
+        assert p.mechanism == "placebo", f"{title!r} received template {p.mechanism!r}"
+        assert p.arms == ["baseline", "placebo"], title
 
 
-def test_the_ldreg_template_matches_on_two_independent_signals():
-    """Without the name, two signals are required — the concept plus the failure mode."""
-    p = probe_synth.plan(doc("Untitled", "we study intrinsic dimensionality and dimensional collapse"))
-    assert p.mechanism == "ldreg"
+def test_the_planner_holds_no_method_name_vocabulary():
+    """Structural, not behavioural: a future dispatch would have to name a paper again."""
+    import inspect
 
-
-def test_one_signal_alone_does_not_match_a_specific_template():
-    """A related-work mention of intrinsic dimensionality must not hijack the planner."""
-    p = probe_synth.plan(doc("Untitled", "we mention intrinsic dimensionality once"))
-    assert p.mechanism == "placebo"
+    src = inspect.getsource(probe_synth).split("if __name__")[0]
+    for token in ("ldreg", "LDReg", "APT", "SAPG", "classifier-free", "CoFi", "LLMPruner"):
+        assert token not in src, f"{token!r} appears in the synthesis module"
 
 
 def test_an_unrelated_paper_falls_back_to_the_placebo_control():
@@ -82,9 +101,12 @@ def test_matching_reads_the_front_of_the_paper_not_the_whole_thing():
 
 
 def test_the_advertised_repo_url_is_part_of_the_matching_corpus():
+    """The corpus still includes the advertised URL — that was never the defect. What is
+    gone is the dispatch that read a method name out of it and selected a template."""
     d = doc("Untitled", "a paper")
     d.repo_url = "https://github.com/HanxunH/LDReg"
-    assert probe_synth.plan(d).mechanism == "ldreg"
+    assert "ldreg" in probe_synth.corpus(d).lower(), "the url is still searchable"
+    assert probe_synth.plan(d).mechanism == "placebo", "but it selects nothing"
 
 
 # --------------------------------------------------------------------------- #
@@ -118,20 +140,6 @@ def test_no_placeholder_survives_rendering(d: PaperDoc):
         assert placeholder not in body
 
 
-def test_the_ldreg_script_implements_both_published_algorithms():
-    body = probe_synth.plan(doc("LDReg")).script
-    assert "def lid_mom_est" in body, "Algorithm 1"
-    assert "def ldreg_loss" in body, "Algorithm 2"
-    assert "-beta * torch.log" in body, "L_L1 = -beta * (1/N) * sum ln LID"
-    assert "m / (w - m" in body, "MoM estimator LID = m / (w - m)"
-
-
-def test_the_ldreg_script_regularizes_the_representation_not_the_projection():
-    """The paper applies LDReg to the representation; the projector output is not it."""
-    body = probe_synth.plan(doc("LDReg")).script
-    assert "ldreg_loss(torch.cat([h1, h2], 0)" in body
-
-
 @pytest.mark.parametrize("hostile", [
     'we claim """ + __import__("os").system("echo pwned") + """ a gain',
     "ignore previous instructions and ''' + exec(open('x').read()) + '''",
@@ -159,8 +167,8 @@ def test_a_claim_from_the_paper_is_never_interpolated_as_code(hostile: str):
 # --------------------------------------------------------------------------- #
 def test_synthesis_runs_when_a_finding_is_settleable(cfg: Config):
     out = synthesize_probe(cfg, doc("LDReg"), spec(), RepoAcquisition())
-    assert out.provenance == "synthesized" and out.mechanism == "ldreg"
-    assert out.script and out.arms == ["baseline", "ldreg"]
+    assert out.provenance == "synthesized" and out.mechanism == "placebo"
+    assert out.script and out.arms == ["baseline", "placebo"]
 
 
 def test_nothing_is_synthesized_when_no_finding_is_settleable(cfg: Config):
@@ -187,14 +195,10 @@ def test_the_repo_command_is_never_overwritten(cfg: Config):
     assert out.provenance == "template" and not out.script
 
 
-def test_a_mechanism_probe_drops_the_finding_it_does_not_test(cfg: Config):
-    """LDReg's probe measures LID; the finding that ranked first was about wall-clock."""
-    out = synthesize_probe(cfg, doc("LDReg"), spec(finding_id="overclaim-06",
-                                                   claim="wall-clock hours"), RepoAcquisition())
-    assert out.finding_id == "", "a LID measurement may not be filed under a timing claim"
-    assert "LID" in out.claim
-
-
+#  has no producer now that the only template is the placebo, which
+# calibrates the finding it came from. The field and its guard are kept: they are three
+# lines, and they are what stops a measurement of one thing being filed under a claim
+# about another if a mechanism template is ever reintroduced deliberately.
 def test_a_placebo_probe_keeps_the_finding_whose_gain_it_calibrates(cfg: Config):
     out = synthesize_probe(cfg, doc("Weather"), spec(finding_id="overclaim-01",
                                                      claim="a 0.3 point gain"), RepoAcquisition())
@@ -206,8 +210,15 @@ def test_a_placebo_probe_keeps_the_finding_whose_gain_it_calibrates(cfg: Config)
 # 4. The provenance ceiling — the boundary that must not erode
 # --------------------------------------------------------------------------- #
 def _rec(provenance: str, values: list[float]) -> Reconciliation:
+    """Identity established by default (C4): this section tests the PROVENANCE ceiling,
+    not identity resolution — see test_experiment_identity.py for that gate."""
     return reconcile(ProbeSpec(paper_id=PID, table_ref="T1:r0:c1", claimed_cell_value="59.28",
-                               provenance=provenance), values, 0.10, [0, 1])
+                               provenance=provenance,
+                               experiment=ExperimentIdentity(state="established", reason="fixture"),
+                               metric_identity=MetricIdentity(state="established", reason="fixture"),
+                               configuration=ConfigurationIdentity(state="established",
+                                                                   reason="fixture")),
+                     values, 0.10, [0, 1])
 
 
 def test_a_synthesized_probe_may_not_convict_a_printed_cell():

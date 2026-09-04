@@ -41,6 +41,33 @@ def paper_id_for(path: str | Path) -> str:
     return state.slugify(Path(path).stem, 40)
 
 
+def _same_paper_by_content(doc_path: Path, src: Path) -> bool:
+    """Can a legacy project (no content_sha) be shown to be THIS document?
+
+    Only from content. The title the parser recovers from the PDF is compared with the
+    title the legacy artifact recorded; agreement is content-level evidence that the two
+    are the same paper, and anything else — a missing title, a parse failure, a different
+    title — is not. Deliberately conservative: a wrong "different paper" answer costs a
+    duplicate project directory, and a wrong "same paper" answer reviews one paper against
+    another paper's evidence.
+    """
+    try:
+        recorded = str(state.read_json(doc_path).get("title") or "").strip()
+    except (OSError, ValueError):
+        return False
+    if not recorded:
+        return False
+    try:
+        title = (pdf.guess_title(pdf.page_texts(src)) or "").strip()
+    except Exception:
+        return False
+    return bool(title) and _norm_title(title) == _norm_title(recorded)
+
+
+def _norm_title(s: str) -> str:
+    return " ".join((s or "").lower().split())
+
+
 def allocate_paper_id(cfg: Config, src: Path, sha: str) -> tuple[str, bool]:
     """(paper_id, is_same_paper) — the slug, disambiguated if it is already taken.
 
@@ -58,10 +85,24 @@ def allocate_paper_id(cfg: Config, src: Path, sha: str) -> tuple[str, bool]:
             recorded = str(state.read_json(doc).get("content_sha") or "")
         except (OSError, ValueError):
             recorded = ""
-        # An empty recorded hash means the document predates this field. Treating it as a
-        # match preserves every existing project rather than forking it on upgrade.
-        if recorded in ("", sha):
-            return pid, True
+        if recorded == sha:
+            return pid, True                       # provably the same document
+        if not recorded:
+            # A legacy project with no recorded hash. It is PRESERVED — never overwritten,
+            # never deleted — but it may not absorb a document whose identity cannot be
+            # matched against it, because an absent hash is the absence of evidence and not
+            # evidence of sameness. Reproduced: a legacy `apt-icml` with content_sha=None
+            # accepted an unrelated PDF whose filename slugified the same way, reported
+            # `cached: True`, and drove a complete review of the new paper against the old
+            # doc.json, the old lens files and the old findings.
+            #
+            # Identity is established from the paper's own bytes where the parser can do it:
+            # if the legacy doc.json records a title and the new PDF parses to the same
+            # title, that is content-level agreement and the case is reused. Otherwise the
+            # new document gets its own id, and the legacy project stays exactly as it is.
+            if _same_paper_by_content(doc, src):
+                return pid, True
+            continue
     # Both taken by other documents: fall back to the full hash, which cannot collide
     # without the papers being byte-identical.
     return f"{base}-{sha}", False
@@ -88,6 +129,8 @@ def run_ingest(cfg: Config, paper_path: str) -> dict:
     pages = pdf.page_texts(src)
     sections = pdf.split_sections(pages)
     tables = pdf.extract_tables(src, pages)
+    figures = pdf.extract_figures(pages)
+    equations = pdf.extract_equations(pages)
     numbers = pdf.table_numbers(tables) + pdf.prose_numbers(sections)
     title = pdf.guess_title(pages) or src.stem
 
@@ -102,7 +145,8 @@ def run_ingest(cfg: Config, paper_path: str) -> dict:
 
     doc = PaperDoc(paper_id=pid, title=title, source_path=str(src), content_sha=sha,
                    n_pages=len(pages),
-                   sections=sections, tables=tables, reported_numbers=numbers)
+                   sections=sections, tables=tables, figures=figures, equations=equations,
+                   reported_numbers=numbers)
     # The repository the paper advertises, ranked by how strongly the surrounding text
     # marks it as the authors' own. Recorded at ingest so S3 never re-opens the PDF, and
     # so a reader can see which URL the harness would clone before anything is fetched.

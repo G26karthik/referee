@@ -39,9 +39,9 @@ def lens_json(lens: str, verifiable: bool = False) -> dict:
 
 
 def write_lenses(cfg: Config, lenses=LENSES, verifiable: bool = False) -> None:
+    from harness.stages import audit as audit_stage
     for lens in lenses:
-        state.write_json(state.project_dir(cfg, PID) / "audit" / f"{lens}.json",
-                         lens_json(lens, verifiable))
+        audit_stage.accept_lens(cfg, PID, lens, json.dumps(lens_json(lens, verifiable)))
 
 
 def test_review_stops_for_audits_and_names_every_prompt(cfg: Config):
@@ -95,13 +95,15 @@ def test_review_reports_a_missing_pdf_cleanly(cfg: Config):
 
 
 def test_unsubstantiated_findings_are_dropped_and_counted(cfg: Config):
+    from harness.stages import audit as audit_stage
+
     review(cfg, str(PAPER))
     write_lenses(cfg, lenses=("overclaim",))
     bad = lens_json("protocol")
     bad["findings"][0]["evidence_quote"] = "a number this paper never printed"
     for lens in ("protocol", "confound", "contradiction"):
         bad["lens"] = lens
-        state.write_json(state.project_dir(cfg, PID) / "audit" / f"{lens}.json", bad)
+        audit_stage.accept_lens(cfg, PID, lens, json.dumps(bad))
     res = review(cfg, PID, skip_probe=True)
     assert res["findings"] == 1, "only the substantiated finding survives"
     assert res["dropped_unsubstantiated"] == 3
@@ -168,6 +170,7 @@ def test_several_papers_route_to_the_batch_path(monkeypatch):
 
     monkeypatch.setattr(cli.controller, "review_papers", fake)
     args = argparse.Namespace(paper=["a.pdf", "b.pdf", "c.pdf"], force_probe=False,
-                              skip_probe=False, auto_audit=False, out=None)
+                              skip_probe=False, auto_audit=False, auto_grade=False,
+                              require_grades=False, out=None)
     cli.cmd_review(args)
     assert seen["papers"] == ["a.pdf", "b.pdf", "c.pdf"]

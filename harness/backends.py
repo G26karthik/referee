@@ -103,7 +103,7 @@ class ExecOutcome:
     long-running experiment cut short read as the same event. They are opposite evidence
     about whether the experiment was reached.
 
-    The identity fields — `argv`, `cwd`, `started_at`, `ended_at` — are echoed back by the
+    The identity fields — `argv`, `cwd`, `environment`, `started_at`, `ended_at` — are echoed back by the
     backend rather than assumed by the caller. A record that says what the caller INTENDED
     to run is not evidence of what ran; a reviewer checking a reproduction verdict needs
     the command the process was actually given, from the thing that gave it.
@@ -120,6 +120,7 @@ class ExecOutcome:
     error: str = ""                      # why it did not launch, when launched is False
     argv: list[str] = field(default_factory=list)
     cwd: str = ""
+    environment: str = ""                # the backend's own account of where this ran
     started_at: str = ""                 # UTC ISO-8601
     ended_at: str = ""
 
@@ -148,6 +149,7 @@ class BackendResources:
     cpu_count: int | None = None
     gpu_count: int | None = None
     gpu_name: str = ""
+    python_version: str = ""             # 'major.minor.micro' INSIDE the backend, if knowable
     detail: str = ""
 
 
@@ -178,13 +180,31 @@ class BackendProfile:
     ram_bytes: int | None = None
     disk_bytes: int | None = None
     cpu_count: int | None = None
+    gpu_count: int | None = None
     gpu_name: str = ""
+    python_version: str = ""
     max_walltime_s: int | None = None
-    network_at_runtime: bool = False
     requires_credentials: bool = False
     can_execute: bool = False
-    reproducibility: str = ""
     detail: str = ""
+    # ponytail: `network_at_runtime` and `reproducibility` are DECLARED and consulted by
+    # nothing. `select_for` cannot match them because no requirement encodes the other
+    # half: nothing extracts "this experiment downloads a checkpoint at runtime" from the
+    # paper or the repository, and `ResourceRequirement` has no field for it. Inventing
+    # one would make an unknown demand look answered, which is the failure `memory_stated`
+    # exists to close.
+    #
+    # The ceiling: an experiment needing a runtime download could be selected for an
+    # environment with no runtime network. It fails safe — the download raises during
+    # startup, `reached_experiment` is False, and the result is INCONCLUSIVE rather than a
+    # reproduction verdict — but it fails wastefully, after provisioning.
+    #
+    # The upgrade path is an extractor, not a field: a `code_audit` rule over the checkout
+    # for `from_pretrained`, `load_dataset`, `hf_hub_download`, `torch.hub.load`, `wget`
+    # and `curl`, whose findings carry a file:line the way every other requirement carries
+    # a quote. Then a network demand is evidence, and this field has something to match.
+    network_at_runtime: bool = False
+    reproducibility: str = ""
 
 
 @dataclass(frozen=True)
@@ -211,12 +231,31 @@ class BackendSelection:
 # The interface
 # --------------------------------------------------------------------------- #
 class ExecutionBackend(ABC):
-    """Six operations. Adding Linux/WSL/container means implementing these and nothing else.
+    """Five operations to implement, three to override. That is the whole provider contract.
 
-    The audit, identity and reconciliation layers never import a concrete backend and
-    never branch on `backend.name`. They ask for a platform, a capability record, an
-    outcome — all of which are backend-independent shapes — so a new backend changes
-    where a process runs without changing what any verdict means.
+        MUST     resources    what is on offer, in bytes
+                 capability    can this repository be given a fair run here
+                 provision     build the environment the repository declares
+                 execute       start one process, collect its output
+                 cleanup       remove only what provisioning created
+
+        MAY      profile       what to MATCH a demand against, when it cannot be measured
+                 available     is this reachable right now
+                 environment   where a process this backend starts actually runs
+
+    A remote provider is a class implementing the first five and overriding the last
+    three. Nothing above this seam changes: the audit, identity and reconciliation layers
+    never import a concrete backend and never branch on `backend.name`. They ask for a
+    platform, a capability record, an outcome — all backend-independent shapes — so a new
+    backend changes where a process runs without changing what any verdict means.
+
+    **What is deliberately not here.** No submit/poll/fetch triple, and no staging call.
+    A remote backend blocks inside `execute()` and returns the same `ExecOutcome`, and
+    stages the checkout inside `provision()` by returning a `RepoAcquisition` whose `path`
+    and `env_path` are meaningful in ITS namespace — which `execute` then interprets as
+    `cwd`. Splitting either into lifecycle methods buys asynchronous resume, and nothing
+    in this harness resumes an execution today, so it would be an interface shaped around
+    a caller that does not exist.
 
     `platform` is the load-bearing member for future backends. `assess_capability`
     compares a repository's declared platform against the platform the run will actually
@@ -241,15 +280,34 @@ class ExecutionBackend(ABC):
         return BackendProfile(
             name=self.name, platform=r.platform, vram_bytes=r.vram_bytes,
             ram_bytes=r.ram_bytes, disk_bytes=r.disk_bytes, cpu_count=r.cpu_count,
-            gpu_name=r.gpu_name, can_execute=True, detail=r.detail)
+            gpu_count=r.gpu_count, gpu_name=r.gpu_name, python_version=r.python_version,
+            network_at_runtime=True, can_execute=True, detail=r.detail)
 
     @property
     def platform(self) -> str:
         return self.resources().platform
 
     def available(self) -> BackendAvailability:
-        """Is this backend usable on this machine right now?"""
+        """Is this backend usable on this machine right now?
+
+        Distinct from `profile().can_execute`, and the distinction is the whole reason both
+        exist. `can_execute` is a permanent property — a declaration will never run
+        anything. `available` is a property of the moment: a real runner whose provider is
+        returning 503 can execute and cannot execute *now*. One is a reason to stop asking;
+        the other is a reason to try later, and collapsing them loses that.
+        """
         return BackendAvailability(True, "")
+
+    def environment(self) -> str:
+        """Where a process this backend starts will actually run, in one line.
+
+        Stamped onto every `ExecOutcome` so the execution record locates itself. Derived
+        from `resources()` by default, which is enough for a machine you can point at. A
+        remote backend overrides it to name the session it obtained — otherwise a
+        reproduction verdict would rest on hardware nobody can identify afterwards.
+        """
+        r = self.resources()
+        return " ".join(x for x in (self.name, r.platform, r.python, r.gpu_name) if x)
 
     # --- capability checking ------------------------------------------------------------
     @abstractmethod
@@ -286,6 +344,7 @@ class LocalBackend(ExecutionBackend):
         vram, gpu_name, gpu_count = resources_mod.host_vram_bytes()
         return BackendResources(
             name=self.name, platform=sys.platform, python=cfg.python,
+            python_version=".".join(str(n) for n in sys.version_info[:3]),
             has_gpu=cfg.has_gpu(), vram_bytes=vram, gpu_name=gpu_name, gpu_count=gpu_count or None,
             ram_bytes=resources_mod.host_ram_bytes(),
             disk_bytes=resources_mod.host_disk_bytes(cfg.projects_dir),
@@ -309,7 +368,8 @@ class LocalBackend(ExecutionBackend):
         halfway through a seed loop, and the caller needs every ending as data."""
         started, t0 = _utc(), time.time()
         env = {**os.environ, **req.env} if req.env else None
-        stamp = dict(backend=self.name, argv=list(req.argv), cwd=req.cwd, started_at=started)
+        stamp = dict(backend=self.name, argv=list(req.argv), cwd=req.cwd,
+                     environment=self.environment(), started_at=started)
         try:
             p = subprocess.run(req.argv, cwd=req.cwd or None, capture_output=True, text=True,
                                encoding="utf-8", errors="replace", timeout=req.timeout_s,
@@ -369,7 +429,8 @@ class DeclaredBackend(ExecutionBackend):
     def resources(self) -> BackendResources:
         p = self.spec
         return BackendResources(
-            name=p.name, platform=p.platform, python="", has_gpu=bool(p.vram_bytes),
+            name=p.name, platform=p.platform, python="", python_version=p.python_version,
+            has_gpu=bool(p.vram_bytes),
             vram_bytes=p.vram_bytes, ram_bytes=p.ram_bytes, disk_bytes=p.disk_bytes,
             cpu_count=p.cpu_count, gpu_count=1 if p.vram_bytes else None,
             gpu_name=p.gpu_name, detail=p.detail)
@@ -411,7 +472,7 @@ class KaggleBackend(DeclaredBackend):
     spec = BackendProfile(
         name="kaggle", platform="linux", vram_bytes=16 * (1024 ** 3),
         ram_bytes=13 * (1024 ** 3), disk_bytes=73 * (1024 ** 3), cpu_count=4,
-        gpu_name="Tesla T4", max_walltime_s=12 * 3600, network_at_runtime=False,
+        gpu_count=1, gpu_name="Tesla T4", max_walltime_s=12 * 3600, network_at_runtime=False,
         requires_credentials=True, can_execute=False, reproducibility="session",
         detail="Kaggle free tier, published specification")
 
@@ -425,7 +486,7 @@ class ColabBackend(DeclaredBackend):
     spec = BackendProfile(
         name="colab", platform="linux", vram_bytes=16 * (1024 ** 3),
         ram_bytes=13 * (1024 ** 3), disk_bytes=78 * (1024 ** 3), cpu_count=2,
-        gpu_name="Tesla T4", max_walltime_s=12 * 3600, network_at_runtime=False,
+        gpu_count=1, gpu_name="Tesla T4", max_walltime_s=12 * 3600, network_at_runtime=False,
         requires_credentials=True, can_execute=False, reproducibility="session",
         detail="Google Colab free tier, published specification")
 
@@ -507,9 +568,11 @@ def select_for(requirement, cfg: Config, declared_platform: str = "",
     among runnable ones the smallest sufficient environment wins — a reproduction should
     not silently claim a larger machine than it needs.
 
-    The refusal codes are ordered by what is most useful to act on. `credentials_
-    unavailable` outranks `resources_insufficient` because "somewhere could run this, but
-    not from here" is actionable and "nothing is big enough" is not.
+    The refusal codes are ordered by what is most useful to act on, closest-to-a-yes
+    first: `backend_unavailable` (a real runner that fits, merely unreachable now) then
+    `credentials_unavailable` ("somewhere could run this, but not from here") then
+    `platform_incompatible` and `resources_insufficient`. Only the first can resolve
+    itself; the rest need an operator, a different machine, or nothing at all.
     """
     if requirement is None or not getattr(requirement, "stated", False):
         return BackendSelection(
@@ -539,7 +602,14 @@ def select_for(requirement, cfg: Config, declared_platform: str = "",
                  (("VRAM", requirement.vram_bytes, p.vram_bytes),
                   ("RAM", requirement.ram_bytes, p.ram_bytes),
                   ("disk", requirement.disk_bytes, p.disk_bytes),
-                  ("CPU", requirement.cpu_count, p.cpu_count))
+                  ("CPU", requirement.cpu_count, p.cpu_count),
+                  # A multi-GPU experiment does not fit a single-GPU environment, and
+                  # `assess_resources` has always said so. Omitting the count here let
+                  # selection report `selected: local` for an 8-GPU experiment that the
+                  # resource check then refused as `insufficient` — two components
+                  # disagreeing about the same experiment on the same host, with the
+                  # optimistic one written into `spec.backend_selection`.
+                  ("GPU count", requirement.gpu_count, p.gpu_count))
                  if not _fits(need, have)]
         if walltime_s and p.max_walltime_s and walltime_s > p.max_walltime_s:
             short.append("walltime")
@@ -563,12 +633,39 @@ def select_for(requirement, cfg: Config, declared_platform: str = "",
         runnable.append((p.vram_bytes or 0, backend, p))
 
     frozen = tuple(considered)
+    offline = [w for _, v, w in considered if v == "unavailable"]
+    if runnable and not requirement.memory_stated:
+        # A candidate met everything that was stated, and the memory demand was not among
+        # it. Choosing it would be reporting `selected` for an experiment whose deciding
+        # quantity nobody established — and `assess_resources` would then refuse the same
+        # spec as `unknown`, so selecting here would only put a contradiction on the spec.
+        #
+        # Checked at this point rather than beside the `stated` guard at the top so a
+        # candidate that WAS ruled out on platform, size or credentials still reports that
+        # specific reason instead of being flattened into ignorance.
+        return BackendSelection(
+            None, "requirement_unknown",
+            "an environment meets every requirement this experiment states, but its memory "
+            "demand was never established, so no environment can be SHOWN to host it. "
+            + (f"Unstated: {', '.join(requirement.unstated)}." if requirement.unstated else ""),
+            frozen)
     if runnable:
         runnable.sort(key=lambda t: t[0])
         backend, p = runnable[0][1], runnable[0][2]
         return BackendSelection(backend, "selected",
                                 f"'{p.name}' meets every stated requirement of this experiment",
                                 frozen)
+    if offline:
+        # Ranked above a declaration, and above the size and platform reports. A backend
+        # that fits the experiment AND can run it is the closest thing to a yes the
+        # registry holds: it needs no credentials, no account and no operator setup, only
+        # a later attempt. It is the one refusal in this function that may resolve itself
+        # without anything about the paper or the host changing, which is why it is
+        # reported ahead of the ones that will not.
+        return BackendSelection(
+            None, "backend_unavailable",
+            "an environment that can host this experiment is registered but not reachable: "
+            + "; ".join(offline), frozen)
     if declared:
         names = ", ".join(p.name for _, p in declared)
         return BackendSelection(
@@ -669,9 +766,12 @@ def authorize(cfg: Config, spec: ProbeSpec, backend: ExecutionBackend | None,
                    f"{backend.available().detail}")
 
     if not backend.available().usable:
-        return ExecAuthorization(allowed=False, decision="no_backend", backend=name,
+        # `backend_offline`, not `no_backend`. The registry HAS a runner for this
+        # experiment; it cannot be reached at this moment. An operator reading
+        # "no backend" looks for one to add, which is the wrong next step.
+        return ExecAuthorization(allowed=False, decision="backend_offline", backend=name,
                                  failure_class="backend_unavailable",
-                                 detail=f"repository execution needs a usable backend: "
+                                 detail=f"'{name}' can execute but is not reachable now: "
                                         f"{backend.available().detail}")
 
     if not cfg.allow_repo_exec:
@@ -720,6 +820,20 @@ def authorize(cfg: Config, spec: ProbeSpec, backend: ExecutionBackend | None,
                     else "the experiment's resource demand was never assessed against this "
                          "backend, so it cannot be shown to fit"))
 
+    # The records above were produced against ONE backend. `spec.backend` names it, and a
+    # capability or resource assessment made for a different machine says nothing about
+    # this one — an 8 GiB card's `satisfied` is not an 80 GiB card's, and a `win32`
+    # capability is not a `linux` capability. `ProbeSpec.backend` exists to carry exactly
+    # this, so it is checked rather than assumed.
+    planned = (spec.backend or "").strip()
+    if planned and planned != name:
+        return ExecAuthorization(
+            allowed=False, decision="backend_mismatch", backend=name,
+            failure_class="execution_unauthorized",
+            detail=f"capability and resources were assessed against '{planned}' but execution "
+                   f"was requested on '{name}'; an assessment of one environment is not an "
+                   f"assessment of another")
+
     return ExecAuthorization(
         allowed=True, decision="authorized", backend=name, failure_class="none",
         detail=f"identity established, capability established, the published experiment fits "
@@ -758,6 +872,19 @@ if __name__ == "__main__":  # self-check: python -m harness.backends
 
     slow = backend.execute(ExecRequest([cfg.python, "-c", "import time; time.sleep(5)"], "", 1))
     assert slow.launched and not slow.completed and slow.timed_out, "a timeout is not a failed launch"
+
+    # --- the provider-neutral contract -------------------------------------------------
+    # Every registered backend, not just the one that runs here. A new provider is a class
+    # and a profile; if either of these fails, something above the seam would have to change.
+    for _name in registered_backends():
+        _b = _REGISTRY[_name]()
+        assert _b.name == _name and _b.profile().name == _name
+        assert _b.resources().platform, f"{_name} must say what platform it presents"
+        assert _b.environment(), f"{_name} must be able to say where a run happens"
+
+    # Where it ran, as the backend itself reports it. Locally the hardware is implicit;
+    # remotely it is the only record of what a verdict came from.
+    assert out.environment == backend.environment() and sys.platform in out.environment
 
     # --- registry ----------------------------------------------------------------------
     assert "local" in registered_backends()
@@ -822,6 +949,45 @@ if __name__ == "__main__":  # self-check: python -m harness.backends
                      commit=good).decision == "provenance_insufficient"
 
     assert not authorize(open_cfg, repo_spec, None, commit=good).allowed, "no backend, no run"
+
+    # A runner that is down is not an absent runner, and neither is a declaration. Three
+    # refusals, three names — collapsing them would send an operator looking for a backend
+    # to add when the registry already holds one that would have run the experiment.
+    class _Down(LocalBackend):
+        name = "down"
+
+        def available(self) -> BackendAvailability:
+            return BackendAvailability(False, "the provider API returned 503")
+
+    decisions = {authorize(open_cfg, repo_spec, None, commit=good).decision,
+                 authorize(open_cfg, repo_spec, _Down(), commit=good).decision,
+                 authorize(open_cfg, repo_spec, KaggleBackend(), commit=good).decision}
+    assert decisions == {"no_backend", "backend_offline", "backend_cannot_execute"}, decisions
+
+    # ...and selection reports the same three distinctly. An unreachable runner used to
+    # land in `resources_insufficient` with an empty reason, having been rejected for
+    # nothing of the kind.
+    from .artifacts import ResourceEvidence, ResourceRequirement
+    _fitting = ResourceRequirement(vram_bytes=2 * (1024 ** 3),
+                                   evidence=[ResourceEvidence(quote="q", kind="declared_requirement")])
+    _saved = dict(_REGISTRY)
+    try:
+        _REGISTRY.clear()
+        _REGISTRY["down"] = _Down
+        _sel = select_for(_fitting, cfg)
+        assert _sel.reason_code == "backend_unavailable" and _sel.chosen is None, _sel.reason_code
+        assert "503" in _sel.reason
+    finally:
+        _REGISTRY.clear()
+        _REGISTRY.update(_saved)
+
+    # Selection and the resource check must agree. They did not about GPU count: an 8-GPU
+    # experiment selected the single-card local backend, which `assess_resources` then
+    # refused — the optimistic answer being the one written onto the spec.
+    _multi = ResourceRequirement(vram_bytes=1024 ** 3, gpu_count=8,
+                                 evidence=[ResourceEvidence(quote="q", kind="declared_requirement")])
+    assert select_for(_multi, cfg).reason_code == "resources_insufficient"
+    assert resources_mod.assess_resources(_multi, res, backend="local").state == "insufficient"
 
     # --- cleanup -------------------------------------------------------------------------
     with tempfile.TemporaryDirectory() as td:

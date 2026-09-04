@@ -116,6 +116,63 @@ def test_modified_tracked_files_are_reported(tmp_path):
     assert dirty_files(repo) == ["eval.py"]
 
 
+def test_an_untracked_file_makes_the_tree_dirty(tmp_path):
+    """C5 — `--untracked-files=no` was the hole: a NEW file dropped beside the audited
+    ones (a patched module, a shadowing `__init__.py`) is untracked, so it never showed
+    up, and the checkout still reported clean. An untracked file must count as dirty."""
+    repo = _repo(tmp_path)
+    assert dirty_files(repo) == []
+    (repo / "sneaky.py").write_text("import eval as _shadow\n", encoding="utf-8")
+    assert dirty_files(repo) == ["sneaky.py"]
+    ver = verify_commit(repo, head_commit(repo))
+    assert ver.state == "dirty", ver.reason
+
+
+def test_a_submodule_ignore_setting_does_not_hide_its_modification(tmp_path):
+    """C5 — `submodule.<name>.ignore` in `.gitmodules` or the local config makes plain
+    `git status` stop reporting a submodule's own modifications. `--ignore-submodules=none`
+    must override that so a modified submodule still shows up as dirty."""
+    inner = _repo(tmp_path, "inner")
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    _git(outer, "init", "--quiet")
+    _git(outer, "-c", "protocol.file.allow=always", "submodule", "add",
+        "--quiet", str(inner).replace("\\", "/"), "sub")
+    _git(outer, "commit", "--quiet", "-m", "add submodule")
+    _git(outer, "config", "-f", ".gitmodules", "submodule.sub.ignore", "all")
+    _git(outer, "submodule", "update", "--init", "--quiet")
+
+    (outer / "sub" / "eval.py").write_text("print('tampered submodule')\n", encoding="utf-8")
+    assert dirty_files(outer) != [], "a modified submodule must not be hidden by its own ignore setting"
+
+
+def test_a_dot_git_file_redirect_is_uninspectable(tmp_path):
+    """C5 — `acquire()` only ever produces a real `git clone`, whose `.git` is a
+    directory. A `.git` FILE (a linked worktree/submodule redirect, or tampering) means
+    this checkout is not its own independent tree, so it must never be certified clean."""
+    repo = _repo(tmp_path)
+    real_git = repo / ".git"
+    target = real_git.rename(tmp_path / "elsewhere_gitdir")
+    (repo / ".git").write_text(f"gitdir: {target}\n", encoding="utf-8")
+
+    ver = verify_commit(repo, head_commit(repo) or "0" * 40)
+    assert ver.state == "unknown", ver.reason
+    assert ".git" in ver.reason
+
+
+def test_an_assume_unchanged_path_is_uninspectable(tmp_path):
+    """C5 — assume-unchanged exists specifically to make `git status` stop reporting a
+    path's own modifications, so a checkout carrying one on a tracked file cannot be
+    certified clean even when `git status` itself reports nothing."""
+    repo = _repo(tmp_path)
+    _git(repo, "update-index", "--assume-unchanged", "eval.py")
+    (repo / "eval.py").write_text("print('tampered but hidden')\n", encoding="utf-8")
+
+    ver = verify_commit(repo, head_commit(repo))
+    assert ver.state == "unknown", ver.reason
+    assert "assume-unchanged" in ver.reason or "skip-worktree" in ver.reason
+
+
 # --------------------------------------------------------------------------- #
 # Verification
 # --------------------------------------------------------------------------- #

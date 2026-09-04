@@ -80,6 +80,46 @@ class Config:
     # get a different answer out of a gate that is doing its job.
     audit_retries: int = field(default_factory=lambda: int(os.environ.get("SH_AUDIT_RETRIES", "2")))
 
+    # --- S2.5 independent grading --------------------------------------------------
+    # OFF by default, same reasoning as `allow_auto_audit`: a second external process,
+    # a second command an operator must opt into. Unlike a lens, the grader runs with
+    # ZERO tools and no filesystem access at all — see `harness/grade_driver.py` — so it
+    # cannot read the severity or any other finding it is deliberately not shown.
+    #
+    # Grading does not change what THRESHOLDS mean (`RED_FATAL` etc. in
+    # `stages/report.py` are untouched); it changes what is ELIGIBLE to be counted at
+    # each severity. With the gate closed, `Finding.counted_severity` stays empty and
+    # `stages.report.counted()` falls back to the lens's own `severity` — the verdict is
+    # byte-identical to what it was before this subsystem existed.
+    allow_grading: bool = field(default_factory=lambda: _flag("SH_ALLOW_GRADING"))
+    grade_cmd: str = field(default_factory=lambda: os.environ.get("SH_GRADE_CMD", ""))
+    grade_timeout_s: int = field(default_factory=lambda: int(os.environ.get("SH_GRADE_TIMEOUT", "600")))
+    grade_retries: int = field(default_factory=lambda: int(os.environ.get("SH_GRADE_RETRIES", "2")))
+    # "serious": only FATAL/MAJOR candidates are graded — justified by threshold
+    # reachability, not cost: a MINOR cannot cross any RED branch on its own, so grading
+    # it can only ever move a YELLOW toward GREEN, the direction a false negative there
+    # is cheapest. "all" grades every substantiated candidate, for evaluation runs.
+    grade_scope: str = field(default_factory=lambda: os.environ.get("SH_GRADE_SCOPE", "serious"))
+    grade_budget_chars: int = field(
+        default_factory=lambda: int(os.environ.get("SH_GRADE_BUDGET_CHARS", "45000")))
+    # If set, an incomplete grading pass blocks the report (`waiting`, not a partial
+    # report) instead of the default — proceed with whatever graded, everything else
+    # ungraded and falling back to its lens severity. Off by default: abstention is not
+    # failure, and a paper must still reach a complete report when the grader available
+    # this run could not cover everything, exactly as the audit lenses already work.
+    require_grades: bool = field(default_factory=lambda: _flag("SH_REQUIRE_GRADES"))
+
+    # --- the substantive verdict -----------------------------------------------------
+    # A single, best-effort, never-retried, whole-paper opinion — see
+    # `harness/prompts/verdict.py`. OFF by default: a third external process an operator
+    # must opt into, same reasoning as the two gates above it. Its failure NEVER blocks
+    # a report; only `verdict`/`verdict_reason` (the deterministic ones) do that.
+    allow_substantive_verdict: bool = field(
+        default_factory=lambda: _flag("SH_ALLOW_SUBSTANTIVE_VERDICT"))
+    verdict_cmd: str = field(default_factory=lambda: os.environ.get("SH_VERDICT_CMD", ""))
+    verdict_timeout_s: int = field(
+        default_factory=lambda: int(os.environ.get("SH_VERDICT_TIMEOUT", "300")))
+
     # Which execution backend runs THIRD-PARTY repository code. Not a gate — `local` is
     # the only registered backend, and selecting one grants nothing on its own: the
     # repo-exec gate, the identity chain and the capability check all still apply. It

@@ -142,7 +142,7 @@ harness/
   pdf.py               PDF → sections, tables, numbers
   dossier.py           cross-paper consolidation
   prompts/audit.py     the four lens prompts
-tests/                 556 tests
+tests/                 647 tests
 docs/                  the architecture map
 papers/                source PDFs
 projects/<pid>/        per-paper state: paper, audit, runs, reports, controller.json
