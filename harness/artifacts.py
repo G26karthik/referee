@@ -14,6 +14,11 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# The one harness import here, and it is safe in both directions: `harness.failures` is
+# pure regex and imports nothing from this package, so the vocabulary can be defined
+# beside the classification logic that owns it rather than duplicated here.
+from .failures import FAILURE_KINDS
+
 
 class _Base(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -78,9 +83,11 @@ class Section(_Base):
 class Figure(_Base):
     """One extracted figure CAPTION — never the figure's plotted content, which this
     harness has no way to read. `ref()` is what `verify_evidence` matches against; the
-    evidence class it earns (`caption_verified`) is capped at NOTE in
-    `harness.grading.EVIDENCE_CEILING` for exactly that reason: a caption NAMES a
-    figure, it does not report the values in it."""
+    evidence class it earns (`caption_verified`) supports at most LOW confidence in
+    `harness.grading.EVIDENCE_CONFIDENCE_CEILING` for exactly that reason: a caption
+    NAMES a figure, it does not report the values in it. That bounds how SURE anyone can
+    be, not how severe the finding may be — and a second independent check (the grader's
+    own citation, or a harness-reproduced calculation) lifts the bound."""
 
     figure_idx: int
     page: int = 0
@@ -94,8 +101,15 @@ class Figure(_Base):
 class Equation(_Base):
     """One extracted display equation. Text-only and lossy by construction — symbols,
     sub/superscripts and inline math routinely survive PDF extraction mangled or
-    missing — so its evidence class (`equation_verified`) is capped at MINOR, not
-    trusted the way a table cell is."""
+    missing — so its evidence class (`equation_verified`) supports at most MEDIUM
+    confidence, not the HIGH a table cell earns.
+
+    Extraction is deliberately willing to find NOTHING. Some papers' equations arrive as
+    per-glyph fragments with no operator on any one line; `pdf._equation_body` returns ''
+    rather than attaching a number to whatever text happens to precede it, because a
+    wrongly assembled body would make `verify_evidence` certify a quote as
+    `equation_verified` against text that is not the equation — a false machine
+    attestation, which is worse than an absent one."""
 
     equation_idx: int
     page: int = 0
@@ -159,11 +173,33 @@ SEVERITIES = ("FATAL", "MAJOR", "MINOR", "NOTE")
 # grader's confidence places on `counted_severity` lives in `harness/grading.py`.
 CONFIDENCES = ("HIGH", "MEDIUM", "LOW")
 
-# The three-way, non-collapsible bucket a lens must sort its own candidate into. Only
-# CONFIRMED_FINDING is eligible to carry FATAL/MAJOR once graded; a PLAUSIBLE_CONCERN or
-# OPEN_QUESTION is printed but counts toward no threshold. See `FINDING_CLASSES` below
-# for the harness-derived analogue, which additionally distinguishes REFUTED/UNGRADED.
-CANDIDATE_CLASSES = ("CONFIRMED_FINDING", "PLAUSIBLE_CONCERN", "OPEN_QUESTION")
+# The four-way, non-collapsible bucket a lens must sort its own candidate into.
+# `harness.grading.CANDIDATE_CAP` ENFORCES the distinction rather than merely documenting
+# it: only CONFIRMED_FINDING is eligible to carry FATAL/MAJOR, a PLAUSIBLE_CONCERN is
+# capped at MINOR, and an OPEN_QUESTION or DISMISSED counts toward no threshold at all.
+# "Never promote a suspicion directly to a confirmed finding" is that cap, not an
+# instruction. See `FINDING_CLASSES` below for the harness-derived analogue, which
+# additionally distinguishes REFUTED/UNGRADED.
+#
+# DISMISSED is kept as a reportable bucket rather than being dropped at the source. A
+# candidate the lens raised and then talked itself out of is exactly the work the
+# discipline asks for, and a reviewer who can see it did not have to wonder whether the
+# question was ever asked.
+CANDIDATE_CLASSES = ("CONFIRMED_FINDING", "PLAUSIBLE_CONCERN", "OPEN_QUESTION", "DISMISSED")
+
+# §10 — how much a MISSING comparison actually matters, which is a different question
+# from whether it is missing. Absence is easy to establish and says nothing on its own;
+# these four say what the absence costs the paper, and `harness.grading.BASELINE_CAP`
+# holds a finding to the lens's own answer.
+BASELINE_CLASSES = ("OPTIONAL_COMPARISON", "USEFUL_CONTROL", "IMPORTANT_MISSING_BASELINE",
+                    "CENTRAL_VALIDITY_THREAT", "NOT_APPLICABLE")
+
+# §10 — WHERE a novelty or prior-art claim's load-bearing half comes from. The harness can
+# re-verify a quote from this paper and cannot re-verify the reviewer's recollection of
+# another one, so the three are not interchangeable and `harness.grading.PRIOR_ART_CAP`
+# prices them differently.
+PRIOR_ART_BASES = ("PAPER_INTERNAL", "EXTERNAL_VERIFIED", "REVIEWER_INFERENCE",
+                   "NOT_APPLICABLE")
 
 # What KIND of numeric discrepancy this is, once recomputed — these are not equivalent,
 # and only GENUINE_CONTRADICTION is evidence of a defect; the others are usually not.
@@ -324,6 +360,12 @@ class Finding(_Base):
     candidate_class: str = Field(default="", description=" | ".join(CANDIDATE_CLASSES))
     confidence: str = Field(default="", description="separate from severity: " + " | ".join(CONFIDENCES))
     discrepancy_type: str = Field(default="", description=" | ".join(DISCREPANCY_TYPES))
+    baseline_class: str = Field(
+        default="", description="for a MISSING-COMPARISON finding, what its absence actually "
+                                "costs the paper: " + " | ".join(BASELINE_CLASSES))
+    prior_art_basis: str = Field(
+        default="", description="for a NOVELTY/PRIOR-ART finding, where its load-bearing half "
+                                "comes from: " + " | ".join(PRIOR_ART_BASES))
     what_the_paper_says: str = Field(default="", description="the claim restated plainly, before argument")
     alternative_interpretation: str = Field(
         default="", description="the reasonable reading under which this is NOT a problem")
@@ -372,6 +414,18 @@ class Finding(_Base):
                                                                           "verified the same way the "
                                                                           "lens's was")
     grader_verified_observation: str = Field(default="", description="WRITTEN BY THE HARNESS")
+    evidence_ceiling: str = Field(
+        default="",
+        description="WRITTEN BY THE HARNESS: the highest CONFIDENCE this finding's citations can "
+                    "support, from `harness.grading.evidence_support`. Evidence type bounds how "
+                    "sure anyone can be; confidence then bounds severity. It never caps severity "
+                    "directly — see that module for why the earlier direct ceiling was wrong.")
+    evidence_sources: list[str] = Field(
+        default_factory=list,
+        description="WRITTEN BY THE HARNESS: the independent checks behind this finding — the "
+                    "lens's citation, the grader's own citation, and a harness-recomputed "
+                    "calculation each count once. More than one LIFTS `evidence_ceiling`: "
+                    "corroborated evidence collectively supports a stronger finding.")
 
     def as_reasoning(self) -> str:
         return (self.reasoning or self.statement or "").strip()
@@ -385,6 +439,18 @@ class Finding(_Base):
 
 class LensReport(_Base):
     lens: str
+    schema_version: int = Field(
+        default=0,
+        description="the LENS PROMPT's contract version this report was written against. "
+                    "Report-level, not per-finding — `prompts/audit._RETURN` puts it here, "
+                    "beside `findings`. Declared explicitly rather than surviving as an "
+                    "`extra` field because `stages/audit._coerce` has to read it and thread "
+                    "it into `grading.pass_b_state`: while it was only an extra, that "
+                    "function looked for it on each FINDING, found nothing on every real "
+                    "lens file, and returned `legacy` — which is uncapped — so the whole "
+                    "falsification/steelman non-degeneracy check was inert in production "
+                    "while its unit tests passed. 0 means a pre-contract file.",
+    )
     findings: list[Finding] = Field(default_factory=list)
     unasked_question: str = Field(
         default="", description="the obvious baseline/comparison this lens finds conspicuously absent"
@@ -1305,6 +1371,14 @@ class EvalReport(_Base):
                     "dissent: it demands human attention (a contested banner, `run.py` exit 3), "
                     "never a change of color.",
     )
+    n_figures: int = Field(default=0, description="figure captions extracted (citable as F<n>)")
+    n_equations: int = Field(default=0, description="display equations extracted (citable as E<n>)")
+    self_audit: "ReviewSelfAudit | None" = Field(
+        default=None,
+        description="HARNESS-WRITTEN: did this review exercise the discipline it claims? See "
+                    "`harness/selfaudit.py`. Consumed by no threshold — a failed check refuses "
+                    "to let the review call itself complete, it does not change the verdict.",
+    )
 
 
 SUBSTANTIVE_VERDICTS = ("STRONG", "SOUND_WITH_MINOR_CONCERNS", "SUBSTANTIAL_CONCERNS",
@@ -1314,13 +1388,104 @@ SUBSTANTIVE_VERDICTS = ("STRONG", "SOUND_WITH_MINOR_CONCERNS", "SUBSTANTIAL_CONC
 class SubstantiveVerdict(_Base):
     """One model's whole-paper opinion — see `EvalReport.substantive_verdict`. Every
     field here is a model's claim; none of it is harness-written, because none of it is
-    evidence — it is printed as an opinion, labelled as one, consumed by no threshold."""
+    evidence — it is printed as an opinion, labelled as one, consumed by no threshold.
+
+    The fields below the first three are the reviewer spec's own whole-paper questions,
+    answered one at a time rather than compressed into a single sentence. That shape is
+    the point: "what is the real contribution", "what most threatens it" and "are the
+    weaknesses local or systemic" are separate judgements, and a reader who disagrees with
+    the overall verdict needs to see which of them they disagree with.
+    """
 
     verdict: str = Field(default="", description=" | ".join(SUBSTANTIVE_VERDICTS))
     reason: str = ""
     strongest_contribution: str = ""
     weakest_link: str = ""
     weaknesses_are: str = Field(default="", description="LOCAL | SYSTEMIC | MIXED")
+    real_contribution: str = Field(
+        default="", description="what the paper actually contributes, in the reviewer's own words")
+    strongest_support: str = Field(default="", description="the evidence that most supports it")
+    strongest_threat: str = Field(default="", description="the evidence that most threatens it")
+    claims_well_supported: list[str] = Field(
+        default_factory=list, description="claims that stand on the evidence as presented")
+    claims_needing_qualification: list[str] = Field(
+        default_factory=list, description="claims that hold only in a narrower form")
+    core_contribution_stands: str = Field(
+        default="", description="YES | YES_QUALIFIED | NO | UNDETERMINED — the whole-paper "
+                                "answer, reasoned rather than counted. Read as an opinion: no "
+                                "threshold consumes it.")
+
+
+class SelfAuditItem(_Base):
+    """One line of the reviewer self-audit — see `harness/selfaudit.py`.
+
+    Harness-written throughout. `state` is `pass | fail | not_applicable`, and
+    `not_applicable` is a real answer rather than a hedge: a paper with no serious
+    findings has no serious findings to have steelmanned, and reporting that as a pass
+    would claim diligence that was never exercised.
+    """
+
+    key: str = ""
+    question: str = ""
+    state: str = Field(default="not_applicable", description="pass | fail | not_applicable")
+    detail: str = ""
+    offenders: list[str] = Field(
+        default_factory=list, description="the findings responsible, named so the gap is actionable")
+    n_offenders: int = 0
+    n_in_scope: int = 0
+
+
+class ReviewSelfAudit(_Base):
+    """Did this review do the work it claims to have done? See `harness/selfaudit.py`.
+
+    `complete` being False does NOT change the verdict — the threshold table is the
+    verdict and nothing here is allowed a second path to a color. What it changes is
+    whether the review may present itself as finished.
+    """
+
+    items: list[SelfAuditItem] = Field(default_factory=list)
+    failed: list[str] = Field(default_factory=list, description="keys of the unmet checks")
+    complete: bool = False
+    summary: str = ""
+
+
+# --------------------------------------------------------------------------- #
+# Corpus accounting — every requested paper, in exactly one terminal state
+# --------------------------------------------------------------------------- #
+# `requested` is not a synonym for "queued": it means a paper was asked for and NO case
+# exists for it, which is a harness defect and the state this vocabulary exists to make
+# unmissable. `started` likewise means the loop stopped mid-flight without recording why.
+# Neither may hide inside `failed`, because the operator's next action differs.
+CORPUS_STATES = ("requested", "started", "completed", "failed", "inconclusive")
+
+
+class CorpusEntry(_Base):
+    """One requested paper's terminal state. Keyed on the REQUEST, not on `paper_id`:
+    two different files can slugify to the same id, and a `paper_id`-keyed summary
+    silently collapses them into one row."""
+
+    source: str = Field(default="", description="exactly what the caller asked for")
+    paper_id: str = ""
+    state: str = Field(default="requested", description=" | ".join(CORPUS_STATES))
+    reason: str = ""
+    verdict: str = ""
+    phase: str = ""
+    reproduction_class: str = ""
+    failure_kind: str = Field(default="", description=" | ".join(FAILURE_KINDS))
+    resume_after: str = ""
+    report_path: str = ""
+
+
+class CorpusReport(_Base):
+    """The batch, request by request — see `harness/corpus.py` for the conservation law
+    (`sum(counts.values()) == requested`) that is asserted rather than assumed."""
+
+    requested: int = 0
+    entries: list[CorpusEntry] = Field(default_factory=list)
+    counts: dict[str, int] = Field(default_factory=dict)
+    by_state: dict[str, list[str]] = Field(default_factory=dict)
+    complete: bool = Field(default=False, description="every requested paper reached `completed`")
+    summary: str = ""
 
 
 class ExperimentalChain(_Base):
@@ -1433,6 +1598,15 @@ class CaseState(_Base):
                     "re-running review is worth trying again after an account-level rate limit — "
                     "advisory only, the controller does not sleep or poll on it.",
     )
+    failure_kind: str = Field(
+        default="",
+        description="WHY the last phase attempt did not succeed, from `harness.failures.classify`: "
+                    + " | ".join(FAILURE_KINDS) + ". Persisted because 'waiting' alone does not "
+                    "tell an operator whether to wait, re-run, or fix their install — and only "
+                    "a retry-NOW failure is allowed to consume part of a bounded retry budget.",
+    )
+    retry_policy: str = Field(
+        default="", description="now | later | never, for `failure_kind` above")
 
     @property
     def terminal(self) -> bool:

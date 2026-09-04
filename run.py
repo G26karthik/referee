@@ -44,6 +44,12 @@ def _echo_steps(prefix: str, res: dict) -> None:
               file=sys.stderr)
 
 
+def _detail(res: dict, stage: str) -> dict:
+    """The most recent step for one stage label. The step dicts already carry every
+    stage's own compact result, so nothing has to be threaded up separately."""
+    return next((s for s in reversed(res.get("steps", [])) if s.get("stage") == stage), {})
+
+
 def cmd_review(args: argparse.Namespace) -> int:
     """Review one or many papers. More than one runs the batch and writes a dossier."""
     cfg = Config.load()
@@ -68,6 +74,10 @@ def cmd_review(args: argparse.Namespace) -> int:
         if res.get("verdict_contested"):
             print("\n🚩 CONTESTED — the independent substantive read disagrees sharply "
                  "with this verdict; see the report.")
+        if unmet := _detail(res, "S4 report").get("self_audit_failed"):
+            print(f"\n⚠️  Reviewer self-audit: {len(unmet)} check(s) unmet "
+                 f"({', '.join(unmet)}) — see '## Reviewer self-audit' in the report. "
+                 f"The verdict is unaffected; the review is not claiming to be complete.")
         print(f"\n=== {res['verdict']} — {res['title']} ===")
         print(f"{res['reason']}\n")
         print(Path(res["report_md"]).read_text(encoding="utf-8"))
@@ -79,6 +89,24 @@ def cmd_review(args: argparse.Namespace) -> int:
     res = controller.review_papers(cfg, args.paper, dossier_out=out, **opts)
     for r in res["results"]:
         _echo_steps(f"[{r.get('paper_id', r['input'])}] ", r)
+
+    # CORPUS ACCOUNTING FIRST, and by REQUEST rather than by result. "5 papers reviewed"
+    # when six were asked for is the summary shape this block exists to make impossible:
+    # every requested paper appears on exactly one line, and `harness.corpus.account` has
+    # already asserted that the states sum to the request count.
+    corpus = res.get("corpus") or {}
+    if corpus:
+        print(f"\n=== CORPUS: {corpus.get('summary', '')} ===")
+        for e in corpus.get("entries", []):
+            extra = e.get("verdict") or e.get("failure_kind") or ""
+            note = f" · {e['resume_after']}" if e.get("resume_after") else ""
+            print(f"  {e['state']:<13} {(e.get('paper_id') or e['source'])[:34]:<34} "
+                  f"{extra:<20} {e.get('reason', '')[:70]}{note}")
+        if not corpus.get("complete"):
+            print(f"  ⚠️  {corpus['requested'] - corpus['counts'].get('completed', 0)} of "
+                  f"{corpus['requested']} requested paper(s) did NOT complete.")
+        if p := res.get("corpus_path"):
+            print(f"  machine-readable: {p}")
 
     print(f"\n=== {res['papers']} paper(s) ===")
     print(f"complete    : {', '.join(res['complete']) or '(none)'}")

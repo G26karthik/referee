@@ -23,14 +23,42 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import state
+from . import failures, state
 from .artifacts import Grade
-from .audit_driver import RateLimited, _RATE_LIMIT_RE, _kill_tree, _reset_hint
+from .audit_driver import NonRetryable, RateLimited, _kill_tree, _reset_hint
 from .config import Config
 
 
 class GradeDriverError(RuntimeError):
-    """The configured grader did not produce a usable grade."""
+    """The configured grader did not produce a usable grade.
+
+    Self-classifying, exactly as `audit_driver.AuditDriverError` is and for the same
+    reason. NOT a subclass of it: the grading path is optional and must never be able to
+    block a report, so an `except AuditDriverError` in the audit path must not
+    accidentally swallow a grading failure or vice versa.
+    """
+
+    def __init__(self, message: str, *, kind: str = "", retry: str = "",
+                 reset_hint: str = "") -> None:
+        super().__init__(message)
+        if not kind:
+            kind, retry, reset_hint = failures.classify(message)
+        self.kind, self.retry, self.reset_hint = kind, retry, reset_hint
+
+
+def grade_error(message: str) -> GradeDriverError | RateLimited | NonRetryable:
+    """The right class for one grader failure. Mirrors `audit_driver.driver_error`.
+
+    The two `later`/`never` classes are shared with the audit path deliberately: the
+    controller's retry accounting keys on them, and a rate limit is the same fact about
+    the world whichever subprocess met it.
+    """
+    kind, retry, hint = failures.classify(message)
+    if retry == "later":
+        return RateLimited(message, kind=kind, retry=retry, reset_hint=hint)
+    if retry == "never":
+        return NonRetryable(message, kind=kind, retry=retry, reset_hint=hint)
+    return GradeDriverError(message, kind=kind, retry=retry, reset_hint=hint)
 
 
 def default_cmd() -> str:
@@ -132,8 +160,9 @@ def run_candidate(cfg: Config, pid: str, slug: str, prompt: Path, out: Path, *,
 
         if not staged.exists():
             tail = (p.stderr or p.stdout or "").strip()[-300:]
-            if _RATE_LIMIT_RE.search(tail):
-                raise RateLimited(f"grader account rate-limited{f' — resets {_reset_hint(tail)}' if _reset_hint(tail) else ''}: {tail}")
+            err = grade_error(tail or f"the command exited {p.returncode} with no output")
+            if getattr(err, "kind", "unknown") != "unknown":
+                raise err
             raise GradeDriverError(
                 f"the command exited {p.returncode} without writing {out.name}"
                 + (f" — {tail}" if tail else ""))
@@ -142,9 +171,10 @@ def run_candidate(cfg: Config, pid: str, slug: str, prompt: Path, out: Path, *,
         try:
             grade = parse_grade_json(raw)
         except GradeDriverError:
-            if _RATE_LIMIT_RE.search(raw):
+            classified = grade_error(raw.strip()[:300])
+            if getattr(classified, "retry", "now") in ("later", "never"):
                 staged.replace(rejected)
-                raise RateLimited(f"grader account rate-limited{f' — resets {_reset_hint(raw)}' if _reset_hint(raw) else ''}: {raw.strip()[:200]}") from None
+                raise classified from None
             staged.replace(rejected)
             raise
         staged.unlink(missing_ok=True)
@@ -165,9 +195,9 @@ def run_candidate(cfg: Config, pid: str, slug: str, prompt: Path, out: Path, *,
 
 def fill(cfg: Config, pid: str, awaiting: list[str], prompts: dict[str, str]) -> dict:
     """Attempt every pending candidate. Mirrors `audit_driver.fill` exactly, including
-    the `rate_limited` / `failed` split — an account rate limit must not consume a
-    grading retry any more than it should consume an audit one."""
-    filled, failed, rate_limited = [], {}, {}
+    the retry-policy buckets — a `later` or `never` failure must not consume a grading
+    retry any more than it should consume an audit one."""
+    filled, failed, rate_limited, blocked, kinds = [], {}, {}, {}, {}
     grade_dir = state.project_dir(cfg, pid) / "audit" / "grade"
     withheld = ["severity", "severity_rationale", "lens", "other_findings",
                "prior_grades", "verdict_thresholds", "derivation_table"]
@@ -181,11 +211,14 @@ def fill(cfg: Config, pid: str, awaiting: list[str], prompts: dict[str, str]) ->
                              headers={"slug": slug, "verdict": rec["verdict"],
                                       "seconds": rec["seconds"]},
                              path=str(grade_dir / f"{slug}.json"))
-        except RateLimited as e:
-            rate_limited[slug] = str(e)
-        except GradeDriverError as e:
-            failed[slug] = str(e)
-    return {"filled": filled, "failed": failed, "rate_limited": rate_limited}
+        except (GradeDriverError, RateLimited, NonRetryable) as e:
+            kind = getattr(e, "kind", "unknown")
+            retry = getattr(e, "retry", "now")
+            kinds[slug] = {"kind": kind, "retry": retry,
+                           "reset_hint": getattr(e, "reset_hint", "")}
+            {"later": rate_limited, "never": blocked}.get(retry, failed)[slug] = str(e)
+    return {"filled": filled, "failed": failed, "rate_limited": rate_limited,
+            "blocked": blocked, "kinds": kinds}
 
 
 if __name__ == "__main__":       # self-check: python -m harness.grade_driver

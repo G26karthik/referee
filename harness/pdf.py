@@ -47,12 +47,27 @@ _TABLE_CAPTION = re.compile(r"^\s*(?:table|tab\.)\s*([IVXLC]+|\d+)\s*[:.—-]?\s
 # Mirrors `_TABLE_CAPTION` exactly, substituting "figure"/"fig." — same reasoning, same
 # shape. `MAX_FIGURES` bounds it the way `MAX_TABLES` bounds table extraction.
 _FIGURE_CAPTION = re.compile(r"^\s*(?:figure|fig\.)\s*([IVXLC]+|\d+)\s*[:.—-]?\s*(.{0,300})", re.I)
-# A display equation, text-extracted: a line carrying a relational operator, ending in a
-# parenthesized number the way LaTeX numbers equations. Deliberately lossy — this is a
-# text-line heuristic, not layout geometry, so it catches the common "y = mx + b   (7)"
-# shape and nothing more exotic; `SOURCE_FIDELITY` in the audit prompt tells the reviewer
-# equation extraction is lossy for exactly this reason.
-_EQUATION_LINE = re.compile(r"^(.{1,220}?[=≤≥∝≈].{0,220}?)\s*\((\d{1,3}[a-z]?)\)\s*$")
+# A display equation, text-extracted: a line carrying a relational operator, numbered the
+# way LaTeX numbers equations. Deliberately lossy — this is a text-line heuristic, not
+# layout geometry; `SOURCE_FIDELITY` in the audit prompt tells the reviewer equation
+# extraction is lossy for exactly this reason.
+#
+# TWO SHAPES, because real PDFs use the second one. An equation number typeset in the
+# right margin is a SEPARATE text block from the equation body, so pymupdf's reading order
+# emits it on its own line: `_EQUATION_NUMBER_ONLY` matches that, and the body is the
+# nearest preceding line carrying a relational operator. Requiring both on one line — which
+# is what this did — matched a synthetic "y = mx + b   (7)" fixture and ZERO equations
+# across every real paper in the corpus, all of which number their display equations.
+_EQUATION_LINE = re.compile(r"^(.{1,220}?[=≤≥∝≈<>].{0,220}?)\s*\((\d{1,3}[a-z]?)\)\s*$")
+_EQUATION_NUMBER_ONLY = re.compile(r"^\(\s*(\d{1,3}[a-z]?)\s*\)$")
+_EQUATION_BODY = re.compile(r"[=≤≥∝≈<>]")
+# How far back to look for the body belonging to a lone number. Small on purpose: an
+# equation's own line is normally immediately above its number, and a wide window would
+# attach the number to an unrelated sentence several lines up.
+_EQUATION_LOOKBACK = 3
+# A body line must not be ordinary prose that merely contains a comparison. Prose is long
+# and word-dense; a display equation is short and symbol-dense.
+_EQUATION_MAX_WORDS = 24
 MAX_FIGURES = 40
 MAX_EQUATIONS = 60
 _WS = re.compile(r"\s+")
@@ -162,17 +177,47 @@ def extract_figures(pages: list[str], max_figures: int = MAX_FIGURES) -> list[Fi
     return out
 
 
+def _equation_body(lines: list[str], at: int) -> str:
+    """The equation body belonging to a lone `(n)` on line `at`, or ''.
+
+    Walks back up to `_EQUATION_LOOKBACK` lines for the nearest short, symbol-bearing
+    line. Returns '' rather than guessing when the preceding lines are prose — a wrong
+    body would be worse than no equation, because `verify_evidence` would then certify a
+    quote as `equation_verified` against text that is not the equation.
+    """
+    for back in range(1, _EQUATION_LOOKBACK + 1):
+        j = at - back
+        if j < 0:
+            return ""
+        cand = lines[j]
+        if not cand:
+            continue                              # a blank line between body and number
+        if _EQUATION_NUMBER_ONLY.match(cand):
+            return ""                             # two numbers in a row: not our body
+        if _EQUATION_BODY.search(cand) and len(cand.split()) <= _EQUATION_MAX_WORDS:
+            return cand
+        return ""                                 # nearest non-blank line is prose
+    return ""
+
+
 def extract_equations(pages: list[str], max_equations: int = MAX_EQUATIONS) -> list[Equation]:
-    """Every display-equation line the text-line heuristic recognises. Lossy by
-    construction — see `_EQUATION_LINE` and `harness.artifacts.Equation`."""
+    """Every display equation the text-line heuristic recognises, in both real-world
+    shapes — body-and-number on one line, and a right-margin number that text extraction
+    emitted on its own. Lossy by construction: see `_EQUATION_LINE` and
+    `harness.artifacts.Equation`."""
     out: list[Equation] = []
     for pno, text in enumerate(pages, start=1):
-        for raw in text.splitlines():
-            m = _EQUATION_LINE.match(_norm(raw))
-            if not m:
+        lines = [_norm(raw) for raw in text.splitlines()]
+        for i, line in enumerate(lines):
+            if m := _EQUATION_LINE.match(line):
+                number, body = m.group(2), _norm(m.group(1))
+            elif n := _EQUATION_NUMBER_ONLY.match(line):
+                number, body = n.group(1), _equation_body(lines, i)
+            else:
                 continue
-            out.append(Equation(equation_idx=len(out), page=pno,
-                                number=m.group(2), text=_norm(m.group(1))))
+            if not body:
+                continue
+            out.append(Equation(equation_idx=len(out), page=pno, number=number, text=body))
             if len(out) >= max_equations:
                 return out
     return out

@@ -38,38 +38,68 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import state
+from . import failures, state
 from .artifacts import LensReport
 from .config import Config
 from .prompts import audit as P
 
 
 class AuditDriverError(RuntimeError):
-    """The configured command did not produce a usable lens report."""
+    """The configured command did not produce a usable lens report.
 
+    Self-classifying. Every instance carries `kind` / `retry` / `reset_hint` from
+    `harness.failures.classify` over its own message, so a raise site does not have to
+    know or care which failure taxonomy bucket its text falls into — and so a failure
+    mode nobody anticipated still arrives at the controller with a retry policy attached
+    rather than as an undifferentiated string. See `harness/failures.py` for why the
+    three policies (`now` / `later` / `never`) are not interchangeable.
+    """
 
-# "You've hit your session limit · resets 3:20pm (Asia/Kolkata)" and similar Claude CLI
-# account-level messages. This is NOT a malformed response — the same prompt run again
-# in 9 seconds fails identically, and the previous behaviour (treating it as one more
-# transient parse failure) burned the whole `SH_AUDIT_RETRIES` budget in seconds and
-# left the paper permanently `waiting` with no path back to reviewing it.
-_RATE_LIMIT_RE = re.compile(r"(session|usage|rate)\s*limit", re.I)
-_RESET_RE = re.compile(r"resets?\s+([^\n\"'.]{0,40})", re.I)
+    def __init__(self, message: str, *, kind: str = "", retry: str = "",
+                 reset_hint: str = "") -> None:
+        super().__init__(message)
+        if not kind:
+            kind, retry, reset_hint = failures.classify(message)
+        self.kind, self.retry, self.reset_hint = kind, retry, reset_hint
 
 
 class RateLimited(AuditDriverError):
-    """The reviewer refused because the operator's OWN account hit a usage limit.
+    """A refusal that a LATER attempt could satisfy and an immediate one cannot: the
+    operator's own account over its usage limit, a 429, an overloaded or 5xx upstream.
 
     A subclass of `AuditDriverError` so every existing `except AuditDriverError` still
     catches it, and a distinct class so `fill()` can route it away from `failed` (a
-    quality problem with the reviewer's output) into `rate_limited` (an account-level
-    fact that a retry cannot fix) for the controller to treat differently.
+    quality problem with the reviewer's output that a retry might well fix) for the
+    controller to treat differently — a `later` failure must not consume a retry attempt.
     """
 
 
+class NonRetryable(AuditDriverError):
+    """A refusal that will fail identically forever: no reviewer installed, an
+    unauthenticated account, a flag the CLI does not accept, an unreadable PDF.
+
+    Kept apart from `RateLimited` because the operator's next action is the opposite one.
+    Waiting fixes a rate limit and never fixes a missing `claude` on PATH — and spending
+    three attempts to discover that hides the actual fix behind a retry log.
+    """
+
+
+def driver_error(message: str) -> AuditDriverError:
+    """Build the RIGHT exception class for a failure message. One classification point.
+
+    The defect this replaces: a hand-carved `_RATE_LIMIT_RE` at two call sites, covering
+    exactly one of the eleven ways a delegated reviewer can fail. Everything else — a
+    revoked credential, an unrecognised flag, an upstream outage — arrived as the generic
+    class and burned the whole retry budget against a wall that would not move.
+    """
+    kind, retry, hint = failures.classify(message)
+    cls = {"later": RateLimited, "never": NonRetryable}.get(retry, AuditDriverError)
+    return cls(message, kind=kind, retry=retry, reset_hint=hint)
+
+
 def _reset_hint(text: str) -> str:
-    m = _RESET_RE.search(text or "")
-    return m.group(1).strip() if m else ""
+    """Kept as a name because `grade_driver` imports it. See `failures.reset_hint`."""
+    return failures.reset_hint(text)
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
@@ -288,9 +318,13 @@ def run_lens(cfg: Config, pid: str, lens: str, prompt: Path, out: Path, *,
         p = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
         if not staged.exists():
+            # Classify the reviewer's OWN words first: a rate limit, a revoked
+            # credential and a flag the CLI does not accept all arrive here as the same
+            # non-zero exit, and they have three different right responses.
             tail = (p.stderr or p.stdout or "").strip()[-300:]
-            if _RATE_LIMIT_RE.search(tail):
-                raise RateLimited(f"reviewer account rate-limited{f' — resets {_reset_hint(tail)}' if _reset_hint(tail) else ''}: {tail}")
+            err = driver_error(tail or f"the command exited {p.returncode} with no output")
+            if err.kind != "unknown":
+                raise err
             raise AuditDriverError(
                 f"the command exited {p.returncode} without writing {out.name}"
                 + (f" — {tail}" if tail else ""))
@@ -299,11 +333,13 @@ def run_lens(cfg: Config, pid: str, lens: str, prompt: Path, out: Path, *,
         try:
             report = parse_lens_json(raw, lens)
         except AuditDriverError:
-            if _RATE_LIMIT_RE.search(raw):
-                # The reviewer's entire response WAS the rate-limit notice — `raw` is
-                # short, plain prose, not a lens report that merely failed to parse.
+            classified = driver_error(raw.strip()[:300])
+            if classified.retry in ("later", "never"):
+                # The reviewer's entire response WAS the refusal notice — `raw` is short
+                # plain prose, not a lens report that merely failed to parse. Retrying a
+                # parse failure can work; retrying this cannot.
                 staged.replace(rejected)
-                raise RateLimited(f"reviewer account rate-limited{f' — resets {_reset_hint(raw)}' if _reset_hint(raw) else ''}: {raw.strip()[:200]}") from None
+                raise classified from None
             # Move the unusable output somewhere nothing reads as a lens result, and
             # keep it, because "the reviewer said something and it was not a report" is
             # worth seeing.
@@ -335,11 +371,17 @@ def fill(cfg: Config, pid: str, awaiting: list[str], prompts: dict[str, str],
         pdf_dir: str = "") -> dict:
     """Attempt every pending lens. Partial success is success for the lenses that worked.
 
-    `rate_limited` is kept separate from `failed`: a malformed response might succeed on
-    retry, an account-level rate limit will not, and `controller._phase_audit` treats
-    the two differently — a rate limit must not consume a retry attempt.
+    THE BUCKETS ARE THE RETRY POLICIES, not the exception classes. `rate_limited` holds
+    every `later` failure (an account limit, a 429, an overloaded upstream), `blocked`
+    every `never` one (no CLI installed, unauthenticated, a flag the CLI rejects, an
+    unreadable PDF), and `failed` only what a second attempt could plausibly fix. The
+    controller spends its bounded retry budget on `failed` alone — see
+    `harness/failures.py` for why treating all three alike stranded a paper permanently.
+
+    `kinds` carries the classification per lens so the reason survives into the case
+    state and the report, rather than only into a log line.
     """
-    filled, failed, rate_limited = [], {}, {}
+    filled, failed, rate_limited, blocked, kinds = [], {}, {}, {}, {}
     audit_dir = state.project_dir(cfg, pid) / "audit"
     for lens in awaiting:
         prompt = Path(prompts[lens])
@@ -350,11 +392,11 @@ def fill(cfg: Config, pid: str, awaiting: list[str], prompts: dict[str, str],
                              headers={"lens": lens, "findings": rec["findings"],
                                       "seconds": rec["seconds"]},
                              path=str(audit_dir / f"{lens}.json"))
-        except RateLimited as e:
-            rate_limited[lens] = str(e)
         except AuditDriverError as e:
-            failed[lens] = str(e)
-    return {"filled": filled, "failed": failed, "rate_limited": rate_limited}
+            kinds[lens] = {"kind": e.kind, "retry": e.retry, "reset_hint": e.reset_hint}
+            {"later": rate_limited, "never": blocked}.get(e.retry, failed)[lens] = str(e)
+    return {"filled": filled, "failed": failed, "rate_limited": rate_limited,
+            "blocked": blocked, "kinds": kinds}
 
 
 if __name__ == "__main__":       # self-check: python -m harness.audit_driver

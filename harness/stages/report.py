@@ -21,7 +21,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 
-from .. import state
+from .. import selfaudit, state
 from ..artifacts import (CodeAudit, CodeAuditFinding, EvalReport, ExperimentalChain, Finding,
                          LensReport, PaperDoc, ProbeResult, Reconciliation, RepoAcquisition)
 from ..config import Config
@@ -202,6 +202,20 @@ def severity_review(findings: list[Finding]) -> list[str]:
             f"{f.evidence_class.replace('_', ' ')}, not a cited table cell"
             for f in findings
             if counted(f) in ("FATAL", "MAJOR") and f.evidence_class != "cell_verified"]
+
+
+def questions(findings: list[Finding]) -> list[Finding]:
+    """The findings that are QUESTIONS rather than defects, from either reader's answer.
+
+    Kept as its own predicate because two sections need the same set — the report's
+    `## Open review questions` and the whole-paper prompt's own question block — and a
+    strong paper's review is mostly this list. `harness.grading.CANDIDATE_CAP` already
+    holds them to NOTE, so nothing here affects a threshold; what matters is that they
+    are PRINTED as questions instead of quietly folded in among the defects.
+    """
+    return [f for f in findings
+            if f.finding_class == "OPEN_QUESTION"
+            or (f.finding_class == "UNGRADED" and f.candidate_class == "OPEN_QUESTION")]
 
 
 def grading_review(findings: list[Finding]) -> list[str]:
@@ -702,13 +716,11 @@ def render_eval_report(r: EvalReport) -> str:
                      f"FATAL/MAJOR finding(s) — see the table below._")
     L.append("")
 
-    questions = [f for f in ranked if f.finding_class == "OPEN_QUESTION"
-                or (f.finding_class == "UNGRADED" and f.candidate_class == "OPEN_QUESTION")]
-    if questions:
+    if qs := questions(ranked):
         L += ["## Open review questions", "",
               "Questions a reviewer should ask, not evidence of a flaw — these count "
-              "toward no threshold.", ""]
-        for f in questions[:MAX_THREAT_BULLETS]:
+              "toward no threshold. A strong paper legitimately has several.", ""]
+        for f in qs[:MAX_THREAT_BULLETS]:
             L.append(f"- {_cell(f.title or f.statement, 200)}")
         L.append("")
 
@@ -721,6 +733,17 @@ def render_eval_report(r: EvalReport) -> str:
             reason = f.grade.falsification if f.grade else ""
             L.append(f"- **{f.title}** (lens asserted {f.severity}) — "
                      f"{_cell(reason, 240) or 'no reason recorded'}")
+        L.append("")
+
+    dismissed = [f for f in ranked if f.candidate_class == "DISMISSED"]
+    if dismissed:
+        L += ["## Candidates raised and withdrawn", "",
+              "The lens itself considered these and a reasonable reading resolved them. "
+              "Printed so a reader can see the question was asked and answered rather "
+              "than never asked.", ""]
+        for f in dismissed[:MAX_THREAT_BULLETS]:
+            L.append(f"- **{_cell(f.title, 110)}** — resolved by: "
+                     f"{_cell(f.alternative_interpretation, 240) or 'no reading recorded'}")
         L.append("")
 
     if r.grade_coverage.get("candidates"):
@@ -763,14 +786,27 @@ def render_eval_report(r: EvalReport) -> str:
 
     if r.substantive_verdict:
         sv = r.substantive_verdict
-        L += ["## Substantive read (model opinion, not counted)", "",
-              f"**{sv.verdict}** ({sv.weaknesses_are or 'scope unstated'}) — agreement with the "
-              f"deterministic verdict: `{r.verdict_agreement}`.", "",
+        L += ["## Whole-paper assessment (model opinion, not counted)", "",
+              "Reasoned independently rather than derived from the counts above — the one "
+              "judgement a threshold table structurally cannot make. It moves no colour: "
+              f"agreement with the deterministic verdict is `{r.verdict_agreement}`.", "",
+              f"**{sv.verdict}**"
+              + (f" · core contribution stands: **{sv.core_contribution_stands}**"
+                 if sv.core_contribution_stands else "")
+              + f" · weaknesses are {sv.weaknesses_are or 'unstated'}", "",
               f"> {_cell(sv.reason, 500)}", ""]
-        if sv.strongest_contribution:
-            L.append(f"- Strongest contribution: {_cell(sv.strongest_contribution, 200)}")
-        if sv.weakest_link:
-            L.append(f"- Weakest link: {_cell(sv.weakest_link, 200)}")
+        for label, value in (
+                ("Real contribution", sv.real_contribution or sv.strongest_contribution),
+                ("Strongest support", sv.strongest_support),
+                ("Strongest threat", sv.strongest_threat or sv.weakest_link)):
+            if value:
+                L.append(f"- **{label}:** {_cell(value, 300)}")
+        if sv.claims_well_supported:
+            L.append("- **Claims that stand as stated:**")
+            L += [f"  - {_cell(c, 200)}" for c in sv.claims_well_supported[:5]]
+        if sv.claims_needing_qualification:
+            L.append("- **Claims needing qualification:**")
+            L += [f"  - {_cell(c, 200)}" for c in sv.claims_needing_qualification[:5]]
         L.append("")
 
     if r.probe:
@@ -820,6 +856,25 @@ def render_eval_report(r: EvalReport) -> str:
     else:
         L.append("_No lens identified a conspicuously missing comparison._")
     L.append("")
+
+    if r.self_audit is not None:
+        sa = r.self_audit
+        L += ["## Reviewer self-audit", "",
+              ("🟢 " if sa.complete else "⚠️ ") + f"**{sa.summary}**", "",
+              "Machine-checked against harness-written fields, never against a reviewer's "
+              "own assessment of its diligence. **A failed check does not change the "
+              "verdict** — the threshold table is the verdict — it refuses to let this "
+              "review call itself complete, and names what was not done.", ""]
+        for i in sa.items:
+            mark = {"pass": "✅", "fail": "❌", "not_applicable": "—"}.get(i.state, "?")
+            scope = (f" ({i.n_offenders}/{i.n_in_scope})" if i.state == "fail"
+                    else (f" ({i.n_in_scope})" if i.state == "pass" else ""))
+            L.append(f"- {mark} {i.question}{scope}")
+            if i.state == "fail":
+                L.append(f"  {i.detail} — {', '.join(i.offenders)}"
+                        + (f" _(+{i.n_offenders - len(i.offenders)} more)_"
+                           if i.n_offenders > len(i.offenders) else ""))
+        L.append("")
 
     L += ["## Audit lens findings", "",
           "| Severity | Lens | Target | Finding | Evidence |",
@@ -891,14 +946,26 @@ def run_report(cfg: Config, pid: str) -> dict:
     from .. import verdict_driver
     ok, _why = verdict_driver.available(cfg)
     if ok:
+        # COUNTED severity, and the questions block alongside it. A whole-paper read shown
+        # only the defects is being asked to weigh one side of the evidence: what a
+        # reviewer asked and could not settle, and what it raised and then withdrew, are
+        # part of judging the paper, and a reader deciding "are the weaknesses local or
+        # systemic" needs both columns.
         findings_summary = "\n".join(
             f"- [{counted(f)}] ({f.lens}) {f.title}: {f.statement}" for f in findings[:30])
+        withdrawn = [f for f in findings
+                     if f.finding_class in ("REFUTED", "OPEN_QUESTION")
+                     or f.candidate_class in ("OPEN_QUESTION", "DISMISSED")]
+        questions_summary = "\n".join(
+            f"- [{f.finding_class}/{f.candidate_class or 'unsorted'}] {f.title}"
+            for f in withdrawn[:20])
         grading_summary = (f"{coverage['graded']} of {coverage['candidates']} candidate(s) "
                            f"independently graded.")
         probe_summary = probe.reason if probe else ""
         from ..prompts import verdict as verdict_prompts
         substantive = verdict_driver.run(
-            cfg, verdict_prompts.build(doc.title, findings_summary, grading_summary, probe_summary),
+            cfg, verdict_prompts.build(doc.title, findings_summary, grading_summary,
+                                       probe_summary, questions_summary),
             timeout_s=cfg.verdict_timeout_s)
 
     agreement, contested = "unavailable", False
@@ -921,11 +988,16 @@ def run_report(cfg: Config, pid: str) -> dict:
         findings=findings, unasked_question=pick_unasked_question(reports),
         n_pages=doc.n_pages, n_sections=len(doc.sections), n_tables=len(doc.tables),
         n_numbers=len(doc.reported_numbers),
+        n_figures=len(doc.figures), n_equations=len(doc.equations),
         lenses_run=[r.lens for r in reports], dropped_findings=dropped, probe=probe,
         experimental_chain=build_chain(findings, probe),
         grade_coverage={k: v for k, v in coverage.items() if k != "paper_id"},
         substantive_verdict=substantive, verdict_agreement=agreement, verdict_contested=contested,
     )
+    # LAST, over the finished report: the self-audit reads `substantive_verdict` and
+    # `grade`, so it has to run after both are attached. It writes nothing else and
+    # changes no verdict — see `harness/selfaudit.py`.
+    report.self_audit = selfaudit.audit(report, counted)
 
     md_path, json_path = root / "reports" / f"{pid}.md", root / "reports" / f"{pid}.json"
     state.write_json(json_path, report.model_dump())
@@ -936,14 +1008,17 @@ def run_report(cfg: Config, pid: str) -> dict:
         headers={"verdict": verdict, "findings": len(findings), "dropped": dropped,
                  "severities": {s: sum(1 for f in findings if counted(f) == s) for s in _SEVERITY_RANK},
                  "lenses": report.lenses_run, "probe": probe.verdict if probe else None,
-                 "grade_coverage": report.grade_coverage, "verdict_contested": contested},
+                 "grade_coverage": report.grade_coverage, "verdict_contested": contested,
+                 "self_audit_failed": report.self_audit.failed if report.self_audit else []},
         path=str(md_path),
     )
     return {"paper_id": pid, "verdict": verdict, "reason": reason,
             "findings": len(findings), "dropped_unsubstantiated": dropped,
             "lenses": report.lenses_run, "probe": probe.verdict if probe else None,
             "report_md": str(md_path), "report": f"reports/{pid}.json",
-            "verdict_contested": contested}
+            "verdict_contested": contested,
+            "self_audit_complete": bool(report.self_audit and report.self_audit.complete),
+            "self_audit_failed": report.self_audit.failed if report.self_audit else []}
 
 
 if __name__ == "__main__":  # self-check: python -m harness.stages.report

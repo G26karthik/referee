@@ -145,6 +145,7 @@ def _phase_ingest(cfg: Config, case: CaseState, **_) -> PhaseOutcome:
         # A bare case id: the paper was ingested by an earlier run.
         pid = case.paper_id or case.source
         if not (state.project_dir(cfg, pid) / "paper" / "doc.json").exists():
+            case.failure_kind, case.retry_policy = "bad_invocation", "never"
             return PhaseOutcome("error", f"'{case.source}' is neither a PDF path nor an "
                                          f"already-ingested case id")
         case.paper_id = pid
@@ -152,11 +153,31 @@ def _phase_ingest(cfg: Config, case: CaseState, **_) -> PhaseOutcome:
     try:
         res = ingest_stage.run_ingest(cfg, str(src))
     except FileNotFoundError as e:
+        # An unreadable or absent PDF is an extraction failure, not a transient one, and
+        # naming it as such is what lets a corpus summary say "1 execution_failed" instead
+        # of quietly listing five of six papers. See `harness/failures.py`.
+        case.failure_kind, case.retry_policy = "extraction_failed", "never"
         return PhaseOutcome("error", str(e))
     case.paper_id = res["paper_id"]
     case.content_sha = res.get("content_sha", "") or ""
     return PhaseOutcome("ok", f"ingested {res.get('sections', 0)} section(s), "
                               f"{res.get('tables', 0)} table(s)", res)
+
+
+def _record_failure(case: CaseState, kinds: dict) -> None:
+    """Persist WHY a delegation failed, worst policy first, onto the case.
+
+    `waiting` on its own does not tell an operator whether to wait, re-run, or fix their
+    install, and a reason that lives only in a log line is a reason nobody reads. Ordered
+    `never` before `later` before `now`: when several lenses failed differently, the one
+    that needs a human is the one worth naming.
+    """
+    if not kinds:
+        return
+    order = {"never": 0, "later": 1, "now": 2}
+    worst = min(kinds.values(), key=lambda k: order.get(k.get("retry", "now"), 3))
+    case.failure_kind = worst.get("kind", "") or case.failure_kind
+    case.retry_policy = worst.get("retry", "") or case.retry_policy
 
 
 def _phase_audit(cfg: Config, case: CaseState, *, auto_audit: bool = False, **_) -> PhaseOutcome:
@@ -198,29 +219,33 @@ def _phase_audit(cfg: Config, case: CaseState, *, auto_audit: bool = False, **_)
     after = audit_stage.run_audit(cfg, case.paper_id)
     case.awaiting = list(after.get("awaiting", []))
     detail = {"filled": filled["filled"], "failed": filled["failed"],
-              "rate_limited": filled["rate_limited"], "awaiting": case.awaiting}
+              "rate_limited": filled["rate_limited"], "blocked": filled.get("blocked", {}),
+              "kinds": filled.get("kinds", {}), "awaiting": case.awaiting}
+    _record_failure(case, filled.get("kinds", {}))
     if not case.awaiting:
         return PhaseOutcome("ok", f"delegated and filled {len(filled['filled'])} lens(es)", detail)
 
-    if filled["rate_limited"]:
-        # An account-level rate limit is not evidence that THIS attempt was flawed — the
-        # same prompt run again in nine seconds fails identically, so treating it as an
-        # ordinary transient failure burns the whole retry budget in seconds and stalls
-        # the paper permanently. `step` already incremented `attempts["audit"]` before
-        # this handler ran; undoing that is what "does not consume an attempt" means in
-        # a loop where the increment happens unconditionally, before the handler is
-        # even invoked, and this handler is the only place that can know a failure was
-        # deterministic-until-a-clock-turns-over rather than reviewer-quality noise.
+    # A failure a LATER attempt could satisfy (an account limit, a 429, an overloaded
+    # upstream) or one that will fail identically forever (no CLI, unauthenticated, a
+    # flag the CLI rejects). Neither is evidence that THIS attempt was flawed, so neither
+    # may spend part of a bounded retry budget — see `harness/failures.py`. `step` already
+    # incremented `attempts["audit"]` before this handler ran; undoing that is what "does
+    # not consume an attempt" means in a loop where the increment is unconditional and
+    # happens before the handler is even invoked. This handler is the only place that can
+    # know which of the three kinds of failure it met.
+    unretryable = {**filled["rate_limited"], **filled.get("blocked", {})}
+    if unretryable:
         case.attempts["audit"] = max(0, case.attempts.get("audit", 1) - 1)
-        hints = [v.split("resets ", 1)[1].split(": ", 1)[0].strip() if "resets " in v else ""
-                for v in filled["rate_limited"].values()]
+        hints = [v.get("reset_hint", "") for v in filled.get("kinds", {}).values()]
         case.resume_after = next((h for h in hints if h), "") or case.resume_after
-        why = "; ".join(f"{k}: {v}" for k, v in filled["rate_limited"].items())
+        why = "; ".join(f"{k}: {v}" for k, v in unretryable.items())
+        later = bool(filled["rate_limited"])
         return PhaseOutcome(
             "waiting",
-            f"rate-limited on {len(filled['rate_limited'])} lens(es), not a reviewer "
-            f"quality failure — re-run once available"
-            + (f" ({case.resume_after})" if case.resume_after else "") + f": {why}",
+            f"{len(unretryable)} lens(es) blocked by a {case.failure_kind or 'non-retryable'} "
+            f"failure, not by reviewer quality — "
+            + ("re-run once available" if later else "this needs an operator fix, not a retry")
+            + (f" ({case.resume_after})" if case.resume_after and later else "") + f": {why}",
             detail)
 
     # `step` increments the counter BEFORE calling this handler, so `attempts` already
@@ -338,18 +363,22 @@ def _phase_grade(cfg: Config, case: CaseState, *, auto_grade: bool = False, **_)
     after = grade_stage.run_grade(cfg, case.paper_id)
     still_awaiting = list(after.get("awaiting", []))
     detail = {"filled": filled["filled"], "failed": filled["failed"],
-              "rate_limited": filled["rate_limited"], "awaiting": still_awaiting}
+              "rate_limited": filled["rate_limited"], "blocked": filled.get("blocked", {}),
+              "kinds": filled.get("kinds", {}), "awaiting": still_awaiting}
+    _record_failure(case, filled.get("kinds", {}))
     if not still_awaiting:
         return PhaseOutcome("ok", f"delegated and graded {len(filled['filled'])} candidate(s)", detail)
 
-    if filled["rate_limited"]:
-        # Same reasoning as `_phase_audit`: a rate limit is not a quality failure of
-        # this attempt, so it must not consume the retry budget.
+    unretryable = {**filled["rate_limited"], **filled.get("blocked", {})}
+    if unretryable:
+        # Same reasoning as `_phase_audit`: neither a retry-later nor a retry-never
+        # failure is a quality failure of this attempt, so neither may consume the budget.
         case.attempts["grade"] = max(0, case.attempts.get("grade", 1) - 1)
-        why = "; ".join(f"{k}: {v}" for k, v in filled["rate_limited"].items())
+        why = "; ".join(f"{k}: {v}" for k, v in unretryable.items())
         outcome = "waiting" if cfg.require_grades else "ok"
-        return PhaseOutcome(outcome, f"rate-limited on {len(filled['rate_limited'])} "
-                                     f"candidate(s), not a grader quality failure: {why}", detail)
+        return PhaseOutcome(outcome, f"{len(unretryable)} candidate(s) blocked by a "
+                                     f"{case.failure_kind or 'non-retryable'} failure, not by "
+                                     f"grader quality: {why}", detail)
 
     attempts = case.attempts.get("grade", 1)
     why = "; ".join(f"{k}: {v}" for k, v in filled["failed"].items())
@@ -543,7 +572,15 @@ def drive_all(cfg: Config, sources: list[str], **opts) -> list[CaseState]:
 
 
 def summarize(cases: list[CaseState]) -> dict:
-    """The batch, as a caller sees it. Pure — reads the cases, decides nothing."""
+    """The batch, as a caller sees it. Pure — reads the cases, decides nothing.
+
+    NOT the authoritative accounting: this keys on `paper_id or source` and can only see
+    cases that exist, so it cannot report a REQUESTED paper that lost its case or two
+    requests that slugified to the same id. `harness.corpus.account` is built from the
+    request list for exactly that reason and asserts its own conservation law;
+    `review_papers` returns it as `corpus`. These keys remain because the CLI and the
+    dossier consume them.
+    """
     return {
         "papers": len(cases),
         "complete": [c.paper_id for c in cases if c.status == "complete"],
@@ -577,7 +614,8 @@ def as_result(cfg: Config, case: CaseState) -> dict:
              for e in case.history]
     if case.status == "error":
         return {"status": "error", "paper_id": case.paper_id or None,
-                "error": case.blocked_reason, "steps": steps}
+                "error": case.blocked_reason, "steps": steps,
+                "failure_kind": case.failure_kind, "retry_policy": case.retry_policy}
 
     doc_path = state.project_dir(cfg, case.paper_id) / "paper" / "doc.json"
     title = str(state.read_json(doc_path).get("title") or "") if doc_path.exists() else ""
@@ -588,6 +626,8 @@ def as_result(cfg: Config, case: CaseState) -> dict:
                 "steps": steps, "awaiting": list(case.awaiting),
                 "prompts": {ln: prompts[ln] for ln in case.awaiting if ln in prompts},
                 "blocked_reason": case.blocked_reason,
+                "failure_kind": case.failure_kind, "retry_policy": case.retry_policy,
+                "resume_after": case.resume_after,
                 "next": (f"Write projects/{case.paper_id}/audit/<lens>.json for each pending "
                          f"lens, one lens per turn, then re-run. Or pass --auto-audit to let "
                          f"the controller delegate them.")}
@@ -616,7 +656,14 @@ def review_papers(cfg: Config, papers: list[str], *, dossier_out: Path | None = 
     fact about that paper, not a reason to abandon the others. Papers that did not finish
     are still handed to the dossier, which lists them as missing — a summary that omits
     its failures is worse than no summary.
+
+    `corpus` is the machine-readable answer to "is this batch done": every REQUESTED
+    paper in exactly one terminal state, with the conservation law asserted rather than
+    assumed (`harness/corpus.py`). It is built from `papers` rather than from `cases`
+    precisely so a paper that lost its case, or whose id collided with another's, stays
+    visible instead of vanishing from a smaller count.
     """
+    from . import corpus as corpus_mod
     from . import dossier as dossier_mod
 
     cases = drive_all(cfg, papers, **opts)
@@ -626,11 +673,21 @@ def review_papers(cfg: Config, papers: list[str], *, dossier_out: Path | None = 
         r["input"] = paper
         results.append(r)
 
+    accounting = corpus_mod.account(papers, list(cases))
     out = {**summarize(cases), "results": results,
-           "needs_audit": {c.paper_id: c.awaiting for c in cases if c.status == "waiting"}}
+           "needs_audit": {c.paper_id: c.awaiting for c in cases if c.status == "waiting"},
+           "corpus": accounting.model_dump()}
     ordered = [c.paper_id for c in cases if c.paper_id]
     if ordered:
         out["dossier"] = dossier_mod.build(cfg, ordered, dossier_out)
+        # Persisted beside the dossier so the accounting outlives the process that
+        # printed it — a corpus summary a reader cannot re-open is a claim, not a record.
+        corpus_path = (dossier_out or (cfg.projects_dir.parent / "reports")) / "corpus.json"
+        try:
+            state.write_json(corpus_path, accounting.model_dump())
+            out["corpus_path"] = str(corpus_path)
+        except OSError as e:
+            out["corpus_path_error"] = str(e)
     return out
 
 

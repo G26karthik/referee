@@ -26,8 +26,9 @@ import re
 import time
 
 from .. import audit_driver, grading, pdf, state
-from ..artifacts import (CANDIDATE_CLASSES, CONFIDENCES, DISCREPANCY_TYPES, EVIDENCE_ORIGINS,
-                         SEVERITIES, Equation, Figure, Finding, LensReport, PaperDoc)
+from ..artifacts import (BASELINE_CLASSES, CANDIDATE_CLASSES, CONFIDENCES, DISCREPANCY_TYPES,
+                         EVIDENCE_ORIGINS, PRIOR_ART_BASES, SEVERITIES, Equation, Figure,
+                         Finding, LensReport, PaperDoc)
 from ..config import Config
 from ..prompts import audit as P
 
@@ -460,6 +461,11 @@ def _coerce(lens: str, data, corpus: str | Sequence[tuple[int, str]],
                 else "(lens file has no 'findings' list)")
         return LensReport(lens=lens, notes=note), 0, False
     verify = functools.partial(verify_evidence, by_figure=by_figure, by_equation=by_equation)
+    # THE REPORT'S schema version, not each finding's. `prompts/audit._RETURN` puts it at
+    # the top level beside `findings`, so it has to be read here and threaded down — see
+    # `grading.pass_b_state`, which read it off the finding dict and therefore returned
+    # `legacy` (uncapped) for every finding of every real lens file.
+    schema_version = data.get("schema_version")
     findings, dropped = [], 0
     for i, f in enumerate(data.get("findings") or []):
         if not isinstance(f, dict):
@@ -476,8 +482,14 @@ def _coerce(lens: str, data, corpus: str | Sequence[tuple[int, str]],
         sev = sev if sev in _SEVERITIES else "MINOR"
         calc = f.get("independent_calculation")
         calc = calc if isinstance(calc, dict) else {}
-        verification_state = grading.pass_b_state(f, sev)
+        verification_state = grading.pass_b_state(f, sev, schema_version)
         calc_class = grading.recheck_calculation(calc, verify, corpus, by_idx, max_page)
+        candidate_class = _enum(f.get("candidate_class"), CANDIDATE_CLASSES)
+        confidence = _enum(f.get("confidence"), CONFIDENCES)
+        baseline_class = _enum(f.get("baseline_class"), BASELINE_CLASSES)
+        prior_art_basis = _enum(f.get("prior_art_basis"), PRIOR_ART_BASES)
+        evidence_ceiling, evidence_sources = grading.evidence_support(
+            evidence_class, calc_class=calc_class)
         # Baseline derivation from the lens's OWN submission alone — no grader has run
         # yet (that happens in a later pipeline phase; see `stages/grade.py:attach`,
         # which re-derives these same four fields once a grade exists, strictly
@@ -488,7 +500,9 @@ def _coerce(lens: str, data, corpus: str | Sequence[tuple[int, str]],
         # when neither this baseline nor a later grade capped it.
         finding_class, counted_severity, binding_cap, derivation = grading.derive(
             lens_severity=sev, verification_state=verification_state,
-            calc_class=calc_class, graded=False, evidence_class=evidence_class)
+            calc_class=calc_class, graded=False, evidence_class=evidence_class,
+            lens_confidence=confidence, candidate_class=candidate_class,
+            baseline_class=baseline_class, prior_art_basis=prior_art_basis)
         if counted_severity == sev:
             # Nothing capped it — leave `counted_severity` empty rather than a value
             # identical to `severity`, so a reader can tell "verified equal" apart from
@@ -512,8 +526,10 @@ def _coerce(lens: str, data, corpus: str | Sequence[tuple[int, str]],
             # The pass-B fields: lens-authored, non-degeneracy checked but not rewritten
             # — a lens's actual words are kept even when `verification_state` below
             # says they were not enough.
-            candidate_class=_enum(f.get("candidate_class"), CANDIDATE_CLASSES),
-            confidence=_enum(f.get("confidence"), CONFIDENCES),
+            candidate_class=candidate_class,
+            confidence=confidence,
+            baseline_class=baseline_class,
+            prior_art_basis=prior_art_basis,
             discrepancy_type=_enum(f.get("discrepancy_type"), DISCREPANCY_TYPES),
             what_the_paper_says=_prose(f.get("what_the_paper_says")),
             alternative_interpretation=_prose(f.get("alternative_interpretation")),
@@ -537,6 +553,7 @@ def _coerce(lens: str, data, corpus: str | Sequence[tuple[int, str]],
                                 in ("", _origin_from_ref(ref)) else "corrected"),
             finding_class=finding_class, counted_severity=counted_severity,
             binding_cap=binding_cap, derivation=derivation,
+            evidence_ceiling=evidence_ceiling, evidence_sources=list(evidence_sources),
         ))
     return LensReport(
         lens=lens, findings=findings,

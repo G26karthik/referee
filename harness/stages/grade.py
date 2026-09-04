@@ -189,7 +189,9 @@ def attach(cfg: Config, pid: str, doc: PaperDoc, reports: list[LensReport]) -> d
                 falsification_survived=g.falsification_survived,
                 has_impact_statement=bool(g.impact_statement.strip()),
                 has_steelman=bool(g.steelman.strip()),
-                evidence_class=f.evidence_class, grader_evidence_class=grader_evidence_class)
+                evidence_class=f.evidence_class, grader_evidence_class=grader_evidence_class,
+                lens_confidence=f.confidence, candidate_class=f.candidate_class,
+                baseline_class=f.baseline_class, prior_art_basis=f.prior_art_basis)
             f.grade = g
             f.grade_state = "graded"
             f.finding_class = finding_class
@@ -198,6 +200,12 @@ def attach(cfg: Config, pid: str, doc: PaperDoc, reports: list[LensReport]) -> d
             f.derivation = derivation
             f.grader_evidence_class = grader_evidence_class
             f.grader_verified_observation = grader_obs
+            # Re-derived with the GRADER's citation now in scope: a figure-only concern the
+            # grader independently corroborated against a table cell is no longer
+            # figure-only, and the ceiling the report prints has to say so.
+            f.evidence_ceiling, sources = grading.evidence_support(
+                f.evidence_class, grader_evidence_class, f.calc_class)
+            f.evidence_sources = list(sources)
             graded_n += 1
     return {"graded": graded_n}
 
