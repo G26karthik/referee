@@ -942,10 +942,14 @@ def run_report(cfg: Config, pid: str) -> dict:
     rec = probe.reconciliation if probe else None
     verdict, reason = overall_verdict(findings, rec)
 
-    substantive = None
     from .. import verdict_driver
+    # A SEALED whole-paper read wins over calling the subprocess: it is already produced,
+    # already attributed, and re-running would spend a call to overwrite it. This is also
+    # the only channel that works at all when the CLI is unreachable — see
+    # `verdict_driver.accept_verdict`.
+    substantive = verdict_driver.load_accepted(cfg, pid)
     ok, _why = verdict_driver.available(cfg)
-    if ok:
+    if substantive is None and ok:
         # COUNTED severity, and the questions block alongside it. A whole-paper read shown
         # only the defects is being asked to weigh one side of the evidence: what a
         # reviewer asked and could not settle, and what it raised and then withdrew, are

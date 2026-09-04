@@ -24,7 +24,7 @@ import json
 import sys
 from pathlib import Path
 
-from harness import controller, dossier, state
+from harness import controller, dossier, state, verdict_driver
 from harness.config import Config
 from harness.stages import audit as audit_stage
 from harness.stages import grade as grade_stage
@@ -136,6 +136,75 @@ def cmd_review(args: argparse.Namespace) -> int:
     return 1 if res["errors"] else (2 if res["needs_audit"] else (3 if contested else 0))
 
 
+def cmd_accept(args: argparse.Namespace) -> int:
+    """Validate and seal lens files a reviewer produced OUTSIDE the auto-audit path.
+
+    The manual channel has always been first-class — `review` without `--auto-audit`
+    writes `audit/prompts/<lens>.md`, exits 2, and resumes once the lens files exist —
+    but the only way to actually SEAL one was to import `stages.audit.accept_lens` from
+    Python. So the documented path required writing code, and the obvious alternative
+    (drop the JSON straight into `audit/<lens>.json`) is exactly the side-write that
+    `lens_is_accepted` refuses, because it skips `parse_lens_json`'s validation and
+    leaves no provenance record. This is that gate as a command.
+
+    Reads from a staging directory rather than accepting inline JSON: a lens report runs
+    to tens of kilobytes, which does not belong on a command line, and staging-then-
+    promoting is the same discipline `audit_driver.run_lens` already uses.
+    """
+    cfg = Config.load()
+    root = state.project_dir(cfg, args.paper)
+    accepted, refused = {}, {}
+
+    def take(src: Path, label: str, fn) -> None:
+        try:
+            accepted[label] = fn(src.read_text(encoding="utf-8"))
+        except Exception as e:
+            # Kept, not deleted: "the reviewer produced something and it was not a
+            # report" is worth reading — the same reasoning `run_lens` applies to its
+            # own `.rejected.txt`.
+            refused[label] = str(e)
+            src.replace(src.with_suffix(".rejected.txt"))
+        else:
+            # Consumed. `run_lens` unlinks its staging file after promotion for the same
+            # reason: a staged file that survives promotion gets re-promoted on the next
+            # invocation, rewriting a sealed artifact's sidecar with a fresh timestamp
+            # and making a re-run look like new work. The promoted copy is the record.
+            src.unlink(missing_ok=True)
+
+    lens_dir = Path(args.staged) if args.staged else root / "audit" / ".staged"
+    for lens in sorted(audit_stage.LENSES):
+        if (src := lens_dir / f"{lens}.json").exists():
+            take(src, f"lens:{lens}",
+                 lambda raw, ln=lens: str(audit_stage.accept_lens(
+                     cfg, args.paper, ln, raw, reviewer=args.reviewer,
+                     tool_policy=args.tool_policy)["findings"]) + " finding(s)")
+
+    # Grades live one level down, keyed by candidate slug rather than by lens name, so
+    # this takes whatever is there instead of iterating a known vocabulary.
+    grade_dir = root / "audit" / "grade" / ".staged"
+    for src in sorted(grade_dir.glob("*.json")) if grade_dir.is_dir() else []:
+        take(src, f"grade:{src.stem}",
+             lambda raw, s=src.stem: grade_stage.accept_grade(
+                 cfg, args.paper, s, raw, grader=args.reviewer,
+                 tool_policy=args.tool_policy)["verdict"])
+
+    # The whole-paper read: one per paper, so a single staged file rather than a directory.
+    if (src := root / "reports" / ".staged" / "substantive.json").exists():
+        take(src, "whole-paper",
+             lambda raw: verdict_driver.accept_verdict(
+                 cfg, args.paper, raw, reader=args.reviewer,
+                 tool_policy=args.tool_policy)["verdict"])
+
+    for label, what in accepted.items():
+        print(f"accepted : {label:<34} {what}")
+    for label, why in refused.items():
+        print(f"REFUSED  : {label:<34} {why[:140]}")
+    if not accepted and not refused:
+        print(f"nothing staged in {lens_dir} or {grade_dir}")
+        return 1
+    return 1 if refused else 0
+
+
 def cmd_dossier(args: argparse.Namespace) -> int:
     """Consolidate finished reports. Runs no stage."""
     cfg = Config.load()
@@ -220,6 +289,17 @@ def main() -> int:
     rv.add_argument("--skip-probe", action="store_true", help="never run the probe")
     rv.add_argument("--out", help="directory for the dossier (default: reports/)")
     rv.set_defaults(func=cmd_review)
+
+    ac = sub.add_parser("accept", help="validate + seal lens files written outside --auto-audit")
+    ac.add_argument("--paper", required=True, help="case id")
+    ac.add_argument("--staged", help="directory holding <lens>.json "
+                                     "(default: projects/<pid>/audit/.staged)")
+    ac.add_argument("--reviewer", default="", help="what produced these, for the sidecar")
+    ac.add_argument("--tool-policy", default="unrecorded",
+                    help="what isolation the reviewer actually ran under. Defaults to "
+                         "'unrecorded' rather than to anything reassuring: unlike the "
+                         "auto-audit path, nothing here can prove a sandbox was enforced.")
+    ac.set_defaults(func=cmd_accept)
 
     ds = sub.add_parser("dossier", help="consolidate finished reports")
     ds.add_argument("papers", nargs="*", help="case ids (default: every reviewed paper)")

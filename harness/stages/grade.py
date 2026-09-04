@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 
-from .. import grading, pdf, state
+from .. import grade_driver, grading, pdf, state
 from ..artifacts import Finding, Grade, LensReport, PaperDoc
 from ..config import Config
 from ..prompts import grade as G
@@ -114,7 +115,8 @@ def grade_is_accepted(gdir, slug: str) -> tuple[bool, str]:
         rec = state.read_json(sidecar)
     except Exception:
         return False, "provenance sidecar is not valid JSON"
-    if not isinstance(rec, dict) or rec.get("written_by") != "grade_driver":
+    if not isinstance(rec, dict) or rec.get("written_by") not in ("grade_driver",
+                                                                  "manual_accept"):
         return False, f"provenance sidecar written_by={rec.get('written_by') if isinstance(rec, dict) else None!r} not recognized"
     want = rec.get("content_sha256")
     if not want:
@@ -122,6 +124,37 @@ def grade_is_accepted(gdir, slug: str) -> tuple[bool, str]:
     if hashlib.sha256(path.read_bytes()).hexdigest() != want:
         return False, "grade file content changed after its provenance sidecar was written"
     return True, ""
+
+
+def accept_grade(cfg: Config, pid: str, slug: str, raw: str, *,
+                 grader: str = "", tool_policy: str = "unrecorded") -> dict:
+    """The grading analogue of `stages.audit.accept_lens`: validate and seal a grade a
+    grader produced OUTSIDE the `grade_driver` subprocess path.
+
+    Exists for the same reason its audit counterpart does. `SH_ALLOW_GRADING` shells out
+    to a CLI, and when that CLI is unavailable — a rate limit, no install, a revoked
+    credential — there was no other way to get a grade in, so `counted_severity` fell
+    back to lens-asserted severity and every report said "grading is off". The blinding
+    that makes a grade worth anything is a property of WHAT THE GRADER WAS SHOWN, which
+    is the prompt file, not of which process read it; so a second reader that sees only
+    `audit/grade/prompts/<slug>.md` is as blinded as the subprocess was.
+
+    What is NOT equivalent, and is recorded rather than glossed: the subprocess ran with
+    `--allowedTools ""` and an empty sandbox cwd, so it COULD NOT open the lens file and
+    read the severity withheld from it. Nothing reaching this function can prove that.
+    `tool_policy` defaults to `unrecorded`, and `grader` names what did the reading.
+    """
+    grade = grade_driver.parse_grade_json(raw)
+    gdir = state.project_dir(cfg, pid) / "audit" / "grade"
+    out = gdir / f"{slug}.json"
+    state.write_json(out, grade.model_dump())
+    record = {"slug": slug, "paper_id": pid, "written_by": "manual_accept",
+              "grader": grader or "unnamed", "tool_policy": tool_policy,
+              "verdict": grade.verdict,
+              "content_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
+              "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    state.write_json(out.with_suffix(".driver.json"), record)
+    return record
 
 
 def run_grade(cfg: Config, pid: str) -> dict:

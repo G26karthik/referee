@@ -6,14 +6,17 @@ reason the report is written exactly as if grading had produced nothing — `ver
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
+from . import state
 from .artifacts import SubstantiveVerdict
 from .audit_driver import _kill_tree
 from .config import Config
@@ -61,6 +64,52 @@ def parse_verdict_json(text: str) -> SubstantiveVerdict:
         return SubstantiveVerdict(**data)
     except Exception as e:
         raise VerdictDriverError(f"output does not match the schema: {e}") from e
+
+
+def accept_verdict(cfg: Config, pid: str, raw: str, *, reader: str = "",
+                   tool_policy: str = "unrecorded") -> dict:
+    """Seal a whole-paper read produced OUTSIDE this module's subprocess.
+
+    Completes the set: `stages.audit.accept_lens` and `stages.grade.accept_grade` already
+    give the audit and grading phases a channel that does not depend on a CLI being
+    reachable. The whole-paper read had none at all — `run_report` called `run()` or got
+    nothing — so on a host where the CLI is rate-limited or absent, every report was
+    permanently missing the one judgement the threshold table structurally cannot make,
+    and the self-audit's `whole_paper_judged_independently` failed for a reason that had
+    nothing to do with the review's diligence.
+
+    Sealed the same way, and for the same reason: an opinion nobody can attribute is
+    worth less than no opinion. Sits at `reports/<pid>.substantive.json` with a sidecar;
+    `load_accepted` is what `run_report` prefers over calling the subprocess.
+    """
+    verdict = parse_verdict_json(raw)
+    out = state.project_dir(cfg, pid) / "reports" / f"{pid}.substantive.json"
+    state.write_json(out, verdict.model_dump())
+    record = {"paper_id": pid, "written_by": "manual_accept", "reader": reader or "unnamed",
+              "tool_policy": tool_policy, "verdict": verdict.verdict,
+              "content_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
+              "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    state.write_json(out.with_suffix(".driver.json"), record)
+    return record
+
+
+def load_accepted(cfg: Config, pid: str) -> SubstantiveVerdict | None:
+    """A sealed whole-paper read for `pid`, or None. Verifies the seal before trusting it —
+    a file edited after acceptance is not the file that was accepted, exactly as
+    `lens_is_accepted` and `grade_is_accepted` require."""
+    out = state.project_dir(cfg, pid) / "reports" / f"{pid}.substantive.json"
+    sidecar = out.with_suffix(".driver.json")
+    if not (out.exists() and sidecar.exists()):
+        return None
+    try:
+        rec = state.read_json(sidecar)
+        if not isinstance(rec, dict) or rec.get("written_by") != "manual_accept":
+            return None
+        if hashlib.sha256(out.read_bytes()).hexdigest() != rec.get("content_sha256"):
+            return None
+        return SubstantiveVerdict(**state.read_json(out))
+    except Exception:
+        return None
 
 
 def run(cfg: Config, prompt_text: str, *, timeout_s: int = 300) -> SubstantiveVerdict | None:
