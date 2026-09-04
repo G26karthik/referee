@@ -948,29 +948,39 @@ def run_report(cfg: Config, pid: str) -> dict:
     # the only channel that works at all when the CLI is unreachable — see
     # `verdict_driver.accept_verdict`.
     substantive = verdict_driver.load_accepted(cfg, pid)
+
+    # COUNTED severity, and the questions block alongside it. A whole-paper read shown
+    # only the defects is being asked to weigh one side of the evidence: what a reviewer
+    # asked and could not settle, and what it raised and then withdrew, are part of
+    # judging the paper, and a reader deciding "are the weaknesses local or systemic"
+    # needs both columns.
+    findings_summary = "\n".join(
+        f"- [{counted(f)}] ({f.lens}) {f.title}: {f.statement}" for f in findings[:30])
+    withdrawn = [f for f in findings
+                 if f.finding_class in ("REFUTED", "OPEN_QUESTION")
+                 or f.candidate_class in ("OPEN_QUESTION", "DISMISSED")]
+    questions_summary = "\n".join(
+        f"- [{f.finding_class}/{f.candidate_class or 'unsorted'}] {f.title}"
+        for f in withdrawn[:20])
+    grading_summary = (f"{coverage['graded']} of {coverage['candidates']} candidate(s) "
+                       f"independently graded.")
+    from ..prompts import verdict as verdict_prompts
+    verdict_prompt = verdict_prompts.build(
+        doc.title, findings_summary, grading_summary, probe.reason if probe else "",
+        questions_summary)
+    # ALWAYS PERSISTED, gate open or shut. The audit and grading phases both write their
+    # prompts to disk and stop, which is what makes a reader able to pick one up and do
+    # the work by hand; this phase built its prompt inline and passed it straight to a
+    # subprocess, so when that subprocess was unreachable there was nothing to hand
+    # anyone — the only phase of the review with no manual entry point at all.
+    prompt_path = root / "reports" / "verdict_prompt.md"
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text(verdict_prompt, encoding="utf-8")
+
     ok, _why = verdict_driver.available(cfg)
     if substantive is None and ok:
-        # COUNTED severity, and the questions block alongside it. A whole-paper read shown
-        # only the defects is being asked to weigh one side of the evidence: what a
-        # reviewer asked and could not settle, and what it raised and then withdrew, are
-        # part of judging the paper, and a reader deciding "are the weaknesses local or
-        # systemic" needs both columns.
-        findings_summary = "\n".join(
-            f"- [{counted(f)}] ({f.lens}) {f.title}: {f.statement}" for f in findings[:30])
-        withdrawn = [f for f in findings
-                     if f.finding_class in ("REFUTED", "OPEN_QUESTION")
-                     or f.candidate_class in ("OPEN_QUESTION", "DISMISSED")]
-        questions_summary = "\n".join(
-            f"- [{f.finding_class}/{f.candidate_class or 'unsorted'}] {f.title}"
-            for f in withdrawn[:20])
-        grading_summary = (f"{coverage['graded']} of {coverage['candidates']} candidate(s) "
-                           f"independently graded.")
-        probe_summary = probe.reason if probe else ""
-        from ..prompts import verdict as verdict_prompts
-        substantive = verdict_driver.run(
-            cfg, verdict_prompts.build(doc.title, findings_summary, grading_summary,
-                                       probe_summary, questions_summary),
-            timeout_s=cfg.verdict_timeout_s)
+        substantive = verdict_driver.run(cfg, verdict_prompt,
+                                         timeout_s=cfg.verdict_timeout_s)
 
     agreement, contested = "unavailable", False
     if substantive is not None:
