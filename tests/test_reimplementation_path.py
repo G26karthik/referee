@@ -286,3 +286,63 @@ def test_the_two_ceilings_name_the_same_set():
     assert 'spec.provenance not in ("driver", "repo_exec")' in src, \
         "the reconciler's ceiling moved; update report.ADMISSIBLE_REPRODUCTION_PROVENANCE too"
     assert set(ADMISSIBLE_REPRODUCTION_PROVENANCE) == {"driver", "repo_exec"}
+
+
+# --------------------------------------------------------------------------- #
+# E. GREEN may not borrow the words of evidence it does not have
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("claim_status", ["NOT_VERIFIED", "VERIFIED_FAILURE"])
+def test_a_decision_without_positive_evidence_never_claims_support(claim_status):
+    """The most consequential misreading this system can produce.
+
+    Two very different papers are both GREEN: one whose printed cell an executed metric
+    reconciled with, and one that nothing could be established about. Only the first has
+    been verified/supported/confirmed, and the second is the overwhelmingly common case —
+    so a decision block that borrows those words for it is not a rare slip, it is the
+    default output being wrong in the direction that gets quoted.
+    """
+    from harness.artifacts import EvalReport
+    from harness.stages.report import (SUPPORT_LANGUAGE, render_eval_report,
+                                       unearned_support_language)
+
+    rep = EvalReport(paper_id="p", title="T", verdict="GREEN",
+                     verdict_reason="No material failure established; 3 MINOR finding(s).",
+                     claim_status=claim_status, reproduction_status="NOT_ATTEMPTED",
+                     execution_provenance="SYNTHESIZED_DIAGNOSTIC", lenses_run=["protocol"])
+    md = render_eval_report(rep)
+    decision = md[:md.index("## Critical validity threats")]
+    assert unearned_support_language(decision, claim_status) == [], decision
+    # and the reader is told, positively, that there is none
+    assert "none" in decision.lower() and "ABSENCE of an established failure" in decision \
+        or claim_status == "VERIFIED_FAILURE"
+    assert set(SUPPORT_LANGUAGE) >= {"verified", "supported", "confirmed"}
+
+
+def test_only_a_positively_checked_claim_may_use_the_word_verified():
+    """The guard on the test above: the rule must not gag the one state that earned it."""
+    from harness.artifacts import EvalReport
+    from harness.stages.report import render_eval_report, support_is_evidenced
+
+    assert support_is_evidenced("VERIFIED_SUPPORT")
+    assert not support_is_evidenced("NOT_VERIFIED")
+    assert not support_is_evidenced("VERIFIED_FAILURE")
+
+    rep = EvalReport(paper_id="p", title="T", verdict="GREEN", verdict_reason="r",
+                     claim_status="VERIFIED_SUPPORT", reproduction_status="REPRODUCED",
+                     execution_provenance="AUTHOR_REPOSITORY", lenses_run=["protocol"])
+    decision = render_eval_report(rep)
+    decision = decision[:decision.index("## Critical validity threats")]
+    assert "reconciled with a printed cell" in decision
+    assert "REPRODUCED" in decision
+
+
+def test_the_support_row_is_present_for_every_claim_status():
+    """A GREEN must never appear without the row that says what stands behind it — the
+    row is the answer to the one question a skimmed verdict provokes."""
+    from harness.artifacts import EvalReport
+    from harness.stages.report import CLAIM_STATUSES, render_eval_report
+
+    for status in CLAIM_STATUSES:
+        rep = EvalReport(paper_id="p", title="T", verdict="GREEN", verdict_reason="r",
+                         claim_status=status, lenses_run=["protocol"])
+        assert "**Supporting evidence**" in render_eval_report(rep), status

@@ -78,6 +78,61 @@ CONCERN_SEVERITY = ("MAJOR",)
 # them look alike, so it prints this field verbatim.
 CLAIM_STATUSES = ("VERIFIED_FAILURE", "VERIFIED_SUPPORT", "NOT_VERIFIED")
 
+SUPPORT_LANGUAGE = ("verified", "supported", "confirmed", "validated", "corroborated")
+EVIDENCED_SUPPORT = ("VERIFIED_SUPPORT",)
+
+# How much experimental evidence stands behind the decision. NOT_ATTEMPTED and
+# NOT_VERIFIED are kept apart deliberately — "no experiment was run" and "an experiment
+# ran and settled nothing" are different facts about the audit, and collapsing them is
+# how a report starts implying it tried harder than it did.
+REPRODUCTION_STATUSES = ("REPRODUCED", "FAILED_REPRODUCTION", "NOT_VERIFIED", "NOT_ATTEMPTED")
+
+
+def support_is_evidenced(claim_status: str) -> bool:
+    """May this report describe the paper as verified/supported/confirmed?
+
+    True only when something was positively checked and held. Absence of an established
+    failure is not support, and this predicate is what keeps the two apart everywhere the
+    report speaks about the paper as a whole.
+    """
+    return claim_status in EVIDENCED_SUPPORT
+
+
+def unearned_support_language(text: str, claim_status: str) -> list[str]:
+    """Every support word used in `text` that `claim_status` has not earned.
+
+    Scoped to DECISION-LEVEL prose — the badge, the reason, the gloss, the Decision
+    table. It is deliberately not run over the whole report, because "cell_verified",
+    "(not verified)" and "confirmed findings" are legitimate elsewhere: they describe an
+    evidence class, a disclaimer, and a finding bucket respectively, none of which is a
+    claim that the PAPER was verified. Empty when support is evidenced.
+    """
+    if support_is_evidenced(claim_status):
+        return []
+    # This scans PROSE, so the harness's own status tokens come out first. `NOT_VERIFIED`,
+    # `VERIFIED_FAILURE` and `FAILED_REPRODUCTION` all contain a support word while
+    # claiming no support whatever — they are the vocabulary the Decision block prints
+    # verbatim on purpose, and a detector that flags the disclaimer it exists to require
+    # is just a broken detector. "not verified" is likewise the report saying so.
+    low = text.lower()
+    for token in (*CLAIM_STATUSES, *REPRODUCTION_STATUSES):
+        low = low.replace(token.lower(), " ")
+    return [w for w in SUPPORT_LANGUAGE if re.search(rf"(?<!not ){w}", low)]
+
+
+# GREEN MAY NOT BORROW THE WORDS OF EVIDENCE IT DOES NOT HAVE.
+#
+# Two very different papers are both GREEN: one whose printed cell an executed metric
+# actually reconciled with, and one nothing could be established about at all. Calling
+# either of them "verified", "supported" or "confirmed" is only true of the first, and
+# the second is the overwhelmingly common case — so the failure mode is not rare, it is
+# the default. A GREEN misread as a clean bill of health is the single most consequential
+# misreading this system can produce, because it is the one that gets quoted.
+#
+# `VERIFIED_SUPPORT` is the ONLY state that has earned this vocabulary, and it earns it
+# from an executed reconciliation, never from an absence of findings. The words are named
+# here rather than left implicit so a test can sweep every state and prove the decision
+# text uses them nowhere else.
 # The provenance ceiling, enforced a SECOND time here. `local_exec.reconcile` already
 # refuses to emit a verdict for anything outside this set, so in a correct system no
 # inadmissible reconciliation ever reaches this module — which is precisely why the check
@@ -123,6 +178,18 @@ _DECISION_GLOSS = {
                     "This is not a finding that the paper is correct, and it is not a finding "
                     "that it is wrong — it is the honest state when the evidence available did "
                     "not settle the question.",
+}
+
+# What positive evidence stands behind the decision, stated as its own row so a GREEN can
+# never appear without it. `NOT_VERIFIED` says "none" in the first three words, because a
+# reader skimming one line is the reader most likely to take GREEN for a clean bill of
+# health. Only the VERIFIED_SUPPORT entry is allowed to use the word "verified" at all —
+# see SUPPORT_LANGUAGE.
+_SUPPORT_ROW = {
+    "VERIFIED_FAILURE": "n/a — this decision rests on an established failure, below",
+    "VERIFIED_SUPPORT": "yes — an executed metric reconciled with a printed cell",
+    "NOT_VERIFIED": "**none** — this decision rests on the ABSENCE of an established "
+                    "failure, not on evidence that the paper is sound",
 }
 _REPRO_GLOSS = {
     "REPRODUCED": "An experiment ran and its metric reconciled with the paper's printed value.",
@@ -852,6 +919,8 @@ def render_eval_report(r: EvalReport) -> str:
         "|---|---|",
         f"| **Paper decision** | {r.verdict} |",
         f"| **Claim status** | `{r.claim_status or 'NOT_VERIFIED'}` |",
+        f"| **Supporting evidence** | "
+        f"{_SUPPORT_ROW.get(r.claim_status, _SUPPORT_ROW['NOT_VERIFIED'])} |",
         f"| **Reproduction** | `{r.reproduction_status or 'NOT_ATTEMPTED'}` |",
         f"| **What ran** | `{r.execution_provenance or 'SYNTHESIZED_DIAGNOSTIC'}` |",
         "",
