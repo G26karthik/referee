@@ -23,6 +23,8 @@ import json
 import sys
 from pathlib import Path
 
+from conftest import fixture_paper
+
 import pytest
 
 from harness import controller, corpus, failures, grading, selfaudit
@@ -40,7 +42,7 @@ RANK = grading.RANK
 
 # The smallest real PDF in the corpus. Used ONLY as a thing that ingests successfully —
 # no assertion below reads its content, so this is not a paper-specific test.
-_PAPER = Path(__file__).resolve().parent.parent / "papers" / "paper1_grokking.pdf"
+_PAPER = fixture_paper("paper1_grokking.pdf")
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
 
@@ -257,12 +259,37 @@ def test_a_fatal_needs_two_independent_checks():
         "one cell and one prose quote is not two independent checks"
 
 
-def test_the_verdict_thresholds_are_unchanged_data():
-    """Invariant #8, as a literal. This whole change adds refusals and derivations; it
-    does not renegotiate the table."""
-    assert (report_stage.RED_FATAL, report_stage.RED_MAJOR_ONE_LENS,
-            report_stage.RED_MAJOR_TOTAL, report_stage.YELLOW_MAJOR,
-            report_stage.YELLOW_MINOR) == (1, 3, 10, 1, 4)
+def test_the_materiality_table_is_data_and_counts_nothing():
+    """Invariant #8, restated for the binary decision.
+
+    The rule is still a table rather than a judgement — that never changed. What changed
+    is that the table names WHICH severity rejects a claim instead of HOW MANY of a
+    lesser one add up to a rejection, so there is no threshold left to tune, and no
+    accumulation an unusually thorough panel can trip.
+    """
+    assert report_stage.MATERIAL_SEVERITY == ("FATAL",)
+    assert report_stage.CONCERN_SEVERITY == ("MAJOR",)
+    assert set(report_stage.CLAIM_STATUSES) == {
+        "VERIFIED_FAILURE", "VERIFIED_SUPPORT", "NOT_VERIFIED"}
+    # The removed thresholds must stay removed: their presence would mean a second,
+    # competing rule had been reintroduced alongside this one.
+    for gone in ("RED_MAJOR_ONE_LENS", "RED_MAJOR_TOTAL", "YELLOW_MAJOR", "YELLOW_MINOR"):
+        assert not hasattr(report_stage, gone), f"{gone} is a counting threshold; it was retired"
+
+
+def test_the_binary_decision_is_exactly_the_verified_failure_state():
+    """RED/GREEN is a projection of `claim_status`, not a parallel rule that could drift
+    from it. Swept over the reachable severity space rather than spot-checked."""
+    from harness.artifacts import Finding
+
+    for sev in ("FATAL", "MAJOR", "MINOR", "NOTE"):
+        for n in (0, 1, 5):
+            fs = [Finding(finding_id=f"f{i}", lens="protocol", severity=sev, statement="s")
+                  for i in range(n)]
+            status, _ = report_stage.claim_status(fs, None)
+            verdict, _ = report_stage.overall_verdict(fs, None)
+            assert (verdict == "RED") == (status == "VERIFIED_FAILURE"), (sev, n, status, verdict)
+            assert verdict in ("RED", "GREEN"), "the paper-level decision is binary"
 
 
 # ══════════════════════════════════════════════════════════════════════════════

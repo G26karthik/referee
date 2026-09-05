@@ -1,5 +1,5 @@
 """The prompt for the SUBSTANTIVE verdict — one model-written opinion per paper, printed
-alongside the deterministic RED/YELLOW/GREEN table but consumed by no threshold.
+alongside the deterministic RED/GREEN decision but consumed by no threshold.
 
 Unlike the audit lenses and the grader, this reviewer sees EVERYTHING: every finding,
 every grade, the probe result. Its job is the one the threshold table structurally

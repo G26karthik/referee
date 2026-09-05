@@ -52,40 +52,52 @@ def test_one_fatal_is_red():
     assert overall_verdict([f("a", severity="FATAL")])[0] == "RED"
 
 
-def test_three_majors_from_one_lens_is_red():
-    """One dimension failing repeatedly is a pattern, not isolated weaknesses."""
-    same = [f(str(i), lens="protocol", severity="MAJOR") for i in range(3)]
-    assert overall_verdict(same)[0] == "RED"
-    assert "protocol" in overall_verdict(same)[1]
+@pytest.mark.parametrize("n", [1, 3, 10, 40, 500])
+def test_no_number_of_majors_ever_reaches_red(n):
+    """THE property the binary rule exists to guarantee.
 
-
-def test_majors_spread_across_lenses_stay_yellow():
-    """Calibration regression. A four-lens panel returns ~2 MAJORs per lens on a GOOD
-    paper; a real run on a pre-registered null result produced 8 MAJORs across 4 lenses
-    with no FATAL, and the earlier rule called that RED. It is a YELLOW."""
+    A concern does not become a rejection by being repeated, so there is no count at
+    which MAJORs cross into RED — not three from one lens, not ten across all of them,
+    not five hundred. The old table had exactly those thresholds and they made the
+    paper-level decision a function of how many things a panel chose to write down,
+    which is a property of the panel and not of the paper.
+    """
+    same = [f(str(i), lens="protocol", severity="MAJOR") for i in range(n)]
     spread = [f(f"{lens}-{i}", lens=lens, severity="MAJOR")
               for lens in ("overclaim", "protocol", "confound", "contradiction")
-              for i in range(2)]
-    assert len(spread) == 8
-    verdict, reason = overall_verdict(spread)
-    assert verdict == "YELLOW", reason
-    assert "no" in reason.lower() and "fatal" in reason.lower()
+              for i in range(n)]
+    assert overall_verdict(same)[0] == "GREEN"
+    assert overall_verdict(spread)[0] == "GREEN"
 
 
-def test_an_overwhelming_total_is_still_red():
-    many = [f(f"{lens}-{i}", lens=lens, severity="MAJOR")
-            for lens in ("overclaim", "protocol", "confound", "contradiction", "x")
-            for i in range(2)]
-    assert overall_verdict(many)[0] == "RED"
+@pytest.mark.parametrize("n", [1, 4, 99])
+def test_no_number_of_minors_ever_reaches_red(n):
+    assert overall_verdict([f(str(i)) for i in range(n)])[0] == "GREEN"
 
 
-def test_two_majors_in_one_lens_is_yellow():
-    assert overall_verdict([f(str(i), lens="protocol", severity="MAJOR") for i in range(2)])[0] == "YELLOW"
+def test_a_single_counted_fatal_is_red_and_says_which_lens():
+    """The one finding-shaped route to RED. FATAL is defined as 'the central claim does
+    not stand' — rejection by definition, which is what RED is reserved for."""
+    verdict, reason = overall_verdict([f("a", lens="protocol", severity="FATAL")])
+    assert verdict == "RED"
+    assert "protocol" in reason and "FATAL" in reason
 
 
-def test_minors_accumulate_to_yellow_at_four():
-    assert overall_verdict([f(str(i)) for i in range(3)])[0] == "GREEN"
-    assert overall_verdict([f(str(i)) for i in range(4)])[0] == "YELLOW"
+def test_green_never_reads_as_a_certificate():
+    """GREEN is the absence of an established failure, not a finding of correctness, and
+    the reason string has to say so — this is the single most misreadable output the
+    system produces."""
+    for findings in ([], [f("a")], [f("a", severity="MAJOR")]):
+        reason = overall_verdict(findings)[1].lower()
+        assert "no material failure established" in reason
+        assert "certificate" in reason or "concern" in reason
+
+
+def test_a_major_is_reported_but_moves_no_colour():
+    """A MAJOR must be neither hidden nor decisive: GREEN, and named in the reason."""
+    verdict, reason = overall_verdict([f("a", lens="protocol", severity="MAJOR")])
+    assert verdict == "GREEN"
+    assert "1 MAJOR" in reason
 
 
 def test_no_findings_is_green():
@@ -205,7 +217,7 @@ def test_a_lens_supplied_title_cannot_inject_a_newline_or_fake_heading():
 
 def test_render_shows_the_verdict_badge_and_reason():
     md = render_eval_report(_report())
-    assert "🔴 REJECT / RED FLAG" in md and "because" in md
+    assert "🔴 RED — a material failure was established" in md and "because" in md
     assert "🟢" in render_eval_report(_report(verdict="GREEN", findings=[]))
 
 

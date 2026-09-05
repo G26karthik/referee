@@ -2,8 +2,8 @@
 
 Two hard rules, both inherited from what the research pipeline learned:
 
-  1. NO LLM DECIDES THE VERDICT. Severity ordering and the RED/YELLOW/GREEN call are
-     a lexicographic sort and a threshold table in plain Python. A model that ranks
+  1. NO LLM DECIDES THE VERDICT. Severity ordering and the binary RED/GREEN call are
+     a lexicographic sort and a materiality table in plain Python. A model that ranks
      its own findings will rank them differently on Tuesday; an editor needs the same
      paper to get the same verdict every time, and needs to be able to argue with the
      rule rather than with a mood.
@@ -37,19 +37,67 @@ _SEVERITY_RANK = {"FATAL": 2, "MAJOR": 1, "MINOR": 0, "NOTE": -1}
 # editor can check the first kind in seconds.
 _LENS_RANK = {"overclaim": 3, "contradiction": 2, "confound": 1, "protocol": 0}
 
-# Verdict thresholds. Stated as data so the rule is inspectable and arguable.
+# The materiality table. Stated as data so the rule is inspectable and arguable, exactly
+# as the RED/YELLOW/GREEN threshold table it replaces was.
 #
-# Calibrated against a real run. A four-lens panel returns roughly two MAJORs per lens
-# on a *good* paper — that is what a MAJOR means, a claim needing work, not a claim
-# that falls over. An earlier "3 MAJOR anywhere => RED" rule therefore returned RED on
-# a pre-registered null result with positive controls and a matched-budget design,
-# which is exactly the reflexive-rejection failure the lens calibration exists to stop.
+# WHAT CHANGED, AND WHY COUNTING HAD TO GO. The old table reached RED by ACCUMULATION:
+# three MAJORs from one lens, or ten across all four. That makes the paper-level decision
+# a function of how many things a panel of readers chose to write down, which is a
+# property of the panel, not of the paper. Two lenses that happen to phrase the same
+# doubt separately move a verdict; one that phrases two doubts together does not. There
+# is no scale on which "10 MAJORs" is a discovery and "9" is not.
 #
-# RED now means a central claim does not stand. That is a FATAL, or three MAJORs from
-# ONE lens (a single dimension failing repeatedly is a coherent pattern, not noise),
-# or an overwhelming total.
-RED_FATAL, RED_MAJOR_ONE_LENS, RED_MAJOR_TOTAL = 1, 3, 10
-YELLOW_MAJOR, YELLOW_MINOR = 1, 4
+# The decision is now binary and definitional, not cumulative:
+#
+#   RED   = a scientifically material failure has been ESTABLISHED, by evidence strong
+#           enough to REJECT the relevant claim.
+#   GREEN = no such failure has been established WITHIN THE AUDITED SCOPE.
+#
+# GREEN is therefore not a certificate. It does not mean the paper is correct, it means
+# this audit did not establish that it is wrong — which is why `claim_status` keeps
+# VERIFIED_SUPPORT and NOT_VERIFIED apart underneath, and why the report prints the
+# reproduction status beside the colour instead of folding it in.
+#
+# Only two things clear the bar, and neither is a count:
+#
+#   1. A failed reproduction, from a provenance the ceiling admits. Arithmetic against
+#      a printed cell, not a judgement.
+#   2. A finding whose COUNTED severity is FATAL — which the prompts define as "if true,
+#      the paper's central claim does not stand", i.e. rejection, definitionally.
+#
+# MAJOR is deliberately absent. Its own definition is "materially weakens a headline
+# claim" — that is a concern, and a concern is not a rejection however many of them
+# there are. They are printed under `## Material concerns` and they move no colour.
+MATERIAL_SEVERITY = ("FATAL",)
+CONCERN_SEVERITY = ("MAJOR",)
+
+# The internal epistemic states. RED/GREEN is a projection of these, not a replacement
+# for them: only VERIFIED_FAILURE is RED, and BOTH of the other two are GREEN, because
+# "we checked and it held" and "we could not check" are the same decision about the
+# paper even though they are opposite states of knowledge. The report must never let
+# them look alike, so it prints this field verbatim.
+CLAIM_STATUSES = ("VERIFIED_FAILURE", "VERIFIED_SUPPORT", "NOT_VERIFIED")
+
+# The provenance ceiling, enforced a SECOND time here. `local_exec.reconcile` already
+# refuses to emit a verdict for anything outside this set, so in a correct system no
+# inadmissible reconciliation ever reaches this module — which is precisely why the check
+# belongs here too. It was not here, and a `FAILED_REPRODUCTION` carrying `synthesized`,
+# `template` or a garbage provenance returned RED: a paper-independent placebo, or a
+# hand-edited probe_results.json, convicting a paper. The old code even detected the case
+# and printed "treat it as a harness defect" while still returning the conviction, so the
+# report contradicted its own verdict. One upstream bug was all that stood between a
+# diagnostic and a published RED.
+ADMISSIBLE_REPRODUCTION_PROVENANCE = ("driver", "repo_exec")
+
+# What actually ran, in the vocabulary a reader needs rather than the internal token.
+# Fails closed: anything unrecognised reads as a diagnostic, never as author code, so a
+# provenance this map has not been taught about cannot be reported as a reproduction.
+PROVENANCE_LABEL = {
+    "repo_exec": "AUTHOR_REPOSITORY",
+    "driver": "INDEPENDENT_REIMPLEMENTATION",
+    "synthesized": "SYNTHESIZED_DIAGNOSTIC",
+    "template": "SYNTHESIZED_DIAGNOSTIC",
+}
 
 _CELL_REF = re.compile(r"^T\d+:r\d+:c\d+$")
 # Salvaged from the retired grounding tournament: pull the leading magnitude out of
@@ -61,6 +109,31 @@ _MAGNITUDE = re.compile(r"[-+]?\d*\.?\d+")
 MAX_TABLE_ROWS = 14
 MAX_THREAT_BULLETS = 6
 _QUOTE_CHARS = 240
+
+# The two sentences a reader most often gets wrong, written once so every report says
+# them the same way. Both spell out what the state does NOT mean, because that is the
+# half that gets dropped when a colour is quoted out of context.
+_DECISION_GLOSS = {
+    "VERIFIED_FAILURE": "A material failure was **established**: the evidence below is strong "
+                        "enough to reject the claim it addresses. This is not a count of concerns.",
+    "VERIFIED_SUPPORT": "Something was **positively checked and held** — an executed metric "
+                        "reconciled with a printed cell. That is support for the cell that was "
+                        "tested, not for the paper as a whole.",
+    "NOT_VERIFIED": "**Nothing was established in either direction** within the audited scope. "
+                    "This is not a finding that the paper is correct, and it is not a finding "
+                    "that it is wrong — it is the honest state when the evidence available did "
+                    "not settle the question.",
+}
+_REPRO_GLOSS = {
+    "REPRODUCED": "An experiment ran and its metric reconciled with the paper's printed value.",
+    "FAILED_REPRODUCTION": "An experiment ran, started successfully, and its metric did not "
+                           "reconcile with the paper's printed value.",
+    "NOT_VERIFIED": "An experiment was attempted and settled nothing — see the chain below for "
+                    "the link that broke. An infrastructure or capability limit never counts "
+                    "against the paper.",
+    "NOT_ATTEMPTED": "No reproduction was attempted, so no experimental evidence stands behind "
+                     "this decision either way.",
+}
 
 
 def parse_magnitude(text: str) -> float:
@@ -111,21 +184,107 @@ def rank(findings: list[Finding]) -> list[Finding]:
     return sorted(findings, key=finding_key, reverse=True)
 
 
+def material_failures(findings: list[Finding]) -> list[Finding]:
+    """The findings that REJECT a claim, as opposed to weakening one.
+
+    COUNTED severity, never the lens's raw assertion — so everything `harness.grading`
+    already enforces is inherited here rather than re-litigated: CANDIDATE_CAP (only a
+    CONFIRMED_FINDING may reach FATAL), the confidence ceiling, and the evidence ceiling
+    that bounds confidence by what the citation actually is. A counted FATAL is therefore
+    already "a confirmed finding, at high confidence, on evidence the harness re-verified
+    against the paper" before this function sees it.
+
+    No SEPARATE precondition is layered on top — notably not "and it must have been
+    graded". That would do nothing when grading is on and silently suppress every RED
+    when it is off (the default), breaking the one guarantee the grading subsystem
+    exists to keep: turning grading off reproduces the ungraded verdict exactly.
+    """
+    return [f for f in findings if counted(f) in MATERIAL_SEVERITY]
+
+
+def material_concerns(findings: list[Finding]) -> list[Finding]:
+    """Counted MAJORs: real, verified, and NOT sufficient to reject a claim. Printed
+    prominently, counted toward nothing. See MATERIAL_SEVERITY for why."""
+    return [f for f in findings if counted(f) in CONCERN_SEVERITY]
+
+
+def claim_status(findings: list[Finding],
+                 reconciliation: Reconciliation | None = None) -> tuple[str, str]:
+    """The epistemic state underneath the colour: what this audit ESTABLISHED.
+
+    Three states, and the distinction the binary decision cannot carry on its own:
+
+      VERIFIED_FAILURE  a material failure was established — a reproduction that failed
+                        from an admissible provenance, or a counted-FATAL finding.
+      VERIFIED_SUPPORT  something was positively checked and held: a reproduction that
+                        reconciled against the printed cell.
+      NOT_VERIFIED      nothing was established in either direction. The honest state
+                        for most papers, and the one a research auditor is allowed to
+                        report rather than resolving it into a fabricated conclusion.
+
+    INCONCLUSIVE is deliberately NOT a failure. A missing dataset, a units mismatch, an
+    unparsed metric, a shut execution gate and an 8 GiB card facing a 24 GiB demand all
+    land in NOT_VERIFIED, and none of them is evidence against a paper.
+    """
+    if (reconciliation is not None and reconciliation.status == "FAILED_REPRODUCTION"
+            and reconciliation.provenance in ADMISSIBLE_REPRODUCTION_PROVENANCE):
+        return "VERIFIED_FAILURE", "a reproduction attempt failed against the printed cell"
+    fatal = material_failures(findings)
+    if fatal:
+        return "VERIFIED_FAILURE", f"{len(fatal)} finding(s) counted FATAL"
+    if reconciliation is not None and reconciliation.status == "RESOLVED_VERIFIED":
+        return "VERIFIED_SUPPORT", "an executed metric reconciled with the printed cell"
+    return "NOT_VERIFIED", "no material failure established, and nothing positively reproduced"
+
+
+def reproduction_status(probe: ProbeResult | None) -> str:
+    """REPRODUCED | FAILED_REPRODUCTION | NOT_VERIFIED | NOT_ATTEMPTED — reported beside
+    the verdict, never folded into it.
+
+    NOT_ATTEMPTED and NOT_VERIFIED are kept apart on purpose: "no experiment was run"
+    and "an experiment ran and settled nothing" are different facts about the audit, and
+    collapsing them is how a report starts implying it tried harder than it did.
+    """
+    if probe is None:
+        return "NOT_ATTEMPTED"
+    rec = probe.reconciliation
+    if rec is None or rec.status == "NOT_ATTEMPTED":
+        return "NOT_ATTEMPTED"
+    if rec.status == "RESOLVED_VERIFIED":
+        return "REPRODUCED"
+    if rec.status == "FAILED_REPRODUCTION":
+        return "FAILED_REPRODUCTION"
+    return "NOT_VERIFIED"
+
+
+def provenance_label(provenance: str) -> str:
+    """Internal provenance token → the reader-facing vocabulary. Fails closed to
+    SYNTHESIZED_DIAGNOSTIC, so an unrecognised token can never be reported as the
+    authors' own code."""
+    return PROVENANCE_LABEL.get(provenance, "SYNTHESIZED_DIAGNOSTIC")
+
+
 def overall_verdict(findings: list[Finding],
                     reconciliation: Reconciliation | None = None) -> tuple[str, str]:
-    """Deterministic RED / YELLOW / GREEN plus the rule that produced it.
+    """The binary paper-level decision, plus the rule that produced it.
 
-    A failed CODE reproduction outranks every paper-side rule. If the authors' own
-    published code, run on their own advertised entrypoint, does not produce the number
-    printed in the cell — or does not run at all — then the central claim is not
-    supported by the artifact the authors themselves offered as support, and no count
-    of MAJORs is needed to reach RED.
-
-    Note what is deliberately NOT escalated: INCONCLUSIVE. A missing dataset, a units
-    mismatch, an unparsed metric and a shut execution gate all land there, and none of
-    them is evidence against a paper.
+    RED iff `claim_status` is VERIFIED_FAILURE. Nothing else — no count, no accumulation,
+    no second mechanism. See MATERIAL_SEVERITY for why counting was removed, and
+    `claim_status` for the states this projects from.
     """
     if reconciliation is not None and reconciliation.status == "FAILED_REPRODUCTION":
+        if reconciliation.provenance not in ADMISSIBLE_REPRODUCTION_PROVENANCE:
+            # The ceiling, held at the verdict gate as well as at the reconciler. Reaching
+            # here means an upstream bug or an edited artifact; either way a program that
+            # is not entitled to reconcile a printed cell does not get to convict a paper,
+            # so this reports the harness defect INSTEAD of the conviction rather than
+            # alongside it.
+            return "GREEN", (
+                f"A reconciliation reported FAILED_REPRODUCTION with provenance "
+                f"'{reconciliation.provenance or '(none)'}', which the provenance ceiling "
+                f"does not admit as a reproduction of a printed cell. That status should "
+                f"have been unreachable, so it is treated as a harness defect and NOT as "
+                f"evidence about the paper. Nothing here counts against the authors.")
         where = f" at {reconciliation.table_ref}" if reconciliation.table_ref else ""
         # WHO ran decides what the failure means, so the sentence is derived from
         # provenance rather than asserted. Only `repo_exec` is the authors' own checkout;
@@ -154,35 +313,25 @@ def overall_verdict(findings: list[Finding],
                      f"defect rather than as evidence about the paper.")
         return "RED", f"Failed code reproduction{where}: {reconciliation.reason} {blame}"
 
-    # COUNTED severity, not the lens's raw assertion — see `counted()`. This is the
-    # whole mechanism by which independent grading can soften an over-escalated verdict:
-    # a MAJOR that a blinded second reviewer could not confirm, or that failed its own
-    # falsification check, has `counted_severity` capped below MAJOR by
-    # `harness.grading.derive`, and so does not reach these counters at all. No
-    # SEPARATE escalation precondition is layered on top of that — a second mechanism
-    # requiring, say, "the MAJORs behind a RED must be graded-confirmed" would either do
-    # nothing (when grading is off, which is the default) or silently suppress RED on
-    # every ungraded run, contradicting the one guarantee this subsystem exists to keep:
-    # turning grading off must reproduce the pre-grading verdict exactly. `counted()`
-    # already gives graded evidence the power to soften a verdict and gives ungraded
-    # evidence none — that IS the brake.
-    n = {s: sum(1 for f in findings if counted(f) == s) for s in _SEVERITY_RANK}
-    per_lens = Counter(f.lens for f in findings if counted(f) == "MAJOR")
-    worst_lens, worst_n = per_lens.most_common(1)[0] if per_lens else ("", 0)
-
-    if n["FATAL"] >= RED_FATAL:
-        return "RED", f"{n['FATAL']} FATAL finding(s): a central claim does not stand as argued."
-    if worst_n >= RED_MAJOR_ONE_LENS:
-        return "RED", (f"{worst_n} MAJOR findings from the '{worst_lens}' lens alone: one dimension "
-                       f"fails repeatedly, which is a pattern rather than isolated weaknesses.")
-    if n["MAJOR"] >= RED_MAJOR_TOTAL:
-        return "RED", f"{n['MAJOR']} MAJOR findings across all lenses (>= {RED_MAJOR_TOTAL})."
-    if n["MAJOR"] >= YELLOW_MAJOR:
-        return "YELLOW", (f"{n['MAJOR']} MAJOR finding(s), at most {worst_n} in any one lens, and no "
-                          f"FATAL: headline claims need work, but none is shown not to stand.")
-    if n["MINOR"] >= YELLOW_MINOR:
-        return "YELLOW", f"{n['MINOR']} MINOR findings (>= {YELLOW_MINOR}) accumulate into real doubt."
-    return "GREEN", f"No FATAL or MAJOR findings; {n['MINOR']} MINOR."
+    # COUNTED severity, not the lens's raw assertion — see `counted()` and
+    # `material_failures()`. Grading can only soften what reaches here; nothing can
+    # promote into it.
+    fatal = material_failures(findings)
+    concerns = material_concerns(findings)
+    if fatal:
+        lenses = ", ".join(sorted({f.lens for f in fatal}))
+        return "RED", (f"{len(fatal)} finding(s) counted FATAL ({lenses}): a central claim does "
+                       f"not stand as argued, on evidence the harness re-verified against the "
+                       f"paper.")
+    n_minor = sum(1 for f in findings if counted(f) == "MINOR")
+    if concerns:
+        return "GREEN", (f"No material failure established. {len(concerns)} MAJOR concern(s) and "
+                         f"{n_minor} MINOR were recorded and are printed in full — a concern "
+                         f"weakens a claim, it does not reject one, and no number of them "
+                         f"accumulates into a rejection.")
+    return "GREEN", (f"No material failure established; {n_minor} MINOR finding(s). This is the "
+                     f"absence of an established failure within the audited scope, not a "
+                     f"certificate of correctness.")
 
 
 def severity_review(findings: list[Finding]) -> list[str]:
@@ -233,13 +382,13 @@ def verdict_sensitivity(findings: list[Finding],
     """The same verdict, over only the findings whose evidence is a verified table cell.
 
     NOT a second grader and not a second opinion. It is `overall_verdict` — the identical
-    threshold table — applied to a subset of the identical findings, chosen by
+    materiality table — applied to a subset of the identical findings, chosen by
     `evidence_class`, which the harness wrote. Nothing here judges anything.
 
     What it answers is the question `severity_review` could only gesture at. That function
     lists the FATAL/MAJOR findings resting on prose; it cannot say whether they MATTER. On
     the pilot corpus they do: 15 of 29 MAJOR findings are prose-backed, and for two of the
-    three papers the RED verdict becomes YELLOW without them. "Severity is not
+    three papers the RED verdict softens to GREEN without them. "Severity is not
     machine-verified" and "this RED depends on grades that are not machine-verified" are
     very different statements to hand an editor, and only the second is actionable.
 
@@ -547,6 +696,25 @@ def _repo_block(a: RepoAcquisition) -> list[str]:
     out += [f"| {k} | {v} |" for k, v in rows]
     if a.reason:
         out += ["", a.reason]
+    if a.reimplementation is not None:
+        # A paper with no code is where a reader most needs to see a DECISION rather than
+        # a stop, so the ingredient table is printed in both directions: it is the
+        # evidence for "we could have rebuilt this and here is the brief", and equally the
+        # evidence for "we could not, and these are the sentences the paper never wrote".
+        r = a.reimplementation
+        out += ["", "### Independent reimplementation (PATH B)", "",
+                ("🟢 **Eligible** — the paper specifies enough to rebuild the experiment."
+                 if r.established else
+                 "⚪ **Not eligible** — the paper does not specify enough to rebuild the "
+                 "experiment."), "", r.reason, "",
+                "| ingredient | required | supplied | found at |", "|---|---|---|---|"]
+        out += [f"| {i.kind} | {'yes' if i.required else 'no'} | "
+                f"{'yes' if i.present else '**no**'} | {('`' + i.ref + '`') if i.ref else '—'} |"
+                for i in r.ingredients]
+        out += ["", "This is an ELIGIBILITY assessment about the paper's completeness. It "
+                    "concludes nothing about whether the paper's claims are correct, and a "
+                    "reimplementation — if one is written — is reported as "
+                    "`INDEPENDENT_REIMPLEMENTATION`, never as the authors' own code."]
     return out
 
 
@@ -647,9 +815,11 @@ def render_eval_report(r: EvalReport) -> str:
     drops findings reads as a clean bill of health for the ones it dropped.
     """
     ranked = rank(r.findings)
-    badge = {"RED": "🔴 REJECT / RED FLAG",
-             "YELLOW": "🟡 BORDERLINE",
-             "GREEN": "🟢 PASS"}.get(r.verdict, r.verdict)
+    # GREEN is deliberately not "PASS". The decision is "no material failure was
+    # ESTABLISHED", which is a statement about this audit's reach, not a certificate
+    # about the paper — and a badge reading PASS is exactly how that gets misread.
+    badge = {"RED": "🔴 RED — a material failure was established",
+             "GREEN": "🟢 GREEN — no material failure established"}.get(r.verdict, r.verdict)
     counts = {s: sum(1 for f in r.findings if counted(f) == s) for s in _SEVERITY_RANK}
     lens_counts = {s: sum(1 for f in r.findings if f.severity == s) for s in _SEVERITY_RANK}
     graded_delta = counts != lens_counts
@@ -675,6 +845,19 @@ def render_eval_report(r: EvalReport) -> str:
         + (f" · lens-asserted: {lens_counts['FATAL']} FATAL / {lens_counts['MAJOR']} MAJOR / "
            f"{lens_counts['MINOR']} MINOR" if graded_delta else "")
         + (f" · {r.dropped_findings} dropped as unsubstantiated" if r.dropped_findings else ""),
+        "",
+        "## Decision",
+        "",
+        "| | |",
+        "|---|---|",
+        f"| **Paper decision** | {r.verdict} |",
+        f"| **Claim status** | `{r.claim_status or 'NOT_VERIFIED'}` |",
+        f"| **Reproduction** | `{r.reproduction_status or 'NOT_ATTEMPTED'}` |",
+        f"| **What ran** | `{r.execution_provenance or 'SYNTHESIZED_DIAGNOSTIC'}` |",
+        "",
+        _DECISION_GLOSS.get(r.claim_status, _DECISION_GLOSS["NOT_VERIFIED"]),
+        "",
+        _REPRO_GLOSS.get(r.reproduction_status, _REPRO_GLOSS["NOT_ATTEMPTED"]),
         "",
         "## Critical validity threats",
         "",
@@ -755,7 +938,7 @@ def render_eval_report(r: EvalReport) -> str:
               f"are counted (see `harness/prompts/grade.py`).", ""]
         if r.verdict_if_lens_severity_only and r.verdict_if_lens_severity_only != r.verdict:
             L += [f"**Grading moved this verdict.** On the lenses' own asserted severities alone, "
-                  f"the same threshold table would have yielded "
+                  f"the same materiality table would have yielded "
                   f"**{r.verdict_if_lens_severity_only}** rather than **{r.verdict}**.", ""]
         moved = grading_review(r.findings)
         for line in moved[:MAX_THREAT_BULLETS]:
@@ -788,7 +971,7 @@ def render_eval_report(r: EvalReport) -> str:
         sv = r.substantive_verdict
         L += ["## Whole-paper assessment (model opinion, not counted)", "",
               "Reasoned independently rather than derived from the counts above — the one "
-              "judgement a threshold table structurally cannot make. It moves no colour: "
+              "judgement a materiality table structurally cannot make. It moves no colour: "
               f"agreement with the deterministic verdict is `{r.verdict_agreement}`.", "",
               f"**{sv.verdict}**"
               + (f" · core contribution stands: **{sv.core_contribution_stands}**"
@@ -833,16 +1016,16 @@ def render_eval_report(r: EvalReport) -> str:
               f"counts \u2014 check these first:", ""]
         L += [f"- {u}" for u in ungraded]
         L += [""]
-        # How much the verdict actually leans on those grades. The same threshold table
+        # How much the verdict actually leans on those grades. The same materiality table
         # over the cell-verified findings alone — no second judgement, no demotion.
         if r.verdict_if_cell_backed_only and r.verdict_if_cell_backed_only != r.verdict:
             L += [f"**This verdict depends on them.** Counting only findings whose evidence is a "
-                  f"verified table cell, the same threshold table yields "
+                  f"verified table cell, the same materiality table yields "
                   f"**{r.verdict_if_cell_backed_only}** rather than **{r.verdict}**. The "
                   f"difference is carried entirely by grades the harness cannot check.", ""]
         elif r.verdict_if_cell_backed_only:
             L += [f"The verdict does not depend on them: counting only cell-verified findings, the "
-                  f"same threshold table still yields **{r.verdict_if_cell_backed_only}**.", ""]
+                  f"same materiality table still yields **{r.verdict_if_cell_backed_only}**.", ""]
 
     # Blockquoted, not interpolated bare: this is the one lens-supplied field the schema
     # invites to be a paragraph or two, so it cannot be collapsed to one line the way
@@ -863,7 +1046,7 @@ def render_eval_report(r: EvalReport) -> str:
               ("🟢 " if sa.complete else "⚠️ ") + f"**{sa.summary}**", "",
               "Machine-checked against harness-written fields, never against a reviewer's "
               "own assessment of its diligence. **A failed check does not change the "
-              "verdict** — the threshold table is the verdict — it refuses to let this "
+              "verdict** — the materiality table is the verdict — it refuses to let this "
               "review call itself complete, and names what was not done.", ""]
         for i in sa.items:
             mark = {"pass": "✅", "fail": "❌", "not_applicable": "—"}.get(i.state, "?")
@@ -941,6 +1124,9 @@ def run_report(cfg: Config, pid: str) -> dict:
     findings = rank([f for r in reports for f in r.findings])
     rec = probe.reconciliation if probe else None
     verdict, reason = overall_verdict(findings, rec)
+    status, _status_why = claim_status(findings, rec)
+    repro = reproduction_status(probe)
+    ran_as = provenance_label(probe.provenance) if probe else "SYNTHESIZED_DIAGNOSTIC"
 
     from .. import verdict_driver
     # A SEALED whole-paper read wins over calling the subprocess: it is already produced,
@@ -984,8 +1170,7 @@ def run_report(cfg: Config, pid: str) -> dict:
 
     agreement, contested = "unavailable", False
     if substantive is not None:
-        soft = verdict in ("GREEN", "YELLOW")
-        if substantive.verdict == "CENTRAL_CLAIM_NOT_ESTABLISHED" and soft:
+        if substantive.verdict == "CENTRAL_CLAIM_NOT_ESTABLISHED" and verdict == "GREEN":
             agreement, contested = "contested", True
         elif substantive.verdict in ("STRONG", "SOUND_WITH_MINOR_CONCERNS") and verdict == "RED":
             agreement = "harness_harsher"
@@ -997,6 +1182,7 @@ def run_report(cfg: Config, pid: str) -> dict:
 
     report = EvalReport(
         paper_id=pid, title=doc.title, verdict=verdict, verdict_reason=reason,
+        claim_status=status, reproduction_status=repro, execution_provenance=ran_as,
         verdict_if_cell_backed_only=verdict_sensitivity(findings, rec),
         verdict_if_lens_severity_only=verdict_if_lens_severity_only(findings, rec),
         findings=findings, unasked_question=pick_unasked_question(reports),
@@ -1019,7 +1205,8 @@ def run_report(cfg: Config, pid: str) -> dict:
     md_path.write_text(render_eval_report(report), encoding="utf-8")
     state.append_log(
         cfg, pid, artifact_type="eval_report", phase="report",
-        headers={"verdict": verdict, "findings": len(findings), "dropped": dropped,
+        headers={"verdict": verdict, "claim_status": status, "reproduction_status": repro,
+                 "ran_as": ran_as, "findings": len(findings), "dropped": dropped,
                  "severities": {s: sum(1 for f in findings if counted(f) == s) for s in _SEVERITY_RANK},
                  "lenses": report.lenses_run, "probe": probe.verdict if probe else None,
                  "grade_coverage": report.grade_coverage, "verdict_contested": contested,
@@ -1027,6 +1214,7 @@ def run_report(cfg: Config, pid: str) -> dict:
         path=str(md_path),
     )
     return {"paper_id": pid, "verdict": verdict, "reason": reason,
+            "claim_status": status, "reproduction_status": repro, "ran_as": ran_as,
             "findings": len(findings), "dropped_unsubstantiated": dropped,
             "lenses": report.lenses_run, "probe": probe.verdict if probe else None,
             "report_md": str(md_path), "report": f"reports/{pid}.json",
@@ -1045,12 +1233,24 @@ if __name__ == "__main__":  # self-check: python -m harness.stages.report
     assert parse_magnitude("not a number") == 0.0
     assert parse_magnitude("") == 0.0
 
+    # The binary decision: only a counted FATAL (or a failed reproduction, below) is RED.
+    # No number of MAJORs accumulates into one — that is the whole point of the change.
     assert overall_verdict([_f("a", "overclaim", "FATAL")])[0] == "RED"
-    assert overall_verdict([_f(str(i), "protocol", "MAJOR") for i in range(3)])[0] == "RED"
-    assert overall_verdict([_f("a", "protocol", "MAJOR")])[0] == "YELLOW"
-    assert overall_verdict([_f(str(i), "protocol", "MINOR") for i in range(4)])[0] == "YELLOW"
-    assert overall_verdict([_f("a", "protocol", "MINOR")])[0] == "GREEN"
+    assert overall_verdict([_f(str(i), "protocol", "MAJOR") for i in range(3)])[0] == "GREEN"
+    assert overall_verdict([_f(str(i), "protocol", "MAJOR") for i in range(40)])[0] == "GREEN"
+    assert overall_verdict([_f(str(i), "protocol", "MINOR") for i in range(99)])[0] == "GREEN"
     assert overall_verdict([])[0] == "GREEN"
+    assert overall_verdict([_f("a", "protocol", "MAJOR")])[0] == "GREEN"
+
+    # ... and the epistemic state underneath keeps apart what the colour cannot.
+    assert claim_status([_f("a", "overclaim", "FATAL")])[0] == "VERIFIED_FAILURE"
+    assert claim_status([_f("a", "protocol", "MAJOR")])[0] == "NOT_VERIFIED"
+    assert claim_status([])[0] == "NOT_VERIFIED"
+    assert reproduction_status(None) == "NOT_ATTEMPTED"
+    # Fails closed: an unknown provenance is never reported as the authors' own code.
+    assert provenance_label("repo_exec") == "AUTHOR_REPOSITORY"
+    assert provenance_label("driver") == "INDEPENDENT_REIMPLEMENTATION"
+    assert provenance_label("nonsense") == "SYNTHESIZED_DIAGNOSTIC"
 
     # severity dominates; cell evidence outranks page evidence at equal severity
     order = rank([_f("m", "overclaim", "MINOR", "T0:r0:c0"),
@@ -1063,12 +1263,13 @@ if __name__ == "__main__":  # self-check: python -m harness.stages.report
     rep = EvalReport(paper_id="p", title="T", verdict="RED", verdict_reason="because",
                      findings=order, unasked_question="why no baseline?", lenses_run=["protocol"])
     md = render_eval_report(rep)
-    assert "🔴 REJECT / RED FLAG" in md and "why no baseline?" in md
+    assert "🔴 RED — a material failure was established" in md and "why no baseline?" in md
     assert md.count("\n|") >= 4 and md.endswith("\n")
     assert _cell("a|b\nc", 99) == "a\\|b c", "pipes must be escaped or the table breaks"
 
     # --- S3 code reproduction ---------------------------------------------------------
     def _rec(status, **kw):
+        kw.setdefault("provenance", "repo_exec")   # the ceiling is enforced here too
         return Reconciliation(table_ref="T1:r0:c1", claimed_raw="59.28", claimed_value=59.28,
                               noise_band=0.1, status=status, reason="r", **kw)
 

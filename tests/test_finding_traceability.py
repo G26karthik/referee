@@ -342,21 +342,22 @@ def _graded(sev: str, klass: str, lens: str, n: int) -> list[Finding]:
                     evidence_class=klass) for i in range(n)]
 
 
-def test_the_same_threshold_table_is_applied_to_the_cell_backed_subset():
+def test_the_same_materiality_table_is_applied_to_the_cell_backed_subset():
     """Not a second grader. `overall_verdict` over a subset chosen by `evidence_class`.
 
-    On the pilot corpus this is load-bearing: 15 of 29 MAJOR findings are prose-backed,
-    and for two of the three papers RED becomes YELLOW without them. "Severity is not
-    machine-verified" and "this RED depends on grades that are not machine-verified" are
+    Load-bearing under the binary rule for the same reason it was under the old table,
+    and arguably more: RED now turns on a single counted FATAL, so whether that one
+    finding rests on a checkable cell or on prose is the whole question. "Severity is not
+    machine-verified" and "this RED depends on a grade that is not machine-verified" are
     different things to tell an editor.
     """
     from harness.stages.report import overall_verdict, verdict_sensitivity
 
-    findings = _graded("MAJOR", "prose_verified", "overclaim", 3)
+    findings = _graded("FATAL", "prose_verified", "overclaim", 1)
     assert overall_verdict(findings, None)[0] == "RED"
     assert verdict_sensitivity(findings, None) == "GREEN", "no cell-verified finding survives"
 
-    backed = _graded("MAJOR", "cell_verified", "overclaim", 3)
+    backed = _graded("FATAL", "cell_verified", "overclaim", 1)
     assert overall_verdict(backed, None)[0] == "RED"
     assert verdict_sensitivity(backed, None) == "RED", "a cell-backed RED does not move"
 
@@ -366,7 +367,7 @@ def test_the_sensitivity_never_changes_the_verdict_itself():
     cannot assess, exactly the thing it exists to flag as undecided."""
     from harness.stages.report import overall_verdict, verdict_sensitivity
 
-    findings = _graded("MAJOR", "prose_verified", "overclaim", 3)
+    findings = _graded("FATAL", "prose_verified", "overclaim", 1)
     verdict, _ = overall_verdict(findings, None)
     rep = EvalReport(paper_id="p", title="T", verdict=verdict, findings=findings,
                      verdict_if_cell_backed_only=verdict_sensitivity(findings, None))
@@ -382,6 +383,7 @@ def test_a_failed_reproduction_is_not_sensitive_to_severity():
     from harness.stages.report import verdict_sensitivity
 
     rec = Reconciliation(status="FAILED_REPRODUCTION", table_ref="T1:r0:c1",
+                         provenance="repo_exec",
                          reason="reproduced 40.0 against the cell's 91.4.")
     assert verdict_sensitivity(_graded("MAJOR", "prose_verified", "overclaim", 3), rec) == "RED"
 

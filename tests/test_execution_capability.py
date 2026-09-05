@@ -21,8 +21,8 @@ import pytest
 from harness.artifacts import (ConfigurationIdentity, ExecCapability, ExperimentIdentity,
                                MetricIdentity, ProbeSpec, RepoAcquisition)
 from harness.config import Config
-from harness.local_exec import (StartupEvidence, classify_setup_error, reached_experiment,
-                                reconcile)
+from harness.local_exec import (StartupEvidence, classify_infra_failure, classify_setup_error,
+                                reached_experiment, reconcile)
 from harness.repo import (accepts_argument, assess_capability, declared_platform,
                           entrypoint_imports)
 from harness.stages.probe import plan_execution
@@ -334,3 +334,181 @@ def test_a_shut_gate_blocks_promotion_but_not_assessment(tmp_path):
     assert out.capability is not None, "the report must be able to say what was required"
     assert out.capability.established is False
     assert out.backend == "local" and out.commit_state in ("unknown", "mismatch", "verified")
+
+
+# --------------------------------------------------------------------------- #
+# 13. infrastructure failures never convict, however far the run had got
+# --------------------------------------------------------------------------- #
+# The capability cases above all fail BEFORE the experiment, so `reached_experiment` is
+# false and INCONCLUSIVE follows from that alone. These four do not: each strikes on a run
+# that demonstrably reached the experiment, which is the only configuration in which the
+# infra branch is load-bearing — remove it and every test below returns
+# FAILED_REPRODUCTION and drives RED against the authors for a fault of this host.
+def _infra(stderr: str, returncode: int | None = None) -> StartupEvidence:
+    """Evidence for a run that reached the experiment and THEN hit an infrastructure fault.
+
+    Two properties, both deliberate. The reach signals are `_ran()`-grade, so
+    `reached_experiment` is true and nothing except the infrastructure classification
+    stands between these cases and a conviction. And `infra_error` is produced by the
+    production classifier rather than asserted by the fixture, so if
+    `classify_infra_failure` stopped recognising one of these stderrs it would come back
+    empty, the run would reconcile as `runtime_failure`, and the test would fail — which
+    is exactly what it should do.
+    """
+    return StartupEvidence(saw_contract_line=True, stdout_lines=30, ran_seconds=600.0,
+                           infra_error=classify_infra_failure(stderr, returncode))
+
+
+@pytest.mark.parametrize("returncode,signal_name", [
+    (-9, "SIGKILL"),                  # the host's OOM killer, or an operator, or a scheduler
+    (-11, "SIGSEGV"),
+    (-6, "SIGABRT"),
+    (0xC0000005 - (1 << 32), "STATUS_ACCESS_VIOLATION"),   # the Windows equivalent
+])
+def test_a_process_killed_by_the_os_is_inconclusive_not_a_failed_reproduction(
+        returncode: int, signal_name: str):
+    """The OS killed it; the program did not choose to exit. That distinction is the whole
+    finding, and it survives only in the exit code: a SIGKILLed process prints nothing at
+    all, so no stderr signature can see it and `reached_experiment` says — correctly — that
+    the experiment HAD started. Without the returncode check the most common way a big
+    training run dies on a memory-pressured host would read as "the paper's own code does
+    not reproduce the number it prints"."""
+    ev = _infra("", returncode)
+    assert ev.infra_error, f"{signal_name} ({returncode}) must be recognised from the exit code alone"
+
+    r = reconcile(_spec(capability=_capable()), [], 0.10, [],
+                  failure=f"exit {returncode}: ", evidence=ev)
+    assert r.status == "INCONCLUSIVE"
+    assert r.failure_class == "infrastructure_failure"
+    assert r.reached_experiment is True, "it HAD started — that is why this case is the hard one"
+    assert overall_verdict([], r)[0] == "GREEN", "the OS killing our process accuses nobody"
+
+
+def test_a_host_memory_exhaustion_is_inconclusive_not_a_failed_reproduction():
+    """A model that does not fit in THIS machine's RAM is a fact about 15 GiB, not about
+    the paper — the same asymmetry invariant #6 states for resources assessed in advance,
+    arriving here after the run started instead. Note the exit code is an ordinary 1: the
+    kernel's own message is doing the work, because a host OOM does not always arrive as a
+    signal (the allocator can fail and the program exit normally)."""
+    ev = _infra("Out of memory: Killed process 4711 (python) "
+                "total-vm:34011584kB, anon-rss:15903232kB", 1)
+    assert ev.infra_error == "out of memory"
+
+    r = reconcile(_spec(capability=_capable()), [], 0.10, [],
+                  failure="exit 1: Out of memory: Killed process 4711 (python)", evidence=ev)
+    assert r.status == "INCONCLUSIVE"
+    assert r.failure_class == "infrastructure_failure"
+    assert overall_verdict([], r)[0] == "GREEN", "8 GB of VRAM is not a defect in the paper"
+
+
+def test_a_full_disk_is_inconclusive_not_a_failed_reproduction():
+    """ENOSPC while writing a checkpoint kills the run hours in, long after the experiment
+    demonstrably began, and the traceback it leaves is indistinguishable in shape from a
+    genuine crash. It is a fact about this filesystem."""
+    ev = _infra("OSError: [Errno 28] No space left on device: '/scratch/ckpt-epoch9.pt'", 1)
+    assert ev.infra_error == "no space left on device"
+
+    r = reconcile(_spec(capability=_capable()), [], 0.10, [],
+                  failure="exit 1: OSError: [Errno 28] No space left on device", evidence=ev)
+    assert r.status == "INCONCLUSIVE"
+    assert r.failure_class == "infrastructure_failure"
+    assert r.reached_experiment is True
+    assert overall_verdict([], r)[0] == "GREEN", "a full disk is this host's problem, not the paper's"
+
+
+@pytest.mark.parametrize("stderr,expected", [
+    ("huggingface_hub.utils._errors.RepositoryNotFoundError: 401 Client Error. "
+     "Repository Not Found for url: https://huggingface.co/api/models/org/ckpt",
+     "401 client error"),
+    ("GatedRepoError: 403 Client Error. Cannot access gated repo for url "
+     "https://huggingface.co/org/ckpt/resolve/main/model.safetensors",
+     "403 client error"),
+    ("OSError: You need to accept the license to access the checkpoint for org/ckpt",
+     "you need to accept the license"),
+    ("requests.exceptions.ConnectionError: Max retries exceeded with url: "
+     "/org/ckpt/resolve/main/model.safetensors",
+     "max retries exceeded"),
+])
+def test_an_unavailable_checkpoint_is_inconclusive_not_a_failed_reproduction(
+        stderr: str, expected: str):
+    """A checkpoint the run cannot fetch at runtime — gated, revoked, moved behind an
+    auth wall, or simply unreachable from here — says nothing about whether the paper's
+    code reproduces its number. It is the reproducer's credentials and network, and it is
+    the one infrastructure failure most likely to look like the paper's fault, because the
+    URL it names belongs to the authors."""
+    ev = _infra(stderr, 1)
+    assert ev.infra_error == expected, "the fetch failure must be recognised by signature"
+
+    r = reconcile(_spec(capability=_capable()), [], 0.10, [],
+                  failure=f"exit 1: {stderr[-200:]}", evidence=ev)
+    assert r.status == "INCONCLUSIVE"
+    assert r.failure_class == "infrastructure_failure"
+    assert overall_verdict([], r)[0] == "GREEN", "an inaccessible download convicts nobody"
+
+
+# --------------------------------------------------------------------------- #
+# 14. the two encodings of a signal death, and in-process memory exhaustion
+#
+# Found by auditing the classifier rather than by a failing run, which is why they are
+# here: each was a live path from an infrastructure fault to a RED verdict against the
+# authors, on the most ordinary setups there are.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("returncode,signal_name", [
+    (137, "SIGKILL via a shell wrapper (128+9) — the OOM killer's usual shape"),
+    (139, "SIGSEGV via a shell wrapper (128+11)"),
+    (134, "SIGABRT via a shell wrapper (128+6)"),
+])
+def test_a_shell_wrapped_signal_death_is_also_infrastructure(returncode, signal_name):
+    """`subprocess` reports a directly-launched child killed by signal N as -N, but any
+    entrypoint that goes through a shell — `bash run.sh`, `torchrun`, a Makefile —
+    reports the identical death as 128+N. Only the negative form was recognised, so an
+    OOM-killed run behind a shell wrapper reconciled as FAILED_REPRODUCTION and published
+    a RED against the authors for the host running out of memory."""
+    rec = reconcile(_spec(capability=_capable()), [], 0.10, [],
+                    failure=f"exit {returncode}: ", evidence=_infra("", returncode))
+    assert rec.status == "INCONCLUSIVE", signal_name
+    assert rec.failure_class == "infrastructure_failure"
+    assert overall_verdict([], rec)[0] == "GREEN", "infrastructure must never convict"
+
+
+@pytest.mark.parametrize("stderr,what", [
+    ("MemoryError", "python's own allocation failure"),
+    ("numpy._core._exceptions._ArrayMemoryError: Unable to allocate 24.0 GiB for an array",
+     "numpy, the usual way a too-large experiment dies on this host"),
+    ("OSError: [Errno 12] Cannot allocate memory", "fork/allocation refused by the OS"),
+    ("terminate called after throwing an instance of 'std::bad_alloc'", "a C++ extension"),
+])
+def test_in_process_memory_exhaustion_is_infrastructure_not_a_failed_reproduction(stderr, what):
+    """The bare "out of memory" signature catches the Linux OOM-killer and CUDA, but an
+    allocation that fails INSIDE the process raises a typed exception containing none of
+    those words. This host has ~15 GiB of RAM and audits papers that ask for more, so
+    this is not an edge case — it is the expected way an honest reproduction dies here."""
+    rec = reconcile(_spec(capability=_capable()), [], 0.10, [],
+                    failure=stderr, evidence=_infra(stderr))
+    assert rec.status == "INCONCLUSIVE", what
+    assert rec.failure_class == "infrastructure_failure"
+
+
+@pytest.mark.parametrize("stderr", [
+    "requests.exceptions.HTTPError: 404 Client Error: Not Found for url: https://…/model.bin",
+    "urllib.error.HTTPError: HTTP Error 404: Not Found",
+    "huggingface_hub.utils._errors.EntryNotFoundError: 404 Client Error.",
+])
+def test_a_checkpoint_that_no_longer_exists_is_infrastructure(stderr):
+    """401/403 (a checkpoint we may not fetch) were already infrastructure; 404 — one the
+    authors moved or deleted — was not, and read as their code failing. Whether a weights
+    file is still hosted two years later says nothing about whether the method works."""
+    rec = reconcile(_spec(capability=_capable()), [], 0.10, [],
+                    failure=stderr, evidence=_infra(stderr))
+    assert rec.status == "INCONCLUSIVE"
+    assert rec.failure_class == "infrastructure_failure"
+
+
+def test_a_genuine_scientific_mismatch_is_still_convictable():
+    """The guard on the three tests above: widening the infrastructure signatures must not
+    swallow a real disagreement. A clean run whose metric simply does not match the cell
+    still reaches FAILED_REPRODUCTION."""
+    rec = reconcile(_spec(capability=_capable()), [64.10, 64.20], 0.10, [0, 1], evidence=_ran())
+    assert rec.status == "FAILED_REPRODUCTION"
+    assert rec.failure_class == "none", "a mismatch is not a crash"
+    assert overall_verdict([], rec)[0] == "RED"

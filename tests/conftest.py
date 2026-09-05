@@ -26,3 +26,24 @@ from pathlib import Path
 HARNESS_ROOT = Path(__file__).resolve().parents[1]   # .../single-harness
 if str(HARNESS_ROOT) not in sys.path:
     sys.path.insert(0, str(HARNESS_ROOT))
+
+# Where the authored fixture papers live. Searched rather than hardcoded because they
+# have already moved once: `papers/` accumulates real papers under review, someone filed
+# the four synthetic ones into `papers/authored/`, and eight tests went red pointing at
+# the old path — a whole-suite failure caused by tidying, with nothing wrong in the code.
+# A fixture that finds its own file makes that class of breakage impossible.
+_PAPER_DIRS = (HARNESS_ROOT / "papers" / "authored", HARNESS_ROOT / "papers")
+
+
+def fixture_paper(name: str) -> Path:
+    """The authored fixture PDF `name`, wherever it currently lives.
+
+    Raises rather than returning a missing path: a test that silently proceeds with a
+    nonexistent fixture reports an ingest failure, which looks like a harness defect and
+    is not one.
+    """
+    for d in _PAPER_DIRS:
+        if (p := d / name).exists():
+            return p
+    raise FileNotFoundError(
+        f"fixture paper {name!r} not found in {[str(d) for d in _PAPER_DIRS]}")

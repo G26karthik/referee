@@ -309,8 +309,13 @@ def test_cell_and_json_parsing_take_the_reported_value():
 # --------------------------------------------------------------------------- #
 # 5. Escalation and execution planning
 # --------------------------------------------------------------------------- #
-def _rec(status: str) -> Reconciliation:
-    return Reconciliation(table_ref="T1:r0:c1", status=status, reason="r", noise_band=0.1)
+def _rec(status: str, provenance: str = "repo_exec") -> Reconciliation:
+    # `provenance` is explicit because the verdict gate enforces the ceiling too: an
+    # unrecorded provenance has not established WHO ran, so it cannot convict. The real
+    # `local_exec.reconcile` always stamps it, so a fixture without it is an artifact the
+    # system never emits.
+    return Reconciliation(table_ref="T1:r0:c1", status=status, reason="r", noise_band=0.1,
+                          provenance=provenance)
 
 
 def test_a_failed_reproduction_turns_the_verdict_red_on_its_own():

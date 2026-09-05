@@ -282,6 +282,19 @@ _INFRA_FAILURE_SIGNATURES = (
     "segmentation fault", "core dumped", "access violation", "bus error",
     "driver/library version mismatch", "cuda driver version is insufficient",
     "the paging file is too small", "insufficient system resources",
+    # HOST memory exhaustion, as each runtime actually spells it. The bare "out of
+    # memory" above catches the Linux OOM-killer's own message and CUDA's, and used to
+    # be the whole story — but an allocation that fails INSIDE the process raises a
+    # typed exception whose text contains none of those words. This host has ~15 GiB of
+    # RAM and the papers under audit routinely ask for more, so an in-process allocation
+    # failure is not an edge case here, it is the expected way a real reproduction dies
+    # — and every one of these was convicting the paper for it.
+    "memoryerror", "arraymemoryerror", "unable to allocate", "cannot allocate memory",
+    "std::bad_alloc", "bad_alloc", "killed process", "oom-kill",
+    # A checkpoint that is simply GONE. 401/403 (below) cover a checkpoint we are not
+    # allowed to fetch; 404 is one the authors moved or deleted, which is equally not a
+    # statement about whether their method works.
+    "404 client error", "http error 404", "entrynotfounderror", "revisionnotfounderror",
     "401 client error", "403 client error", "gated repo", "repository not found",
     "you need to accept the license", "please log in", "authentication required",
     "connection refused", "could not resolve host", "getaddrinfo failed",
@@ -292,11 +305,24 @@ _INFRA_FAILURE_SIGNATURES = (
 # termination (a negative returncode) and the Windows crash-status codes. An OOM-killed
 # or segfaulting process usually prints nothing at all, so the signature list above
 # cannot see it; the exit code is the only evidence left.
-_INFRA_FAILURE_RETURNCODES = frozenset({
-    -9, -11, -6, -8, -4, -7,                 # SIGKILL, SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGBUS
-    0xC0000005 - (1 << 32),                  # STATUS_ACCESS_VIOLATION, as a signed int32
-    0xC00000FD - (1 << 32),                  # STATUS_STACK_OVERFLOW
-})
+#
+# BOTH ENCODINGS OF A SIGNAL DEATH ARE HERE, and the second one is the one that bites.
+# `subprocess` reports a directly-launched child killed by signal N as -N, which is what
+# this set originally held. But the moment the entrypoint is a shell wrapper — `bash
+# run.sh`, `torchrun`, a Makefile, anything that propagates `$?` — the shell reports the
+# same death as 128+N, and 137 (an OOM kill) arrived here as an ordinary non-zero exit.
+# With startup evidence present that is a FAILED_REPRODUCTION and therefore a RED: the
+# host running out of memory, published as a finding against the authors. Real
+# repositories are full of shell entrypoints, so this was reachable on the most ordinary
+# path there is.
+_SIGNAL_RETURNCODES = (9, 11, 6, 8, 4, 7)    # SIGKILL, SIGSEGV, SIGABRT, SIGFPE, SIGILL, SIGBUS
+_INFRA_FAILURE_RETURNCODES = frozenset(
+    {-n for n in _SIGNAL_RETURNCODES} |      # subprocess, direct child
+    {128 + n for n in _SIGNAL_RETURNCODES} | # shell wrapper, 128+signal
+    {
+        0xC0000005 - (1 << 32),              # STATUS_ACCESS_VIOLATION, as a signed int32
+        0xC00000FD - (1 << 32),              # STATUS_STACK_OVERFLOW
+    })
 # A process that ran this long did something beyond importing and exiting. Used only as
 # corroboration alongside real output — never on its own.
 _STARTUP_WINDOW_S = 30.0

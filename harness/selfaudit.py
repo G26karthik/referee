@@ -17,7 +17,7 @@ lens-written one, never against a model's assessment of itself:
                                          degenerate (`grading.pass_b_state` already does
                                          the non-degeneracy half)
 
-WHAT A FAILED ITEM DOES, AND DOES NOT DO. It does NOT move the verdict. The RED/YELLOW/
+WHAT A FAILED ITEM DOES, AND DOES NOT DO. It does NOT move the verdict. The RED/
 GREEN call is a threshold table over `counted_severity` and nothing here touches it —
 adding a second, softer path to a color would make the table advisory. What it does is
 refuse to let the review present itself as complete: `ReviewSelfAudit.complete` is False,

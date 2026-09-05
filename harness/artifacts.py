@@ -586,7 +586,42 @@ class ProbeSpec(_Base):
     )
 
 
-class RepoAcquisition(_Base):
+class ReimplementationIngredient(_Base):
+    """One thing an independent reimplementation needs, and whether the paper supplies it.
+
+    `ref` and `quote` exist so the judgement is checkable rather than asserted: a reader
+    can open the section named and see the same sentence. An absent ingredient carries
+    neither, which is the point — there is nothing to show.
+    """
+
+    kind: str = Field(description="method | architecture | preprocessing | training | dataset | "
+                                  "metric | hyperparameters | comparison_target")
+    required: bool = Field(default=True, description="whether its absence blocks reimplementation")
+    present: bool = False
+    ref: str = Field(default="", description="s<N> section, E<N> equation, or T<N> table")
+    quote: str = Field(default="", description="the sentence found there, for a human to re-check")
+
+
+class ReimplementationReadiness(_Base):
+    """Whether PATH B is open for this paper — an ELIGIBILITY decision, never a claim.
+
+    Nothing in this artifact says anything about whether the paper is right. It says
+    whether the paper says enough to rebuild its experiment, so that "we did not test
+    this" can be an established fact with named gaps instead of an unexplained stop.
+    """
+
+    established: bool = False
+    ingredients: list[ReimplementationIngredient] = Field(default_factory=list)
+    missing: list[str] = Field(
+        default_factory=list,
+        description="required ingredients the paper does not supply. Non-empty ⇒ NOT_VERIFIED, "
+                    "and an implementation would have to INVENT these, which is the one thing "
+                    "PATH B may never do.",
+    )
+    reason: str = ""
+
+
+class RepoAcquisition(_Base):  # noqa: D401 — see ReimplementationReadiness above
     """Where the code under test came from, and whether it is really the paper's.
 
     `status` is the honest part. "unavailable" and "blocked" are not accusations: a
@@ -623,6 +658,13 @@ class RepoAcquisition(_Base):
                     "a further fetch, which matters when the audited SHA is not the one present.",
     )
     reason: str = ""
+    reimplementation: "ReimplementationReadiness | None" = Field(
+        default=None,
+        description="set only when NO repository was advertised: whether the paper says enough "
+                    "to rebuild the experiment independently (PATH B), and if not, which "
+                    "ingredients are missing. Eligibility only — it concludes nothing about the "
+                    "paper's claims.",
+    )
     dependency_files: list[str] = Field(default_factory=list)
     dependencies: list[str] = Field(default_factory=list)
     frameworks: list[str] = Field(default_factory=list, description="torch / jax / sklearn / …")
@@ -1169,7 +1211,7 @@ class Reconciliation(_Base):
     """Executed number vs the table cell the paper printed.
 
     `status` is decided arithmetically from `delta_error` against the measured noise
-    band — never by judgement, for the same reason the RED/YELLOW/GREEN verdict is a
+    band — never by judgement, for the same reason the RED/GREEN verdict is a
     threshold table.
     """
 
@@ -1321,8 +1363,29 @@ class ProbeResult(_Base):
 class EvalReport(_Base):
     paper_id: str
     title: str = ""
-    verdict: str = Field(default="", description="RED | YELLOW | GREEN")
+    verdict: str = Field(default="", description="RED | GREEN — the binary paper-level decision")
     verdict_reason: str = Field(default="", description="the deterministic rule that produced the verdict")
+    claim_status: str = Field(
+        default="",
+        description="VERIFIED_FAILURE | VERIFIED_SUPPORT | NOT_VERIFIED — the epistemic state the "
+                    "binary verdict projects from. RED iff VERIFIED_FAILURE; BOTH other states are "
+                    "GREEN, because 'checked and held' and 'could not check' are the same DECISION "
+                    "about the paper while being opposite states of knowledge. Kept as its own "
+                    "field so a report can never let them look alike.",
+    )
+    reproduction_status: str = Field(
+        default="",
+        description="REPRODUCED | FAILED_REPRODUCTION | NOT_VERIFIED | NOT_ATTEMPTED — how much "
+                    "experimental evidence stands behind the verdict, reported beside it and never "
+                    "folded into it.",
+    )
+    execution_provenance: str = Field(
+        default="",
+        description="AUTHOR_REPOSITORY | INDEPENDENT_REIMPLEMENTATION | SYNTHESIZED_DIAGNOSTIC — "
+                    "what actually ran, in the reader's vocabulary. Fails closed to "
+                    "SYNTHESIZED_DIAGNOSTIC so nothing unrecognised is ever reported as the "
+                    "authors' own code.",
+    )
     findings: list[Finding] = Field(default_factory=list)
     unasked_question: str = ""
     n_pages: int = 0
@@ -1367,7 +1430,7 @@ class EvalReport(_Base):
     verdict_contested: bool = Field(
         default=False,
         description="true when the model's substantive read is CENTRAL_CLAIM_NOT_ESTABLISHED "
-                    "while the deterministic table says GREEN/YELLOW. The one consequence of the "
+                    "while the deterministic table says GREEN. The one consequence of the "
                     "dissent: it demands human attention (a contested banner, `run.py` exit 3), "
                     "never a change of color.",
     )

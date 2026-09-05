@@ -97,7 +97,7 @@ class Config:
     grade_retries: int = field(default_factory=lambda: int(os.environ.get("SH_GRADE_RETRIES", "2")))
     # "serious": only FATAL/MAJOR candidates are graded — justified by threshold
     # reachability, not cost: a MINOR cannot cross any RED branch on its own, so grading
-    # it can only ever move a YELLOW toward GREEN, the direction a false negative there
+    # it can only ever move a verdict toward GREEN, the direction a false negative there
     # is cheapest. "all" grades every substantiated candidate, for evaluation runs.
     grade_scope: str = field(default_factory=lambda: os.environ.get("SH_GRADE_SCOPE", "serious"))
     grade_budget_chars: int = field(

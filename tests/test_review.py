@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from conftest import fixture_paper
+
 import pytest
 
 from harness import state
@@ -16,7 +18,7 @@ from harness.artifacts import PaperDoc
 from harness.config import Config
 from harness.controller import review
 
-PAPER = Path(__file__).resolve().parents[1] / "papers" / "paper4_snri_nullresult.pdf"
+PAPER = fixture_paper("paper4_snri_nullresult.pdf")
 PID = "paper4-snri-nullresult"
 LENSES = ("overclaim", "protocol", "confound", "contradiction")
 

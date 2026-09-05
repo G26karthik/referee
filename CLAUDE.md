@@ -1,8 +1,12 @@
 # single-harness
 
-An autonomous replication auditor for papers. In: PDFs. Out: a RED/YELLOW/GREEN
-report per paper, with a machine-verified evidence pointer behind every finding, plus a
-reproduction verdict when — and only when — one can be earned.
+An autonomous replication auditor for papers. In: PDFs. Out: a binary RED/GREEN
+decision per paper, with a machine-verified evidence pointer behind every finding, plus a
+reproduction status reported separately and earned — or refused — on its own evidence.
+
+RED means a material failure was ESTABLISHED. GREEN means one was not, within the audited
+scope — it is not a certificate of correctness, and `claim_status` keeps VERIFIED_SUPPORT
+("checked and held") apart from NOT_VERIFIED ("could not check") underneath it.
 
 You are the controller's reviewer. `harness/controller.py` drives; deterministic code
 below it decides what may be concluded. Neither side may overrule the other.
@@ -80,13 +84,17 @@ Do not weaken these to make more papers executable or more findings reportable.
 7. Capability, environment, dependency and platform failures yield `INCONCLUSIVE`, never
    `FAILED_REPRODUCTION`. Only a crash *after* the experiment demonstrably started may
    convict.
-8. Verdict thresholds are a table in `stages/report.py`, not a judgement:
-   `RED_FATAL=1`, `RED_MAJOR_ONE_LENS=3`, `RED_MAJOR_TOTAL=10`, `YELLOW_MAJOR=1`,
-   `YELLOW_MINOR=4`. Independent grading (`harness/grading.py`) does not touch these
-   numbers — it changes what is *eligible* to be counted at each severity, and it can
-   only demote a lens's own asserted grade, never promote one. Turning grading off, or
-   never running it, reproduces the pre-grading verdict exactly: `counted_severity`
-   stays empty and `stages.report.counted()` falls back to `severity`.
+8. The paper decision is a materiality TABLE in `stages/report.py`, not a judgement and
+   not a count: `MATERIAL_SEVERITY = ("FATAL",)`. RED iff `claim_status` is
+   VERIFIED_FAILURE — a failed reproduction from an admissible provenance, or a counted
+   FATAL. Nothing accumulates: no number of MAJORs or MINORs ever reaches RED, because a
+   concern weakens a claim and does not reject one, and the old `RED_MAJOR_ONE_LENS=3` /
+   `RED_MAJOR_TOTAL=10` thresholds made the decision a property of how many things a
+   panel chose to write down rather than of the paper. Independent grading
+   (`harness/grading.py`) still cannot promote: it changes what is *eligible* to be
+   counted at each severity and can only demote a lens's own asserted grade. Turning
+   grading off, or never running it, reproduces the ungraded decision exactly:
+   `counted_severity` stays empty and `stages.report.counted()` falls back to `severity`.
 9. No experiment is shrunk, substituted or downscaled to make it fit. There is no
    function that does this, deliberately.
 10. No paper-specific logic. The pilot papers are evaluation cases, not special cases.
@@ -171,6 +179,16 @@ cannot be provisioned from here"*.
 
 ## Known limitations
 
+- **No paper has yet been RED under the binary rule.** RED needs a counted FATAL or a
+  failed reproduction from an admissible provenance; the seven papers reviewed so far
+  produced neither, and all are GREEN with concerns printed. That is the intended
+  conservatism, but it means the RED path is proven only by fixtures, not by a real
+  paper.
+- **PATH B is eligibility-only so far.** `harness/reimplement.py` decides whether a paper
+  with no published code says enough to rebuild, and writes the brief when it does. No
+  independent reimplementation has actually been written and sealed through
+  `run.py accept`, so the INDEPENDENT_REIMPLEMENTATION provenance is exercised by tests
+  and by the `driver` path, not yet end to end from a real no-code paper.
 - `severity` is still model-asserted by the lens that wrote it. What changed:
   `harness/grading.py` now runs a second, blinded reviewer over every FATAL/MAJOR
   candidate (`--auto-grade`) and independently re-verifies its own pass-B work

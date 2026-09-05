@@ -28,9 +28,10 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .. import (backends, code_audit, experiment_id, probe_synth, repo as repo_mod,
-                resources as resources_mod, state)
-from ..artifacts import CodeAudit, Finding, PaperDoc, ProbeSpec, RepoAcquisition
+from .. import (backends, code_audit, experiment_id, probe_synth, reimplement,
+                repo as repo_mod, resources as resources_mod, state)
+from ..artifacts import (CodeAudit, Finding, PaperDoc, ProbeSpec,
+                         ReimplementationReadiness, RepoAcquisition)
 from ..config import Config
 from ..local_exec import run_probe as _run
 from . import audit as audit_stage
@@ -184,8 +185,35 @@ def acquire_and_audit(cfg: Config, root: Path, pid: str, doc: PaperDoc,
     # then assessed against a foreign interpreter, and the first genuinely remote backend
     # inherits a silent substitution — precisely what this harness refuses everywhere else.
     if acq.status == "unavailable":
+        # PATH B opens here, or is refused here with its reasons named. "The authors
+        # published no code" used to end the investigation: a scaffold that raises
+        # NotImplementedError was written, nothing ran it, and a generic placebo was all
+        # that reached the report. The scaffold is still written — it is the artifact a
+        # reimplementer starts from — but the question of whether this paper CAN be
+        # rebuilt is now asked and recorded, so the outcome is a decision rather than a
+        # stop. `assess` is pure and invents nothing; when it refuses, it names the gaps.
+        readiness = reimplement.assess(doc)
         acq = repo_mod.synthesize_standalone(
             root, pid, spec.claim, spec.table_ref, spec.claimed_cell_value)
+        acq.reimplementation = readiness
+        if readiness.established:
+            write_reimplementation_prompt(root, pid, doc, spec, readiness)
+            acq.reason = (f"{acq.reason} An independent reimplementation is eligible: the paper "
+                          f"supplies every required ingredient. The brief is in "
+                          f"reports/reimplementation_prompt.md; a completed implementation is "
+                          f"sealed through `run.py accept` and runs as "
+                          f"INDEPENDENT_REIMPLEMENTATION, never as the authors' code.")
+        else:
+            # A brief from an EARLIER, more permissive assessment must not survive a later
+            # refusal. Left on disk it invites someone to rebuild a paper this run has just
+            # established cannot be rebuilt without inventing the missing piece — the exact
+            # thing PATH B exists to prevent, in the form of a stale file.
+            (root / "reports" / "reimplementation_prompt.md").unlink(missing_ok=True)
+            gaps = ", ".join(readiness.missing)
+            acq.reason = (f"{acq.reason} An independent reimplementation is NOT eligible: the "
+                          f"paper does not supply {gaps}. Building one would mean inventing "
+                          f"{'that' if len(readiness.missing) == 1 else 'those'}, so this claim "
+                          f"stays NOT_VERIFIED.")
 
     if acq.status in ("cloned", "cached") and acq.path:
         audit = code_audit.audit_repo(acq.path, cfg.max_audit_files)
@@ -198,6 +226,65 @@ def acquire_and_audit(cfg: Config, root: Path, pid: str, doc: PaperDoc,
         audit = CodeAudit(repo_path=acq.path, skipped=(
             f"no checkout to inspect (acquisition status '{acq.status}'): {acq.reason}"))
     return acq, audit
+
+
+def write_reimplementation_prompt(root: Path, pid: str, doc: PaperDoc, spec: ProbeSpec,
+                                  readiness: ReimplementationReadiness) -> Path:
+    """Write the PATH B brief to disk and return its path.
+
+    The same shape as `audit/prompts/<lens>.md` and `reports/verdict_prompt.md`, for the
+    same reason: a phase that can only proceed through a model must still leave something
+    on disk a person can pick up, or the manual path is not first-class. There is
+    deliberately NO fourth driver — a reimplementation is written into
+    `runs/<pid>/spec.json` and sealed by `run.py accept`, which routes it down the
+    existing `driver` provenance the ceiling already admits.
+
+    What the brief does NOT do is supply anything the paper omitted. It lists the
+    ingredients WITH THEIR LOCATORS so the implementer works from the paper, and it says
+    plainly that a gap must be reported rather than filled.
+    """
+    lines = [
+        f"# Independent reimplementation brief — `{pid}`", "",
+        "The paper below advertises no public implementation. This harness has checked that",
+        "it nevertheless specifies enough to rebuild the experiment. You are being asked to",
+        "write that implementation from the paper's own formulation.", "",
+        "## The rule that matters most", "",
+        "**Do not invent anything the paper does not state.** If you find, while writing, that",
+        "a detail you need is absent, STOP and report it as missing. A number produced by an",
+        "implementation that filled its own gaps is a statement about your choices, not about",
+        "this paper, and reporting it as a reproduction would be the single worst failure this",
+        "system can commit. An honest `NOT_VERIFIED` is a correct outcome here.", "",
+        "This is **not** a reproduction of the authors' code — it is an independent",
+        "reimplementation, and it will be reported as `INDEPENDENT_REIMPLEMENTATION` however",
+        "well it matches. Never describe it as the authors' code failing or succeeding.", "",
+        f"## Claim under test", "", f"> {spec.claim or '(no claim bound)'}", "",
+        f"Compare against `{spec.table_ref or '(no cell bound)'}` = "
+        f"`{spec.claimed_cell_value or '(none)'}`.", "",
+        "## What the paper supplies", "",
+        "| ingredient | required | found at | the paper's own words |",
+        "|---|---|---|---|",
+    ]
+    for i in readiness.ingredients:
+        mark = "yes" if i.present else "**NO**"
+        quote = (i.quote or "").replace("|", "\\|")[:160]
+        lines.append(f"| {i.kind} | {'yes' if i.required else 'no'} | {mark} "
+                     f"{('`' + i.ref + '`') if i.ref else ''} | {quote} |")
+    lines += [
+        "", "## What to produce", "",
+        "A `runs/<pid>/spec.json` carrying `command` (or `script`), `metric`, `seeds`, and the",
+        "identity fields, plus the implementation itself. Print one `METRIC <name> <value>` line",
+        "per seed on stdout — the same contract every probe in this harness uses.", "",
+        "Seal it with:", "",
+        f"    python run.py accept --paper {pid} --reviewer \"<who wrote this>\"", "",
+        "## The paper", "",
+    ]
+    for s in doc.sections:
+        lines += [f"### {s.title or f'section {s.section_idx}'}  [s{s.section_idx}]", "",
+                  " ".join(s.text.split()), ""]
+    path = root / "reports" / "reimplementation_prompt.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
 
 
 def audited_commit(root: Path, pid: str) -> str:
@@ -389,6 +476,15 @@ def plan_execution(cfg: Config, spec: ProbeSpec, acq: RepoAcquisition,
     spec.arms = ["reproduction"]
     # The authors' own code outranks anything this harness could author, so it replaces a
     # synthesized script and takes the provenance that is allowed to reconcile a cell.
+    #
+    # `repo_exec` is stamped ONLY because `acq` is a real checkout of the paper's own
+    # advertised repository — every path reaching this line came through the
+    # `cloned`/`cached` gate above. A hand-written or reimplemented spec must never be
+    # relabelled as the authors' code by passing through here: that is the one mislabel
+    # with a victim, since it would attribute a failure of somebody else's program to the
+    # authors. `driver` is left exactly as it was found.
+    if spec.provenance == "driver":
+        return spec
     spec.script = ""
     spec.provenance = "repo_exec"
     return spec

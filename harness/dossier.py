@@ -30,7 +30,20 @@ from pathlib import Path
 from . import state
 from .config import Config
 
-BADGE = {"RED": "🔴 RED", "YELLOW": "🟡 YELLOW", "GREEN": "🟢 GREEN"}
+BADGE = {"RED": "🔴 RED", "GREEN": "🟢 GREEN"}
+
+
+def badge(verdict: str) -> str:
+    """The badge for a verdict, or an explicit STALE marker for one this build does not
+    recognise.
+
+    Falls closed rather than passing the raw string through. A `reports/<pid>.json` left
+    on disk from before the binary decision rendered its retired `YELLOW` in the matrix
+    verbatim, indistinguishable from a live verdict — an artifact this system can no
+    longer produce, presented as though it just had.
+    """
+    v = (verdict or "").strip()
+    return BADGE.get(v, f"⚠️ STALE ({v or "none"}) — re-run this paper")
 SEVERITIES = ("FATAL", "MAJOR", "MINOR")
 # Venue is not a field the extractor produces — a paper's own text rarely names its
 # venue in a parseable place, and guessing from the title is how "Published as a
@@ -136,8 +149,9 @@ def provenance_caveat(report: dict) -> str:
     executed = bool(p.get("seeds_run"))
     resolved = rec_status in ("RESOLVED_VERIFIED", "FAILED_REPRODUCTION")
     if prov in ("repo_exec", "driver") and executed and resolved:
-        whose = ("the authors' own checkout" if prov == "repo_exec"
-                else "a hand-written reproduction of the paper's setup")
+        whose = ("the authors' own checkout (AUTHOR_REPOSITORY)" if prov == "repo_exec"
+                else "an INDEPENDENT_REIMPLEMENTATION of the paper's method — not the "
+                     "authors' code")
         return (f"This probe ran {whose}, so its reconciliation against "
                 f"the cited cell is a real reproduction verdict.")
     if prov in ("repo_exec", "driver"):
@@ -174,7 +188,7 @@ def matrix(reports: list[dict]) -> list[list[str]]:
             f"{c['FATAL']} FATAL / {c['MAJOR']} MAJOR / {c['MINOR']} MINOR",
             repo_status(r),
             probe_status(r),
-            BADGE.get(r.get("verdict") or "", r.get("verdict") or "?"),
+            badge(r.get("verdict") or ""),
         ])
     return rows
 
@@ -221,9 +235,12 @@ def render_markdown(reports: list[dict], missing: list[str]) -> str:
     L = [
         "# Executive Review Dossier",
         "",
-        f"{len(reports)} paper(s) reviewed by single-harness. Every verdict below is the "
-        "deterministic output of the threshold table in `stages/report.py`; no model call "
-        "decides a verdict. Every quoted line was re-verified against the parsed PDF at "
+        f"{len(reports)} paper(s) reviewed by single-harness. Every decision below is the "
+        "deterministic output of the materiality table in `stages/report.py`; no model call "
+        "decides one. RED means a material failure was ESTABLISHED; GREEN means one was not "
+        "within the audited scope, which is not a certificate of correctness — the per-paper "
+        "report carries the `claim_status` and `reproduction_status` that say how much was "
+        "actually settled. Every quoted line was re-verified against the parsed PDF at "
         "report time, and findings whose evidence did not check out were dropped before "
         "this document was written.",
         "",
@@ -252,7 +269,7 @@ def render_markdown(reports: list[dict], missing: list[str]) -> str:
     for r in reports:
         c = counts(r)
         L += [
-            f"## {BADGE.get(r.get('verdict',''), r.get('verdict','?'))} — `{r['paper_id']}`",
+            f"## {badge(r.get('verdict',''))} — `{r['paper_id']}`",
             "",
             f"**{r.get('title') or r['paper_id']}**",
             "",
@@ -466,7 +483,7 @@ if __name__ == "__main__":       # self-check: python -m harness.dossier
     import tempfile
 
     fake = {
-        "paper_id": "demo", "title": "A Demonstration", "verdict": "YELLOW",
+        "paper_id": "demo", "title": "A Demonstration", "verdict": "GREEN",
         "verdict_reason": "one MAJOR finding", "n_pages": 8, "n_sections": 6,
         "n_tables": 2, "n_numbers": 11, "lenses_run": ["overclaim"], "dropped_findings": 0,
         "unasked_question": "Why was the obvious baseline not run?",
@@ -492,7 +509,7 @@ if __name__ == "__main__":       # self-check: python -m harness.dossier
     assert rows[0][0] == "Paper" and len(rows) == 2
     assert rows[1][2] == "0 FATAL / 1 MAJOR / 1 MINOR", rows[1]
     assert rows[1][4] == "within_noise (synthesized) · INCONCLUSIVE", rows[1]
-    assert rows[1][5] == "🟡 YELLOW"
+    assert rows[1][5] == "🟢 GREEN"
 
     md = render_markdown([fake], ["ghost"])
     assert "Executive Review Dossier" in md
@@ -508,9 +525,9 @@ if __name__ == "__main__":       # self-check: python -m harness.dossier
     assert "---" not in doc_html.replace("<hr/>", "")
     # The PDF fonts carry no emoji; badges must survive as readable text, not tofu.
     assert "🟡" not in doc_html, "no emoji may reach the PDF renderer"
-    assert ">YELLOW - <" in doc_html.replace("</h2>", ""), "the badge word survives the strip"
+    assert ">GREEN - <" in doc_html.replace("</h2>", ""), "the badge word survives the strip"
     assert "sigma" in doc_html and "σ" not in doc_html
-    assert "🟡 YELLOW" in md, "the markdown keeps the emoji badge"
+    assert "🟢 GREEN" in md, "the markdown keeps the emoji badge"
 
     with tempfile.TemporaryDirectory() as td:
         err = write_pdf(md, Path(td) / "d.pdf")
