@@ -57,8 +57,47 @@ _OUTPUT_QUANTITY: tuple[tuple[str, str], ...] = (
     ("eval_accuracy", "accuracy"), ("accuracy", "accuracy"), ("eval_f1", "accuracy"),
     ("f1", "accuracy"), ("exact_match", "accuracy"),
 )
-_FENCE = re.compile(r"```(?:bash|sh|shell|console)?\s*\n(.*?)```", re.S)
+# ANY info string, not only the four shell-ish ones. A README that opens a ```python
+# block before its ```-only command block used to shift every fence boundary by one:
+# the pattern could not open on ```python, so it opened on that block's CLOSING fence
+# instead and the command block was read as the text BETWEEN blocks. The commands were
+# then invisible even though they sit in a fenced block, plainly, in the repository's own
+# README. Admitting every info string keeps fence pairing aligned; a non-shell block is
+# harmless because its lines still have to look like a command to be picked up.
+_FENCE = re.compile(r"```[A-Za-z0-9_+-]*[ \t]*\n(.*?)```", re.S)
+# Launchers a repository puts IN FRONT of the command it is actually advertising.
+# `srun python3 main_simclr.py --ddp` and `accelerate launch --mixed_precision fp16
+# train.py` are the same kind of statement as `python train.py` — the repository is
+# telling a reader what to run — but an anchored `python|bash|make` pattern sees neither,
+# so a repository whose README advertises only launcher-prefixed commands read as
+# advertising nothing at all, and identity resolution refused with "no command was
+# identified" about a repository that names its commands plainly. Recognising the
+# launcher is discovery, not invention: the argv kept is still verbatim what the
+# repository wrote, minus a scheduler/multi-GPU wrapper this harness cannot honour on a
+# single local machine anyway.
+_LAUNCHERS = ("srun", "torchrun", "accelerate launch", "deepspeed", "mpirun", "horovodrun")
 _CMD_LINE = re.compile(r"^\s*(?:\$\s*)?((?:bash|sh|python|python3|make)\s+\S.*)$", re.M)
+_LAUNCHED = re.compile(
+    r"^\s*(?:\$\s*)?(?:" + "|".join(re.escape(l) for l in _LAUNCHERS) + r")\s+(.*)$", re.M)
+# The launcher's own flags sit between it and the program; the program is the first token
+# that names a file the repository could run.
+_PROGRAM = re.compile(r"(?:^|\s)((?:python3?|bash|sh)\s+\S+\.(?:py|sh)|\S+\.(?:py|sh))(?=\s|$)")
+
+
+def _advertised_line(raw: str) -> str:
+    """The command a line advertises, or '' — direct form first, then launcher-prefixed.
+
+    Returns the command VERBATIM where it is already plain, and for a launched line
+    returns the program invocation the launcher was wrapping. Nothing is synthesised: a
+    line that names no runnable program yields nothing.
+    """
+    if m := _CMD_LINE.match(raw):
+        return m.group(1)
+    if m := _LAUNCHED.match(raw):
+        if p := _PROGRAM.search(m.group(1)):
+            prog = p.group(1)
+            return prog if prog.split()[0] in ("python", "python3", "bash", "sh") else f"python {prog}"
+    return ""
 _SEED_FLAG = re.compile(r"--([a-z_]*seed[a-z_]*)(?:[=\s]+(\S+))?", re.I)
 # A column of ratios always carries its own normaliser: some row reads exactly 100%.
 _HUNDRED = re.compile(r"^\s*100(?:\.0+)?\s*%")
@@ -112,16 +151,16 @@ def harvest_candidates(repo: Path, limit: int = 400) -> list[CandidateCommand]:
         for block in _FENCE.finditer(text):
             line_no = text[:block.start()].count("\n") + 1
             for i, raw in enumerate(block.group(1).splitlines()):
-                if m := _CMD_LINE.match(raw):
+                if advertised := _advertised_line(raw):
                     out.append(CandidateCommand(
-                        argv=m.group(1).split(), source="readme",
+                        argv=advertised.split(), source="readme",
                         source_ref=f"README.md:{line_no + i + 1}"))
 
     run_sh = repo / "run.sh"
     if run_sh.is_file():
         for i, raw in enumerate(run_sh.read_text(encoding="utf-8", errors="replace").splitlines()):
-            if m := _CMD_LINE.match(raw):
-                out.append(CandidateCommand(argv=m.group(1).split(), source="run_script",
+            if advertised := _advertised_line(raw):
+                out.append(CandidateCommand(argv=advertised.split(), source="run_script",
                                             source_ref=f"run.sh:{i + 1}"))
 
     for script in sorted((repo / "scripts").rglob("*.sh"))[:limit]:

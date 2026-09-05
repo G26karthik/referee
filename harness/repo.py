@@ -270,13 +270,58 @@ def inspect_dependencies(repo: Path) -> tuple[list[str], list[str], list[str]]:
 
 
 def find_entrypoint(repo: Path) -> str:
-    """A repo-relative evaluation script a reviewer would plausibly run first."""
+    """A repo-relative script this repository could be asked to run, or ''.
+
+    ADVERTISED FIRST, filename convention second. The fixed candidate list below matches
+    a name only when it is spelled exactly as one of eleven conventional filenames, in one
+    of five conventional directories — and two of four real repositories in the current
+    evaluation corpus failed it while advertising their entrypoint plainly in their own
+    README (`python chaineval/evaluate_predictions.py`, and a `main_simclr.py` reached
+    through a scheduler prefix). Both were reported as "no runnable entrypoint", which is
+    a false statement about the repository and, worse, attributes the resulting
+    non-reproduction to the wrong stage: the harness stopped at discovery and never
+    reached the capability and resource questions that actually decide those two papers.
+
+    What a repository TELLS a reader to run is stronger evidence than what its files are
+    called, and it is the same evidence `experiment_id.harvest_candidates` already trusts
+    for command discovery — so this reuses it rather than inventing a second notion of
+    "runnable". Nothing is synthesised: a program named here was named by the repository.
+
+    This gate only decides whether the deeper assessment runs at all. It cannot bind a
+    claim to a command, and it does not authorise anything — experiment identity and
+    `backends.authorize` remain exactly as strict.
+    """
+    for cmd in _advertised_programs(repo):
+        cand = repo / cmd
+        if cand.is_file():
+            return cmd
     for directory in _ENTRY_DIRS:
         for name in _ENTRY_CANDIDATES:
             cand = repo / directory / name if directory else repo / name
             if cand.is_file():
                 return str(cand.relative_to(repo)).replace("\\", "/")
     return ""
+
+
+def _advertised_programs(repo: Path) -> list[str]:
+    """Repo-relative program paths the repository itself advertises, best first.
+
+    Deferred import: `experiment_id` is the module that already knows how to read a
+    repository's own advertised commands, and duplicating that parser here would create a
+    second, divergent answer to the same question.
+    """
+    from .experiment_id import harvest_candidates
+
+    out: list[str] = []
+    try:
+        candidates = harvest_candidates(repo)
+    except OSError:
+        return out
+    for cmd in candidates:
+        for token in cmd.argv[1:]:
+            if token.endswith((".py", ".sh")) and token not in out:
+                out.append(token.replace("\\", "/"))
+    return out
 
 
 # --------------------------------------------------------------------------- #
