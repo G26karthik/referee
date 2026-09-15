@@ -383,17 +383,26 @@ def discover(doc: PaperDoc, findings: list[Finding],
         for fid in (q.source_finding_ids or ([q.from_finding] if q.from_finding else [])):
             if fid:
                 by_finding.setdefault(fid, q)
-    # LEGACY, and knowingly wrong: section 0 is the untitled front-matter block (title and
-    # authors), so this fired on 0 of 878 objects across the eight-paper corpus. It feeds
-    # `_centrality`'s `in_abstract` and nothing else, and it is left exactly as it is
-    # because fixing it moves `centrality`, which propagates into priority ordering,
-    # `planner._WORTH_PURSUING`, `unresolved_central`, `disposition.blockers_from` and the
-    # coverage accounting. That change needs a measured corpus re-derivation and is not
-    # part of this task.
-    abstract_idx = doc.sections[0].section_idx if doc.sections else -1
-    # CORRECTED, and used ONLY for materiality: the Abstract located by its own heading.
-    # The divergence above is deliberate and temporary — see `harness.materiality`.
-    material_abstract_idx = materiality.abstract_section_idx(doc)
+    # ONE abstract locator, `materiality`'s, which finds the Abstract by its own heading.
+    #
+    # This used to read `doc.sections[0].section_idx` — the untitled front-matter block of
+    # title and authors — and the divergence was left in place because correcting it moves
+    # `centrality`, which propagates into priority ordering, `planner._WORTH_PURSUING`,
+    # `unresolved_central`, `disposition.blockers_from` and the coverage accounting. The
+    # measured re-derivation that was owed has now been done, and it is the reason this is
+    # safe to unify: over the eight-paper corpus the legacy locator resolved the abstract
+    # to section 0 on every paper and matched 0 of 706 objects, and the corrected one
+    # resolves it to section 1 or 2 and matches 0 of 706 objects as well. NO object's
+    # centrality changes.
+    #
+    # That null result is worth keeping rather than burying. It means `in_abstract`
+    # contributes nothing to centrality on real papers in either spelling, because no
+    # discovered object's address lands inside an abstract: objects come from table cells,
+    # parsed quantities and cited findings, and an abstract carries prose claims instead.
+    # Centrality here is therefore almost entirely `anchored_by_*` — a count of which
+    # addresses a lens chose to attack — which is what the claim/evidence dependency work
+    # exists to replace.
+    abstract_idx = material_abstract_idx = materiality.abstract_section_idx(doc)
 
     objects: list[DiscoveredObject] = []
     claimed_refs: set[str] = set()
