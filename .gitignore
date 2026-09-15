@@ -40,4 +40,5 @@ runs_*/projects/*/runs/*/repo/
 *.bbl
 *.blg
 *.out
+*.toc
 *.bak
