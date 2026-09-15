@@ -45,18 +45,21 @@ Under-stopping is the accepted direction. Over-stopping is not: a defect that fa
 test stays visible, ledger-recorded and reported under "## Established failures", and only
 loses the authority to stop the paper.
 
-**The abstract locator here is CORRECT, and `discovery._centrality`'s is not.**
-`discovery.discover` computes `abstract_idx = doc.sections[0].section_idx`, but section 0
-is the untitled front-matter block (title and authors); the real Abstract is a TITLED
-section at index 1 on seven of the eight corpus papers and index 2 on the eighth. That
-locator therefore fired on 0 of 878 corpus objects. `abstract_section_idx` below finds the
-section by its own heading instead.
+**There is one abstract locator in this harness, and it is `abstract_section_idx` below.**
+`discovery.discover` used to compute `abstract_idx = doc.sections[0].section_idx`, but
+section 0 is the untitled front-matter block (title and authors); the real Abstract is a
+TITLED section at index 1 on seven of the eight corpus papers and index 2 on the eighth.
+The two spellings have now been unified, against a measured corpus re-derivation rather
+than on the argument that the corrected one is obviously better:
 
-THE DIVERGENCE IS DELIBERATE AND TEMPORARY. Materiality uses the corrected locator;
-`_centrality` still uses the legacy one. Unifying them changes `centrality` on real
-papers, which propagates into priority ordering, `planner._WORTH_PURSUING`,
-`unresolved_central`, `disposition.blockers_from` and the coverage accounting — a blast
-radius that has to be measured against a corpus re-derivation, and that is not this task.
+    legacy locator (doc.sections[0]):     0 / 706 discovered objects
+    corrected locator (this module):      0 / 706 discovered objects
+
+No object's centrality moves either way, so nothing the v2 run reported is restated. The
+reason it fires on nothing is structural — discovered objects come from table cells and
+parsed quantities, and an abstract carries prose — and that null result is the strongest
+evidence available that object-level centrality does not represent claim importance. The
+answer to it is `harness/claimgraph.py`, not a fifth boolean here.
 """
 from __future__ import annotations
 
