@@ -144,20 +144,41 @@ def test_an_experiment_that_only_a_declared_environment_could_host_says_so():
 
 
 def test_a_linux_only_stack_rules_out_a_windows_host():
+    """The WINDOWS host is ruled out. What else is on offer is a separate question.
+
+    This used to also assert `sel.chosen is None`, which was true only while every
+    registered backend was either this machine or unreachable. A Linux container backend
+    on this host is a genuine answer to "where can a linux-64 stack run", so asserting
+    that nothing is chosen would assert the absence of a capability rather than the
+    presence of the platform check. The platform check is what this test is about, and it
+    is unchanged: `local` reports `platform_incompatible` for a linux-only declaration.
+    """
     import sys
     if sys.platform.startswith("linux"):
         pytest.skip("needs a non-Linux host")
     sel = select_for(_req(vram_bytes=1 * GIB), _cfg(), declared_platform="linux")
     verdicts = {n: v for n, v, _ in sel.considered}
     assert verdicts["local"] == "platform_incompatible"
-    assert sel.chosen is None
+    # Anything that IS chosen must genuinely offer the platform, never this host.
+    assert sel.chosen != "local"
 
 
 def test_a_walltime_beyond_a_backends_session_limit_rules_it_out():
+    """A backend that publishes a session limit shorter than the demand does not fit.
+
+    Asserted per backend rather than over the whole roster. A backend with no published
+    session limit — a container on this host does not time out at a provider's boundary —
+    is not ruled out by this requirement, and demanding that nothing fits would make the
+    test an assertion that no such backend exists.
+    """
     sel = select_for(_req(vram_bytes=1 * GIB, walltime_s=40 * 3600), _cfg(),
                      declared_platform="linux", walltime_s=40 * 3600)
-    assert all(v != "fits" for _, v, _ in sel.considered)
-    assert sel.chosen is None
+    considered = {n: v for n, v, _ in sel.considered}
+    from harness import backends as _b
+    for name, verdict in considered.items():
+        limit = _b._REGISTRY[name]().profile().max_walltime_s
+        if limit and limit < 40 * 3600:
+            assert verdict != "fits", (name, verdict)
 
 
 def test_an_unstated_requirement_matches_nothing():
@@ -233,7 +254,7 @@ def test_a_backend_refusal_cannot_drive_the_paper_red():
     assert verdict == "GREEN", "not being able to reach a GPU says nothing about a paper"
 
 
-def test_a_real_runner_is_still_authorized_when_everything_holds():
+def test_a_real_runner_is_still_authorized_when_everything_holds(confined_local):
     """The wall must not have made every backend unusable."""
     auth = authorize(_cfg(allow_repo_exec=True), _qualified(), local_backend(),
                      commit=_verified())
@@ -342,7 +363,7 @@ def test_selection_and_the_resource_check_agree_about_gpu_count():
     assert (sel.reason_code == "selected") == (assessed.state == "satisfied")
 
 
-def test_selection_is_not_authorization():
+def test_selection_is_not_authorization(confined_local):
     """`select_for` returning a backend permits nothing. `authorize` is the only yes.
 
     Selection answers "where could this run"; authorization answers "may it". A spec that
@@ -453,10 +474,31 @@ def test_selection_refuses_to_choose_when_the_memory_demand_is_unknown():
 
 def test_a_specific_rejection_still_beats_reporting_ignorance():
     """Checked after the candidate loop, not before it: an experiment ruled out on
-    platform keeps that reason rather than being flattened into `requirement_unknown`."""
+    platform keeps that reason rather than being flattened into `requirement_unknown`.
+
+    `backend_unavailable` joined the acceptable answers when the remote sandbox became a
+    registered runner, and it is the MOST useful of the three: this experiment fits a
+    Linux backend that can genuinely execute, and the only thing in the way is a gate the
+    operator can open. The previous best answer was "somewhere with a T4 could host this
+    and we hold no credentials for it", which is true and actionable by nobody. What the
+    test is about is unchanged — the refusal names a specific blocker rather than
+    collapsing into ignorance about the requirement.
+    """
     import sys
     if sys.platform.startswith("linux"):
         pytest.skip("needs a non-Linux host")
     sel = select_for(_req(cpu_count=2), _cfg(), declared_platform="linux")
-    assert sel.reason_code in ("platform_incompatible", "credentials_unavailable")
-    assert sel.reason_code != "requirement_unknown"
+    assert sel.chosen is None, "a named blocker is still a refusal"
+    # Every one of these is a SPECIFIC, actionable statement, and which one is correct
+    # depends on what this host offers. `requirement_unknown` joined the list when a
+    # container backend made `linux` reachable here: once some backend genuinely offers
+    # the platform, the binding blocker for a requirement stating only a CPU count is
+    # that the memory demand was never established — which is invariant 6 refusing an
+    # unstated demand, not the selector shrugging. The thing this test forbids is a
+    # refusal with nothing in it, so it asserts the reason names a cause.
+    assert sel.reason_code in ("platform_incompatible", "credentials_unavailable",
+                               "backend_unavailable", "requirement_unknown"), sel.reason_code
+    assert sel.reason and len(sel.reason) > 20, "a refusal must say what blocked it"
+    if sel.reason_code == "requirement_unknown":
+        assert "never established" in sel.reason or "demand" in sel.reason, sel.reason
+    assert sel.considered, "and it must show what it considered"

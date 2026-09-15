@@ -32,6 +32,7 @@ from harness.config import Config
 from harness.local_exec import run_probe, verify_execution_commit
 from harness.repo import head_commit, verify_commit
 from harness.stages.report import overall_verdict
+from conftest import incidental_objects, material_objects
 
 # The value the fixture's "paper" prints in its "table", and what the script emits.
 CELL = "59.28"
@@ -131,7 +132,7 @@ def _spec(repo: Path, commit: str, cfg: Config, *, seeds=(0, 1, 2)) -> ProbeSpec
         command=[cfg.python, "run.py", "--seed", "{seed}"],
         cwd=str(repo), interpreter=cfg.python, commit=commit,
         arms=["reproduction"], seeds=list(seeds),
-        table_ref="T1:r0:c1", claimed_cell_value=CELL,
+        table_ref="T1:r0:c1", claimed_cell_value=CELL, target_id="T1",
         experiment=_established(ExperimentIdentity),
         metric_identity=_established(MetricIdentity),
         configuration=_established(ConfigurationIdentity),
@@ -168,7 +169,7 @@ def test_a_timeout_keeps_the_output_the_process_had_already_produced(tmp_path):
 # --------------------------------------------------------------------------- #
 # The full chain: authorize → execute → reconcile
 # --------------------------------------------------------------------------- #
-def test_a_qualified_execution_that_matches_resolves_verified(tmp_path):
+def test_a_qualified_execution_that_matches_resolves_verified(confined_local, tmp_path):
     """The verdict this system had never produced.
 
     Synthetic fixture: this proves the execution path, not any paper.
@@ -188,7 +189,7 @@ def test_a_qualified_execution_that_matches_resolves_verified(tmp_path):
     assert rec.failure_class in ("", "none")
 
 
-def test_a_qualified_execution_that_mismatches_fails_reproduction(tmp_path):
+def test_a_qualified_execution_that_mismatches_fails_reproduction(confined_local, tmp_path):
     repo, commit = _repo(tmp_path, EMITS_MISMATCH)
     cfg = _cfg(tmp_path, allow_repo_exec=True)
     result = run_probe(cfg, tmp_path / "projects" / "fixture", _spec(repo, commit, cfg))
@@ -196,11 +197,13 @@ def test_a_qualified_execution_that_mismatches_fails_reproduction(tmp_path):
     rec = result.reconciliation
     assert rec.status == "FAILED_REPRODUCTION", rec.reason
     assert rec.delta_error is not None and rec.delta_error > rec.noise_band
-    verdict, why = overall_verdict([], rec)
-    assert verdict == "RED", "a real failed reproduction is the one thing that drives RED alone"
+    verdict, why = overall_verdict([], rec, objects=material_objects(rec.target_id))
+    assert verdict == "RED", (
+        "a real failed reproduction on a target a central claim rests on is the one thing "
+        "that drives RED alone")
 
 
-def test_a_metric_captured_before_a_nonzero_exit_still_resolves(tmp_path):
+def test_a_metric_captured_before_a_nonzero_exit_still_resolves(confined_local, tmp_path):
     """C3 — the concrete failure the red-team found: a process prints the correct result
     for every requested seed and THEN exits non-zero for a reason unrelated to the
     measurement itself. Exit-code semantics must not override a scientific result that
@@ -218,7 +221,7 @@ def test_a_metric_captured_before_a_nonzero_exit_still_resolves(tmp_path):
     assert rec.failure_class in ("", "none")
 
 
-def test_a_crash_before_any_measurement_is_still_a_failed_reproduction(tmp_path):
+def test_a_crash_before_any_measurement_is_still_a_failed_reproduction(confined_local, tmp_path):
     """The other half of C3: the fix above must not become a blanket amnesty for a
     non-zero exit code. A genuine failure that strikes BEFORE the experiment produces
     its measurement still convicts."""
@@ -233,7 +236,7 @@ def test_a_crash_before_any_measurement_is_still_a_failed_reproduction(tmp_path)
     assert rec.reached_experiment is True, "it did start — that is why this convicts"
 
 
-def test_a_cuda_oom_is_infrastructure_not_a_failed_reproduction(tmp_path):
+def test_a_cuda_oom_is_infrastructure_not_a_failed_reproduction(confined_local, tmp_path):
     """C2 — an infrastructure failure must never become FAILED_REPRODUCTION, however it
     reads at the stderr and however far the process got before it happened."""
     repo, commit = _repo(tmp_path, FAILS_WITH_CUDA_OOM)
@@ -247,7 +250,7 @@ def test_a_cuda_oom_is_infrastructure_not_a_failed_reproduction(tmp_path):
     assert overall_verdict([], rec)[0] == "GREEN", "an infrastructure failure accuses nobody"
 
 
-def test_a_checkout_modified_mid_run_retracts_the_whole_result(tmp_path):
+def test_a_checkout_modified_mid_run_retracts_the_whole_result(confined_local, tmp_path):
     """Major #16 — one commit verification, made before the seed loop starts, does not
     describe every attempt inside it. Here the FIRST seed's own process tampers with the
     tracked script on disk, simulating the checkout changing while later seeds still run
@@ -276,7 +279,7 @@ def test_a_checkout_modified_mid_run_retracts_the_whole_result(tmp_path):
     assert overall_verdict([], rec)[0] == "GREEN"
 
 
-def test_an_import_failure_is_infrastructure_not_the_paper(tmp_path):
+def test_an_import_failure_is_infrastructure_not_the_paper(confined_local, tmp_path):
     """The distinction the whole capability layer exists for. Nothing was reproduced and
     nobody is accused."""
     repo, commit = _repo(tmp_path, FAILS_AT_IMPORT)
@@ -366,7 +369,7 @@ def test_the_provenance_ceiling_holds_over_a_real_execution(tmp_path):
 # --------------------------------------------------------------------------- #
 # Execution artifacts
 # --------------------------------------------------------------------------- #
-def test_every_attempt_is_recorded_with_enough_to_re_derive_the_metric(tmp_path):
+def test_every_attempt_is_recorded_with_enough_to_re_derive_the_metric(confined_local, tmp_path):
     repo, commit = _repo(tmp_path, EMITS_MATCH)
     cfg = _cfg(tmp_path, allow_repo_exec=True)
     result = run_probe(cfg, tmp_path / "projects" / "fixture",
@@ -385,7 +388,7 @@ def test_every_attempt_is_recorded_with_enough_to_re_derive_the_metric(tmp_path)
         assert f"seed={r.seed}" in r.stdout and str(r.metric)[:5] in r.stdout
 
 
-def test_a_failed_attempt_keeps_its_stderr_whole(tmp_path):
+def test_a_failed_attempt_keeps_its_stderr_whole(confined_local, tmp_path):
     """`probe_log.json` kept a 400-character tail. A traceback does not fit in 400
     characters, and the tail is the part that says least about the cause."""
     repo, commit = _repo(tmp_path, FAILS_AT_IMPORT)
@@ -399,7 +402,7 @@ def test_a_failed_attempt_keeps_its_stderr_whole(tmp_path):
     assert "Traceback" in r.stderr, "the whole stderr, not a tail"
 
 
-def test_the_report_chain_points_at_the_execution_log(tmp_path):
+def test_the_report_chain_points_at_the_execution_log(confined_local, tmp_path):
     from harness.stages.report import build_chain
 
     repo, commit = _repo(tmp_path, EMITS_MATCH)
@@ -429,7 +432,7 @@ def test_the_commit_check_reads_the_disk_at_execution_time(tmp_path):
     assert verify_commit(repo, audited).state == "mismatch"
 
 
-def test_authorization_still_fails_closed_without_a_commit_check(tmp_path):
+def test_authorization_still_fails_closed_without_a_commit_check(confined_local, tmp_path):
     repo, commit = _repo(tmp_path, EMITS_MATCH)
     cfg = _cfg(tmp_path, allow_repo_exec=True)
     auth = authorize(cfg, _spec(repo, commit, cfg), local_backend())     # commit omitted

@@ -28,7 +28,8 @@ from pathlib import Path
 import pytest
 
 from harness import audit_driver, controller
-from harness.artifacts import CaseState, PaperDoc, ProbeResult, Reconciliation, Section, Table
+from harness.artifacts import (CaseState, PaperDoc, ProbeResult, QuantFinding, Reconciliation,
+                               Section, Table)
 from harness.config import Config
 from harness.controller import (PHASES, RETRYABLE, PhaseOutcome, drive, drive_all, load_case,
                                 open_case, step, summarize)
@@ -48,6 +49,24 @@ def _doc(pid: str = PID) -> PaperDoc:
                                "split, an improvement we attribute to the new regulariser.")],
         tables=[Table(table_idx=0, page=3, caption="Table 1: results",
                       rows=[["method", "acc"], ["ours", "91.4"]])])
+
+
+def _doc_with_artifact(pid: str = PID) -> PaperDoc:
+    """The same paper, but one whose printed result a discovered target can legitimately
+    pursue: a repository is advertised and the extractor addressed the reported number.
+
+    Needed because the execution gate is no longer `any(f.verifiable_by_experiment)` — an
+    unchecked lens boolean — but a target that survived discovery, prioritisation and
+    `harness.planner`. A paper with no artifact and no addressed quantity now abstains
+    BEFORE the probe, correctly, so a test about how the PROBE abstains has to hand the
+    pipeline a paper that reaches it.
+    """
+    doc = _doc(pid)
+    doc.repo_url = "https://example.invalid/repo"
+    doc.repo_urls = [doc.repo_url]
+    doc.reported_numbers = [QuantFinding(value="91.4", metric="accuracy", method="ours",
+                                         source_quote="91.4", page=3, table_ref="T0:r1:c1")]
+    return doc
 
 
 def _plant(cfg: Config, pid: str = PID, doc: PaperDoc | None = None) -> str:
@@ -92,7 +111,20 @@ def cfg(tmp_path: Path) -> Config:
 # The machine
 # --------------------------------------------------------------------------- #
 def test_the_phase_order_is_the_pipeline():
-    assert PHASES == ("ingest", "audit", "collect", "grade", "probe", "report", "done")
+    """Two positions are policy, not convenience.
+
+    `assess` sits between grading and discovery. It asks "has the paper's own evidence
+    already settled this?", which needs COUNTED severity final (so after `grade`) and
+    nothing expensive yet spent (so before `discover`).
+
+    `discover` sits between `assess` and the probe. It is the only point at which "is an
+    experiment justified?" can be asked with the cheap reasoning already done and the
+    expensive part not yet begun. Moving it earlier would decide before the lenses had
+    read the paper; moving it later would decide after the cost had been paid.
+    """
+    assert PHASES == ("ingest", "audit", "collect", "grade", "assess", "discover",
+                      "probe", "report", "done")
+    assert PHASES.index("grade") < PHASES.index("assess") < PHASES.index("discover")
 
 
 def test_only_a_delegated_lens_may_be_retried():
@@ -158,7 +190,7 @@ def test_the_pipeline_runs_to_a_report_once_every_lens_has_a_result(cfg: Config)
     case = drive(cfg, open_case(cfg, PID), skip_probe=True)
     assert case.status == "complete"
     assert [e.phase for e in case.history] == [
-        "ingest", "audit", "collect", "grade", "probe", "report"]
+        "ingest", "audit", "collect", "grade", "assess", "discover", "probe", "report"]
     assert case.verdict in ("RED", "YELLOW", "GREEN")
     assert Path(case.report_path).is_file()
 
@@ -303,19 +335,42 @@ def test_an_unavailable_reviewer_waits_instead_of_retrying(cfg: Config):
 # --------------------------------------------------------------------------- #
 # Abstention is not failure
 # --------------------------------------------------------------------------- #
-def test_a_paper_with_nothing_settleable_still_reaches_a_report(cfg: Config):
+def test_a_paper_with_no_execution_justified_still_reaches_a_report(cfg: Config):
+    """A paper with no artifact and an under-specified method abstains BEFORE the probe.
+
+    The abstention is now a decision with a stated reason rather than the absence of a
+    lens boolean, and the reason is auditable: the target set records what was discovered,
+    what was settled against the paper itself, and what was blocked by specification,
+    artifact or environment. The review still completes — that is invariant 6 and 7's
+    whole point, and the class name says which of the two it was.
+    """
     _plant(cfg)
     _all_lenses(cfg, PID, verifiable=False)
     case = drive(cfg, open_case(cfg, PID))
     assert case.status == "complete"
-    assert case.reproduction_class == "nothing_settleable"
+    assert case.reproduction_class == "no_execution_justified"
     assert Path(case.report_path).is_file()
+
+
+def test_a_lens_boolean_alone_no_longer_opens_the_execution_path(cfg: Config):
+    """`verifiable_by_experiment` was the sole gate on the whole execution half.
+
+    Setting it on every finding of a paper that advertises no artifact used to send the
+    pipeline into the probe. It no longer does anything on its own: what opens the path
+    is a target the harness itself found addressable and a planner decision that an
+    experiment is justified.
+    """
+    _plant(cfg)
+    _all_lenses(cfg, PID, verifiable=True)
+    case = drive(cfg, open_case(cfg, PID))
+    assert case.status == "complete"
+    assert case.reproduction_class == "no_execution_justified"
 
 
 def test_a_probe_that_raises_abstains_rather_than_failing_the_case(cfg: Config, monkeypatch):
     """A fault in this harness is not evidence about the paper, and must not stop a review."""
     from harness.stages import probe as probe_stage
-    _plant(cfg)
+    _plant(cfg, doc=_doc_with_artifact())
     _all_lenses(cfg, PID, verifiable=True)
     monkeypatch.setattr(probe_stage, "run", lambda *a, **k: (_ for _ in ()).throw(
         RuntimeError("the probe stage exploded")))
@@ -338,7 +393,7 @@ def test_every_abstention_class_still_produces_a_review(cfg: Config, monkeypatch
     pointed at arbitrary papers."""
     from harness import state
     from harness.stages import probe as probe_stage
-    _plant(cfg)
+    _plant(cfg, doc=_doc_with_artifact())
     _all_lenses(cfg, PID, verifiable=True)
 
     def writes_a_blocked_result(cfg_, pid):
@@ -389,7 +444,7 @@ def test_cases_share_no_state(cfg: Config):
     _all_lenses(cfg, "paper-b", quote="91.4", severity="MINOR")
     cases = drive_all(cfg, ["paper-a", "paper-b"], skip_probe=True)
     by_id = {c.paper_id: c for c in cases}
-    assert by_id["paper-a"].verdict == "RED"
+    assert by_id["paper-a"].verdict != "RED", "model FATAL has no rejection authority"
     assert by_id["paper-b"].verdict != "RED", "one paper's severity must not leak"
     for pid in ("paper-a", "paper-b"):
         chain = json.loads((cfg.projects_dir / pid / "reports" / f"{pid}.json")

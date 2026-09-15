@@ -243,7 +243,7 @@ def test_a_prefix_that_does_not_match_is_still_a_mismatch(tmp_path):
 # --------------------------------------------------------------------------- #
 # The gate
 # --------------------------------------------------------------------------- #
-def test_omitting_the_verification_entirely_fails_closed():
+def test_omitting_the_verification_entirely_fails_closed(confined_local):
     """`authorize` defaults `commit` to None, and None refuses. A caller that forgets the
     check must not inherit permission from having forgotten it."""
     auth = authorize(_cfg(allow_repo_exec=True), _qualified(), local_backend())
@@ -252,20 +252,20 @@ def test_omitting_the_verification_entirely_fails_closed():
 
 
 @pytest.mark.parametrize("state", ["mismatch", "dirty", "unknown", "unassessed"])
-def test_only_a_verified_commit_authorizes(state):
+def test_only_a_verified_commit_authorizes(confined_local, state):
     ver = CommitVerification(state=state, expected="a" * 40, actual="b" * 40, reason=state)
     auth = authorize(_cfg(allow_repo_exec=True), _qualified(), local_backend(), commit=ver)
     assert not auth.allowed and auth.decision == "commit_unverified", state
 
 
-def test_a_verified_commit_lets_authorization_through():
+def test_a_verified_commit_lets_authorization_through(confined_local):
     ver = CommitVerification(state="verified", expected="a" * 40, actual="a" * 40)
     auth = authorize(_cfg(allow_repo_exec=True), _qualified(), local_backend(), commit=ver)
     assert auth.allowed and auth.decision == "authorized"
     assert "a" * 12 in auth.detail, "the authorized commit is named in the record"
 
 
-def test_the_commit_check_precedes_the_identity_check():
+def test_the_commit_check_precedes_the_identity_check(confined_local):
     """Both refuse, and the order is deliberate: reasoning about which experiment some
     other commit implements is reasoning about the wrong artifact."""
     spec = _qualified()
@@ -294,7 +294,7 @@ def test_a_harness_authored_probe_has_no_commit_to_be_wrong_about():
     assert verify_execution_commit(ProbeSpec(paper_id="p")) is None
 
 
-def test_a_moved_checkout_blocks_the_run_and_writes_a_blocked_result(tmp_path):
+def test_a_moved_checkout_blocks_the_run_and_writes_a_blocked_result(confined_local, tmp_path):
     repo = _repo(tmp_path)
     audited = head_commit(repo)
     _advance(repo)
@@ -375,7 +375,7 @@ def test_planning_refuses_to_promote_when_the_checkout_has_moved(tmp_path, monke
 # The invariant
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("values", [[59.30, 59.26], [999.0, 999.0]])
-def test_a_commit_refusal_produces_neither_verdict(values):
+def test_a_commit_refusal_produces_neither_verdict(confined_local, values):
     ver = CommitVerification(state="mismatch", expected="a" * 40, actual="b" * 40,
                              reason="HEAD moved")
     auth = authorize(_cfg(allow_repo_exec=True), _qualified(), local_backend(), commit=ver)

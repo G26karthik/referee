@@ -17,7 +17,38 @@ from pydantic import BaseModel, ConfigDict, Field
 # The one harness import here, and it is safe in both directions: `harness.failures` is
 # pure regex and imports nothing from this package, so the vocabulary can be defined
 # beside the classification logic that owns it rather than duplicated here.
+from .disposition import DISPOSITION_BASIS, PAPER_DISPOSITIONS
 from .failures import FAILURE_KINDS
+# Same argument again: `harness.materiality` is pure regex and pure derivation over
+# duck-typed inputs, and imports nothing from this package, so the vocabulary lives beside
+# the rule that owns it.
+from .materiality import MATERIALITY_BASES
+# `harness.taxonomy` is pure vocabulary plus pure derivation and imports nothing from this
+# package either, so the same argument applies. Re-exported here because the field
+# descriptions below name the vocabularies, and a description that drifts from the tuple
+# it documents is worse than no description. The tuples are the SAME objects, asserted in
+# `tests/test_first_review.py`.
+from .taxonomy import (
+    EVIDENCE_STATES,
+    RESOLUTION_STATES,
+    SCIENTIFIC_CLASSES,
+)
+
+# Whether an experiment was NECESSARY, and what became of that judgement. A separate axis
+# from the action taken and from the target's disposition, because "we decided none was
+# needed" is a SUCCESSFUL review outcome and must never be counted beside "we needed one
+# and could not run it". The first four are decided before anything runs; the last three
+# are what became of one that was.
+EXPERIMENT_NECESSITY = (
+    "NO_EXPERIMENT_NEEDED",       # the question does not turn on anything runnable
+    "EXPERIMENT_WARRANTED",       # one is needed, and a route exists
+    "EXPERIMENT_NOT_EXECUTABLE",  # one is needed; no artifact or host can mount it
+    "EXPERIMENT_UNDERSPECIFIED",  # one is needed; the paper does not say enough to build it
+    "EXPERIMENT_EXECUTED",        # it ran
+    "EXPERIMENT_RESOLVED",        # it ran and settled the question
+    "EXPERIMENT_UNRESOLVED",      # it ran and did not
+)
+
 
 
 class _Base(BaseModel):
@@ -31,9 +62,12 @@ class QuantFinding(_Base):
     """A single reported number — the quantitative-prior unit, and the atom the
     overclaim and contradiction lenses argue over.
 
-    `source_quote` is mandatory in practice (enforced at extraction, see
-    `stages/ingest.py:_keep_number`): a number without a verbatim quote is DROPPED,
-    never guessed. `page` and `table_ref` carry it back to where it was printed.
+    `source_quote` is mandatory in practice: `stages/ingest.py` keeps a number only when
+    it can attach the verbatim span it was printed in, so a number without a quote is
+    DROPPED rather than guessed. `page` and `table_ref` carry it back to where it was
+    printed. (This used to name a function `_keep_number`, which exists nowhere in the
+    repository — a docstring pointing at a function nobody can open is worse than one
+    that states the rule, because a reader spends time looking for it.)
     """
 
     benchmark: str = Field(default="", description="dataset/task the number is on, e.g. 'CIFAR-100'")
@@ -59,7 +93,26 @@ class Table(_Base):
 
     table_idx: int
     page: int = Field(default=0, description="1-indexed PDF page")
-    caption: str = ""
+    caption: str = Field(
+        default="",
+        description="the caption line VERBATIM as the paper printed it. It used to be "
+                    "reconstructed as f'Table {n}: {rest}', which inserted a colon the "
+                    "paper does not have: the real line 'Table 2 lists the quantitative "
+                    "comparison between Weath-' became 'Table 2: lists the quantitative...'. "
+                    "That string flows into QuantFinding.benchmark and "
+                    "DiscoveredObject.experiment and reaches a human in targets.json and "
+                    "the ledger, and unlike `evidence_quote` it is never re-verified. A "
+                    "quotation the paper does not contain is what invariant 1 exists to "
+                    "prevent.")
+    label: str = Field(
+        default="",
+        description="the printed number, e.g. '3' from 'Table 3', kept OUT of `caption` so "
+                    "an unlabelled table can be reported as unlabelled instead of being "
+                    "given its neighbour's number. '' means this extractor could not pair a "
+                    "caption with this body.")
+    caption_source: str = Field(
+        default="none", description="ruled_positional | geometric_paired | none — how the "
+                                    "caption was associated with the body")
     header: list[str] = Field(default_factory=list)
     rows: list[list[str]] = Field(default_factory=list)
 
@@ -120,6 +173,35 @@ class Equation(_Base):
         return f"E{self.equation_idx}"
 
 
+class CrossRef(_Base):
+    """One place the PROSE cites a figure, table, equation, section or appendix.
+
+    What the paper CITES, never what the paper CONTAINS. The two are constantly confused
+    and confusing them is the whole risk of a document-integrity layer: over the shipped
+    corpus, a naive "cited but not recovered" check produced twelve claims that a table or
+    equation was missing, and all twelve of those objects are present in the paper and
+    absent only from what extraction recovered.
+
+    So this type carries no `exists`, no `resolved` and no `severity` field. It records a
+    citation and a span that can be re-verified, and any comparison against a recovered
+    object is somebody else's job and has to say whose property the answer is.
+
+    It also exists because the citations were previously being ingested as CAPTIONS:
+    `_FIGURE_CAPTION` matched any line beginning "Figure N", so
+    'Figure 4 shows the visual comparison with real-world' became a figure object, and
+    `stages.audit.verify_evidence` would then certify body prose as `caption_verified` —
+    a false machine attestation of exactly the kind `pdf._equation_body` refuses to make.
+    """
+
+    kind: str = Field(default="", description="figure | table | equation | section | appendix")
+    number: str = Field(default="", description="the printed number, verbatim")
+    page: int = 0
+    section_idx: int = 0
+    span: str = Field(default="", description="a P<i>:<a>-<b> address minted by `claims`")
+    quote: str = Field(default="", description="the citing sentence, so the reference itself "
+                                               "is re-verifiable against the document")
+
+
 class PaperDoc(_Base):
     """The parsed representation of the paper — sections, tables, numbers — and the
     ONLY thing a finding's evidence can be verified against.
@@ -149,13 +231,127 @@ class PaperDoc(_Base):
     figures: list[Figure] = Field(default_factory=list)
     equations: list[Equation] = Field(default_factory=list)
     reported_numbers: list[QuantFinding] = Field(default_factory=list)
+    crossrefs: list[CrossRef] = Field(
+        default_factory=list,
+        description="every place the prose cites a numbered object. WHAT THE PROSE CITES, "
+                    "not what exists — see `CrossRef`.")
+    body_end_section_idx: int = Field(
+        default=-1,
+        description="the index of the References/Bibliography heading, i.e. where the body "
+                    "ends and back matter begins. -1 = not found. A boundary INDEX rather "
+                    "than a per-section is_appendix flag, because the flag would be wrong "
+                    "wherever a bibliography fragment was mis-parsed as a lettered heading — "
+                    "which is exactly what happens: a single capital at line start matches "
+                    "the section-number grammar, so an author initial turns 16 KB of one "
+                    "paper's reference list into five appendix-shaped sections.")
+    extraction_version: int = Field(
+        default=1,
+        description="bumped whenever a change renumbers or re-scopes addressable objects "
+                    "(F<n>, T<i>:r<r>:c<c>, E<n>). A stored reference minted under an older "
+                    "parse must not silently resolve against a newer one: it would point at "
+                    "a different object and the harness would attest to it.")
     repo_url: str = Field(
         default="", description="the official code repository the paper advertises ('' = none found)"
     )
     repo_urls: list[str] = Field(
         default_factory=list,
-        description="every candidate repo URL found in the text, best first; repo_url is repo_urls[0]",
+        description="every candidate repo URL found in the text, best first. `repo_url` is "
+                    "NOT simply `repo_urls[0]`: `stages/ingest` sets it from "
+                    "`repo.official_repo_url`, which requires a cue word before the URL "
+                    "and refuses one sitting in the reference list, so the advertised "
+                    "repository can be absent while candidates are present. The two "
+                    "answer different questions and the description used to conflate them.",
     )
+
+
+# --------------------------------------------------------------------------- #
+# ①b ADDRESSABLE REFERENCES
+# --------------------------------------------------------------------------- #
+# A printed result should not have to be an extractable TABLE CELL to be checkable. It
+# had to, and that single assumption — `^T\d+:r\d+:c\d+$`, enforced in three places —
+# was what kept a prose-stated result off the autonomous evidence path entirely: no
+# grounded delta, no `table_ref`, so `reconcile` never ran on it.
+#
+# What replaces it is a REFERENCE KIND plus a resolver. The kinds below are exactly the
+# addresses `harness.claims.resolve` can re-derive from the parsed paper; a kind the
+# resolver cannot re-derive does not belong here, because an address nobody can check is
+# not an address.
+REFERENCE_KINDS = ("table_cell", "prose_claim", "figure", "equation", "section_span")
+
+# Why a reference did or did not resolve. `ambiguous` is kept apart from `not_found`
+# deliberately: a quote occurring three times in a paper is a real quote at an address
+# nobody can name, and silently taking the first occurrence would mint a stable id for a
+# span the lens may not have meant.
+#
+# NOT `RESOLUTION_STATES`, which is imported from `harness.taxonomy` at the top of this
+# file and is a different axis entirely: whether a review QUESTION was settled and by
+# what. This tuple used to be bound to that name and shadowed it, so
+# `ScientificFinding.resolution_status`, `ReviewQuestion.resolution_status` and
+# `LedgerEntry.resolution_state` — three fields a reader inspects the schema of — all
+# documented themselves as "resolved | not_found | ambiguous | malformed | span_mismatch".
+# The renders were right only because `stages/report._RESOLUTION_GLOSS` hardcodes the real
+# tokens, which means the two definitions could drift with nothing failing.
+REFERENCE_RESOLUTIONS = ("resolved", "not_found", "ambiguous", "malformed", "span_mismatch")
+
+
+class ReportedQuantity(_Base):
+    """A number the paper printed, parsed out of a reference's own text.
+
+    Deliberately willing to find NOTHING. Two numbers in a span with no relation stated
+    between them is not a reported quantity, it is two numbers, and picking one would be
+    the same positional coincidence that `local_exec.json_metric` was criticised for.
+    See `harness.claims.parse_quantity` for the three rules that decide.
+    """
+
+    value: float | None = Field(default=None, description="the quantity, or None if none is unambiguous")
+    raw: str = Field(default="", description="the token the value was parsed from, verbatim")
+    operands: list[float] = Field(
+        default_factory=list, description="left-hand-side numbers when the span states a composition")
+    expression: str = Field(
+        default="", description="the composition, e.g. '58*5*10', or '' when none was stated")
+    arithmetic_ok: bool | None = Field(
+        default=None,
+        description="does `expression` actually evaluate to `value`? None = no expression to check. "
+                    "Re-evaluated by the harness with `grading._safe_eval`, never taken on trust — "
+                    "this is what lets a composition claim be a REPRODUCTION TARGET rather than "
+                    "merely a quotation.",
+    )
+
+
+class ClaimRef(_Base):
+    """One resolvable address into the parsed paper, and the evidence it points at.
+
+    The invariant that makes this safe to accept from a model: **a lens supplies a QUOTE,
+    the harness mints the ADDRESS.** `harness.claims.mint` searches the parsed document
+    for the quote and refuses unless it occurs exactly once. A lens that writes a
+    `prose_claim` ref itself is not trusted either — `resolve` re-reads the span off the
+    document and returns `span_mismatch` when the text there is not the quote.
+
+    Ref grammar, all re-derivable from `PaperDoc` alone:
+
+        T<t>:r<r>:c<c>      table_cell
+        F<n>                figure (the CAPTION, never the plotted values)
+        E<n>                equation
+        S<i>                section_span
+        P<i>:<start>-<end>  prose_claim — a character span in section <i>'s flattened text
+    """
+
+    ref: str = Field(default="", description="the address, in the grammar above")
+    kind: str = Field(default="", description=" | ".join(REFERENCE_KINDS))
+    quote: str = Field(default="", description="the text at that address, verbatim from the doc")
+    section_idx: int = Field(default=-1, description="-1 when the kind is not section-anchored")
+    span: tuple[int, int] | None = Field(
+        default=None, description="(start, end) into the flattened section text, prose_claim only")
+    page: int = Field(default=0, description="1-indexed page, 0 = unknown")
+    resolution: str = Field(default="malformed",
+                        description=" | ".join(REFERENCE_RESOLUTIONS))
+    detail: str = Field(default="", description="why, when `resolution` is not 'resolved'")
+    quantity: ReportedQuantity | None = Field(
+        default=None, description="the number this reference reports, when one is unambiguous")
+
+    @property
+    def resolved(self) -> bool:
+        return self.resolution == "resolved"
 
 
 # --------------------------------------------------------------------------- #
@@ -383,6 +579,13 @@ class Finding(_Base):
     )
 
     # --- harness-written, joining the machine half above; never trusted from a lens file --
+    scientific_class: str = Field(
+        default="UNRESOLVED_QUESTION",
+        description="WRITTEN BY THE HARNESS: what KIND of scientific issue this is, derived by "
+                    "`taxonomy.classify` from the closed-vocabulary fields the lens already "
+                    "chose. It is deliberately NOT an input to `grading.derive`: what kind of "
+                    "issue something is must not decide how severe it is, for the same reason "
+                    "evidence type must not. " + " | ".join(SCIENTIFIC_CLASSES))
     verification_state: str = Field(default="", description="WRITTEN BY THE HARNESS: "
                                                              + " | ".join(VERIFICATION_STATES))
     calc_class: str = Field(default="", description="WRITTEN BY THE HARNESS: " + " | ".join(CALC_CLASSES))
@@ -515,9 +718,21 @@ class ProbeSpec(_Base):
     table_ref: str = Field(
         default="", description="the cell 'T<t>:r<r>:c<c>' the executed metric is reconciled against"
     )
-    claimed_cell_value: str = Field(
-        default="", description="that cell's contents verbatim, carried so reconciliation can parse it"
+    claim_ref: str = Field(
+        default="",
+        description="the ADDRESS the executed metric is reconciled against, in any form "
+                    "`harness.claims.resolve` can re-derive — a cell, but also a prose span "
+                    "'P<i>:<a>-<b>', a figure or an equation. `table_ref` stays cell-only so "
+                    "nothing keyed on a cell address silently starts matching prose; this is "
+                    "the general field, and it is what made a prose-stated result reachable by "
+                    "the autonomous path at all.",
     )
+    claim_kind: str = Field(default="", description=" | ".join(REFERENCE_KINDS))
+    claimed_cell_value: str = Field(
+        default="", description="that address's contents verbatim, carried so reconciliation can parse it"
+    )
+    target_id: str = Field(
+        default="", description="the DiscoveredObject this spec pursues, '' for a legacy spec")
     written_by: str = Field(
         default="",
         description="'harness' when `stages/probe.run` persisted this spec.json itself, at the "
@@ -530,8 +745,10 @@ class ProbeSpec(_Base):
         default="template",
         description="who wrote the code that runs: 'template' = the identical-arms noise floor; "
                     "'synthesized' = the probe planner wrote it from the paper's own formulation; "
-                    "'driver' = a human wrote spec.json; 'repo_exec' = the paper's own checkout. "
-                    "This decides how far a reconciliation is allowed to go — see local_exec.reconcile.",
+                    "'driver' = a human wrote spec.json; 'repo_exec' = the paper's own checkout; "
+                    "'reimpl_exec' = harness.reimplement_driver's governed reconstruction, "
+                    "admissible ONLY with `reimplementation_conformance.established` — see "
+                    "local_exec.reconcile. This decides how far a reconciliation is allowed to go.",
     )
     mechanism: str = Field(
         default="", description="the planner template that authored the script, e.g. 'ldreg'"
@@ -553,6 +770,13 @@ class ProbeSpec(_Base):
         default=None, description="that the executed number is the cell's quantity, on its basis")
     configuration: ConfigurationIdentity | None = Field(
         default=None, description="dataset/model/schedule/seed policy, matched or explicitly not")
+    comparison: Comparison | None = Field(
+        default=None,
+        description="what this spec's result would be held against, derived by "
+                    "`harness.comparison` from the ROUTE. None means the layer did not run, "
+                    "which is how a hand-written spec.json keeps behaving exactly as it "
+                    "did; an unestablished one stops the process before it starts, for the "
+                    "same reason `admissible_if_it_succeeds` does.")
     backend: str = Field(
         default="local",
         description="the execution backend this spec was planned against. Recorded on the spec "
@@ -583,6 +807,14 @@ class ProbeSpec(_Base):
         description="every registered environment and why it was accepted or rejected. Kept so "
                     "an INCONCLUSIVE can say 'a 16 GiB T4 would fit but cannot be provisioned "
                     "from here' rather than leaving a reader to infer it from a bare refusal.",
+    )
+    reimplementation_conformance: "ReimplementationConformance | None" = Field(
+        default=None,
+        description="set only for provenance 'reimpl_exec' — whether harness.reimplement_driver's "
+                    "governed reconstruction actually binds every REQUIRED ingredient the paper "
+                    "specifies to both a paper locator and a verified implementation locator. "
+                    "None or `established=False` refuses reconciliation exactly as an unproven "
+                    "ExperimentIdentity refuses one for `repo_exec` — see local_exec.reconcile.",
     )
 
 
@@ -617,6 +849,80 @@ class ReimplementationReadiness(_Base):
         description="required ingredients the paper does not supply. Non-empty ⇒ NOT_VERIFIED, "
                     "and an implementation would have to INVENT these, which is the one thing "
                     "PATH B may never do.",
+    )
+    reason: str = ""
+
+
+class ReimplementationBinding(_Base):
+    """One required ingredient, tied to BOTH a paper locator and an implementation locator.
+
+    `paper_ref`/`paper_quote` are copied verbatim from the `ReimplementationReadiness`
+    ingredient that already established eligibility — they are not re-derived here, so a
+    binding can never claim a paper locator eligibility itself refused. `impl_ref` and
+    `impl_quote` are what `harness.reimplement_driver` adds: WHERE in the generated
+    program this ingredient is realized, and the literal snippet that shows it.
+
+    `verified` is written by the harness, never trusted from the driver's own report —
+    the same discipline `claims.verify_evidence` applies to a lens's quote: `impl_quote`
+    is re-checked against the actual script text the driver returned, so a delegate that
+    asserts a binding it did not really write cannot make one true by saying so.
+    """
+
+    kind: str = Field(description="method | training | dataset | metric | comparison_target "
+                                  "(the REQUIRED ReimplementationIngredient kinds only)")
+    paper_ref: str = ""
+    paper_quote: str = ""
+    impl_ref: str = Field(default="", description="line/function in the generated script")
+    impl_quote: str = Field(default="", description="the literal snippet naming impl_ref")
+    verified: bool = Field(
+        default=False,
+        description="`impl_quote` is non-empty and was found verbatim in the script text this "
+                    "harness actually persisted — written by the harness, never read off the "
+                    "driver's own say-so.",
+    )
+    bound: bool = Field(
+        default=False,
+        description="paper_ref, impl_ref and verified all hold — the one thing decision 1 "
+                    "requires of EVERY required ingredient before a reconstruction may run.",
+    )
+
+
+class ReimplementationConformance(_Base):
+    """Whether a governed reconstruction may reconcile against a printed cell at all.
+
+    THE GATE `reimpl_exec` PROVENANCE ADDS. `ReimplementationReadiness.established` says
+    the PAPER specifies enough to attempt a reconstruction; this says the ATTEMPT that was
+    actually written stayed inside what the paper specified — every required ingredient
+    bound to both a paper locator and a verified implementation locator, with nothing
+    invented. Established here is required in `local_exec.reconcile` and `backends.authorize`
+    before either may draw a verdict from a `reimpl_exec` run, exactly as an unproven
+    `ExperimentIdentity` refuses one for `repo_exec`.
+
+    A conformant reconstruction's disagreement may establish a failure of the paper's
+    STATED METHOD; it is never phrased as the authors' own code failing, because it is
+    not the authors' own code — see `harness.provenance.PROVENANCE_LABEL['reimpl_exec']`.
+    """
+
+    established: bool = False
+    verified_by: str = Field(
+        default="",
+        description="identity of the independent verifier that checked the proposed "
+                    "bindings. Empty means the generator's report has not been "
+                    "independently assessed and cannot authorize execution.")
+    generated_by: str = Field(
+        default="",
+        description="identity of the context that generated the reconstruction. It must "
+                    "be non-empty and different from verified_by for established=True.")
+    independently_verified: bool = Field(
+        default=False,
+        description="written by the acceptance boundary only when generated_by and "
+                    "verified_by name distinct recorded contexts. Generated code cannot "
+                    "self-certify conformance.")
+    bindings: list[ReimplementationBinding] = Field(default_factory=list)
+    unbound: list[str] = Field(
+        default_factory=list,
+        description="required ingredient kinds that did NOT bind — missing an impl_ref, "
+                    "an unverifiable impl_quote, or absent from the driver's own report.",
     )
     reason: str = ""
 
@@ -756,6 +1062,14 @@ class CodeAuditFinding(_Base):
     code_quote: str = Field(default="", description="verbatim source, never reformatted")
     counter_explanations: list[str] = Field(default_factory=list)
 
+    @property
+    def scientific_class(self) -> str:
+        """Always IMPLEMENTATION_ISSUE: a static hit is by construction a statement about
+        the released artifact, not about the paper's argument. A property rather than a
+        field so it cannot be read from a file or set to anything else."""
+        from . import taxonomy
+        return taxonomy.classify(is_artifact_finding=True)
+
 
 class CodeAudit(_Base):
     """The static pass. Runs with no execution, so it is safe on an untrusted clone."""
@@ -818,6 +1132,10 @@ FAILURE_CLASSES = (
     "experiment_unidentified",  # no proven mapping from the cited cell to a repo command
     "metric_unbound",           # the executed number is not the cell's quantity/basis
     "configuration_unmatched",  # the run's settings are not the cell's settings
+    # The result would have had nothing to be held against. Distinct from the three
+    # identity classes above: those say the wrong program would run, this says the
+    # right one would run and this harness could not compare what it produced.
+    "comparison_unestablished",
     "execution_unauthorized",   # the harness refused to run it — a fact about us, not them
     "resources_insufficient",   # the experiment as published does not fit the hardware here
     "commit_mismatch",          # the code that would run is not the code that was audited
@@ -841,6 +1159,11 @@ EXEC_DECISIONS = (
     "backend_cannot_execute",   # the selected backend is a declaration, not a runner
     "backend_mismatch",         # assessed against one backend, asked to run on another
     "backend_offline",          # a real runner, temporarily unreachable — retry may succeed
+    # A spec that claims an admissible provenance and contains no program at all. Not a
+    # weak spec, a malformed one: `write_probe` would fall back to the identical-arms
+    # noise-floor template, whose number would then be reconciled against the paper's
+    # printed cell under a provenance the ceiling admits. See `local_exec.run_probe`.
+    "spec_incomplete",
 )
 
 
@@ -892,11 +1215,78 @@ class CandidateCommand(_Base):
     argv: list[str] = Field(default_factory=list)
     source: str = Field(default="", description="readme | run_script | scripts_dir | makefile")
     source_ref: str = Field(default="", description="file:line the command was read from")
-    declared_args: dict[str, str] = Field(default_factory=dict)
+    declared_args: dict[str, str] = Field(
+        default_factory=dict,
+        description="field -> value this command's OWN text declares (a hardcoded "
+                    "'--sparsity 0.5' in a scripts_dir candidate, a referenced config "
+                    "file, or an argparse default), written by "
+                    "`harness.alignment.candidates.declared_configuration`. This is what "
+                    "lets `harness.alignment.configuration.narrow` tell two candidates "
+                    "that both emit the cited quantity apart by what CONFIGURATION each "
+                    "one runs under — the fix for a repository whose 84 scripts all "
+                    "measure accuracy and differ only by which row they belong to.")
+    declared_args_evidence: dict[str, str] = Field(
+        default_factory=dict,
+        description="field -> source_ref for each entry in `declared_args`, so a matched "
+                    "configuration is checkable the way every other evidence pointer in "
+                    "this harness is, not merely asserted.")
     seed_flag: str = Field(default="", description="the seed flag the repo itself uses, if any")
     seed_values: list[str] = Field(default_factory=list, description="seeds the repo passes")
     emits: list[str] = Field(default_factory=list, description="output keys/files this command writes")
     label: str = Field(default="", description="what the command actually does")
+
+
+class ArgSpec(_Base):
+    """One CLI argument an entrypoint's own `argparse.add_argument` call declares.
+
+    Written by `harness.alignment.argparse_surface`, which reads the SOURCE and never
+    runs it — `harness.alignment.trial` is the only place in that package that asks the
+    program itself, and it is optional and gated. Every field here is what the source
+    text says, not what a real invocation would show.
+    """
+
+    flag: str = ""
+    default: str = ""
+    choices: list[str] = Field(default_factory=list)
+    type: str = ""
+    required: bool = False
+    is_flag: bool = Field(
+        default=False, description="action='store_true': no value, presence only")
+    source_ref: str = ""
+
+
+class TrialResult(_Base):
+    """The outcome of an OPTIONAL, GATED `--help` invocation confirming an argparse
+    surface against the real program.
+
+    Written by `harness.alignment.trial`, which never touches `backends.authorize()` or
+    `experiment_id.identities_established` — this is a separate, narrower permission
+    (`SH_ALLOW_ALIGNMENT_TRIAL`) for a cheaper action than running the experiment, gated
+    by the SAME isolation sufficiency repository execution requires, because a `--help`
+    invocation still executes the top of a file this harness did not write.
+
+    `attempted=False` means the gate was shut or isolation was insufficient — nothing
+    ran, and that is recorded as a fact about this review, never as a fact about the
+    repository. `attempted=True, ran=False` means a process was refused or crashed before
+    producing output. Only `ran=True` entitles `confirmed_flags` to mean anything.
+    """
+
+    attempted: bool = False
+    ran: bool = False
+    argv: list[str] = Field(default_factory=list)
+    returncode: int | None = None
+    stdout_tail: str = Field(default="", description="the last portion of stdout, for a reader")
+    confirmed_flags: list[str] = Field(
+        default_factory=list,
+        description="flags the STATIC surface declared and this run's --help output "
+                    "actually printed")
+    unconfirmed_flags: list[str] = Field(
+        default_factory=list,
+        description="flags the static surface declared that --help did NOT print — a "
+                    "real disagreement between the source read and the program run, "
+                    "worth a reader's attention")
+    backend: str = ""
+    reason: str = Field(default="", description="why nothing ran, when `attempted` is False")
 
 
 class _Identity(_Base):
@@ -981,6 +1371,61 @@ class ExecCapability(_Base):
                     "capable there without changing any of the logic that decides capability.",
     )
     backend: str = Field(default="", description="the execution backend that answered these checks")
+
+
+# --------------------------------------------------------------------------- #
+# Comparison — WHAT THE RESULT WOULD BE COMPARED AGAINST
+# --------------------------------------------------------------------------- #
+# Identity asks whether the right program ran. This asks what its output is then held up
+# against, and until now there was only ever one answer: a measured number versus a
+# quantity the paper printed. That is the right comparison for "is 61.4 the number their
+# code produces" and it is not a comparison at all for "is the gain attributable to the
+# augmentation or to the loss weight", which holds one ARM against another and where the
+# paper printed neither side.
+#
+# Because `local_exec.reconcile` could only do the first, `discovery._routes` offered an
+# executable route only where a printed quantity had been parsed — so an attribution, a
+# control-presence or a protocol-conformance question could reach no route at all and was
+# reported as "no verification route this system has would settle the question". A route
+# existed; the comparison at the end of it did not. `harness.comparison` names which.
+COMPARISON_KINDS = (
+    "AGAINST_PRINTED_VALUE",   # a measured quantity vs the one the paper printed
+    "BETWEEN_ARMS",            # one measured arm vs another measured arm
+    "AGAINST_EXISTENCE",       # something the claim requires is present, or it is not
+    "AGAINST_SPECIFICATION",   # an observed procedure vs the one the paper specifies
+)
+
+# Four different facts about whether the comparison could be carried out, and not one of
+# them is a finding about the paper. `unsupported` in particular is a limit of this
+# system's method inventory — the same distinction `NO_ROUTE_AVAILABLE` draws one layer up.
+COMPARISON_STATES = (
+    "established",        # the comparison can be performed
+    "no_reference",       # the paper printed nothing at this address to compare against
+    "arms_unspecified",   # a second arm would be needed and none was built
+    "unsupported",        # this system has no arithmetic for this kind of comparison
+    "unmapped",           # not assessed, or the route produces nothing to compare
+)
+
+
+class Comparison(_Base):
+    """What one target's result would be held against, and whether that is possible.
+
+    Derived by `harness.comparison` from the ROUTE, never from the question and never
+    from anything a model wrote. Keeping it a property of the route is what stops "this
+    is an attribution question" from becoming "so its number may be reconciled against a
+    printed cell": the route decides what is produced, and what is produced decides what
+    it can be compared with.
+    """
+
+    kind: str = Field(default="", description=" | ".join(COMPARISON_KINDS))
+    state: str = Field(default="unmapped", description=" | ".join(COMPARISON_STATES))
+    measured: str = Field(default="", description="what the route would produce")
+    reference: str = Field(default="", description="what it would be compared against")
+    reason: str = Field(default="", description="why it cannot be carried out, when it cannot")
+
+    @property
+    def established(self) -> bool:
+        return self.state == "established"
 
 
 # --------------------------------------------------------------------------- #
@@ -1173,7 +1618,16 @@ class ExecutionRecord(_Base):
                     "this is implicit in the host; remotely it is the only record of the hardware "
                     "a verdict came from, and a reproduction nobody can locate is not evidence.",
     )
-    commit: str = Field(default="", description="the audited commit this execution is about")
+    commit: str = Field(default="", description="the audited commit this execution is about, "
+                                                "written only when the authors' repository is "
+                                                "what ran")
+    provenance: str = Field(
+        default="",
+        description="whose program this record is of, copied from the spec. The execution log "
+                    "is the artifact a reproduction verdict must be re-derivable from by hand, "
+                    "and it carried no provenance at all while stamping the authors' repository "
+                    "commit onto every record - so eighty harness-authored diagnostic runs were "
+                    "identified in the durable trace by the authors' SHA and nothing else.")
     started_at: str = ""
     ended_at: str = ""
     seconds: float = 0.0
@@ -1216,6 +1670,13 @@ class Reconciliation(_Base):
     """
 
     table_ref: str = Field(default="", description="the addressed cell 'T<t>:r<r>:c<c>'")
+    claim_ref: str = Field(
+        default="",
+        description="the address actually reconciled against — a cell, or a prose span, or "
+                    "another form `harness.claims.resolve` re-derives. Equal to `table_ref` "
+                    "when the address is a cell.")
+    claim_kind: str = Field(default="", description=" | ".join(REFERENCE_KINDS))
+    target_id: str = ""
     finding_id: str = ""
     metric: str = ""
     claimed_value: float | None = Field(default=None, description="parsed from the cited cell")
@@ -1239,9 +1700,9 @@ class Reconciliation(_Base):
     )
     provenance: str = Field(
         default="",
-        description="the ProbeSpec.provenance that produced this. Only 'driver' and 'repo_exec' "
-                    "may reach a verdict: a synthesized probe is our reimplementation on a toy "
-                    "problem, and it is not entitled to convict a paper's printed number.",
+        description="the ProbeSpec.provenance that produced this. Only 'driver', 'repo_exec' and "
+                    "'reimpl_exec' may reach a verdict: a synthesized probe is our reimplementation "
+                    "on a toy problem, and it is not entitled to convict a paper's printed number.",
     )
     failure_class: str = Field(
         default="none",
@@ -1252,6 +1713,15 @@ class Reconciliation(_Base):
     experiment_state: str = Field(default="unmapped", description="ExperimentIdentity.state")
     metric_state: str = Field(default="unmapped", description="MetricIdentity.state")
     configuration_state: str = Field(default="unmapped", description="ConfigurationIdentity.state")
+    comparison_kind: str = Field(
+        default="",
+        description="WHICH comparison this reconciliation performed — " +
+                    " | ".join(COMPARISON_KINDS) + " — or '' when the layer did not run. "
+                    "Recorded because the arithmetic below is the AGAINST_PRINTED_VALUE "
+                    "one and nothing in the record used to say so; a reader tracing a "
+                    "verdict has to be able to see which of four comparisons produced it.")
+    comparison_state: str = Field(
+        default="", description="Comparison.state at the time of this reconciliation, or ''")
     reached_experiment: bool | None = Field(
         default=None,
         description="did the process get past setup into the experiment? None means not assessed. "
@@ -1360,11 +1830,145 @@ class ProbeResult(_Base):
 # --------------------------------------------------------------------------- #
 # ④ REPORT (S4)
 # --------------------------------------------------------------------------- #
+class ScientificFinding(_Base):
+    """One finding as a REVIEWER reads it: what kind of issue, and what became of it.
+
+    A projection, not a new judgement. Every field is copied from a `Finding`, the
+    `ReviewQuestion` it raised, or the `TargetOutcome` that pursued it — `stages/report`
+    assembles it and decides nothing. It exists because the primary output of this system
+    is a set of scientific findings with resolution states, and reading that off three
+    joined artifacts at render time is how a report starts to disagree with its own ledger.
+
+    The three axes are three fields here for the same reason they are three axes
+    everywhere else: `scientific_class` says what kind of problem it is,
+    `resolution_status` whether it was settled, `evidence_state` what the route produced.
+    A single label would destroy two of them, and a colour destroys all three.
+    """
+
+    finding_id: str = ""
+    scientific_class: str = Field(default="UNRESOLVED_QUESTION", description=" | ".join(SCIENTIFIC_CLASSES))
+    title: str = ""
+    statement: str = ""
+    lens: str = Field(default="", description="who raised it")
+    corroborating_lenses: list[str] = Field(
+        default_factory=list,
+        description="other lenses that reached the same question at the same address. "
+                    "Independent agreement, recorded — it raises no severity anywhere.")
+    severity: str = Field(
+        default="",
+        description="the severity `overall_verdict` counts, after every cap. With grading "
+                    "off this IS the lens's own asserted severity — `stages.report.counted` "
+                    "falls back to it, which is what makes turning grading off reproduce "
+                    "the pre-grading decision exactly. It is not independently verified "
+                    "unless `--auto-grade` ran.")
+    confidence: str = Field(default="", description="the lens's own, bounded by its evidence")
+    claim_ref: str = Field(default="", description="the address in the paper")
+    evidence_quote: str = ""
+    evidence_class: str = Field(default="", description="how the quotation re-verified")
+
+    # --- the question this finding raises, and what became of it ----------------------
+    question_id: str = ""
+    question: str = Field(default="", description="the question, as a question")
+    why_material: str = ""
+    evidence_needed: str = Field(default="", description="what would settle it")
+    resolution_status: str = Field(default="NOT_INVESTIGATED", description=" | ".join(RESOLUTION_STATES))
+    evidence_state: str = Field(default="NOT_INVESTIGATED", description=" | ".join(EVIDENCE_STATES))
+    experiment_necessity: str = Field(default="NO_EXPERIMENT_NEEDED", description=" | ".join(EXPERIMENT_NECESSITY))
+    evidence_refs: list[str] = Field(default_factory=list)
+    conclusion: str = Field(default="", description="what follows scientifically, if anything")
+
+
+class ReviewOutcome(_Base):
+    """The four rows a human reviewer reads first — see `harness/outcome.py`.
+
+    Four independent folds over disjoint inputs, so that "what did this review establish
+    about the paper" and "what happened when we tried to run something" can never be the
+    same sentence. Every field is derived from a decision an earlier stage already made:
+    `finding_state` from `claim_status`, which is where the provenance ceiling was applied;
+    `execution_state` from each `TargetOutcome`'s own derived `evidence_state`, which is
+    where it was applied a second time. Nothing here is stored by a stage and read back by
+    another, and no model writes any of it.
+
+    `triage` and `claim_status` are CARRIED, not decided. They exist on this object so the
+    block a reader sees and the threshold table that produced the colour cannot disagree.
+    """
+
+    paper_id: str = ""
+    execution_actor: str = Field(
+        default="",
+        description="whose program produced the evidence the execution row describes, in "
+                    "the reader's words, derived from provenance alone. The two execution "
+                    "states that say anything about the paper used to name the authors' "
+                    "code unconditionally, while being reachable from all three admissible "
+                    "provenances - so a reimplementation that disagreed with a paper "
+                    "accused the authors' code of producing the disagreement.")
+    finding_state: str = Field(
+        default="NO_CONCERN_SURVIVED_VERIFICATION",
+        description="MATERIAL_FAILURE_ESTABLISHED | CONCERNS_RECORDED | "
+                    "NO_CONCERN_SURVIVED_VERIFICATION — what this review established about "
+                    "the paper's science. A function of `claim_status` and the kept findings "
+                    "and of nothing about execution, so a blocked, refused or inadmissible "
+                    "run cannot move it.")
+    finding_detail: str = ""
+    question_state: str = Field(
+        default="NO_QUESTION_RAISED",
+        description="ALL_QUESTIONS_SETTLED | SOME_QUESTIONS_SETTLED | NO_QUESTION_SETTLED | "
+                    "NO_QUESTION_RAISED — what became of the questions the review raised.")
+    question_detail: str = ""
+    execution_state: str = Field(
+        default="NO_EXECUTION_WARRANTED",
+        description="EXECUTION_CONTRADICTED_A_PRINTED_QUANTITY | "
+                    "EXECUTION_REPRODUCED_A_PRINTED_QUANTITY | "
+                    "EXECUTION_PRODUCED_NO_ADMISSIBLE_EVIDENCE | "
+                    "EXECUTION_BLOCKED_BEFORE_IT_STARTED | "
+                    "EXECUTION_WARRANTED_AND_NOT_ATTEMPTED | NO_EXECUTION_WARRANTED. Only the "
+                    "two that name a printed quantity say anything about the paper; the other "
+                    "four are facts about a plan, an artifact, a host or a gate.")
+    execution_detail: str = Field(
+        default="",
+        description="THE EXACT REASON, carried verbatim from the target outcome. An execution "
+                    "that settled nothing must be able to say why in the same breath, or "
+                    "'did not produce admissible evidence' becomes another opaque token.")
+    scope_state: str = Field(
+        default="NO_TARGET_PURSUED",
+        description="CENTRAL_CLAIMS_LEFT_UNCHECKED | SOME_TARGETS_PURSUED | NO_TARGET_PURSUED — "
+                    "how much of the paper the three rows above are an assessment of.")
+    scope_detail: str = ""
+    claim_status: str = Field(default="NOT_VERIFIED", description="carried, not decided here")
+    triage: str = Field(default="GREEN", description="carried, not decided here; routing only")
+
+
 class EvalReport(_Base):
     paper_id: str
     title: str = ""
     verdict: str = Field(default="", description="RED | GREEN — the binary paper-level decision")
     verdict_reason: str = Field(default="", description="the deterministic rule that produced the verdict")
+    triage: str = Field(
+        default="",
+        description="RED | YELLOW | GREEN — the REVIEW-level decision a first-pass reviewer "
+                    "hands to a human. A strict projection of `verdict`: triage RED is binary "
+                    "RED, unchanged and unreachable by accumulation, and the split is inside "
+                    "the old GREEN. YELLOW means a verified MAJOR concern or a central claim "
+                    "this review could address and did not settle — neither of which is an "
+                    "accusation, and neither of which is 'checked and clean'. See "
+                    "`stages/report.triage`.",
+    )
+    triage_reason: str = Field(default="", description="the deterministic fold that produced `triage`")
+    targets_summary: dict = Field(
+        default_factory=dict,
+        description="how many targets ended in each disposition. A paper now has a SET of "
+                    "targets and they end differently; a single reproduction status cannot "
+                    "carry 'one blocked, one reproduced, one failed'.",
+    )
+    review_efficiency: dict = Field(
+        default_factory=dict,
+        description="`CaseLedger.efficiency`, carried here so the conditional-escalation claim "
+                    "is checkable from the report alone: questions generated, how many closed "
+                    "without running anything, how many escalated, which gate stopped the rest.",
+    )
+    reviewer_report_path: str = Field(
+        default="", description="the concise 1-2 page report a human actually reads")
+    ledger_path: str = Field(default="", description="the machine-readable evidence trace")
     claim_status: str = Field(
         default="",
         description="VERIFIED_FAILURE | VERIFIED_SUPPORT | NOT_VERIFIED — the epistemic state the "
@@ -1386,7 +1990,33 @@ class EvalReport(_Base):
                     "SYNTHESIZED_DIAGNOSTIC so nothing unrecognised is ever reported as the "
                     "authors' own code.",
     )
+    disposition: str = Field(
+        default="NOT_REVIEWED",
+        description="WHAT HAPPENS TO THE PAPER: " + " | ".join(PAPER_DISPOSITIONS) + ". "
+                    "Folded by `harness.disposition.derive` and carried here, never decided "
+                    "here. This is NOT a fifth verdict and does not replace the colour: "
+                    "`triage` sorts a queue, `verdict` is the binary claim decision, "
+                    "`claim_status` is the epistemic state underneath it, and this is the "
+                    "ACTION. STOP_MATERIAL_FAILURE is exactly claim_status == "
+                    "VERIFIED_FAILURE, asserted as an identity so the two cannot disagree.",
+    )
+    disposition_basis: str = Field(
+        default="NONE",
+        description="ON WHAT a material failure was established: " + " | ".join(DISPOSITION_BASIS)
+                    + ". NONE for every disposition that is not a stop. Kept apart from the "
+                    "disposition because 'four lenses agreed and the blinded grader "
+                    "sustained it' and 'the authors' own code did not produce the number' "
+                    "are different things to hand a referee.",
+    )
+    disposition_reason: str = Field(
+        default="", description="the deterministic rule that produced `disposition`")
     findings: list[Finding] = Field(default_factory=list)
+    scientific_findings: list[ScientificFinding] = Field(
+        default_factory=list,
+        description="the PRIMARY output: every kept finding as a scientific category with a "
+                    "resolution state, joined to the question it raised. `findings` above is "
+                    "the raw lens-level record and stays exactly as it was; this is what the "
+                    "reviewer report and the evaluation layer read.")
     unasked_question: str = ""
     n_pages: int = 0
     n_sections: int = 0
@@ -1433,6 +2063,49 @@ class EvalReport(_Base):
                     "while the deterministic table says GREEN. The one consequence of the "
                     "dissent: it demands human attention (a contested banner, `run.py` exit 3), "
                     "never a change of color.",
+    )
+    claim_status_reason: str = Field(
+        default="",
+        description="the deterministic rule that produced `claim_status`. Discarded at the "
+                    "call site until the reader-facing outcome block needed to state it: "
+                    "'nothing was established' and 'a reproduction failed' are the same "
+                    "field with opposite reasons.")
+    artifact_state: str = Field(
+        default="",
+        description="HARNESS-WRITTEN: NO_ARTIFACT_ADVERTISED | ARTIFACT_NOT_FETCHED | "
+                    "ARTIFACT_UNOBTAINABLE | ARTIFACT_PRESENT_UNUSABLE | "
+                    "ARTIFACT_PRESENT_USABLE | ARTIFACT_UNASSESSED. Derived by "
+                    "`taxonomy.artifact_state`; only the first is a fact about the paper. "
+                    "`execution_provenance` read SYNTHESIZED_DIAGNOSTIC for four of these, "
+                    "so the review could not say whether the authors published anything.")
+    review_path: str = Field(
+        default="",
+        description="HARNESS-WRITTEN: PAPER_ONLY | PAPER_AND_ARTIFACT. Which of the two "
+                    "review paths this paper was on, which decides what evidence was "
+                    "reachable: only the artifact path can produce an admissible "
+                    "reproduction, and only the paper-only path reaches the governed "
+                    "reconstruction route.")
+    coverage: "CoverageReport | None" = Field(
+        default=None,
+        description="HARNESS-WRITTEN: structural review-surface coverage, with the paper's own "
+                    "addressable surface as the denominator. NOT issue recall — see "
+                    "`harness/coverage.py` and `CoverageReport.semantic_coverage`.")
+    document_observations: list["DocumentObservation"] = Field(
+        default_factory=list,
+        description="HARNESS-WRITTEN: mechanically determined document-level facts. Its own "
+                    "list, never `findings`, and it gates nothing — see "
+                    "`harness/docintegrity.py`. Each says whether it is about the PAPER or "
+                    "about this harness's EXTRACTION.")
+    guarantees: "ReviewGuarantees | None" = Field(
+        default=None,
+        description="HARNESS-WRITTEN: what this review guarantees and what it explicitly does "
+                    "not, with the artifact that establishes each. See `harness/guarantees.py`.")
+    outcome: "ReviewOutcome | None" = Field(
+        default=None,
+        description="HARNESS-WRITTEN: the four rows a reviewer reads first — what was "
+                    "established, what was settled, what execution produced, how much was "
+                    "looked at. A pure projection of fields decided upstream; see "
+                    "`harness/outcome.py` for why the four are folded separately.",
     )
     n_figures: int = Field(default=0, description="figure captions extracted (citable as F<n>)")
     n_equations: int = Field(default=0, description="display equations extracted (citable as E<n>)")
@@ -1537,6 +2210,15 @@ class CorpusEntry(_Base):
     failure_kind: str = Field(default="", description=" | ".join(FAILURE_KINDS))
     resume_after: str = ""
     report_path: str = ""
+    disposition: str = Field(
+        default="NOT_REVIEWED",
+        description="WHAT HAPPENS TO THIS PAPER: " + " | ".join(PAPER_DISPOSITIONS) + ". "
+                    "Distinct from `state`, which says how the RUN ended: a paper can be "
+                    "`completed` and still be STOP_MATERIAL_FAILURE or BLOCKED_ARTIFACT, "
+                    "and until this field existed both mapped to `completed` with the "
+                    "difference visible only inside the report.")
+    disposition_basis: str = Field(
+        default="NONE", description=" | ".join(DISPOSITION_BASIS))
 
 
 class CorpusReport(_Base):
@@ -1549,6 +2231,196 @@ class CorpusReport(_Base):
     by_state: dict[str, list[str]] = Field(default_factory=dict)
     complete: bool = Field(default=False, description="every requested paper reached `completed`")
     summary: str = ""
+
+
+# --------------------------------------------------------------------------- #
+# ⑦ REVIEW-SURFACE COVERAGE — structural, never issue recall
+# --------------------------------------------------------------------------- #
+# The measure this project is entitled to make. There is no adjudicated ground truth for
+# any paper in the corpus, so precision and recall over "real issues" are not computable
+# and are not computed (`harness/evaluation.LIMITATIONS` says so in the artifact). What IS
+# computable is how much of the paper's own addressable surface a review connected to a
+# question, and against WHAT denominator.
+#
+# The denominator that must never be used is the one this system already published:
+# `targets_addressable / targets_discovered` divides the harness's own object list by
+# itself, and because an unresolvable reference never becomes an object at all, a WORSE
+# extractor scores HIGHER. A denominator that improves when the measurement degrades is
+# not a denominator. See `harness/coverage.py`.
+SURFACE_KINDS = ("table_cell", "figure", "equation", "section_span", "reported_quantity")
+
+
+class ReviewSurface(_Base):
+    """The paper's own addressable surface, enumerated from `PaperDoc` and nothing else.
+
+    `harness.coverage.surface` takes a `PaperDoc` and NOTHING derived from the review, so
+    the numerator cannot redefine the denominator. That is a signature-level guarantee of
+    the same kind `grading.derive` makes: the fabrication is inexpressible rather than
+    merely absent.
+
+    `content_sha` records WHICH DOCUMENT this was computed over, because a coverage number
+    with no document identity can be quoted beside any paper.
+    """
+
+    paper_id: str = ""
+    content_sha: str = Field(
+        default="", description="sha256[:12] of the PDF bytes this surface was computed over")
+    addresses: list[str] = Field(
+        default_factory=list,
+        description="every addressable unit, deduplicated, each re-resolvable by "
+                    "`claims.resolve` against the same document")
+    by_kind: dict[str, int] = Field(default_factory=dict, description=" | ".join(SURFACE_KINDS))
+    table_cells_nonempty: int = 0
+    table_cells_total: int = Field(
+        default=0, description="every row x column slot, including the empty padding cells "
+                               "`pdf.render_tables` skips and the lens therefore never saw")
+    sections: int = 0
+    prose_chars_total: int = Field(default=0, description="extracted section text, in full")
+    prose_chars_presented: int = Field(
+        default=0,
+        description="how much of it `pdf.render_sections` actually placed in the lens prompt. "
+                    "The prompt has a character budget divided across sections, so a long "
+                    "paper is TRUNCATED before a lens reads it — the ceiling on any recall "
+                    "claim, and unmeasured until this field existed.")
+    surface_empty: bool = Field(
+        default=True,
+        description="true when extraction recovered no addressable unit at all. A rate over "
+                    "an empty surface is None, never 1.0.")
+
+
+class CoverageReport(_Base):
+    """Two numerators over one denominator, and they are not the same claim.
+
+    `addressed` counts surface units this review minted an address for. `examined` counts
+    units where a route was actually PURSUED. Corpus-wide, 629 of 867 targets ended
+    NOT_INVESTIGATED, so reporting the first as coverage would claim ~93% of papers where
+    nearly three quarters of the targets were never looked at.
+
+    `off_surface` is a DEFECT CHANNEL, not a bucket: an address the review minted that is
+    not in the surface means the two were computed over different documents or the surface
+    enumeration is incomplete. It is reported rather than silently dropped or counted.
+    """
+
+    paper_id: str = ""
+    content_sha: str = ""
+    surface_size: int = 0
+    addressed: int = 0
+    examined: int = 0
+    off_surface: list[str] = Field(default_factory=list)
+    addressed_rate: float | None = None
+    examined_rate: float | None = None
+    prose_presented_fraction: float | None = None
+    by_kind_addressed: dict[str, int] = Field(default_factory=dict)
+    # ALWAYS PRESENT, and always this value. Borrowed from the one external repo that got
+    # this right: its claim-coverage report carries `semantic_extraction_coverage:
+    # "not_machine_detectable"` unconditionally, so a clean report cannot be read as
+    # evidence that every substantive claim was found. The same caveat applies here and
+    # for the same reason, so it is a field rather than a paragraph someone may not read.
+    semantic_coverage: str = Field(
+        default="not_machine_detectable",
+        description="Structural coverage says nothing about whether the review found the "
+                    "issues that matter. That question needs adjudicated ground truth, "
+                    "which no paper in this corpus has.")
+
+
+# --------------------------------------------------------------------------- #
+# ⑧ DOCUMENT INTEGRITY — observations, never conclusions
+# --------------------------------------------------------------------------- #
+INTEGRITY_CHECKS = (
+    "CROSSREF_UNRESOLVED",      # the prose cites Figure N and no such object was recovered
+    "OBJECT_UNCITED",           # a recovered object nothing in the prose cites
+    "LABEL_DUPLICATED",         # two tables both printed "Table 10"
+    "LABEL_OUT_OF_ORDER",       # a caption sequence that does not ascend
+    "BODY_UNCAPTIONED",         # a recovered body with no paired caption
+    "NUMBERING_GAP",            # a label set with a hole in it
+    "SECTION_REF_UNRESOLVED",   # "Section 4.2" with no such numbered heading
+    "TABLE_ARITHMETIC",         # an average column that does not average its own row
+    "PROSE_CELL_MISMATCH",      # the prose states a number the cited cell does not carry
+    "CAPTION_LABEL_CONFLICT",   # a caption's printed label disagrees with its neighbours
+)
+
+# WHOSE PROPERTY the observation is, and the field is required because getting this wrong
+# is the whole risk of the layer. A naive "referenced but missing" check over the shipped
+# corpus produced twelve observations of the second kind and none of the first: every
+# table and equation it called absent is present in the paper and merely absent from what
+# extraction recovered. Reporting those as defects would make a colour a property of
+# extraction quality, which is the same failure the removed count-of-findings threshold had.
+INTEGRITY_ABOUT = (
+    "PAPER",        # a property of the document the authors published
+    "EXTRACTION",   # a property of what this harness recovered from it
+)
+
+
+class DocumentObservation(_Base):
+    """One mechanically determined document-level fact. NOT a finding, NOT a severity.
+
+    Modelled on `CodeAudit.runtime`'s `RuntimeDemand`, which goes in its own list and
+    never in `findings` "because a requirement filed there would be read as an
+    accusation", and which gates nothing. The same posture applies here, and more
+    strongly: these observations are kept apart from scientific validity unless a
+    scientific consequence is DEMONSTRATED, and nothing in this layer demonstrates one.
+
+    DELIBERATELY ABSENT: `severity`, `confidence`, `scientific_class`, `candidate_class`,
+    `counted_severity`, `verdict`, `route`. Their absence is asserted by a field-absence
+    test, because a field that exists is a field something will eventually read.
+    """
+
+    check: str = Field(default="", description=" | ".join(INTEGRITY_CHECKS))
+    about: str = Field(description="REQUIRED, no default: " + " | ".join(INTEGRITY_ABOUT))
+    ref: str = Field(default="", description="an address `claims.resolve` can re-derive, or ''")
+    quote: str = Field(default="", description="verbatim from the parsed document")
+    page: int = 0
+    detail: str = Field(
+        default="",
+        description="the reader-facing sentence. An EXTRACTION observation must say so in "
+                    "its own words rather than relying on the `about` field being read.")
+
+
+# --------------------------------------------------------------------------- #
+# ⑨ GUARANTEES AND NON-GUARANTEES
+# --------------------------------------------------------------------------- #
+GUARANTEE_KINDS = (
+    "PROCESS",     # something this system enforces mechanically, per review
+    "SCIENTIFIC",  # something about the paper. This system makes NONE of these.
+)
+
+
+class Guarantee(_Base):
+    """One thing this system does or does not promise, and what makes it checkable.
+
+    Split by KIND because the two are constantly confused: "every evidence pointer was
+    re-verified against the parsed paper" is a process guarantee this system enforces and
+    can be checked per review, while "every important issue was found" is a scientific
+    guarantee it does not make and could not check without adjudicated ground truth.
+    A system that lists both under one heading is inviting the second to be read off the
+    first.
+    """
+
+    kind: str = Field(default="PROCESS", description=" | ".join(GUARANTEE_KINDS))
+    statement: str = ""
+    holds: bool = Field(
+        default=False,
+        description="for a PROCESS guarantee, whether it held FOR THIS REVIEW, established "
+                    "from an artifact rather than asserted")
+    evidence: str = Field(default="", description="the artifact and field that establishes it")
+
+
+class ReviewGuarantees(_Base):
+    """What this review guarantees, what it explicitly does not, and why.
+
+    Non-guarantees are first-class and are printed. The list is closed and paper-agnostic:
+    it describes the SYSTEM, so nothing in it may be derived from a paper's identity or
+    from how a particular review turned out. Only `Guarantee.holds` and `evidence` are
+    per-review, and both are read off artifacts.
+    """
+
+    paper_id: str = ""
+    guarantees: list[Guarantee] = Field(default_factory=list)
+    non_guarantees: list[str] = Field(default_factory=list)
+    unmet: list[str] = Field(
+        default_factory=list,
+        description="PROCESS guarantees that did NOT hold for this review. A non-empty list "
+                    "is a defect in this harness, not a finding about the paper.")
 
 
 class ExperimentalChain(_Base):
@@ -1602,7 +2474,750 @@ class ExperimentalChain(_Base):
 # RETRIES; it does not JUDGE. It cannot authorize an execution, choose a backend, set an
 # identity state, or write a reconciliation status — every one of those stays in the
 # deterministic layer underneath, and the controller only records the answer it got.
-PHASES = ("ingest", "audit", "collect", "grade", "probe", "report", "done")
+# --------------------------------------------------------------------------- #
+# ③b QUESTIONS, TARGETS, PLANS, LEDGER (S3a — the review's own reasoning state)
+# --------------------------------------------------------------------------- #
+# What a discovery pass may find. These are the OBJECTS a first-round reviewer argues
+# about, and the reason the list is closed is the same reason every other vocabulary here
+# is closed: an open one lets a model name its own category and thereby escape whatever
+# rule is keyed on the category.
+DISCOVERY_KINDS = (
+    "SCIENTIFIC_CLAIM",           # an assertion the paper makes about the world
+    "EXPERIMENTAL_RESULT",        # a printed number, in a table or in prose
+    "BASELINE_COMPARISON",        # a comparison against another method
+    "ABLATION",                   # a component removed to attribute the gain
+    "CONTROL",                    # a condition that isolates an explanation
+    "DATASET_RESULT",             # a result on one named dataset
+    "ERROR_ANALYSIS",             # a qualitative or per-class breakdown
+    "IMPLEMENTATION_CLAIM",       # a claim about the released artifact
+    "REPRODUCTION_TARGET",        # a printed quantity an execution could re-derive
+    "UNANSWERED_REVIEW_QUESTION", # a question the paper leaves open
+)
+
+# How much the paper's central conclusion rests on this object. Set by the harness from
+# structural evidence (is it in the abstract? is it the compared-against number? does a
+# finding attack it?), NOT read from a model — a model that could declare its own target
+# central could raise the priority of whatever it happened to find first.
+CENTRALITY = ("CENTRAL", "SUPPORTING", "PERIPHERAL", "UNASSESSED")
+
+# WHICH of `harness_addressable`'s three requirements failed. The conjunction is one
+# boolean and the three failures are three different facts about three different things:
+# the first is a limit of this harness's extraction, the second of the paper's reporting,
+# the third of this harness's method inventory. Collapsing them told 52 of 52 corpus
+# targets that their address could not be built while printing the address.
+ADDRESSING_BLOCKERS = (
+    "NONE",                # addressable
+    "ADDRESS_UNRESOLVED",  # no address in the parsed paper the harness can re-derive
+    "QUANTITY_UNPARSED",   # the kind needs a printed quantity and none parsed unambiguously
+    "NO_ROUTE",            # addressed and quantified; no route this system has applies
+)
+
+# The ways a question can be answered, cheapest first. The ORDER is load-bearing:
+# `harness.planner` walks it and stops at the first admissible route, which is what makes
+# "escalate only when justified" a property of the code rather than an instruction.
+VERIFICATION_ROUTES = (
+    "PAPER_INTERNAL_CHECK",           # the paper contradicts itself; no execution needed
+    "ARITHMETIC_RECHECK",             # the printed composition does not evaluate
+    "ARTIFACT_INSPECTION",            # static reading of the released repository
+    "AUTHOR_CODE_EXECUTION",          # run the authors' own checkout
+    "INDEPENDENT_RECONSTRUCTION",     # rebuild the method from the paper's specification
+    "FOCUSED_VALIDATION_EXPERIMENT",  # a new experiment that discriminates explanations
+    "LITERATURE_SEARCH",              # prior-art / novelty, when the tooling exists
+    "NONE",                           # scientifically relevant, no legitimate route
+)
+
+# What became of one applicable (review question, evidence route) pair.  This is a
+# separate vocabulary from TARGET_DISPOSITIONS: a target is one executable/checkable
+# object, while a route attempt answers whether the review exhausted one way of answering
+# the question.  In particular, COMPLETED_INCONCLUSIVE records work which finished but did
+# not settle the scientific question (the canonical case is PAPER_INTERNAL_CHECK merely
+# re-verifying a quotation).
+ROUTE_ATTEMPT_STATES = (
+    "DISCHARGED_RAN",
+    "DISCHARGED_COMPLETED",
+    "DISCHARGED_BLOCKED",
+    "COMPLETED_INCONCLUSIVE",
+    "GATE_CLOSED",
+    "DEFERRED_BUDGET",
+    "DEFERRED_POLICY",
+    "NOT_TRIED",
+)
+
+# Where one target ended up. Every one of these is TERMINAL for that target and for that
+# target only — the paper's evidence collection continues. That is the whole point of the
+# type: a single blocked target used to end the paper's reproduction outright.
+TARGET_DISPOSITIONS = (
+    "PENDING",
+    "REPRODUCED",
+    "FAILED_REPRODUCTION",
+    "PAPER_ONLY_RESOLVED",        # settled without running anything
+    # NOT a resolution, and kept apart from the line above because it was one for seven
+    # papers and should not have been. The paper-only route has two branches and they
+    # establish different things: re-evaluating a composition the paper printed
+    # (ARITHMETIC_RECHECK) settles whether the paper's own arithmetic holds, while
+    # re-verifying the QUOTATION behind a concern (PAPER_INTERNAL_CHECK) establishes only
+    # that the concern rests on text the paper really contains. The second answers nothing
+    # about whether the concern is correct — `stages/discover._paper_only_outcome` says so
+    # in its own reason string — yet both shared PAPER_ONLY_RESOLVED, so the review filed
+    # the disputed sentence under "What held up" while its own findings attacked it, and
+    # the funnel counted 20 corpus targets as "settled a question about the paper" when
+    # the honest count was zero. Its evidence state is NOT_INVESTIGATED, deliberately.
+    "CITATION_VERIFIED_ONLY",     # the quotation is real; the concern was not settled
+    # A THIRD fact that used to share PAPER_ONLY_RESOLVED's label, and the one that
+    # actually matters: the ARITHMETIC_RECHECK branch settles the paper's own composition
+    # in EITHER direction, and "it agrees" and "it does not" are opposite conclusions, not
+    # two readings of one disposition. `claims.parse_quantity` recomputes the operands the
+    # paper itself prints and compares the product to the paper's own stated total — no
+    # model judgement, no execution, no repository. When it does not evaluate, that
+    # ESTABLISHES A DEFECT, and `establishes_failure` recognises this disposition
+    # directly, never through `provenance.admits` — this is not reproduction evidence and
+    # must never be judged by the reproduction ceiling, which exists to gate EXECUTION
+    # provenance. Its provenance stays "paper" and always will.
+    #
+    # ESTABLISHED IS NOT MATERIAL. Whether the defect also stops the paper is a separate
+    # question, decided by `harness.materiality` from where the claim sits in the paper:
+    # a contradicted composition in an appendix footnote is established, reported and
+    # ledger-recorded, and does not reject the paper.
+    "PAPER_ARITHMETIC_CONTRADICTION",
+    "SPECIFICATION_BLOCKED",      # the paper does not say enough to run it
+    "ARTIFACT_BLOCKED",           # no code, or the code does not contain the experiment
+    "ENVIRONMENT_BLOCKED",        # dependencies, platform, install
+    "RESOURCE_BLOCKED",           # the hardware this experiment needs is not here
+    # THREE REFUSALS THAT USED TO SHARE ONE LABEL. `harness_addressable` is a
+    # conjunction of three distinct requirements and every failure of any of them landed
+    # on ADDRESSING_BLOCKED, whose reader-facing sentence is "this review could not build
+    # a re-derivable address for the claim". Over the shipped corpus that sentence was
+    # printed 39 times across six of seven reviews and was FALSE every time: all 52
+    # targets carrying it have a RESOLVED address, and in one review it sits two lines
+    # under the printed address it claims not to have. The real blocker in all 52 was
+    # that no verification route applies. A reviewer needs the three apart, because one
+    # is our extraction, one is the paper's reporting, and one is our method inventory.
+    "ADDRESSING_BLOCKED",         # WE could not build an address for the claim
+    "REPORTING_BLOCKED",          # the paper prints no unambiguous quantity to compare against
+    "NO_ROUTE_AVAILABLE",         # addressed and quantified; no route this system has applies
+    "IDENTITY_BLOCKED",           # what would run is not bound to what was printed
+    # Identity says the right program would run; this says its output could not be
+    # held against anything. A focused validation experiment compares two arms and
+    # this harness could build one; an artifact-inspection route answers a presence
+    # question this system has no admissible evidence model for. A limit of our
+    # method inventory, like NO_ROUTE_AVAILABLE and unlike ARTIFACT_BLOCKED — and, on
+    # a CENTRAL target, `disposition.BLOCKER_FOR_DISPOSITION` maps it to METHOD for
+    # exactly that reason: a central claim this review had no comparison for must
+    # never read as a paper checked and found clean.
+    "COMPARISON_BLOCKED",         # nothing this run produced could be compared
+    "AUTHORIZATION_BLOCKED",      # a gate refused; a fact about this harness
+    "INCONCLUSIVE",               # it ran and settled nothing
+    "NO_EXPERIMENT_NEEDED",       # the referee judged none necessary — a review outcome
+    "BUDGET_DEFERRED",            # warranted, ordered, and past this run's target budget
+    # A material failure was already established from the paper itself, so the investigation
+    # branch stopped. A property of the REVIEW's own conclusion, never of the target.
+    "SUPERSEDED_BY_ESTABLISHED_FAILURE",
+    "NOT_ATTEMPTED",
+)
+
+# None of these is a statement about the PAPER except the two that name a reproduction.
+# `harness.stages.report` keys on that distinction, and invariants 4-7 in CLAUDE.md are
+# the reason: a failed install is a fact about this host.
+BLOCKED_DISPOSITIONS = ("SPECIFICATION_BLOCKED", "ADDRESSING_BLOCKED", "REPORTING_BLOCKED",
+                        "NO_ROUTE_AVAILABLE", "ARTIFACT_BLOCKED", "ENVIRONMENT_BLOCKED",
+                        "RESOURCE_BLOCKED", "IDENTITY_BLOCKED", "AUTHORIZATION_BLOCKED",
+                        "COMPARISON_BLOCKED")
+
+# What the planner decided to DO about a target. Separate from the disposition because
+# "we decided no experiment was needed" and "we tried and were blocked" are different
+# facts, and a system that cannot say the first one has to pretend it tried.
+PLAN_ACTIONS = (
+    "NO_EXPERIMENT_NEEDED",
+    "PAPER_ONLY_RESOLUTION",
+    "AUTHOR_CODE_REPRODUCTION",
+    "INDEPENDENT_RECONSTRUCTION",
+    "FOCUSED_VALIDATION_EXPERIMENT",
+    "MECHANISM_TEST_ONLY",
+    "INFEASIBLE_SPECIFICATION",
+    "INFEASIBLE_ADDRESSING",
+    # The two that used to be folded into the line above. See TARGET_DISPOSITIONS.
+    "INFEASIBLE_REPORTING",
+    "INFEASIBLE_ROUTE",
+    "INFEASIBLE_ARTIFACT",
+    "INFEASIBLE_ENVIRONMENT",
+    # Two deferrals. Neither is a judgement that no experiment is needed — one target is
+    # answered by another target's run, the other is outranked by a more central claim.
+    # Folding them into NO_EXPERIMENT_NEEDED made "the referee decided not to run this"
+    # and "the referee is running it under another name" the same number.
+    "DEFERRED_TO_ANOTHER_TARGET",
+    "OUTRANKED_BY_CENTRAL_TARGET",
+    # The paper's own evidence already settled it. NOT a refusal and NOT a blocker: the
+    # referee reached a conclusion and there is nothing left for an experiment to add.
+    # Reproducing a claim already disproved from the paper buys nothing, so this is a
+    # NO_EXPERIMENT_NEEDED necessity like the two deferrals above it, and its evidence
+    # state is NOT_INVESTIGATED because declining to run something settles nothing on the
+    # evidence axis (invariant 22).
+    "SUPERSEDED_BY_ESTABLISHED_FAILURE",
+)
+
+ACTIONS_REQUIRING_EXECUTION = ("AUTHOR_CODE_REPRODUCTION", "INDEPENDENT_RECONSTRUCTION",
+                               "FOCUSED_VALIDATION_EXPERIMENT", "MECHANISM_TEST_ONLY")
+
+
+# Plan action -> the necessity judgement it embodies. Pure re-labelling of a decision the
+# planner has already made; nothing here decides anything.
+NECESSITY_FOR_ACTION = {
+    "NO_EXPERIMENT_NEEDED": "NO_EXPERIMENT_NEEDED",
+    "PAPER_ONLY_RESOLUTION": "NO_EXPERIMENT_NEEDED",
+    "DEFERRED_TO_ANOTHER_TARGET": "NO_EXPERIMENT_NEEDED",
+    "OUTRANKED_BY_CENTRAL_TARGET": "NO_EXPERIMENT_NEEDED",
+    "SUPERSEDED_BY_ESTABLISHED_FAILURE": "NO_EXPERIMENT_NEEDED",
+    "AUTHOR_CODE_REPRODUCTION": "EXPERIMENT_WARRANTED",
+    "INDEPENDENT_RECONSTRUCTION": "EXPERIMENT_WARRANTED",
+    "FOCUSED_VALIDATION_EXPERIMENT": "EXPERIMENT_WARRANTED",
+    "MECHANISM_TEST_ONLY": "EXPERIMENT_WARRANTED",
+    "INFEASIBLE_SPECIFICATION": "EXPERIMENT_UNDERSPECIFIED",
+    "INFEASIBLE_ADDRESSING": "EXPERIMENT_NOT_EXECUTABLE",
+    "INFEASIBLE_REPORTING": "EXPERIMENT_NOT_EXECUTABLE",
+    # NOT NO_EXPERIMENT_NEEDED, deliberately. Invariant 22 makes NO_EXPERIMENT_NEEDED a
+    # SUCCESSFUL review outcome — the referee judged that nothing runnable would settle
+    # the question. "This system has no method that applies" is a limit of our method
+    # inventory, not a judgement that none is needed, and counting it as success would
+    # inflate the one number invariant 22 exists to keep honest.
+    "INFEASIBLE_ROUTE": "EXPERIMENT_NOT_EXECUTABLE",
+    "INFEASIBLE_ARTIFACT": "EXPERIMENT_NOT_EXECUTABLE",
+    "INFEASIBLE_ENVIRONMENT": "EXPERIMENT_NOT_EXECUTABLE",
+}
+
+# Terminal disposition -> what became of an experiment that was warranted. Only consulted
+# for a target whose plan warranted one; a target that needed no experiment keeps
+# NO_EXPERIMENT_NEEDED whatever its disposition.
+NECESSITY_FOR_DISPOSITION = {
+    "REPRODUCED": "EXPERIMENT_RESOLVED",
+    "FAILED_REPRODUCTION": "EXPERIMENT_RESOLVED",
+    "INCONCLUSIVE": "EXPERIMENT_UNRESOLVED",
+    "SPECIFICATION_BLOCKED": "EXPERIMENT_UNDERSPECIFIED",
+    "ADDRESSING_BLOCKED": "EXPERIMENT_NOT_EXECUTABLE",
+    "REPORTING_BLOCKED": "EXPERIMENT_NOT_EXECUTABLE",
+    "NO_ROUTE_AVAILABLE": "EXPERIMENT_NOT_EXECUTABLE",
+    "ARTIFACT_BLOCKED": "EXPERIMENT_NOT_EXECUTABLE",
+    "ENVIRONMENT_BLOCKED": "EXPERIMENT_NOT_EXECUTABLE",
+    "RESOURCE_BLOCKED": "EXPERIMENT_NOT_EXECUTABLE",
+    "IDENTITY_BLOCKED": "EXPERIMENT_NOT_EXECUTABLE",
+    "COMPARISON_BLOCKED": "EXPERIMENT_NOT_EXECUTABLE",
+    "AUTHORIZATION_BLOCKED": "EXPERIMENT_NOT_EXECUTABLE",
+    # Warranted, ordered, and nothing has happened to it yet. Still warranted — a target
+    # this run did not reach must not be counted as one that ran and settled nothing.
+    "BUDGET_DEFERRED": "EXPERIMENT_WARRANTED",
+    "NOT_ATTEMPTED": "EXPERIMENT_WARRANTED",
+    "PENDING": "EXPERIMENT_WARRANTED",
+    "NO_EXPERIMENT_NEEDED": "NO_EXPERIMENT_NEEDED",
+    # Nothing ran, so an experiment that was warranted still is. Unreachable in practice
+    # — the only producer of this disposition is the PAPER_ONLY_RESOLUTION action, whose
+    # necessity is NO_EXPERIMENT_NEEDED and which therefore never consults this table —
+    # and mapped anyway so the fail-open default (`EXPERIMENT_UNRESOLVED`, "it ran and did
+    # not settle it") can never describe a target on which nothing was executed.
+    "CITATION_VERIFIED_ONLY": "EXPERIMENT_WARRANTED",
+}
+
+# The review-level triage, which is NOT the reproduction status and must never be read as
+# one. See `stages/report.triage` for the fold, and CLAUDE.md invariant 8 for why RED
+# still cannot be reached by accumulation.
+TRIAGE_LEVELS = ("RED", "YELLOW", "GREEN")
+
+
+# WHAT KIND OF QUESTION this is — the semantic unit of investigation.
+#
+# Routing used to key on `has_value`: a target with a parsed printed quantity could reach
+# an executable route and a target without one could not, whatever the question was. That
+# made "did the paper print a number here" the only thing that decided whether a concern
+# could be pursued, and it is the wrong question for most of what a referee asks. An
+# attribution question is not answered by re-deriving the number the paper already
+# published; a missing control is not a number at all.
+#
+# Derived by `harness.questions` from the finding's OWN closed-vocabulary self-
+# classification — `discrepancy_type`, then `baseline_class`, then the lens — exactly as
+# `taxonomy.classify` and the question templates are, so no count, number, metric name or
+# paper identity reaches the derivation and a paper-specific rule stays inexpressible.
+QUESTION_KINDS = (
+    "PRINTED_QUANTITY",       # is the number the paper printed the number its code produces?
+    "COMPOSITION",            # do the paper's own printed operands compose to its total?
+    "ATTRIBUTION",            # is the effect caused by the mechanism the paper credits?
+    "CONTROL_PRESENCE",       # is the comparison or control the claim needs actually there?
+    "PROTOCOL_CONFORMANCE",   # does the procedure match the claim drawn from it?
+    "SPECIFICATION",          # is the quantity or procedure defined well enough to check?
+    "PRIOR_ART",              # is the contribution new relative to published work?
+    # The eighth, and it is not a gap in the list above. A finding that declared no
+    # discrepancy type, no baseline class and no recognised lens has said nothing about
+    # what kind of question it raises, and guessing one would let routing be decided by a
+    # default. Its routes are exactly what `has_value` used to give every target, so an
+    # unclassified question behaves as the whole system did before this vocabulary existed.
+    "UNCLASSIFIED",
+)
+
+
+class ReviewQuestion(_Base):
+    """A methodological concern turned into something answerable.
+
+    A finding says what is wrong. A question says what would settle it, which is the
+    difference between a critique and a review: "the paper changes augmentation and loss
+    weighting together" is an observation, and "is the gain attributable to the
+    augmentation or to the loss weight?" is a question an experiment can discriminate.
+
+    `route` is the harness's decision, not the lens's. A lens may argue that a question
+    matters; whether a route exists is a structural fact about the paper and the artifact.
+    """
+
+    question_id: str = ""
+    question: str = Field(default="", description="the question, as a question")
+    kind: str = Field(
+        default="UNCLASSIFIED",
+        description="WRITTEN BY THE HARNESS: " + " | ".join(QUESTION_KINDS) + ". What KIND "
+                    "of question this is, which is what decides the routes admissible for "
+                    "it. Derived from the finding's own closed-vocabulary self-"
+                    "classification, never from its prose and never from a lens's opinion "
+                    "of what should be run.")
+    from_finding: str = Field(default="", description="the finding_id this was derived from")
+    source_finding_ids: list[str] = Field(
+        default_factory=list,
+        description="every finding that raised this question. Two lenses reaching the same "
+                    "question about the same address is ONE question with two sources — "
+                    "and that agreement is evidence, so it is recorded rather than "
+                    "de-duplicated away at render time.")
+    lens: str = ""
+    claim_ref: ClaimRef | None = Field(
+        default=None,
+        description="the address in the paper this question is about, minted by the harness "
+                    "from the finding's quotation. A question with no address can be asked "
+                    "and cannot be pursued.")
+    why_it_matters: str = Field(default="", description="what turns on the answer")
+    what_would_settle_it: str = Field(default="", description="the evidence that would close it")
+    possible_resolution_routes: list[str] = Field(
+        default_factory=list,
+        description="WRITTEN BY THE HARNESS: the admissible routes, cheapest first. A lens "
+                    "may argue a question matters; whether a route exists is a structural "
+                    "fact about the paper and the artifact.")
+    route: str = Field(default="NONE", description="WRITTEN BY THE HARNESS: " + " | ".join(VERIFICATION_ROUTES))
+    materiality: str = Field(default="UNASSESSED", description=" | ".join(CENTRALITY))
+    resolution_status: str = Field(
+        default="NOT_INVESTIGATED", description="WRITTEN BY THE HARNESS: " + " | ".join(RESOLUTION_STATES))
+    evidence_state: str = Field(
+        default="NOT_INVESTIGATED", description="WRITTEN BY THE HARNESS: " + " | ".join(EVIDENCE_STATES))
+    evidence_refs: list[str] = Field(
+        default_factory=list,
+        description="where the evidence behind the resolution lives — an execution log, a "
+                    "target id, an address in the paper")
+    resolved_without_execution: bool = Field(
+        default=False, description="answered from the paper or the artifact alone")
+    resolution: str = Field(default="", description="the answer, when one was reached")
+    conclusion: str = Field(
+        default="", description="what follows scientifically, when anything does")
+
+    @property
+    def evidence_needed(self) -> str:
+        """Alias for `what_would_settle_it`, which is the stored name. Kept as a property
+        rather than a second field so a reader cannot set one and leave the other."""
+        return self.what_would_settle_it
+
+    @property
+    def is_open(self) -> bool:
+        return self.resolution_status in ("UNRESOLVED", "NOT_INVESTIGATED")
+
+
+class DiscoveredObject(_Base):
+    """One thing the review found worth checking, with its address and its routes.
+
+    **`verifiable_by_experiment` is no longer authoritative anywhere.** A lens may still
+    write it and it is carried here as `proposed_by_lens`, but what decides whether this
+    object can be pursued is `harness_addressable` — a harness-derived conjunction of a
+    resolved `ClaimRef`, a parsed quantity where one is required, and a route that is not
+    NONE. That demotion is the point: the boolean was an unchecked model field standing
+    as the sole gate on the entire execution half of the system.
+    """
+
+    target_id: str = ""
+    kind: str = Field(default="", description=" | ".join(DISCOVERY_KINDS))
+    ref: ClaimRef | None = Field(default=None, description="the resolved address, or None")
+    claim_text: str = Field(default="", description="the claim, in the paper's own words where possible")
+    metric: str = Field(default="", description="the quantity, when the object reports one")
+    expected_value: float | None = Field(default=None, description="what the paper printed")
+    expected_raw: str = Field(default="", description="verbatim, as printed")
+    experiment: str = Field(default="", description="the experiment/configuration this belongs to")
+    centrality: str = Field(default="UNASSESSED", description="WRITTEN BY THE HARNESS: " + " | ".join(CENTRALITY))
+    materiality_basis: str = Field(
+        default="NONE",
+        description="WRITTEN BY THE HARNESS: " + " | ".join(MATERIALITY_BASES) + ". WHY a "
+                    "failure established on this target would be material to a CENTRAL "
+                    "scientific claim, or NONE. A separate axis from `centrality`, which "
+                    "asks only how strongly to prioritise and track this object: "
+                    "`centrality` returns CENTRAL for anything that prints a composition "
+                    "(`self_checking`), which is a fact about the form of a sentence and "
+                    "not about what the paper's conclusion rests on, so it cannot gate a "
+                    "paper-level stop. A basis rather than a bare boolean so the reason is "
+                    "auditable off the artifact. See `harness.materiality` — it is a "
+                    "CONSERVATIVE SUFFICIENT CONDITION and deliberately not a complete "
+                    "materiality model: NONE means 'not machine-established as material', "
+                    "never 'does not matter'.")
+    evidence_requirements: list[str] = Field(
+        default_factory=list, description="what would have to be true to check this")
+    routes: list[str] = Field(default_factory=list, description="admissible routes, cheapest first")
+    discovery_confidence: str = Field(default="", description=" | ".join(CONFIDENCES))
+    status: str = Field(default="PENDING", description=" | ".join(TARGET_DISPOSITIONS))
+    proposed_by_lens: bool = Field(
+        default=False, description="the lens's own `verifiable_by_experiment`, kept as METADATA")
+    harness_addressable: bool = Field(
+        default=False, description="WRITTEN BY THE HARNESS: is this structurally checkable at all")
+    addressing_blocker: str = Field(
+        default="NONE",
+        description="WRITTEN BY THE HARNESS: WHICH of `harness_addressable`'s three "
+                    "requirements failed — " + " | ".join(ADDRESSING_BLOCKERS) + ". The "
+                    "conjunction alone reached the planner as one boolean and left as one "
+                    "refusal, so a paper whose claim we addressed perfectly and had no "
+                    "method for was told its address could not be built.")
+    note: str = Field(default="", description="why it is or is not addressable")
+    counter_explanations: list[str] = Field(
+        default_factory=list,
+        description="the alternative readings the originating finding itself offered, carried "
+                    "through untouched so `planner.plan` can record what an experiment would "
+                    "discriminate between without inventing anything. Empty when the object "
+                    "came from a printed quantity rather than from a finding.")
+    question_id: str = Field(
+        default="",
+        description="the ReviewQuestion this target exists to answer. REQUIRED of every "
+                    "object whose plan requires an execution — `stages/discover.build` "
+                    "mints one for an object the extractor found rather than a lens, so "
+                    "that a run always says which question it was spending compute on.")
+    question_kind: str = Field(
+        default="",
+        description="WRITTEN BY THE HARNESS: " + " | ".join(QUESTION_KINDS) + ", or '' when "
+                    "the object predates this layer. Carried on "
+                    "the object because `discovery._routes` needs it before any question "
+                    "object exists, and because the planner and the probe read it without "
+                    "a lookup. Always equal to the bound question's `kind`.")
+    priority: float = Field(default=0.0, description="WRITTEN BY THE HARNESS: see harness.priority")
+    priority_reason: str = Field(default="", description="which dimensions produced that score")
+
+
+class PlanDecision(_Base):
+    """What the planner decided about one target, and every gate it consulted.
+
+    The gates are recorded rather than summarised because "we did not run this" is only
+    trustworthy when a reader can see WHICH condition failed. A model proposing an
+    experiment gets no say here: `harness.planner.classify` is a pure function of typed
+    structural facts.
+    """
+
+    target_id: str = ""
+    action: str = Field(default="NO_EXPERIMENT_NEEDED", description=" | ".join(PLAN_ACTIONS))
+    route: str = Field(default="NONE", description=" | ".join(VERIFICATION_ROUTES))
+    reason: str = ""
+    gates: dict[str, bool] = Field(
+        default_factory=dict, description="every precondition consulted, by name, and its answer")
+    blocking_gate: str = Field(default="", description="the first gate that failed, '' if none did")
+    requires_execution: bool = False
+    necessity: str = Field(
+        default="NO_EXPERIMENT_NEEDED", description=" | ".join(EXPERIMENT_NECESSITY))
+
+    # --- WHY this escalation, not merely why not ---------------------------------------
+    # `gates` already records every precondition consulted and its answer, which is the
+    # "why not" half. These four are the "why yes" half: a system that spends compute must
+    # be able to answer "why did you spend it on this?" in a machine-readable way, and
+    # "the gates passed" is not that answer.
+    why_material: str = Field(
+        default="", description="what turns on the answer to this target's question")
+    paper_only_insufficient_because: str = Field(
+        default="", description="why the paper's own content could not settle it")
+    inspection_insufficient_because: str = Field(
+        default="", description="why reading the released artifact could not settle it")
+    competing_explanations: list[str] = Field(
+        default_factory=list,
+        description="the readings this experiment would discriminate between. Carried from "
+                    "the finding's own counter-explanations, never invented here.")
+    expected_observation: str = Field(
+        default="", description="what the run should produce if the paper's claim holds")
+
+    # --- STEP 6: route fallback, recorded as an ORDERED LOG rather than an overwrite ----
+    # A target's identity binding against AUTHOR_CODE_EXECUTION is a fact only
+    # `stages/probe.py` can establish — it needs a real checkout — so the FIRST plan for a
+    # target that also offers INDEPENDENT_RECONSTRUCTION cannot know in advance whether a
+    # fallback will be needed. When it is, `harness.planner.plan` is called again with
+    # `author_code_exhausted=True` and `TargetSet.plans` gets a SECOND `PlanDecision` for
+    # the SAME `target_id`, appended after the first. Every existing reader that does
+    # `{p.target_id: p for p in ts.plans}` already keeps the LAST entry for a repeated key,
+    # so this needs no change anywhere that reads "the current plan for this target" — it
+    # only adds meaning for a reader that wants the full attempt history.
+    attempt: int = Field(
+        default=1,
+        description="which attempt this plan represents for its target. 1 is the first "
+                    "route chosen; a re-plan after an earlier attempt's identity failed "
+                    "to bind increments it. Never decided by `plan()` itself — the caller "
+                    "that performs the re-plan numbers its own attempts.")
+    superseded_by: str = Field(
+        default="",
+        description="the ROUTE of the attempt that replaced this one, set on an EARLIER "
+                    "attempt once a later one is made — never set by `plan()`, which does "
+                    "not know its own future. '' means this is the plan currently in force "
+                    "for its target. Never a foreign target_id: a re-plan is a second "
+                    "attempt at the SAME question, not a new one.")
+
+
+class TargetOutcome(_Base):
+    """Where one target ended, with the evidence behind it.
+
+    Independent per target. A paper with a blocked target A and a reproduced target C has
+    two of these, and the report has to explain both rather than reporting whichever one
+    happened to be first.
+    """
+
+    target_id: str = ""
+    disposition: str = Field(default="NOT_ATTEMPTED", description=" | ".join(TARGET_DISPOSITIONS))
+    action: str = Field(default="", description="the PlanDecision.action that led here")
+    route: str = Field(default="NONE", description=" | ".join(VERIFICATION_ROUTES))
+    provenance: str = Field(
+        default="", description="template | synthesized | driver | repo_exec | reimpl_exec")
+    reconciliation: Reconciliation | None = None
+    failure_class: str = Field(default="none", description=" | ".join(FAILURE_CLASSES))
+    reason: str = ""
+    execution_ref: str = Field(
+        default="", description="where the whole record lives, e.g. 'runs/<pid>/execution.jsonl'")
+    attempts: int = 0
+
+    launched: int = Field(
+        default=0,
+        description="processes this target actually STARTED, read off the execution record "
+                    "rather than inferred from a disposition. `judged to warrant an "
+                    "execution` and `an execution happened` are different counts and a "
+                    "funnel that reports one as the other is reporting an intention as a "
+                    "result.")
+    identity_state: str = Field(
+        default="",
+        description="what the EXPERIMENT identity layer concluded for this target: "
+                    + " | ".join(IDENTITY_STATES) + ", or empty when identity was never "
+                    "reached. Carried here because the reconciliation's own copy is "
+                    "written after the provenance ceiling has already returned for a "
+                    "refused probe, and a reader asking WHY nothing bound needs the four "
+                    "answers apart: `no_candidate` (the cited quantity is not something "
+                    "this checkout produces), `ambiguous` (several commands could, and "
+                    "choosing would be a guess), `unsupported` (the repository cannot "
+                    "express what the cell requires) and `unmapped` (nothing was "
+                    "assessed) are four different facts about the artifact.")
+
+    @property
+    def establishes_failure(self) -> bool:
+        """The target-level states that may contribute a material failure. Kept as a
+        property so the fold in `stages/report` cannot accidentally count a blocked
+        target as a failed one.
+
+        TWO STRUCTURALLY SEPARATE ROUTES, deliberately never merged into one condition:
+
+          FAILED_REPRODUCTION  admissible only through `provenance.admits` — the
+                               reproduction-provenance ceiling, which exists to keep a
+                               synthesized or template probe from convicting a paper.
+          PAPER_ARITHMETIC_CONTRADICTION  admissible UNCONDITIONALLY, by disposition
+                               alone, and never through `provenance.admits`. Its
+                               provenance is "paper" — not a member of
+                               `ADMISSIBLE_REPRODUCTION_PROVENANCE` and never meant to
+                               be — because this is not reproduction evidence and the
+                               reproduction ceiling has no authority over it. The
+                               ceiling that DOES apply already ran, inside
+                               `claims.parse_quantity`, before this disposition could
+                               ever be written: the composition must be unambiguous,
+                               deterministically recomputed from the paper's own
+                               printed operands, with no model judgement involved.
+        """
+        from .provenance import admits
+        return ((self.disposition == "FAILED_REPRODUCTION" and admits(self.provenance))
+                or self.disposition == "PAPER_ARITHMETIC_CONTRADICTION")
+
+    # The three scientific axes, DERIVED — never stored, never read from a file, and so
+    # never able to drift from the disposition and provenance they describe. See
+    # `harness.taxonomy` for why they are three and not one.
+    @property
+    def evidence_state(self) -> str:
+        from . import taxonomy
+        return taxonomy.evidence_state(self.disposition, self.provenance)
+
+    @property
+    def resolution_state(self) -> str:
+        from . import taxonomy
+        return taxonomy.resolution_state(self.evidence_state)
+
+    @property
+    def concerns_the_paper(self) -> bool:
+        """Does this outcome say anything about the PAPER, as opposed to about an
+        artifact, a host, or one of this harness's own gates? Invariants 4-7."""
+        from . import taxonomy
+        return taxonomy.concerns_the_paper(self.evidence_state)
+
+    def necessity(self, warranted: bool) -> str:
+        """What became of the experiment-necessity judgement for this target.
+
+        `warranted` comes from the PlanDecision, because a target that needed no
+        experiment keeps NO_EXPERIMENT_NEEDED whatever happened to it afterwards —
+        collapsing the two is how "we decided not to run this" starts being counted
+        beside "we needed to and could not".
+        """
+        if not warranted:
+            return "NO_EXPERIMENT_NEEDED"
+        return NECESSITY_FOR_DISPOSITION.get(self.disposition, "EXPERIMENT_UNRESOLVED")
+
+
+class RouteAttempt(_Base):
+    """Durable accounting for one applicable route for one material review question.
+
+    The booleans are intentionally explicit rather than inferred by consumers.  A route
+    can be attempted and completed without being exhausted: verifying that a quotation
+    exists completes PAPER_INTERNAL_CHECK, but it does not answer whether the concern is
+    correct.  ``source_refs`` makes the row traceable to the paper address, target, plan,
+    and execution record from which it was derived.
+    """
+
+    question_id: str = ""
+    route: str = Field(default="NONE", description=" | ".join(VERIFICATION_ROUTES))
+    target_ids: list[str] = Field(default_factory=list)
+    attempted: bool = False
+    completed: bool = False
+    exhausted: bool = False
+    state: str = Field(default="NOT_TRIED", description=" | ".join(ROUTE_ATTEMPT_STATES))
+    blocker: str = Field(
+        default="",
+        description="typed terminal blocker or harness-owned gate/budget/policy cause")
+    source_refs: list[str] = Field(
+        default_factory=list,
+        description="paper addresses, target ids and execution records supporting this row")
+    reason: str = ""
+
+
+class TargetSet(_Base):
+    """Every target considered for one paper, in priority order, with its disposition.
+
+    The campaign's `manuscript/target_sets.json` was the prototype for this and was
+    hand-curated: no harness module read or wrote it. This is the same accounting, emitted
+    by the pipeline, which is what makes "every plausible target was considered" a
+    checkable property rather than a methodology claim.
+    """
+
+    paper_id: str = ""
+    objects: list[DiscoveredObject] = Field(default_factory=list)
+    questions: list[ReviewQuestion] = Field(default_factory=list)
+    plans: list[PlanDecision] = Field(default_factory=list)
+    outcomes: list[TargetOutcome] = Field(default_factory=list)
+    route_attempts: list[RouteAttempt] = Field(
+        default_factory=list,
+        description="one durable row per applicable implemented route for each central or "
+                    "machine-material question")
+    route_exhaustion_question_ids: list[str] = Field(
+        default_factory=list,
+        description="the exact question denominator used by route-exhaustion coverage")
+    extraction_coverage: dict = Field(
+        default_factory=dict,
+        description="how much of the paper was addressable at all: tables extracted, cells with "
+                    "numbers, prose quantities found, refs that resolved. An empty target set "
+                    "caused by failed table extraction reads identically to a paper with no "
+                    "checkable results unless this is recorded.",
+    )
+
+    def by_id(self, target_id: str) -> DiscoveredObject | None:
+        return next((o for o in self.objects if o.target_id == target_id), None)
+
+    def outcome_for(self, target_id: str) -> TargetOutcome | None:
+        return next((o for o in self.outcomes if o.target_id == target_id), None)
+
+
+class LedgerEntry(_Base):
+    """One traceable line from a paper's own words to a scientific implication.
+
+    The property that matters is that every field is filled from an artifact that already
+    exists — none of it is re-derived prose. For any material conclusion the system must
+    be able to answer: what claim, where stated, what question, which target, why that
+    target, which route, what code at what commit, what happened, what was observed,
+    what published quantity it was compared with, why that comparison is admissible, and
+    what follows.
+    """
+
+    entry_id: str = ""
+    claim_text: str = ""
+    materiality_basis: str = Field(
+        default="NONE",
+        description="WRITTEN BY THE HARNESS: " + " | ".join(MATERIALITY_BASES) + ". Copied "
+                    "from the target's DiscoveredObject so a reader tracing a paper-level "
+                    "stop can see WHY this target was entitled to cause one — or, on an "
+                    "established defect carrying NONE, why it was not.")
+    source_ref: str = Field(default="", description="the ClaimRef address")
+    source_quote: str = ""
+    question: str = ""
+    target_id: str = ""
+    selection_reason: str = Field(default="", description="why this target was prioritised")
+    route: str = ""
+    action: str = ""
+    provenance: str = ""
+    commit: str = ""
+    command: list[str] = Field(default_factory=list)
+    observed: str = Field(default="", description="what the execution produced, in one line")
+    compared_with: str = Field(default="", description="the published quantity, verbatim")
+    admissibility: str = Field(default="", description="why that comparison is or is not admissible")
+    disposition: str = ""
+    implication: str = Field(default="", description="the scientific conclusion, if any, that follows")
+
+    # --- the three axes, carried so the trace can be sorted by any of them -------------
+    evidence_state: str = Field(
+        default="NOT_INVESTIGATED", description=" | ".join(EVIDENCE_STATES))
+    resolution_state: str = Field(
+        default="NOT_INVESTIGATED", description=" | ".join(RESOLUTION_STATES))
+    necessity: str = Field(
+        default="", description="what became of the experiment question for this entry: "
+                                + " | ".join(EXPERIMENT_NECESSITY))
+    concerns_the_paper: bool = Field(
+        default=False,
+        description="does this entry's evidence say anything about the PAPER, as opposed "
+                    "to about an artifact, a host, or one of this harness's gates? The "
+                    "single most misread distinction in the whole trace, so it is a field.")
+    launched: int = Field(default=0, description="processes this entry's target STARTED")
+    why_material: str = Field(default="", description="what turns on this entry's answer")
+
+
+class CaseLedger(_Base):
+    """The machine-readable audit trace for one paper. NOT the reviewer's report.
+
+    Kept separate on purpose: the reviewer report is one to two pages and summarises this,
+    and a human should not have to read the ledger to understand the conclusion. The
+    ledger exists so that any line of the report can be traced back to an artifact.
+    """
+
+    paper_id: str = ""
+    entries: list[LedgerEntry] = Field(default_factory=list)
+    route_attempts: list[RouteAttempt] = Field(
+        default_factory=list,
+        description="the per-question route accounting copied from discovery/targets.json")
+    efficiency: dict = Field(
+        default_factory=dict,
+        description="the conditional-escalation instrumentation: questions generated, resolved "
+                    "without execution, requiring artifact inspection, triggering execution, "
+                    "blocked before execution, seconds spent. Measured, never asserted — a "
+                    "system claiming efficiency it does not count is claiming nothing.",
+    )
+
+
+class PaperAssessment(_Base):
+    """Whether the paper's own evidence already settles it — asked BEFORE anything runs.
+
+    Written by `harness.assessment.assess` from the kept findings and nothing else. The
+    restriction is the point: a gate that could be moved by an execution outcome would let
+    infrastructure decide what a review established, which is invariants 4 to 7 in the one
+    place they would be hardest to notice.
+
+    `material_failure_established` stops the EXPENSIVE INVESTIGATION BRANCH — acquisition,
+    static audit, identity, resources, execution — and stops nothing else. Discovery, the
+    report, the ledger and the four pure layers all still run, because the referee record
+    has to be complete whatever the outcome.
+    """
+
+    material_failure_established: bool = False
+    basis: str = Field(default="NONE", description=" | ".join(DISPOSITION_BASIS))
+    reason: str = Field(default="", description="the deterministic rule that produced this")
+    counted_fatal_ids: list[str] = Field(
+        default_factory=list,
+        description="the findings that stopped the paper, by id. 'We stopped early' is "
+                    "only trustworthy when a reader can see which finding stopped it.")
+
+
+PHASES = ("ingest", "audit", "collect", "grade", "assess", "discover", "probe", "report",
+          "done")
 
 CASE_STATUSES = (
     "pending",    # created, nothing run yet
@@ -1654,6 +3269,19 @@ class CaseState(_Base):
                     "the papers it most needs to be careful about.",
     )
     verdict: str = Field(default="", description="the S4 verdict, once the report exists")
+    assessment: PaperAssessment | None = Field(
+        default=None,
+        description="the ASSESS phase's answer: did the paper's own evidence already "
+                    "establish a material failure? Persisted so a reader of the case can "
+                    "see WHY the investigation branch did or did not run, without "
+                    "re-deriving it from the findings.")
+    disposition: str = Field(
+        default="NOT_REVIEWED",
+        description="WHAT HAPPENS TO THIS PAPER, carried from the report: "
+                    + " | ".join(PAPER_DISPOSITIONS) + ". Persisted on the case so a batch "
+                    "summary can answer 'which of these do I stop?' without re-opening "
+                    "every report.")
+    disposition_basis: str = Field(default="NONE", description=" | ".join(DISPOSITION_BASIS))
     report_path: str = ""
     resume_after: str = Field(
         default="",

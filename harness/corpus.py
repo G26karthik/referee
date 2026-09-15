@@ -61,6 +61,13 @@ def account(requests: list[str], cases: list[CaseState | None]) -> CorpusReport:
             failure_kind=(case.failure_kind if case else ""),
             resume_after=(case.resume_after if case else ""),
             report_path=(case.report_path if case else ""),
+            # WHAT HAPPENS TO THE PAPER, beside how the RUN ended. A case that never
+            # reached a report has no disposition to carry, and NOT_REVIEWED is the
+            # honest value rather than an empty string that reads as "clean".
+            disposition=(getattr(case, "disposition", "") or "NOT_REVIEWED"
+                         if case and state == "completed" else "NOT_REVIEWED"),
+            disposition_basis=(getattr(case, "disposition_basis", "") or "NONE"
+                               if case and state == "completed" else "NONE"),
         ))
 
     by_state = {s: [e.source for e in entries if e.state == s] for s in CORPUS_STATES}

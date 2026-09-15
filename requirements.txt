@@ -1,6 +1,12 @@
-# single-harness local runtime deps. No API client, no cloud SDK — the harness makes
-# no network calls at all.
+# single-harness runtime deps.
 #   uv pip install --python .venv/Scripts/python.exe -r single-harness/requirements.txt
+#
+# The review pipeline itself makes two kinds of network call and both are gated: a
+# `git clone` of the repository a paper advertises (SH_ALLOW_NETWORK, on by default,
+# read-only), and — only with SH_ALLOW_SANDBOX — leasing a remote Linux sandbox to run
+# third-party code somewhere other than this machine. Nothing calls a hosted model: the
+# deterministic stages are plain Python and the judgement stages shell out to whatever
+# reviewer the operator configures.
 pydantic>=2
 
 # S1 ingestion. Two extractors on purpose: fitz gives page text in reading order,
@@ -11,6 +17,27 @@ pdfplumber>=0.11
 # S3 default probe template (imported by the probe subprocess, not by the harness).
 numpy>=1.26
 scikit-learn>=1.4
+
+# REMOTE EXECUTION — the `modal` backend (harness/sandbox.py). Optional: it is imported
+# lazily inside the backend's own methods, never at module level, so a harness without it
+# reports `modal` as unavailable with a reason and every other stage is unaffected.
+# Install it to run a paper's own code on a leased Linux machine instead of this host;
+# credentials and the SH_ALLOW_SANDBOX gate are separate (see .env.sandbox.example).
+#
+# Bounded above deliberately. Every call `harness/sandbox.py` makes was checked against
+# the signatures of 1.5.4 and re-checked against 1.5.5 — `Sandbox.create`,
+# `Sandbox.exec`, `Sandbox.from_id`, `terminate`, `detach`, `App.lookup`,
+# `Image.debian_slim/apt_install/pip_install/env`. An unbounded `>=1.5` would let a 2.x
+# that renames one of them install silently, and the failure would surface as a staging
+# error on someone else's paper rather than as an install-time version conflict.
+modal>=1.5,<2
+
+# TESTS. Not a runtime dependency of the harness, and required to do the first thing
+# HANDOFF.md tells you to do — which is why it is here rather than in a dev-extra nobody
+# reads: a fresh `pip install -r requirements.txt` followed by `pytest tests -q` used to
+# fail with "No module named pytest", so the documented first step did not work for
+# anyone who had not already set this machine up.
+pytest>=8
 
 # OPTIONAL — install to run probes on a local GPU. The probe detects cuda/mps/cpu at
 # runtime and falls back to the sklearn path when torch is absent, so the harness works

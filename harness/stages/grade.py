@@ -19,7 +19,7 @@ import hashlib
 import re
 import time
 
-from .. import grade_driver, grading, pdf, state
+from .. import delegation, grade_driver, grading, pdf, state
 from ..artifacts import Finding, Grade, LensReport, PaperDoc
 from ..config import Config
 from ..prompts import grade as G
@@ -115,8 +115,7 @@ def grade_is_accepted(gdir, slug: str) -> tuple[bool, str]:
         rec = state.read_json(sidecar)
     except Exception:
         return False, "provenance sidecar is not valid JSON"
-    if not isinstance(rec, dict) or rec.get("written_by") not in ("grade_driver",
-                                                                  "manual_accept"):
+    if not isinstance(rec, dict) or rec.get("written_by") not in _ACCEPTED_GRADE_WRITERS:
         return False, f"provenance sidecar written_by={rec.get('written_by') if isinstance(rec, dict) else None!r} not recognized"
     want = rec.get("content_sha256")
     if not want:
@@ -126,8 +125,15 @@ def grade_is_accepted(gdir, slug: str) -> tuple[bool, str]:
     return True, ""
 
 
+# Every writer a validated grade path can produce: the CLI grader, plus every mode the
+# delegation vocabulary admits. ONE set, so a mode cannot be sealed by `accept_grade` and
+# then refused by `grade_is_accepted`, which would read as "the grader never ran".
+_ACCEPTED_GRADE_WRITERS = ("grade_driver",) + tuple(delegation.WRITTEN_BY.values())
+
+
 def accept_grade(cfg: Config, pid: str, slug: str, raw: str, *,
-                 grader: str = "", tool_policy: str = "unrecorded") -> dict:
+                 grader: str = "", tool_policy: str = "unrecorded",
+                 mode: str = "MANUAL") -> dict:
     """The grading analogue of `stages.audit.accept_lens`: validate and seal a grade a
     grader produced OUTSIDE the `grade_driver` subprocess path.
 
@@ -148,8 +154,17 @@ def accept_grade(cfg: Config, pid: str, slug: str, raw: str, *,
     gdir = state.project_dir(cfg, pid) / "audit" / "grade"
     out = gdir / f"{slug}.json"
     state.write_json(out, grade.model_dump())
-    record = {"slug": slug, "paper_id": pid, "written_by": "manual_accept",
-              "grader": grader or "unnamed", "tool_policy": tool_policy,
+    # The mode, recorded, exactly as `accept_lens` records it. A grade produced by an
+    # isolated subagent the controller dispatched and a grade a human typed are different
+    # provenance, and `grade_coverage` reporting one number over both would say a paper's
+    # severities were independently weighed when some of them were not.
+    prov = delegation.provenance_record(mode=mode, reviewer=grader,
+                                        tool_policy=tool_policy)
+    record = {"slug": slug, "paper_id": pid, "written_by": prov["written_by"],
+              "delegation_mode": prov["delegation_mode"],
+              "grader": prov["reviewer"], "tool_policy": prov["tool_policy"],
+              "isolation_claim": prov["isolation_claim"],
+              "tool_policy_provable": prov["tool_policy_provable"],
               "verdict": grade.verdict,
               "content_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
               "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}

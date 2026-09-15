@@ -39,6 +39,7 @@ accuses nobody — refusing to run someone's code is a fact about this harness.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -48,7 +49,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import repo as repo_mod, resources as resources_mod
+from . import (container as container_mod, isolation as isolation_mod, repo as repo_mod,
+               resources as resources_mod)
 from .artifacts import (CommitVerification, ExecAuthorization, ExecCapability, ProbeSpec,
                         RepoAcquisition)
 from .config import Config
@@ -69,6 +71,7 @@ def _text(buf) -> str:
 # and only these may reconcile against a printed cell — the same ceiling `reconcile`
 # enforces, restated here so an unauthorized command cannot even start.
 _REPO_PROVENANCE = "repo_exec"
+_REIMPL_PROVENANCE = "reimpl_exec"
 
 
 # --------------------------------------------------------------------------- #
@@ -186,6 +189,17 @@ class BackendProfile:
     max_walltime_s: int | None = None
     requires_credentials: bool = False
     can_execute: bool = False
+    # HOW STRONGLY this backend confines code it did not write. See `harness.isolation`.
+    #
+    # Distinct from `can_execute`, and both are required for repository execution:
+    # `can_execute` says a process can be started here at all, `isolation` says whether
+    # starting a THIRD PARTY's process here is safe. The local backend answers yes to the
+    # first and VENV to the second, which is exactly the combination that ran a paper's
+    # repository under the operator's own user with their filesystem and network in reach.
+    #
+    # Defaults to NONE so a backend that forgets to declare one is refused rather than
+    # trusted — the same fail-closed direction as `provenance.admits`.
+    isolation: str = "NONE"
     detail: str = ""
     # ponytail: `network_at_runtime` and `reproducibility` are DECLARED and consulted by
     # nothing. `select_for` cannot match them because no requirement encodes the other
@@ -265,6 +279,31 @@ class ExecutionBackend(ABC):
     """
 
     name: str = "abstract"
+    # HOW STRONGLY this backend confines code it did not write (`harness.isolation`).
+    # Declared per class rather than derived, because no runtime probe can establish it:
+    # a backend that confines knows that it does, and one that does not cannot be asked.
+    # NONE by default so a new backend that forgets to declare a level is refused
+    # repository execution rather than silently granted it.
+    isolation: str = "NONE"
+
+    def __init__(self, cfg: Config | None = None) -> None:
+        self._cfg = cfg
+
+    def config(self) -> Config:
+        """The config this backend was SELECTED with, falling back to the environment's.
+
+        `resources()`, `profile()` and `available()` take no arguments — they answer
+        questions about the backend, not about a request — but the answers depend on
+        settings: which interpreter the local backend would use, which accelerator a
+        reservation asks for, whether a gate is open. Re-reading the environment inside
+        each of them made those answers ignore the `cfg` the caller was actually holding,
+        so a selection made against one configuration could be reported against another.
+
+        Optional, and defaulting to a fresh load, because the registry constructs backends
+        by name with no arguments in the interface conformance checks and in
+        `registered_backends`. `select_backend` and `select_for` pass the config through.
+        """
+        return self._cfg if self._cfg is not None else Config.load()
 
     # --- resource / platform checks ---------------------------------------------------
     @abstractmethod
@@ -281,7 +320,12 @@ class ExecutionBackend(ABC):
             name=self.name, platform=r.platform, vram_bytes=r.vram_bytes,
             ram_bytes=r.ram_bytes, disk_bytes=r.disk_bytes, cpu_count=r.cpu_count,
             gpu_count=r.gpu_count, gpu_name=r.gpu_name, python_version=r.python_version,
-            network_at_runtime=True, can_execute=True, detail=r.detail)
+            network_at_runtime=True, can_execute=True,
+            # The measured default describes a backend that runs on THIS host under an
+            # interpreter this harness built, which is VENV and not more. A backend that
+            # genuinely confines overrides `profile()` and says so; `LocalBackend` is the
+            # one that reaches this line, and VENV is the honest answer for it.
+            isolation=self.isolation, detail=r.detail)
 
     @property
     def platform(self) -> str:
@@ -327,6 +371,32 @@ class ExecutionBackend(ABC):
     @abstractmethod
     def cleanup(self, root: Path, pid: str) -> list[str]: ...
 
+    def release(self, root: Path, pid: str) -> tuple[bool, str]:
+        """Give back leased compute, keeping every artifact. Default: nothing was leased.
+
+        Distinct from `cleanup`, and the distinction is a lifetime. `cleanup` removes what
+        provisioning wrote to durable storage — a venv that can be rebuilt — and is called
+        when an operator wants the disk back. `release` ends a *lease*: a machine that is
+        billing right now and whose only reason to exist was this paper.
+
+        Two different callers follow from that. Nothing calls `cleanup` in the pipeline,
+        deliberately: a built environment is worth keeping between runs. `stages/probe.run`
+        calls `release` in a `finally`, because a paper that crashes mid-review must not
+        leave a machine running — that is the one failure mode in this seam that costs the
+        operator money rather than accuracy, and it accrues silently.
+        """
+        return False, "this backend leases nothing, so there is nothing to release"
+
+    def commit_tree(self, cwd: str) -> "repo_mod.GitTree | None":
+        """The tree `verify_commit` must read to certify what THIS backend will run.
+
+        `None` means the local path, which is the whole story for a backend that runs on
+        this machine. A backend that runs elsewhere returns a reader over the checkout it
+        will actually execute — so E2 is enforced against the tree that runs rather than
+        against a same-named directory on the operator's disk.
+        """
+        return None
+
 
 class LocalBackend(ExecutionBackend):
     """This machine, this OS, subprocesses. Exactly the behaviour that existed before.
@@ -338,9 +408,14 @@ class LocalBackend(ExecutionBackend):
     """
 
     name = "local"
+    # A venv scopes imports and wall time. It does not confine the filesystem, the
+    # network, the environment or the user, so it may not host the authors' own code --
+    # see `harness.isolation` and `authorize`'s isolation condition. Declaring anything
+    # stronger here would be a claim this process cannot back up.
+    isolation = "VENV"
 
     def resources(self) -> BackendResources:
-        cfg = Config.load()
+        cfg = self.config()
         vram, gpu_name, gpu_count = resources_mod.host_vram_bytes()
         return BackendResources(
             name=self.name, platform=sys.platform, python=cfg.python,
@@ -397,6 +472,276 @@ class LocalBackend(ExecutionBackend):
         is the evidence the static audit cites, and never `runs/<pid>` itself, which
         holds the probe source and results a reader needs to check the report.
         """
+        env_dir = Path(root) / "runs" / pid / "env"
+        if not env_dir.is_dir():
+            return []
+        shutil.rmtree(env_dir, ignore_errors=True)
+        return [str(env_dir)]
+
+
+class ContainerBackend(ExecutionBackend):
+    """A Linux container on this host. The first backend entitled to run a paper's code.
+
+    The mechanics are in `harness/container.py`; this class is the seam. Everything above
+    it is unchanged: `authorize()` is still the only thing that may permit a run,
+    `verify_commit` still decides whether the tree is the audited one, `assess_capability`
+    still decides whether the repository gets a fair run, and `local_exec.reconcile` still
+    decides what a number may conclude. A containerised reproduction and a local one pass
+    through the identical gates in the identical order.
+
+    **Three things it does differently.**
+
+    *The platform the run will see is linux, and it is measured.* `assess_capability`
+    compares a repository's declared environment against the backend's platform rather
+    than against `sys.platform`, and that parameter existed for exactly this backend. A
+    `linux-64` conda environment is `environment_incompatible` on the Windows host and
+    capable here, with no change to the capability logic itself.
+
+    *The import probe is delegated to the interpreter that will run it.* The venv lives
+    inside the container's filesystem view, so resolving its modules from the host would
+    start nothing and report every dependency missing — refusing a capable environment as
+    `dependency_missing`. `assess_capability` takes a resolver for this reason.
+
+    *The commit is NOT re-verified in a second place, and that is a real difference from
+    the remote sandbox rather than a shortcut.* The sandbox stages a copy onto another
+    machine, so it has to certify the copy. A bind mount is not a copy: the container
+    reads the same bytes on the same disk that `verify_commit` already certified, so
+    `commit_tree` returning None means "the local tree IS the tree that runs", which is
+    true here and false there.
+
+    **What it does not do.** It does not fall back. A daemon that is not running, an image
+    that will not pull, an environment that will not build and a container that will not
+    start are each reported as themselves and refuse, because a fallback to the host would
+    make the isolation requirement advisory.
+    """
+
+    name = "container"
+    # The repository gets its own filesystem, process namespace, user and network stack,
+    # and does not carry the operator's home directory, credentials or PATH. That is what
+    # CONTAINER means in `harness.isolation`, and it is the property that makes running a
+    # stranger's training script defensible. It is not a claim of adversarial containment
+    # against a shared kernel, and `harness/container.py` says so in those words.
+    isolation = "CONTAINER"
+
+    # `available()` and `resources()` are called by `select_for` for EVERY registered
+    # backend on EVERY paper, and the GPU probe starts a container. Cached per process so
+    # a review does not pay for it once per target.
+    _gpu_cache: "tuple[bool, str] | None" = None
+
+    def _gpu(self) -> tuple[bool, str]:
+        if ContainerBackend._gpu_cache is None:
+            if not self.available().usable:
+                ContainerBackend._gpu_cache = (False, "no reachable container runtime")
+            else:
+                ContainerBackend._gpu_cache = container_mod.gpu_available()
+        return ContainerBackend._gpu_cache
+
+    def resources(self) -> BackendResources:
+        """What a container on this host actually gets. Measured from the daemon.
+
+        The memory figure is the daemon's, not the host's. On a Desktop install those
+        differ — the Linux VM is given a slice of the machine — and reporting the host's
+        would hand `select_for` a machine that does not exist, turning an honest resource
+        refusal into a crash inside the experiment.
+        """
+        cfg = self.config()
+        inv = container_mod.inventory()
+        has_gpu, gpu_detail = self._gpu()
+        vram, gpu_name, gpu_count = (resources_mod.host_vram_bytes() if has_gpu
+                                     else (0, "", None))
+        return BackendResources(
+            name=self.name, platform="linux", python="python3",
+            python_version="", has_gpu=has_gpu, vram_bytes=vram,
+            gpu_name=(gpu_name or gpu_detail if has_gpu else ""), gpu_count=gpu_count or None,
+            ram_bytes=inv.get("ram_bytes") or 0,
+            # The mount is a host directory, so the disk a run can fill is the host's.
+            disk_bytes=resources_mod.host_disk_bytes(cfg.projects_dir),
+            cpu_count=inv.get("cpus"),
+            detail=(inv.get("detail") or "container runtime")
+                   + (f", {gpu_detail}" if has_gpu else ", no GPU in containers"))
+
+    def profile(self) -> BackendProfile:
+        r = self.resources()
+        return BackendProfile(
+            name=self.name, platform="linux", vram_bytes=r.vram_bytes, ram_bytes=r.ram_bytes,
+            disk_bytes=r.disk_bytes, cpu_count=r.cpu_count, gpu_count=r.gpu_count,
+            gpu_name=r.gpu_name, python_version=r.python_version,
+            network_at_runtime=False, can_execute=True, isolation=self.isolation,
+            reproducibility="container", detail=r.detail)
+
+    def available(self) -> BackendAvailability:
+        ok, why = container_mod.daemon_status()
+        return BackendAvailability(ok, why)
+
+    def environment(self) -> str:
+        r = self.resources()
+        return " ".join(x for x in (self.name, r.platform, r.detail) if x)
+
+    # --- capability -------------------------------------------------------------------
+    def _mount(self, acq: RepoAcquisition) -> str:
+        """The host directory bind-mounted into the container.
+
+        `runs/<pid>` holds both halves a run needs — `repo/` and `env/` — so one mount
+        covers them and there is exactly one host path to translate.
+        """
+        p = Path(acq.path) if acq.path else None
+        return str(p.parent) if p else ""
+
+    def _resolver(self, acq: RepoAcquisition):
+        """An import probe that runs inside the container, not on this host."""
+        mount, image = self._mount(acq), self._image(acq)
+
+        def resolve(interpreter: str, repo: Path, modules: list[str]) -> list[str]:
+            if not modules:
+                return []
+            probe = ("import importlib.util, json, sys\n"
+                     "sys.path.insert(0, sys.argv[1])\n"
+                     "out = []\n"
+                     "for m in sys.argv[2:]:\n"
+                     "    try:\n"
+                     "        if importlib.util.find_spec(m) is None: out.append(m)\n"
+                     "    except Exception: out.append(m)\n"
+                     "print(json.dumps(out))\n")
+            repo_in = container_mod.to_container_path(str(repo), mount) or f"{container_mod.MOUNT}/repo"
+            argv = container_mod.run_argv(
+                [interpreter, "-c", probe, repo_in, *modules],
+                host_mount=mount, workdir=repo_in, image=image)
+            rc, out, _ = container_mod._run(argv, timeout=300)
+            if rc != 0:
+                return list(modules)              # cannot ask: unresolved, never "fine"
+            try:
+                return list(json.loads((out or "[]").strip().splitlines()[-1]))
+            except (ValueError, TypeError, IndexError):
+                return list(modules)
+
+        return resolve
+
+    def capability(self, acq: RepoAcquisition, interpreter: str,
+                   harness_python: str, flag: str = "seed") -> ExecCapability:
+        cap = repo_mod.assess_capability(acq, interpreter, harness_python, flag,
+                                         platform=self.platform,
+                                         resolve_imports=self._resolver(acq))
+        cap.backend = self.name
+        return cap
+
+    # --- provisioning -----------------------------------------------------------------
+    def _image(self, acq: RepoAcquisition) -> str:
+        return container_mod.image_for(getattr(acq, "declared_python", "") or "")[0]
+
+    def provision(self, cfg: Config, root: Path, pid: str,
+                  acq: RepoAcquisition) -> RepoAcquisition:
+        """Build the repository's declared stack INSIDE a container, onto the host disk.
+
+        The venv is created by the container's own Linux python and written through the
+        bind mount, so it persists between runs exactly as the local one does while being
+        native to the platform that will execute it. Nothing is installed on the host.
+
+        `env_status` becomes "ready" only when something was actually installed OR the
+        repository declares no dependencies at all. It used to be set to "ready"
+        unconditionally, which is how three corpus clones carried `env_status: ready`
+        beside a site-packages directory holding nothing but pip.
+        """
+        if acq.status not in ("cloned", "cached") or not acq.path:
+            acq.env_status = "not_attempted"
+            return acq
+        ok, why = container_mod.daemon_status()
+        if not ok:
+            acq.env_status, acq.reason = "blocked", why
+            return acq
+        if not (cfg.allow_install and cfg.allow_network):
+            acq.env_status = "blocked"
+            acq.reason = "the install or network gate is shut, so no environment was built"
+            return acq
+
+        mount = self._mount(acq)
+        image, image_note = container_mod.image_for(getattr(acq, "declared_python", "") or "")
+        repo_in = container_mod.to_container_path(str(acq.path), mount)
+        if not repo_in:
+            acq.env_status = "failed"
+            acq.reason = "the checkout is not under the directory this backend mounts"
+            return acq
+        env_in = f"{container_mod.MOUNT}/env"
+        py_in = f"{env_in}/bin/python"
+
+        rc, out, err = container_mod._run(
+            container_mod.run_argv(["python", "-m", "venv", env_in],
+                                   host_mount=mount, image=image), timeout=600)
+        if rc != 0:
+            acq.env_status = "failed"
+            acq.reason = f"venv creation in the container failed: {(err or out).strip()[-300:]}"
+            return acq
+
+        installed = False
+        for rel in acq.dependency_files:
+            if not rel.endswith(".txt"):
+                continue                      # only pip requirement files are installable here
+            rc, out, err = container_mod._run(
+                container_mod.run_argv([py_in, "-m", "pip", "install", "-r", f"{repo_in}/{rel}"],
+                                       host_mount=mount, workdir=repo_in, image=image),
+                timeout=cfg.install_timeout_s)
+            if rc != 0:
+                acq.env_status = "failed"
+                acq.reason = f"pip install -r {rel} failed in the container: {(err or out).strip()[-300:]}"
+                return acq
+            installed = True
+
+        acq.env_path = py_in
+        # A bare venv is not the repository's declared stack. Saying "ready" for one let
+        # `assess_capability`'s env_status gate pass and surfaced the real problem later
+        # as `dependency_missing`, which reads as a fact about the repository rather than
+        # about what this harness installed.
+        declared = [r for r in acq.dependency_files if r.endswith(".txt")]
+        if installed or not acq.dependency_files:
+            acq.env_status = "ready"
+            acq.reason = ((image_note + "; " if image_note else "")
+                          + ("installed " + ", ".join(declared) if installed
+                             else "the repository declares no dependency file; a bare "
+                                  f"{image} interpreter is what would run"))
+        else:
+            acq.env_status = "empty_environment"
+            acq.reason = ((image_note + "; " if image_note else "")
+                          + "the repository declares dependencies this backend cannot "
+                            "install from: " + ", ".join(acq.dependency_files))
+        return acq
+
+    # --- execution --------------------------------------------------------------------
+    def execute(self, req: ExecRequest) -> ExecOutcome:
+        """Run one process in a container. Never raises; every ending comes back as data."""
+        started, t0 = _utc(), time.time()
+        mount = str(Path(req.cwd).parents[0]) if req.cwd else ""
+        stamp = dict(backend=self.name, argv=list(req.argv), cwd=req.cwd,
+                     environment=self.environment(), started_at=started)
+        if not req.cwd.startswith(container_mod.MOUNT):
+            # The argv and cwd are built upstream from what `provision` returned, which is
+            # already in the container's namespace. Anything else means the translation
+            # did not happen, and relaying a host path would produce a not-found recorded
+            # against the paper. Refuse instead of rewriting.
+            return ExecOutcome(launched=False, completed=False, seconds=0.0, ended_at=_utc(),
+                               error=(f"refusing to run: cwd {req.cwd!r} is not inside "
+                                      f"{container_mod.MOUNT}, so this command was not "
+                                      f"prepared for a container"), **stamp)
+        host_mount = getattr(self, "_host_mount", "") or mount
+        argv = container_mod.run_argv(
+            list(req.argv), host_mount=host_mount, workdir=req.cwd,
+            image=getattr(self, "_image_name", container_mod.DEFAULT_IMAGE),
+            gpus=self._gpu()[0], env=dict(req.env or {}), network=False)
+        try:
+            p = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=req.timeout_s)
+        except subprocess.TimeoutExpired as e:
+            return ExecOutcome(launched=True, completed=False, timed_out=True,
+                               stdout=_text(e.stdout), stderr=_text(e.stderr),
+                               seconds=round(time.time() - t0, 3), ended_at=_utc(),
+                               error=f"timeout after {req.timeout_s}s", **stamp)
+        except OSError as e:
+            return ExecOutcome(launched=False, completed=False,
+                               seconds=round(time.time() - t0, 3), ended_at=_utc(),
+                               error=f"could not start the container: {e}", **stamp)
+        return ExecOutcome(launched=True, completed=True, returncode=p.returncode,
+                           stdout=p.stdout or "", stderr=p.stderr or "",
+                           seconds=round(time.time() - t0, 3), ended_at=_utc(), **stamp)
+
+    def cleanup(self, root: Path, pid: str) -> list[str]:
         env_dir = Path(root) / "runs" / pid / "env"
         if not env_dir.is_dir():
             return []
@@ -473,7 +818,8 @@ class KaggleBackend(DeclaredBackend):
         name="kaggle", platform="linux", vram_bytes=16 * (1024 ** 3),
         ram_bytes=13 * (1024 ** 3), disk_bytes=73 * (1024 ** 3), cpu_count=4,
         gpu_count=1, gpu_name="Tesla T4", max_walltime_s=12 * 3600, network_at_runtime=False,
-        requires_credentials=True, can_execute=False, reproducibility="session",
+        requires_credentials=True, can_execute=False, isolation="REMOTE_SESSION",
+        reproducibility="session",
         detail="Kaggle free tier, published specification")
 
 
@@ -487,8 +833,241 @@ class ColabBackend(DeclaredBackend):
         name="colab", platform="linux", vram_bytes=16 * (1024 ** 3),
         ram_bytes=13 * (1024 ** 3), disk_bytes=78 * (1024 ** 3), cpu_count=2,
         gpu_count=1, gpu_name="Tesla T4", max_walltime_s=12 * 3600, network_at_runtime=False,
-        requires_credentials=True, can_execute=False, reproducibility="session",
+        requires_credentials=True, can_execute=False, isolation="REMOTE_SESSION",
+        reproducibility="session",
         detail="Google Colab free tier, published specification")
+
+
+class SandboxBackend(ExecutionBackend):
+    """A remote Linux sandbox, leased per paper. The mechanics live in `harness/sandbox.py`.
+
+    This class is thin on purpose. Everything specific to a provider — leasing, staging,
+    measuring, running, releasing — is in one module behind six calls, and everything
+    specific to *review* stays where it already was: `authorize()` is still the only thing
+    that may say yes, `verify_commit` still decides whether the tree is the audited one,
+    `assess_capability` still decides whether the code gets a fair run, and
+    `local_exec.reconcile` still decides what a number may conclude. A remote reproduction
+    and a local one pass through the identical gates in the identical order.
+
+    **Three things it does differently, and each closes a hole a naive remote would open.**
+
+    *Capability is asked of the sandbox's interpreter.* The static half of the check reads
+    the local checkout, which is byte-identical because both trees are the same verified
+    commit. The one dynamic question — can this interpreter resolve the entrypoint's
+    imports — is delegated to the machine that owns the interpreter.
+
+    *The commit is verified inside the sandbox, by the same function.* `commit_tree`
+    returns a reader over the staged checkout, so E2 certifies the tree that will run.
+    A missing session returns a tree that cannot be read, which reports `unknown` and
+    refuses, rather than falling back to certifying a directory on this disk.
+
+    *Nothing falls back to local.* Every failure — no client, no credentials, a closed
+    gate, a refused reservation, a machine smaller than the reservation, a commit that
+    could not be staged — sets `env_status` and a reason, and capability then refuses.
+    There is no branch that runs the experiment here instead.
+    """
+
+    name = "modal"
+    # The leased machine is not the operator's, holds none of their credentials or files,
+    # and is torn down in `stages/probe.run`'s `finally`. That is what REMOTE_SESSION
+    # means, and it is why this is currently the ONLY backend entitled to run a paper's
+    # own repository — see `harness.isolation` and `authorize`'s isolation condition.
+    isolation = "REMOTE_SESSION"
+
+    # --- what is on offer -------------------------------------------------------------
+    def _spec(self):
+        from . import sandbox as sandbox_mod
+        return sandbox_mod.spec_from_config(self.config())
+
+    def resources(self) -> BackendResources:
+        """The RESERVATION, not a measurement. Nothing is leased to answer this.
+
+        Called during planning, before any sandbox exists, and by `select_for` for every
+        registered backend on every paper — so it must not contact a provider. What a
+        reservation actually turned into is measured in `provision` and refused there if it
+        is smaller; what a process actually ran on is stamped by `execute` from that
+        measurement. This is the request.
+        """
+        spec = self._spec()
+        return BackendResources(
+            name=self.name, platform="linux", python=spec.python_version,
+            python_version=spec.python_version,
+            has_gpu=bool(spec.gpu), vram_bytes=spec.vram_bytes,
+            gpu_count=spec.gpu_count, gpu_name=spec.gpu_kind,
+            ram_bytes=spec.memory_mib * 1024 * 1024,
+            disk_bytes=spec.disk_gib * (1024 ** 3),
+            cpu_count=max(1, int(spec.cpu)),
+            detail=f"remote sandbox reservation — {spec.describe()}")
+
+    def profile(self) -> BackendProfile:
+        r = self.resources()
+        spec = self._spec()
+        return BackendProfile(
+            name=self.name, platform="linux", vram_bytes=r.vram_bytes, ram_bytes=r.ram_bytes,
+            disk_bytes=r.disk_bytes, cpu_count=r.cpu_count, gpu_count=r.gpu_count,
+            gpu_name=r.gpu_name, python_version=r.python_version,
+            max_walltime_s=spec.timeout_s, requires_credentials=True,
+            # The load-bearing difference from Kaggle and Colab: this one can be driven.
+            # It is still refused by `authorize` whenever `available()` is false, so a
+            # missing token or a closed gate blocks exactly as a declaration would — but
+            # it blocks as `backend_offline`, which an operator can resolve, rather than
+            # as `credentials_unavailable`, which they cannot.
+            can_execute=True, isolation=self.isolation,
+            network_at_runtime=True, reproducibility="session",
+            detail=f"leased Linux sandbox — {spec.describe()}")
+
+    def available(self) -> BackendAvailability:
+        from . import sandbox as sandbox_mod
+        ok, why = sandbox_mod.driver_status(self.config())
+        return BackendAvailability(ok, why)
+
+    def environment(self) -> str:
+        """What a run WOULD happen on, for the planning record.
+
+        `execute` overrides this per outcome with what the session actually measured,
+        because that is the line a reproduction verdict has to be locatable from. This one
+        answers the interface's question before any machine exists.
+        """
+        spec = self._spec()
+        return f"{self.name} linux python{spec.python_version} {spec.gpu_kind or 'no GPU'}"
+
+    # --- staging ------------------------------------------------------------------------
+    def provision(self, cfg: Config, root: Path, pid: str,
+                  acq: RepoAcquisition) -> RepoAcquisition:
+        """Lease a machine, stage the audited commit, build the repo's stack, verify both.
+
+        Mirrors `LocalBackend.provision`'s refusals exactly where they coincide — no
+        checkout is `not_attempted`, a shut install or network gate is `blocked` — so the
+        only new refusals are the ones genuinely about a remote machine.
+        """
+        from . import sandbox as sandbox_mod
+
+        if acq.status not in ("cloned", "cached") or not acq.path:
+            acq.env_status = "not_attempted"
+            return acq
+        if not (cfg.allow_install and cfg.allow_network):
+            acq.env_status = "blocked"
+            acq.reason = ("a remote session needs SH_ALLOW_NETWORK to fetch the audited "
+                          "commit and SH_ALLOW_INSTALL to build the repository's stack")
+            return acq
+        try:
+            session = sandbox_mod.open_session(
+                cfg, local_path=acq.path, url=acq.url, commit=acq.commit,
+                requirement_files=[r for r in acq.dependency_files if r.endswith(".txt")],
+                paper_id=pid)
+        except sandbox_mod.SandboxSetupError as e:
+            # `blocked` when the refusal is about permission or equipment we do not have,
+            # `failed` when a lease was obtained and the staging did not work. The two are
+            # different facts about US and neither is a fact about the paper — but only the
+            # first tells an operator there is something they could change.
+            gated = any(s in str(e) for s in
+                        ("SH_ALLOW_SANDBOX", "credentials", "not importable",
+                         "SH_ALLOW_NETWORK", "SH_ALLOW_INSTALL"))
+            acq.env_status = "blocked" if gated else "failed"
+            acq.reason = f"no remote sandbox was staged for this checkout: {e}"
+            return acq
+
+        # E2, inside the machine that will run. The SAME function certifies it — see
+        # `repo.GitTree`. A sandbox whose tree is not provably the audited commit is
+        # released here rather than carried into an execution that would be labelled with
+        # a SHA nobody verified there.
+        verified = repo_mod.verify_commit(
+            acq.path, acq.commit, tree=sandbox_mod.SandboxGitTree(session))
+        if not verified.established:
+            sandbox_mod.release(acq.path)
+            acq.env_status = "failed"
+            acq.reason = (f"the sandbox checkout could not be certified as the audited "
+                          f"commit: {verified.reason}")
+            return acq
+
+        acq.env_path = session.env_python
+        acq.env_status = "ready"
+        gpu = session.gpu_name or "no GPU"
+        acq.reason = (f"staged into remote sandbox {session.sandbox_id} at commit "
+                      f"{verified.actual[:12]}, verified in place; the machine reports "
+                      f"{gpu} and {session.measured.get('cpu_count') or '?'} CPU(s)")
+        return acq
+
+    # --- the two questions that must be asked inside the machine ----------------------
+    def capability(self, acq: RepoAcquisition, interpreter: str,
+                   harness_python: str, flag: str = "seed") -> ExecCapability:
+        from . import sandbox as sandbox_mod
+
+        session = sandbox_mod.session_for(acq.path) if acq.path else None
+        if session is None:
+            cap = ExecCapability(
+                established=False, reason_code="environment_incompatible", backend=self.name,
+                env_status=acq.env_status or "", interpreter=interpreter or "",
+                entrypoint=acq.entrypoint or "", current_platform="linux",
+                detail=("no remote sandbox is staged for this checkout, so there is no "
+                        "interpreter to give the repository a fair run: "
+                        + (acq.reason or "nothing was provisioned")))
+            return cap
+        cap = repo_mod.assess_capability(
+            acq, interpreter, harness_python, flag, platform=session.platform,
+            resolve_imports=sandbox_mod.import_resolver(session))
+        cap.backend = self.name
+        return cap
+
+    def commit_tree(self, cwd: str) -> "repo_mod.GitTree | None":
+        from . import sandbox as sandbox_mod
+
+        session = sandbox_mod.session_for(cwd) if cwd else None
+        if session is None:
+            return sandbox_mod.AbsentGitTree(
+                cwd, "no remote sandbox is staged for this checkout, so the tree that would "
+                     "run cannot be read, let alone shown to be the audited commit")
+        return sandbox_mod.SandboxGitTree(session)
+
+    # --- running ------------------------------------------------------------------------
+    def execute(self, req: ExecRequest) -> ExecOutcome:
+        """Run one command in the session staged for `req.cwd`. Never raises.
+
+        `req.cwd` is a path on THIS machine — the local checkout — and the translation to
+        the sandbox's own namespace happens in `sandbox.run_in`. That is why the interface
+        needed no new parameter: the local checkout is the identifier both halves of the
+        pipeline already carry, and it is the key the session is stored under.
+        """
+        from . import sandbox as sandbox_mod
+
+        started, t0 = _utc(), time.time()
+        session = sandbox_mod.session_for(req.cwd) if req.cwd else None
+        if session is None:
+            return ExecOutcome(
+                launched=False, completed=False, backend=self.name, argv=list(req.argv),
+                cwd=req.cwd, environment=self.environment(), started_at=started,
+                ended_at=_utc(), seconds=round(time.time() - t0, 3),
+                error=("no remote sandbox is staged for this checkout; nothing was run, and "
+                       "this command was NOT run on the local machine instead"))
+        run = sandbox_mod.run_in(session, list(req.argv), req.cwd, req.timeout_s, req.env)
+        return ExecOutcome(
+            launched=run.launched, completed=run.completed, returncode=run.returncode,
+            stdout=run.stdout, stderr=run.stderr, seconds=run.seconds,
+            timed_out=run.timed_out, backend=self.name, error=run.error,
+            argv=run.argv or list(req.argv), cwd=run.cwd or req.cwd,
+            # From what the machine MEASURED, not from what was reserved. This is the only
+            # record of the hardware a remote verdict came from.
+            environment=session.environment(), started_at=started, ended_at=_utc())
+
+    # --- giving the machine back ---------------------------------------------------------
+    def release(self, root: Path, pid: str) -> tuple[bool, str]:
+        from . import sandbox as sandbox_mod
+        return sandbox_mod.release(Path(root) / "runs" / pid / "repo")
+
+    def cleanup(self, root: Path, pid: str) -> list[str]:
+        """End the lease and remove the session record. Never touches the checkout.
+
+        The checkout is the evidence the static audit cites and `runs/<pid>` holds the
+        results a reader needs, so the same rule the local backend follows applies: only
+        what provisioning itself created is removed.
+        """
+        from . import sandbox as sandbox_mod
+
+        checkout = Path(root) / "runs" / pid / "repo"
+        record = sandbox_mod.session_path(checkout)
+        existed = record.is_file()
+        sandbox_mod.release(checkout)
+        return [str(record)] if existed else []
 
 
 class UnknownBackend(ValueError):
@@ -497,6 +1076,15 @@ class UnknownBackend(ValueError):
 
 _REGISTRY: dict[str, type[ExecutionBackend]] = {
     "local": LocalBackend,
+    # A Linux container on this host, and the first LOCAL backend whose isolation is
+    # sufficient to run a paper's own repository. It is registered unconditionally and
+    # reports itself unavailable when no daemon answers, so registering it grants nothing
+    # on a host without a container runtime — the same discipline `modal` follows.
+    "container": ContainerBackend,
+    # A real runner, and the only registered one that is not this machine. Needs the
+    # sandbox gate and provider credentials; without either it reports itself unavailable
+    # and `authorize` refuses, so registering it grants nothing on its own.
+    "modal": SandboxBackend,
     # Declarations, not integrations. They exist so `select_for` can say WHY an experiment
     # has nowhere to run — see DeclaredBackend. Neither can execute anything.
     "kaggle": KaggleBackend,
@@ -527,18 +1115,26 @@ def select_backend(cfg: Config) -> ExecutionBackend:
         raise UnknownBackend(
             f"execution backend '{name}' is not registered; known backends: "
             f"{', '.join(registered_backends())}")
-    return cls()
+    return cls(cfg)
 
 
 def backend_for(cfg: Config, spec: ProbeSpec) -> ExecutionBackend | None:
     """The backend this spec would run on, or None when the operator named an unknown one.
 
     Harness-authored code always runs locally — see `local_backend`. Only a spec carrying
-    the repository's own command is subject to selection, and an unresolvable selection
-    yields None rather than a substitute, so `authorize` refuses instead of running a
-    Linux repository on whatever host happened to be available.
+    the repository's own command, OR a governed reconstruction, is subject to selection;
+    an unresolvable selection yields None rather than a substitute, so `authorize` refuses
+    instead of running a Linux repository on whatever host happened to be available.
+
+    `reimpl_exec` is the one provenance without `spec.command` that is NOT exempted here.
+    It has no `command` because it runs as `spec.script`, exactly like `template` and
+    `synthesized` — but unlike them it is third-party (model-authored) code, and forcing
+    it onto `local_backend()` regardless of `cfg.exec_backend` would make it structurally
+    unable to ever reach the CONTAINER/REMOTE_SESSION isolation `backends.authorize`'s
+    `reimpl_exec` branch requires — permanently refusing it even when an operator has
+    configured the sandbox and taken on that risk deliberately.
     """
-    if not spec.command:
+    if not spec.command and spec.provenance != "reimpl_exec":
         return local_backend()
     try:
         return select_backend(cfg)
@@ -584,12 +1180,14 @@ def select_for(requirement, cfg: Config, declared_platform: str = "",
     if getattr(requirement, "walltime_s", None) and walltime_s is None:
         walltime_s = requirement.walltime_s
 
-    runnable: list[tuple[int, ExecutionBackend, BackendProfile]] = []
+    runnable: list[tuple[tuple[int, int], ExecutionBackend, BackendProfile]] = []
     declared: list[tuple[ExecutionBackend, BackendProfile]] = []
     considered: list[tuple[str, str, str]] = []
 
     for name in registered_backends():
-        backend = _REGISTRY[name]()
+        # Constructed WITH the config being matched against, so a profile answers for the
+        # settings in play rather than for whatever the environment happens to hold.
+        backend = _REGISTRY[name](cfg)
         p = backend.profile()
 
         if declared_platform and declared_platform not in (p.platform or ""):
@@ -629,8 +1227,20 @@ def select_for(requirement, cfg: Config, declared_platform: str = "",
             continue
 
         considered.append((name, "fits", f"'{name}' meets every stated requirement"))
-        # Rank by VRAM so the smallest sufficient environment is preferred.
-        runnable.append((p.vram_bytes or 0, backend, p))
+        # Two keys, and the first one matters more than it looks. Among environments that
+        # ALL meet every stated requirement, the one the operator configured wins; only
+        # then is the smallest sufficient one preferred.
+        #
+        # Without the first key, `SH_EXEC_BACKEND` meant nothing whenever a second runner
+        # also fitted: an operator who asked for the remote sandbox would have their small
+        # experiments silently run on this laptop instead, because a laptop is "smaller"
+        # and the requirement was met either way. That is a substitution — the run happens
+        # on hardware the operator did not choose, and nothing in the record says a choice
+        # was overridden. Selection may still rule the named backend OUT on platform,
+        # size, credentials or availability, which is a refusal it reports; what it may not
+        # do is quietly prefer a different one that is equally sufficient.
+        preferred = 0 if name == (getattr(cfg, "exec_backend", "") or "local").strip().lower() else 1
+        runnable.append(((preferred, p.vram_bytes or 0), backend, p))
 
     frozen = tuple(considered)
     offline = [w for _, v, w in considered if v == "unavailable"]
@@ -732,6 +1342,66 @@ def authorize(cfg: Config, spec: ProbeSpec, backend: ExecutionBackend | None,
     moment of execution, and a caller that forgets to make it must fail closed rather
     than inherit a verification made minutes earlier against a checkout since replaced.
     """
+    if spec.provenance == _REIMPL_PROVENANCE:
+        # --- GOVERNED RECONSTRUCTION, gated like repository execution, not like our own
+        # code -------------------------------------------------------------------------
+        # A `reimpl_exec` spec carries no `spec.command` — it runs as `spec.script`, like
+        # every other harness-authored probe — so without this branch it would fall
+        # straight into the `not spec.command` free pass below and run UNCONFINED as "code
+        # this harness or its operator authored". It is neither: it is a MODEL's output,
+        # written by `harness.reimplement_driver` from the paper's specification and never
+        # reviewed by a human before running, which is exactly the third-party-code-
+        # execution risk `sufficient_for_repo_exec` exists to confine. Decision 10 is
+        # explicit that no capability increasing that risk lands without the boundary
+        # enforced, so this reuses the identical floor `repo_exec` requires rather than
+        # inventing a weaker one for "only" a reconstruction.
+        if backend is None:
+            return ExecAuthorization(
+                allowed=False, decision="no_backend", backend="",
+                failure_class="backend_unavailable",
+                detail="no execution backend is available for this experiment")
+        name = backend.name
+        if not backend.profile().can_execute:
+            return ExecAuthorization(
+                allowed=False, decision="backend_cannot_execute", backend=name,
+                failure_class="credentials_unavailable" if backend.profile().requires_credentials
+                else "backend_unavailable",
+                detail=f"'{name}' is a declared environment, not a runner: "
+                       f"{backend.available().detail}")
+        if not backend.available().usable:
+            return ExecAuthorization(
+                allowed=False, decision="backend_offline", backend=name,
+                failure_class="backend_unavailable",
+                detail=f"'{name}' can execute but is not reachable now: "
+                       f"{backend.available().detail}")
+        if not cfg.allow_reimplementation_exec:
+            return ExecAuthorization(
+                allowed=False, decision="gate_closed", backend=name,
+                failure_class="execution_unauthorized",
+                detail="SH_ALLOW_REIMPLEMENTATION_EXEC is not set; running a governed "
+                       "reconstruction stays an explicit per-invocation opt-in, separate "
+                       "from SH_ALLOW_REPO_EXEC because this is not the authors' code")
+        if not isolation_mod.sufficient_for_repo_exec(backend.profile().isolation):
+            return ExecAuthorization(
+                allowed=False, decision="isolation_insufficient", backend=name,
+                failure_class="execution_unauthorized",
+                detail=isolation_mod.refusal_detail(name, backend.profile().isolation))
+        conf = spec.reimplementation_conformance
+        if conf is None or not conf.established:
+            return ExecAuthorization(
+                allowed=False, decision="conformance_unproven", backend=name,
+                failure_class="execution_unauthorized",
+                detail=(conf.reason if conf is not None else
+                        "no ReimplementationConformance was established for this spec: every "
+                        "required ingredient must be bound to both a paper locator and a "
+                        "verified implementation locator before a reconstruction may run"))
+        return ExecAuthorization(
+            allowed=True, decision="authorized", backend=name, failure_class="none",
+            detail="every required ingredient is bound to both a paper locator and a "
+                   "verified implementation locator, the execution gate is open, and this "
+                   "backend confines third-party code to a container or a leased remote "
+                   "session")
+
     if not spec.command:
         # A generated probe, a driver's script, or the identical-arms template. This is
         # code we or the operator authored, running under our own interpreter, and the
@@ -780,6 +1450,24 @@ def authorize(cfg: Config, spec: ProbeSpec, backend: ExecutionBackend | None,
             failure_class="execution_unauthorized",
             detail="SH_ALLOW_REPO_EXEC is not set; running a third-party repository "
                    "stays an explicit per-invocation opt-in")
+
+    # --- THE ISOLATION BOUNDARY -------------------------------------------------------
+    # Placed after the gate and before provenance, because it answers a question that is
+    # prior to every scientific one: not "is this the right code" but "is running somebody
+    # else's code HERE safe at all". A venv scopes imports and wall time; it does not
+    # confine the filesystem, the network, the environment or the user, and until this
+    # condition existed `SH_ALLOW_REPO_EXEC=1` ran a paper's repository under the
+    # operator's own account with all four in reach.
+    #
+    # This is a TIGHTENING and never a widening: every spec refused here was already
+    # refused-or-worse by one of the conditions below on any backend that would have run
+    # it, and nothing previously refused becomes permitted. `harness.isolation` reads no
+    # configuration, so there is no environment variable that lowers the requirement.
+    if not isolation_mod.sufficient_for_repo_exec(backend.profile().isolation):
+        return ExecAuthorization(
+            allowed=False, decision="isolation_insufficient", backend=name,
+            failure_class="execution_unauthorized",
+            detail=isolation_mod.refusal_detail(name, backend.profile().isolation))
 
     if spec.provenance != _REPO_PROVENANCE:
         return ExecAuthorization(
@@ -910,8 +1598,31 @@ if __name__ == "__main__":  # self-check: python -m harness.backends
     open_cfg = Config.load()
     open_cfg.allow_repo_exec = True
 
-    # E2 — with the gate open, an unverified checkout is the next thing in the way, and
-    # omitting the verification entirely must refuse rather than wave through.
+    # --- THE ISOLATION BOUNDARY, before every scientific condition ---------------------
+    # The local backend can start a process and cannot confine one, so with the gate open
+    # it is refused here — before commit, identity, capability or resources are consulted,
+    # because "is running a stranger's code here safe" is prior to "is it the right code".
+    a = authorize(open_cfg, repo_spec, backend)
+    assert not a.allowed and a.decision == "isolation_insufficient", a.decision
+    assert a.failure_class == "execution_unauthorized"
+    assert "CONTAINER or REMOTE_SESSION" in a.detail
+    assert "Nothing about the paper follows" in a.detail
+    assert backend.profile().isolation == "VENV", "a venv is not a boundary"
+
+    # Every remaining condition is exercised against a backend that IS entitled to run
+    # third-party code. This is the local backend with one field changed, so the rest of
+    # the ladder is tested exactly as it always was.
+    class _Confined(LocalBackend):
+        name = "local"
+        isolation = "REMOTE_SESSION"
+
+    confined = _Confined(cfg)
+    assert isolation_mod.sufficient_for_repo_exec(confined.profile().isolation)
+    backend = confined
+
+    # E2 — with the gate open and the boundary satisfied, an unverified checkout is the
+    # next thing in the way, and omitting the verification entirely must refuse rather
+    # than wave through.
     a = authorize(open_cfg, repo_spec, backend)
     assert not a.allowed and a.decision == "commit_unverified", a.decision
     good = CommitVerification(state="verified", expected="a" * 40, actual="a" * 40)

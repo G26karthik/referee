@@ -463,7 +463,7 @@ def test_a_resource_refusal_leaves_the_experiment_exactly_as_published(tmp_path)
 # --------------------------------------------------------------------------- #
 # The gate, and the invariant behind it
 # --------------------------------------------------------------------------- #
-def test_authorization_refuses_an_experiment_that_does_not_fit():
+def test_authorization_refuses_an_experiment_that_does_not_fit(confined_local):
     tight = ResourceCapability(state="insufficient",
                                reason="VRAM: requires 24.0 GiB, the 'local' backend offers 8.0 GiB",
                                shortfalls=["VRAM: 24.0 GiB vs 8.0 GiB"])
@@ -480,21 +480,21 @@ def test_authorization_refuses_an_experiment_that_does_not_fit():
     ResourceCapability(state="unassessed", reason="never examined"),
     ResourceCapability(state="insufficient", reason="too big"),
 ])
-def test_only_satisfied_authorizes(resources):
+def test_only_satisfied_authorizes(confined_local, resources):
     auth = authorize(_cfg(allow_repo_exec=True), _spec(resources), local_backend(),
                      commit=_verified())
     assert not auth.allowed, resources
     assert auth.decision == "resources_unproven"
 
 
-def test_a_satisfied_requirement_lets_authorization_through():
+def test_a_satisfied_requirement_lets_authorization_through(confined_local):
     auth = authorize(_cfg(allow_repo_exec=True), _spec(_fits()), local_backend(),
                      commit=_verified())
     assert auth.allowed and auth.decision == "authorized"
 
 
 @pytest.mark.parametrize("values", [[59.30, 59.26], [999.0, 999.0]])
-def test_a_resource_refusal_produces_neither_verdict(values):
+def test_a_resource_refusal_produces_neither_verdict(confined_local, values):
     """Both directions. A number obtained without establishing that the experiment fits has
     no standing to acquit a cell either."""
     tight = ResourceCapability(state="insufficient", reason="too big")
@@ -563,7 +563,7 @@ def test_a_definite_shortfall_still_outranks_an_unknown_memory_demand():
     assert cap.state == "insufficient" and any("CPU" in s for s in cap.shortfalls)
 
 
-def test_authorization_refuses_a_requirement_with_no_memory_figure():
+def test_authorization_refuses_a_requirement_with_no_memory_figure(confined_local):
     spec = _spec(assess_resources(_one(cpu_count=2), ThisMachine(), backend="local"))
     auth = authorize(_cfg(allow_repo_exec=True), spec, local_backend(), commit=_verified())
     assert not auth.allowed and auth.decision == "resources_unproven"

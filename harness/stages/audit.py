@@ -25,7 +25,7 @@ import os
 import re
 import time
 
-from .. import audit_driver, grading, pdf, state
+from .. import audit_driver, delegation, grading, pdf, state, taxonomy
 from ..artifacts import (BASELINE_CLASSES, CANDIDATE_CLASSES, CONFIDENCES, DISCREPANCY_TYPES,
                          EVIDENCE_ORIGINS, PRIOR_ART_BASES, SEVERITIES, Equation, Figure,
                          Finding, LensReport, PaperDoc)
@@ -235,7 +235,7 @@ def lens_is_accepted(root: Path, lens: str) -> tuple[bool, str]:
         rec = state.read_json(driver_path)
     except Exception:
         return False, "provenance sidecar is not valid JSON"
-    if not isinstance(rec, dict) or rec.get("written_by") not in ("audit_driver", "manual_accept"):
+    if not isinstance(rec, dict) or rec.get("written_by") not in _ACCEPTED_WRITERS:
         return False, f"provenance sidecar written_by={rec.get('written_by') if isinstance(rec, dict) else None!r} not recognized"
     want = rec.get("content_sha256")
     if not want:
@@ -245,8 +245,15 @@ def lens_is_accepted(root: Path, lens: str) -> tuple[bool, str]:
     return True, ""
 
 
+# Every `written_by` token a validated path can produce, read off the delegation
+# vocabulary rather than written out here. Two copies of this set would let a mode be
+# added to one and refused by the other, which surfaces as "the reviewer never ran".
+_ACCEPTED_WRITERS = tuple(delegation.WRITTEN_BY.values())
+
+
 def accept_lens(cfg: Config, pid: str, lens: str, raw: str, *,
-                reviewer: str = "", tool_policy: str = "unrecorded") -> dict:
+                reviewer: str = "", tool_policy: str = "unrecorded",
+                mode: str = "MANUAL") -> dict:
     """Validate and persist a HAND-WRITTEN lens file through the SAME gate the
     auto-audit path uses, closing the asymmetry `lens_is_accepted` exists to police:
     before this, a manually-written `audit/<lens>.json` skipped `parse_lens_json`
@@ -266,8 +273,15 @@ def accept_lens(cfg: Config, pid: str, lens: str, raw: str, *,
     out = root / "audit" / f"{lens}.json"
     state.write_json(out, report.model_dump())
     content_sha256 = hashlib.sha256(out.read_bytes()).hexdigest()
-    record = {"lens": lens, "paper_id": pid, "written_by": "manual_accept",
-              "reviewer": reviewer or "unnamed", "tool_policy": tool_policy,
+    # WHICH MODE, recorded, and `harness.delegation` decides what that mode is entitled
+    # to claim. `mode` defaults to MANUAL because that is the mode that promises least: a
+    # caller who does not say gets the token asserting no isolation, rather than
+    # inheriting an autonomous mode's guarantees by omission. This function used to
+    # hard-code `manual_accept`, which made an isolated subagent the controller dispatched
+    # autonomously and a human pasting JSON into a file the same provenance.
+    record = {"lens": lens, "paper_id": pid,
+              **delegation.provenance_record(mode=mode, reviewer=reviewer,
+                                             tool_policy=tool_policy),
               "content_sha256": content_sha256, "findings": len(report.findings),
               "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     state.write_json(out.with_suffix(".driver.json"), record)
@@ -287,7 +301,15 @@ def run_audit(cfg: Config, pid: str, lenses: tuple[str, ...] = LENSES) -> dict:
     pdir = root / "audit" / "prompts"
     pdir.mkdir(parents=True, exist_ok=True)
     for lens in lenses:
-        body = _header(lens, pid) + P.build(lens, doc.title, **ctx)
+        # Sanitised at the boundary, not at extraction: `doc.json` stays byte-faithful to
+        # what the PDF gave up, and this is where the paper's text leaves the harness for
+        # another process's stdin. Real prompts carry these today — each
+        # `projects/iclr/audit/prompts/*.md` holds 3 NUL bytes and 30 other control
+        # characters, straight out of PDF text extraction. Not a live failure on this
+        # host, but a reader that truncates at NUL would fail as "the command exited
+        # without writing anything", which `audit_driver` itself notes is the one shape
+        # of failure it cannot attribute to a cause.
+        body = pdf.sanitise_controls(_header(lens, pid) + P.build(lens, doc.title, **ctx))
         (pdir / f"{lens}.md").write_text(body, encoding="utf-8")
 
     done = [ln for ln in lenses if lens_is_accepted(root, ln)[0]]
@@ -573,6 +595,14 @@ def _coerce(lens: str, data, corpus: str | Sequence[tuple[int, str]],
             # own non-degeneracy any more than it could certify its own evidence).
             evidence_class=evidence_class,
             verified_observation=observation,
+            # WHAT KIND of issue this is, derived from the closed-vocabulary fields the
+            # lens has already chosen above. Deliberately NOT passed to
+            # `grading.derive`: kind must not decide severity, and keeping the call
+            # signature free of it is what makes "a CONFOUND is always MAJOR"
+            # inexpressible rather than merely absent.
+            scientific_class=taxonomy.classify(
+                lens=lens, discrepancy_type=_enum(f.get("discrepancy_type"), DISCREPANCY_TYPES),
+                baseline_class=baseline_class, candidate_class=candidate_class),
             verification_state=verification_state,
             calc_class=calc_class,
             evidence_origin=_origin_from_ref(ref),

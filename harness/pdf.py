@@ -15,8 +15,23 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from pathlib import Path
+from typing import NamedTuple
 
-from .artifacts import Equation, Figure, QuantFinding, Section, Table
+from .artifacts import CrossRef, Equation, Figure, QuantFinding, Section, Table
+
+# Bumped whenever a change RENUMBERS or RE-SCOPES an addressable object — `F<n>`,
+# `T<i>:r<r>:c<c>`, `E<n>`, `S<i>`, `P<i>:<a>-<b>`. It is stamped onto every `PaperDoc`
+# this module's output is assembled into, so a reference minted against an older parse
+# can be recognised as belonging to an older parse instead of silently resolving to a
+# different object — which is the same false-attestation failure `_equation_body`
+# refuses to make, one layer up.
+#
+# 2: cross-references stopped being ingested as captions (`_FIGURE_CAPTION` /
+#    `_TABLE_CAPTION` now require the delimiter), table captions became verbatim, the
+#    geometric table fallback stopped being gated on the ruled path finding nothing, and
+#    bibliography lines stopped being read as appendix headings. Each of those changes
+#    moves at least one index.
+EXTRACTION_VERSION = 2
 
 # ponytail: bounds sized for conference ML papers (8-10pp + appendix). A 400-page
 # thesis is truncated, not crashed; raise these if that ever becomes the workload.
@@ -43,10 +58,51 @@ _KNOWN_HEADINGS = (
 _SECNO = r"(?:\d+|[A-Z])(?:\.\d+)*"
 _NAMED_HEADING = re.compile(rf"^(?:{_SECNO}\.?\s+)?({_KNOWN_HEADINGS})\b.{{0,40}}$", re.I)
 _NUMBERED_HEADING = re.compile(rf"^({_SECNO})\.?\s+([A-Z][^.!?]{{1,68}})$")
-_TABLE_CAPTION = re.compile(r"^\s*(?:table|tab\.)\s*([IVXLC]+|\d+)\s*[:.—-]?\s*(.{0,200})", re.I)
+# A caption NAMES an object; a cross-reference MENTIONS one. Both begin a line with
+# "Figure 4", and in text-extracted output the delimiter after the number is the only
+# thing that separates them: a caption prints "Figure 4." or "Figure 4:", a citation
+# prints "Figure 4 shows", "Figure 4, this" or "Figure 4a,".
+#
+# The delimiter used to be OPTIONAL (`[:.—-]?`), and what that cost was a FALSE MACHINE
+# ATTESTATION rather than a cosmetic mislabelling. 'Figure 4 shows the visual comparison
+# with real-world' — body prose — became a `Figure` object, and
+# `stages.audit.verify_evidence` then returned `caption_verified` plus the harness's own
+# observation "Figure caption F5 (page 6, 'Figure 4') of the parsed paper contains the
+# quoted text verbatim." Reproduced on three separate refs against the shipped
+# `projects/cvpr/paper/doc.json`. `_equation_body` already returns '' rather than
+# attaching a number to whatever precedes it, for exactly this reason; the figure and
+# table paths had no such guard.
+#
+# Requiring the delimiter classified 63 of 63 caption-shaped lines correctly across the
+# three pilot papers, and it can only REMOVE objects — so it cannot manufacture
+# provenance. What it also costs is a sentence-final citation ("...as shown in
+# Figure 3.") and a subfigure-labelled caption ("Figure 5a: ..."), neither of which is
+# distinguishable from the other case in a flattened line. Recovering less is the
+# posture this module already takes everywhere else.
+_CAPTION_DELIM = r"(?:\s*[:.—-](?=\s|$))"
+_TABLE_CAPTION = re.compile(
+    rf"^\s*(?:table|tab\.)\s*([IVXLC]+|\d+){_CAPTION_DELIM}\s*(.{{0,200}})", re.I)
+# The delimiter-OPTIONAL shape, kept for exactly one job: a line beginning "Table 4" is
+# not a row of table data, whether it names a table or merely cites one, so it must not
+# be swallowed into a table body. That is a different question from "does this line NAME
+# a table?", and collapsing the two into the strict regex cost seven captioned tables on
+# APT — in-text reference lines rejoined the body runs and re-cut them, so `_grid` and
+# `_pair` saw different bodies. `is_heading`/`_heading_admitted` is split for the same
+# reason: one predicate per question.
+_TABLE_LINE_SHAPED = re.compile(r"^\s*(?:table|tab\.)\s*(?:[IVXLC]+|\d+)\b", re.I)
+# The same strict rule, minus the "delimiter then whitespace" lookahead, for use over
+# pdfplumber WORD ROWS rather than pymupdf page lines. On a PDF whose font encoding
+# names no space glyph, `extract_words` returns the whole visual line as one token —
+# APT page 7 comes back as 'Table2.RoBERTaandT5pruningwithAPT…' — so the lookahead can
+# never hold there and the caption row goes unrecognised. That is not a hypothetical:
+# it silently cost seven of APT's captioned tables their bodies, because the row-level
+# mask and `_page_captions` are zipped BY INDEX and have to select the same lines.
+# Whitespace after the delimiter is evidence this coordinate system does not have.
+_TABLE_CAPTION_ROW = re.compile(r"^\s*(?:table|tab\.)\s*(?:[IVXLC]+|\d+)\s*[:.—-]", re.I)
 # Mirrors `_TABLE_CAPTION` exactly, substituting "figure"/"fig." — same reasoning, same
 # shape. `MAX_FIGURES` bounds it the way `MAX_TABLES` bounds table extraction.
-_FIGURE_CAPTION = re.compile(r"^\s*(?:figure|fig\.)\s*([IVXLC]+|\d+)\s*[:.—-]?\s*(.{0,300})", re.I)
+_FIGURE_CAPTION = re.compile(
+    rf"^\s*(?:figure|fig\.)\s*([IVXLC]+|\d+){_CAPTION_DELIM}\s*(.{{0,300}})", re.I)
 # A display equation, text-extracted: a line carrying a relational operator, numbered the
 # way LaTeX numbers equations. Deliberately lossy — this is a text-line heuristic, not
 # layout geometry; `SOURCE_FIDELITY` in the audit prompt tells the reviewer equation
@@ -70,11 +126,123 @@ _EQUATION_LOOKBACK = 3
 _EQUATION_MAX_WORDS = 24
 MAX_FIGURES = 40
 MAX_EQUATIONS = 60
+# A caption line is kept VERBATIM, so it needs its own bound. Truncation keeps a PREFIX
+# of the printed line, which is still a substring of the page — a reconstructed string
+# is not, and that is the whole point of the field.
+MAX_CAPTION_CHARS = 240
+
+# Where the prose CITES a numbered object. Digits only, deliberately: with `re.I` a
+# roman-numeral alternative matches the "i" in "figures in the appendix" and mints a
+# citation of figure I that nobody wrote. Only the first number of "Figures 3 and 4" is
+# recovered; a second pattern for lists would have to decide whether "3-5" is a range or
+# a hyphenated identifier, and guessing there is how a citation inventory starts
+# reporting citations that are not in the paper.
+_CROSSREF_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("figure", re.compile(r"\b(?:figures?|figs?\.)\s*(\d+)", re.I)),
+    ("table", re.compile(r"\b(?:tables?|tabs?\.)\s*(\d+)", re.I)),
+    ("equation", re.compile(r"\b(?:equations?|eqs?\.|eqn\.?)\s*\(?(\d+)", re.I)),
+    ("section", re.compile(r"\b(?:sections?|secs?\.|§)\s*(\d+(?:\.\d+)*)", re.I)),
+    # Not `re.I` on the letter: an appendix is lettered with a CAPITAL, and a
+    # case-insensitive group would read "appendix and" as a citation of appendix A.
+    ("appendix", re.compile(r"(?i:appendix)\s*([A-Z](?:\.\d+)*)")),
+)
+MAX_CROSSREFS = 400
+# The citing sentence, in flattened characters. Long enough to carry the claim the
+# citation is embedded in, short enough that a runaway span (a section whose sentence
+# boundaries were lost to extraction) cannot quote half the paper.
+MAX_CROSSREF_QUOTE = 400
+_SENTENCE_END = re.compile(r"[.!?]\s")
+
+# A bare known-heading word — `Method`, `Model`, `Training` alone on a line — is what a
+# table's first column header looks like once pymupdf has emitted each cell on its own
+# line. Measured false headings under the shape rule alone: CVPR 6 of 27 sections, ICLR
+# 11 of 25, APT 16 of 59, and the human-facing report prints that count verbatim.
+#
+# The corroboration is the line that FOLLOWS. A real section heading is followed by the
+# first line of a paragraph; a header cell is followed by another cell. Measured over
+# the three pilot papers, every false bare heading is followed by 1-4 words and every
+# genuine one by 6 or more, so this threshold sits strictly between the two populations
+# rather than on the edge of either.
+_HEADING_FOLLOWED_BY_WORDS = 5
+# Inside the reference range, a section number that is neither a small integer nor a
+# letter continuing an appendix sequence is a year or a page number that happened to
+# land at the start of a bibliography line. Two digits, because no paper has a hundred
+# top-level sections.
+_MAX_BARE_SECTION_NUMBER_DIGITS = 2
+_REFERENCES_HEADING = re.compile(r"^(?:\d+|[A-Z])?\.?\s*(?:references|bibliography)\b", re.I)
+_APPENDIX_LETTER = re.compile(r"^[A-Z]$")
+
+# C0 control characters other than tab and newline. Real prompts carry them today: each
+# `projects/iclr/audit/prompts/*.md` holds 3 NUL bytes and 30 other control characters,
+# straight out of PDF text extraction and into a reviewer's stdin. Not a live failure on
+# this host, but an unhardened boundary whose failure mode on another reader is "the
+# command exited without writing anything" — a silent cause, which is the one shape of
+# failure this harness is least able to attribute.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 _WS = re.compile(r"\s+")
 
 
 def _norm(s: str) -> str:
     return _WS.sub(" ", (s or "").replace("­", "")).strip()
+
+
+def sanitise_controls(s: str, replacement: str = " ") -> str:
+    """Strip C0 control characters, keeping tab and newline.
+
+    A boundary function, not an extraction one: `doc.json` stays byte-faithful to what
+    the PDF gave up, and this is applied where the text leaves the harness for another
+    process's stdin. See `_CONTROL_CHARS` for the failure it prevents. `replacement` is
+    a space rather than '' so two words a NUL happened to sit between do not become one
+    word that appears nowhere in the paper.
+    """
+    return _CONTROL_CHARS.sub(replacement, s or "")
+
+
+# Publication metadata that a first-page line-scan reaches before the title on a journal
+# reprint. A closed list of METADATA words, never of venues or paper titles: three of
+# seven corpus papers ended up with a title like 'Accepted: 6 November 2024 / Published
+# online: 21 November 2024', which the reviewer report then printed as the paper's name.
+_TITLE_METADATA = (
+    "received", "accepted", "revised", "published", "submitted", "in press",
+    "doi", "https://doi", "volume", "vol.", "issue", "pages", "pp.", "copyright",
+    "proceedings of", "preprint", "arxiv", "under review", "keywords", "abstract",
+    "correspondence", "editor",
+)
+# An author-affiliation marker: the asterisk-or-dagger-then-digit that a two-column
+# venue prints after each name ("Jayesh Singla * 1 Ananye Agarwal * 1 Deepak Pathak 1").
+# This is a rule about a TYPESETTING CONVENTION, not about names: a rule that tried to
+# recognise "a comma-separated list of people" would reject real subtitles, and printing
+# one wrong title is a smaller cost than dropping a right one.
+_AFFILIATION_MARKER = re.compile(r"[*†‡§]\s*\d")
+
+
+def title_is_plausible(s: str) -> bool:
+    """Could this string be a paper's title?
+
+    Pure and report-only: nothing here changes extraction, and the caller decides what
+    to do with a False (`stages/report.py` falls back to the paper id). Four real
+    failures are recognised, all measured on the shipped corpus: a date line
+    ('Accepted: 6 November 2024 / Published online: 21 November 2024'), a venue banner
+    ('Proceedings of the 64th Annual Meeting…'), a page range, and an author byline
+    carrying affiliation markers ('Jayesh Singla * 1 Ananye Agarwal * 1…').
+
+    What it deliberately does NOT recognise is a byline with no markers: a
+    comma-separated list of names is shaped exactly like a subtitle, and a rule that
+    guessed would start rejecting real titles — a larger cost than printing one bad one.
+    """
+    line = _norm(s)
+    if len(line) < 12 or len(line.split()) < 3:
+        return False
+    low = line.lower()
+    if any(low.startswith(w) for w in _TITLE_METADATA):
+        return False
+    if _AFFILIATION_MARKER.search(line):
+        return False
+    digits = sum(c.isdigit() for c in line)
+    letters = sum(c.isalpha() for c in line)
+    # A title carries prose. A date line, a page range and a DOI are mostly digits and
+    # punctuation, and this is the only test that catches all three without naming any.
+    return letters > digits * 2 and letters >= 8
 
 
 def is_heading(line: str) -> bool:
@@ -133,14 +301,90 @@ def guess_title(pages: list[str]) -> str:
     return ""
 
 
+def _is_bare_known_heading(line: str) -> bool:
+    """A known heading WORD with no section number in front of it.
+
+    The form that a table's first column header is indistinguishable from on shape
+    alone. A numbered heading ("3. Method") is corroborated by its own number and is
+    never subject to the following-line test.
+    """
+    if not _NAMED_HEADING.match(line):
+        return False
+    return not re.match(rf"^(?:{_SECNO})\.?\s", line)
+
+
+def _heading_admitted(line: str, next_line: str, *, in_references: bool,
+                      appendix_letter: str) -> bool:
+    """Shape said "heading"; may the DOCUMENT overrule it?
+
+    `is_heading` answers a question about one line and is deliberately left alone — it
+    is a shape predicate and its callers, including `guess_title`, ask nothing else of
+    it. The two overrules below need context a single line does not have, which is why
+    they live here and not there.
+
+    1. A bare known-heading word needs the next line to look like prose
+       (`_HEADING_FOLLOWED_BY_WORDS`).
+    2. Inside the reference range, a single capital at line start is an author's
+       initial far more often than an appendix letter — measured, APT's `References`
+       section held 694 of ~17,200 characters and 16.5 KB of its bibliography became
+       five sections, four of them shaped exactly like appendix headings ('M. Analysis
+       of dawnbench, a time-to-accuracy machine', 10,461 chars). The discriminator is
+       SEQUENCE: appendix letters run A, B, C… from A, and 'M' before any 'A' has been
+       seen is not an appendix. The alternative rule — "the line also contains a year,
+       or `pp.`, or `In Proceedings`" — was tried against the real lines and fails on
+       all four of them, because `_NUMBERED_HEADING` only matches a line short enough
+       to have left the year behind on the next one.
+
+    A rejected heading is not a dropped line: its text joins the preceding section, so
+    the failure direction is a bibliography that stays whole under one label.
+    """
+    if _is_bare_known_heading(line) and len(next_line.split()) < _HEADING_FOLLOWED_BY_WORDS:
+        return False
+    m = _NUMBERED_HEADING.match(line)
+    if not in_references or not m or _NAMED_HEADING.match(line):
+        return True
+    secno = m.group(1)
+    if "." in secno:
+        return True                       # 'A.1', '3.2' — a shape no reference line takes
+    if _APPENDIX_LETTER.match(secno):
+        return secno == "A" if not appendix_letter else secno >= appendix_letter
+    return len(secno) <= _MAX_BARE_SECTION_NUMBER_DIGITS
+
+
+def references_boundary(sections: Sequence[Section]) -> int:
+    """The index of the References/Bibliography heading, or -1.
+
+    A boundary INDEX, not a per-section `is_appendix` flag. The flag would have to be
+    written onto every section after this one, and it would be wrong on exactly the
+    sections a mis-parsed bibliography produces — so it would assert something about the
+    paper that is a fact about the parse.
+    """
+    for s in sections:
+        if _REFERENCES_HEADING.match(_norm(s.title)):
+            return s.section_idx
+    return -1
+
+
 def split_sections(pages: list[str]) -> list[Section]:
-    """Walk every line, starting a new Section at each heading.
+    """Walk every line, starting a new Section at each ADMITTED heading.
 
     Text before the first heading becomes the front-matter section, so no content is
-    ever dropped on the floor.
+    ever dropped on the floor — and a heading the document overrules (see
+    `_heading_admitted`) contributes its own line to the section it interrupts rather
+    than opening a new one.
+
+    Lines are flattened across page boundaries first, because the corroboration test
+    looks at the FOLLOWING line and a heading set at the foot of a page has its
+    paragraph on the next one. Reading page by page made every such heading fail.
     """
+    lines: list[tuple[int, str]] = [
+        (pno, _norm(raw))
+        for pno, text in enumerate(pages, start=1)
+        for raw in text.splitlines()
+    ]
     sections: list[Section] = []
     title, buf, start = "", [], 1
+    in_references, appendix_letter = False, ""
 
     def flush(end_page: int) -> None:
         body = _norm(" ".join(buf))[:MAX_SECTION_CHARS]
@@ -148,13 +392,22 @@ def split_sections(pages: list[str]) -> list[Section]:
             sections.append(Section(section_idx=len(sections), title=title,
                                     page_start=start, page_end=end_page, text=body))
 
-    for pno, text in enumerate(pages, start=1):
-        for raw in text.splitlines():
-            if is_heading(raw):
+    for i, (pno, line) in enumerate(lines):
+        if not line:
+            continue
+        if is_heading(line):
+            nxt = next((t for _, t in lines[i + 1:] if t), "")
+            if _heading_admitted(line, nxt, in_references=in_references,
+                                 appendix_letter=appendix_letter):
                 flush(pno)
-                title, buf, start = _norm(raw), [], pno
-            elif _norm(raw):
-                buf.append(_norm(raw))
+                title, buf, start = line, [], pno
+                if _REFERENCES_HEADING.match(line):
+                    in_references = True
+                elif in_references and (m := _NUMBERED_HEADING.match(line)) \
+                        and _APPENDIX_LETTER.match(m.group(1)):
+                    appendix_letter = m.group(1)
+                continue
+        buf.append(line)
     flush(len(pages) or 1)
     return sections
 
@@ -175,6 +428,99 @@ def extract_figures(pages: list[str], max_figures: int = MAX_FIGURES) -> list[Fi
             if len(out) >= max_figures:
                 return out
     return out
+
+
+def _sentence_bounds(text: str, start: int, end: int) -> tuple[int, int]:
+    """The character range of the sentence containing [start, end) in `text`."""
+    left = 0
+    for m in _SENTENCE_END.finditer(text, 0, start):
+        left = m.end()
+    m = _SENTENCE_END.search(text, end)
+    return left, (m.end() if m else len(text))
+
+
+def extract_crossrefs(sections: Sequence[Section]) -> list[CrossRef]:
+    """Every place the prose CITES a numbered object, with a re-verifiable address.
+
+    Takes SECTIONS AND NOTHING ELSE. That is the guarantee, at the signature: this
+    function cannot see `doc.figures`, `doc.tables` or `doc.equations`, so it cannot
+    compare a citation against a recovered label set and cannot report that anything is
+    missing. Over the shipped corpus a naive "cited but not recovered" check produced
+    twelve claims that a table or an equation was absent from a paper, and all twelve of
+    those objects are printed in the paper and absent only from what extraction
+    recovered. Whoever wants that comparison has to build it somewhere that can say
+    whose property the answer is — see `harness.artifacts.CrossRef`.
+
+    Each reference carries a `P<i>:<a>-<b>` span in the same flattened coordinates
+    `harness.claims` mints, so the citing sentence is itself checkable rather than
+    taken on this function's word. `page` is the section's first page, because
+    `Section` records no intra-section page offsets — an honest ceiling, not an
+    estimate.
+
+    A caption occurrence is skipped: 'Figure 3. (a) Spider mamba…' names the figure, it
+    does not cite it, and counting a caption as a citation would make an orphan-object
+    check conclude the prose refers to a figure when only the figure's own caption did.
+    The same test drops a genuine sentence-final citation ('…as shown in Figure 3.'),
+    which is indistinguishable from a caption opening in flattened text.
+    """
+    # Imported inside the function so the extractor and the addressing layer stay
+    # separable: `claims` reads a parsed document, `pdf` produces one, and a module-level
+    # edge would make an import cycle the next person's problem rather than mine.
+    from .claims import flatten
+
+    out: list[CrossRef] = []
+    for s in sections:
+        text = s.text or ""
+        if not text:
+            continue
+        flat, offsets = flatten(text)
+        seen: set[tuple[str, str, int]] = set()
+        for kind, pattern in _CROSSREF_PATTERNS:
+            for m in pattern.finditer(text):
+                if re.match(_CAPTION_DELIM, text[m.end():]):
+                    continue                      # the caption itself, not a citation
+                left, right = _sentence_bounds(text, m.start(), m.end())
+                a = _flat_index(offsets, left)
+                b = min(_flat_index(offsets, right), a + MAX_CROSSREF_QUOTE)
+                if b <= a:
+                    continue
+                key = (kind, m.group(1), a)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(CrossRef(
+                    kind=kind, number=m.group(1), page=s.page_start,
+                    section_idx=s.section_idx, span=f"P{s.section_idx}:{a}-{b}",
+                    quote=_verbatim_span(text, offsets, a, b)))
+                if len(out) >= MAX_CROSSREFS:
+                    return out
+    return out
+
+
+def _flat_index(offsets: list[int], original: int) -> int:
+    """How many flattened characters lie before original offset `original`.
+
+    `offsets` (flattened index -> original index) is strictly increasing, so this is one
+    bisect and it is the correct answer for BOTH ends of a half-open range: the count of
+    kept characters before `left` is the span's start, and the count before `right` is
+    its exclusive end. Computing the two ends by different rules is what would let a
+    span start after it finished on a run of pure whitespace.
+    """
+    import bisect
+
+    return bisect.bisect_left(offsets, original)
+
+
+def _verbatim_span(text: str, offsets: list[int], start: int, end: int) -> str:
+    """The original text spanned by flattened [start, end), whitespace included.
+
+    Mirrors `claims._verbatim` so a `CrossRef.quote` is exactly what `claims.resolve`
+    reads back off the same span. A quote assembled any other way would agree with the
+    address only by luck.
+    """
+    if not offsets or start >= end or end > len(offsets):
+        return ""
+    return text[offsets[start]:offsets[end - 1] + 1]
 
 
 def _equation_body(lines: list[str], at: int) -> str:
@@ -233,13 +579,42 @@ def _clean_rows(raw: Sequence[Sequence[str | None]]) -> list[list[str]]:
     return [r + [""] * (width - len(r)) for r in rows]
 
 
-def _page_captions(text: str) -> list[str]:
-    """Every 'Table N: ...' line on a page, in order of appearance."""
-    out = []
+class _Caption(NamedTuple):
+    """One caption line: the printed number, and the line itself VERBATIM.
+
+    Two fields rather than one reconstructed string. This used to be
+    `f"Table {n}: {rest}"`, which INSERTS a colon the paper does not print: the real
+    line 'Table 2 lists the quantitative comparison between Weath-' came back as
+    'Table 2: lists the quantitative…'. That string becomes `Table.caption`, and
+    through it `QuantFinding.benchmark` and `DiscoveredObject.experiment`, both of
+    which reach a human in `targets.json` and in the ledger — and unlike an
+    `evidence_quote` it is never re-verified against the document, so nothing would
+    have caught it. A quotation the paper does not contain is what invariant 1 exists
+    to prevent.
+
+    Keeping the number separately is also the prerequisite for saying "this extractor
+    could not label this table" instead of giving it its neighbour's number.
+    """
+
+    label: str
+    text: str
+
+
+_NO_CAPTION = _Caption("", "")
+
+
+def _page_captions(text: str) -> list[_Caption]:
+    """Every 'Table N. …' / 'Table N: …' line on a page, in order of appearance.
+
+    The delimiter is required (`_TABLE_CAPTION`), so an in-text 'Table 10, using fully
+    fine-tuned models as the teacher…' is no longer collected as a caption and can no
+    longer be attached to a table body as its name.
+    """
+    out: list[_Caption] = []
     for raw in text.splitlines():
-        m = _TABLE_CAPTION.match(_norm(raw))
-        if m:
-            out.append(_norm(f"Table {m.group(1)}: {m.group(2)}").rstrip(": "))
+        line = _norm(raw)
+        if m := _TABLE_CAPTION.match(line):
+            out.append(_Caption(label=m.group(1), text=line[:MAX_CAPTION_CHARS]))
     return out
 
 
@@ -293,8 +668,11 @@ def _grid(rows: list[list[tuple[float, str]]], tol: float = 10.0) -> list[list[s
     return grid
 
 
-def _body_runs(gapped: list[bool], is_caption: list[bool]) -> list[tuple[int, int]]:
+def _body_runs(gapped: list[bool], excluded: list[bool]) -> list[tuple[int, int]]:
     """Half-open row ranges that look like a table body, found WITHOUT reference to captions.
+
+    `excluded` marks rows that cannot be table data whatever else they are — see
+    `_TABLE_LINE_SHAPED`.
 
     Finding bodies independently is the whole point. Anchoring the scan on a caption and
     reading forward assumes the caption precedes its table, which is true for some venues
@@ -304,9 +682,9 @@ def _body_runs(gapped: list[bool], is_caption: list[bool]) -> list[tuple[int, in
     runs: list[tuple[int, int]] = []
     i = 0
     while i < len(gapped):
-        if gapped[i] and not is_caption[i]:
+        if gapped[i] and not excluded[i]:
             j = i
-            while j < len(gapped) and gapped[j] and not is_caption[j]:
+            while j < len(gapped) and gapped[j] and not excluded[j]:
                 j += 1
             if j - i >= 2:
                 runs.append((i, j))
@@ -348,7 +726,7 @@ def _caption_side(run_spans: Sequence[tuple[float, float]],
 
 
 def _pair(run_spans: Sequence[tuple[float, float]], cap_spans: Sequence[tuple[float, float]],
-          captions: Sequence[str]) -> list[str]:
+          captions: Sequence[_Caption]) -> list[_Caption]:
     """One caption per body, nearest-first on the side this page actually uses.
 
     Nearest-first rather than positional, so a table whose caption sits on the previous
@@ -357,7 +735,7 @@ def _pair(run_spans: Sequence[tuple[float, float]], cap_spans: Sequence[tuple[fl
     unknown, and an unlabelled table is far less damaging than a mislabelled one.
     """
     side = _caption_side(run_spans, cap_spans)
-    labels = [""] * len(run_spans)
+    labels = [_NO_CAPTION] * len(run_spans)
     taken: set[int] = set()
     for ci, (top, bottom) in enumerate(cap_spans):
         if ci >= len(captions):
@@ -377,7 +755,7 @@ def _pair(run_spans: Sequence[tuple[float, float]], cap_spans: Sequence[tuple[fl
     return labels
 
 
-def _unruled_tables(page, captions: list[str]) -> list[tuple[str, list[list[str]]]]:
+def _unruled_tables(page, captions: list[_Caption]) -> list[tuple[_Caption, list[list[str]]]]:
     """Recover LaTeX-style tables that have no ruling lines for pdfplumber to find.
 
     Column gaps are the signal: a prose line or a wrapped caption has no wide
@@ -388,14 +766,18 @@ def _unruled_tables(page, captions: list[str]) -> list[tuple[str, list[list[str]
     rows = _word_rows(page)
     gapped = [any(b["x0"] - a["x1"] > 12 for a, b in zip(r, r[1:])) for r in rows]
     text = [_norm(" ".join(w["text"] for w in r)) for r in rows]
-    is_caption = [bool(_TABLE_CAPTION.match(t)) for t in text]
+    # Two predicates, two questions. `excluded` keeps any "Table N…" line out of a body
+    # (`_TABLE_LINE_SHAPED`); `is_caption` marks only the lines that actually NAME a
+    # table (`_TABLE_CAPTION`), which is what may be paired with a body.
+    excluded = [bool(_TABLE_LINE_SHAPED.match(t)) for t in text]
+    is_caption = [bool(_TABLE_CAPTION_ROW.match(t)) for t in text]
     span = [(min(w["top"] for w in r), max(w["bottom"] for w in r)) for r in rows]
 
-    runs = _body_runs(gapped, is_caption)
+    runs = _body_runs(gapped, excluded)
     labels = _pair([(span[s][0], span[e - 1][1]) for s, e in runs],
                    [span[i] for i, c in enumerate(is_caption) if c], captions)
 
-    out: list[tuple[str, list[list[str]]]] = []
+    out: list[tuple[_Caption, list[list[str]]]] = []
     for (start, end), label in zip(runs, labels):
         # An unlabelled run is discarded. Detecting bodies without reference to captions
         # is what fixes the ordering bug, but it also admits any run of wide-gapped prose
@@ -403,7 +785,7 @@ def _unruled_tables(page, captions: list[str]) -> list[tuple[str, list[list[str]
         # Requiring a caption is the filter that was previously doing that work implicitly,
         # and it is the honest one to keep: a table nobody can name is a table nobody can
         # cite, and admitting it would displace real tables under MAX_TABLES.
-        if not label:
+        if not label.text:
             continue
         grid = _grid([_chunks(rows[i]) for i in range(start, end)])
         if grid and len(grid[0]) >= 2:
@@ -411,25 +793,69 @@ def _unruled_tables(page, captions: list[str]) -> list[tuple[str, list[list[str]
     return out
 
 
+# Two extractors tokenise the same table differently — ruled cells come from the line
+# grid, geometric ones from word gaps — so a duplicate will not have an identical row.
+# What it will have is most of the same cell CONTENTS. Below this fraction the candidate
+# is a different table that happens to share a column header.
+_DUP_CELL_OVERLAP = 0.6
+
+
+def _already_extracted(cap: _Caption, rows: Sequence[Sequence[str]],
+                       already: Sequence[Table]) -> bool:
+    """Would admitting this candidate give a reviewer two addresses for one table?
+
+    The check that makes running the geometric recovery over a page the ruled path
+    already touched safe. That recovery used to be skipped entirely whenever pdfplumber
+    found anything at all on the page, and the cost was measured: CVPR page 6 prints
+    Tables 1 and 2, pdfplumber keeps one ruled body, and Table 2's body was therefore
+    never looked for. ICLR's Tables 12 and 13 have recovered caption lines on page 22
+    and no bodies at all. Those are real printed results a reviewer cannot cite, and
+    they are also what makes a "the paper is missing Table 12" signal false.
+
+    Two nets. The LABEL is the exact one: a page prints "Table 1" once, so a second body
+    carrying label 1 is one table extracted twice, and two `T<i>:r:c` addresses for one
+    printed table double-count its numbers and let a citation name either. The CONTENT
+    overlap catches the same duplication when the ruled body was paired positionally
+    with a different label than the geometric pairing chose.
+    """
+    if cap.label and any(t.label == cap.label for t in already):
+        return True
+    cells = {c for row in rows for c in row if c}
+    if not cells:
+        return True                      # nothing to add; not a table either way
+    for t in already:
+        seen = {c for row in [t.header, *t.rows] for c in row if c}
+        if len(cells & seen) >= _DUP_CELL_OVERLAP * len(cells):
+            return True
+    return False
+
+
 def extract_tables(path: str | Path, pages: list[str], max_tables: int = MAX_TABLES) -> list[Table]:
     """Structured tables with (table_idx, row_idx, col_idx) addressing.
 
-    Ruled tables are read by pdfplumber directly; a page where that finds nothing
-    falls back to word-geometry recovery, because most ML papers ship booktabs
-    tables with no vertical rules at all.
+    Ruled tables are read by pdfplumber directly, and word-geometry recovery then runs
+    over the same page whenever the page's OWN CAPTION LINES outnumber the bodies the
+    ruled path accounted for — the page's statement of how many tables it prints,
+    against how many were found. It used to run only when the ruled path found nothing
+    at all, which is why a page printing two tables and yielding one ruled body never
+    had its second body looked for. Candidates that would duplicate a body already
+    recovered are dropped by `_already_extracted`.
 
     A table needs >=2 rows and >=2 columns to be worth auditing; anything smaller is
     a layout artifact, not data. Row 0 becomes `header` when it contains no digits.
 
-    ponytail: captions are paired positionally — the i-th table found on a page gets
-    the i-th "Table N:" line on that page. Wrong only when a page's tables and their
-    captions appear in different orders, which costs a label, never a cell value.
+    ponytail: ruled captions are paired positionally — the i-th ruled body on a page
+    gets the i-th caption line on that page — and `caption_source` records that, so a
+    reader can tell a positional guess from the geometric pairing `_pair` performs.
+    An unpaired body keeps its cells and records `label=""`: a table nobody can name is
+    still citable by address, and a MISlabelled one is not.
     """
     import pdfplumber
 
     tables: list[Table] = []
 
-    def add(pno: int, caption: str, raw: Sequence[Sequence[str | None]]) -> None:
+    def add(pno: int, cap: _Caption, source: str,
+            raw: Sequence[Sequence[str | None]]) -> None:
         rows = _clean_rows(raw)
         if len(rows) < 2 or len(rows[0]) < 2:
             return
@@ -437,23 +863,28 @@ def extract_tables(path: str | Path, pages: list[str], max_tables: int = MAX_TAB
         if not any(re.search(r"\d", c) for c in rows[0]):
             head, body = rows[0], rows[1:]
         if body:
-            tables.append(Table(table_idx=len(tables), page=pno, caption=caption,
+            tables.append(Table(table_idx=len(tables), page=pno, caption=cap.text,
+                                label=cap.label,
+                                caption_source=source if cap.text else "none",
                                 header=head, rows=body))
 
     with pdfplumber.open(str(path)) as pdf:
         for pno, page in enumerate(pdf.pages[: len(pages)], start=1):
             captions = _page_captions(pages[pno - 1])
-            before = len(tables)
             for found in page.extract_tables():
                 if len(tables) >= max_tables:
                     return tables
                 idx = sum(1 for t in tables if t.page == pno)
-                add(pno, captions[idx] if idx < len(captions) else "", found)
-            if len(tables) == before:
-                for caption, grid in _unruled_tables(page, captions):
-                    if len(tables) >= max_tables:
-                        return tables
-                    add(pno, caption, grid)
+                add(pno, captions[idx] if idx < len(captions) else _NO_CAPTION,
+                    "ruled_positional", found)
+            if len(captions) <= sum(1 for t in tables if t.page == pno):
+                continue                 # every caption on this page already has a body
+            for cap, grid in _unruled_tables(page, captions):
+                if len(tables) >= max_tables:
+                    return tables
+                if _already_extracted(cap, grid, [t for t in tables if t.page == pno]):
+                    continue
+                add(pno, cap, "geometric_paired", grid)
     return tables
 
 
@@ -572,19 +1003,94 @@ def render_sections(sections: list[Section], budget_chars: int) -> str:
     return "\n\n".join(out)
 
 
+class SectionPresentation(NamedTuple):
+    """How much of the extracted prose a lens was actually shown.
+
+    The ceiling on any recall claim this system makes, and unmeasured until this
+    existed: `render_sections` divides a character budget equally across sections, so a
+    long paper is TRUNCATED before any lens reads a word of it. Measured presented
+    fraction over the corpus: 0.384, 0.411, 0.489, 0.589 — while the review's scope
+    section said "4 independent lens(es) read the paper".
+
+    Reported, never enforced: nothing here changes what is rendered. It is computed by
+    the same arithmetic `render_sections` uses so the two cannot disagree.
+    """
+
+    total_chars: int
+    presented_chars: int
+    sections: int
+    sections_truncated: int
+
+    @property
+    def fraction(self) -> float | None:
+        """None when there is no prose at all — never 1.0, which would read as 'all of
+        it was shown' about a document nothing was extracted from."""
+        return (self.presented_chars / self.total_chars) if self.total_chars else None
+
+
+def section_presentation(sections: list[Section], budget_chars: int) -> SectionPresentation:
+    """The measurement of what `render_sections` places in a prompt, without rendering."""
+    if not sections:
+        return SectionPresentation(0, 0, 0, 0)
+    per = max(400, budget_chars // len(sections))
+    total = sum(len(s.text) for s in sections)
+    presented = sum(min(len(s.text), per) for s in sections)
+    return SectionPresentation(total, presented, len(sections),
+                               sum(1 for s in sections if len(s.text) > per))
+
+
 if __name__ == "__main__":  # self-check: python -m harness.pdf <file.pdf>
     import sys
 
+    # The only self-check in this harness that needs an argument, so it is also the only
+    # one that can be run the way all the others are run and crash. It used to raise a
+    # bare IndexError, which reads like a defect in the extractor rather than like a
+    # missing argument — an unhelpful first impression from the module a new reader is
+    # most likely to try, because "does it parse my PDF" is the first question.
+    if len(sys.argv) < 2:
+        print(f"usage: python -m harness.pdf <file.pdf>\n"
+              f"  parses one PDF and prints its sections, tables, figures and equations.\n"
+              f"  Unlike every other `python -m harness.<module>` self-check, this one "
+              f"needs a file.", file=sys.stderr)
+        raise SystemExit(2)
+
     src = Path(sys.argv[1])
+    if not src.is_file():
+        print(f"no such file: {src}", file=sys.stderr)
+        raise SystemExit(2)
     pg = page_texts(src)
     secs, tbls = split_sections(pg), extract_tables(src, pg)
     figs, eqs = extract_figures(pg), extract_equations(pg)
+    xrefs, boundary = extract_crossrefs(secs), references_boundary(secs)
+    pres = section_presentation(secs, 70_000)
     print(f"{src.name}: {len(pg)} pages, {len(secs)} sections, {len(tbls)} tables, "
-         f"{len(figs)} figure caption(s), {len(eqs)} equation(s)")
-    print(f"title: {guess_title(pg)!r}")
+         f"{len(figs)} figure caption(s), {len(eqs)} equation(s), "
+         f"{len(xrefs)} cross-reference(s) [extraction v{EXTRACTION_VERSION}]")
+    print(f"title: {guess_title(pg)!r} (plausible: {title_is_plausible(guess_title(pg))})")
+    print(f"back matter begins at section {boundary}; "
+          f"prose shown to a lens: {pres.presented_chars}/{pres.total_chars} chars, "
+          f"{pres.sections_truncated}/{pres.sections} section(s) truncated")
     assert pg, "no pages extracted"
     assert secs, "no sections extracted"
     assert sum(len(s.text) for s in secs) > 500, "suspiciously little text extracted"
+    # A caption must be text the paper actually contains. This is the property the
+    # reconstructed `f"Table {n}: {rest}"` broke, and it is asserted here against the
+    # real page text rather than against a fixture, because the injected colon only
+    # showed up on a paper whose caption line had no colon in it.
+    flat_pages = [_norm(p) for p in pg]
+    for t in tbls:
+        assert not t.caption or any(t.caption in fp for fp in flat_pages), \
+            f"T{t.table_idx}'s caption is not printed in this paper: {t.caption!r}"
+    # A cross-reference must be re-derivable from its own address, or the address is
+    # decoration. `claims.resolve` is the same resolver a finding's evidence goes
+    # through, so this is the real check and not a parallel one.
+    from .artifacts import PaperDoc as _PaperDoc
+    from .claims import resolve as _resolve
+    probe_doc = _PaperDoc(paper_id="selfcheck", sections=secs)
+    for xr in xrefs[:25]:
+        got = _resolve(probe_doc, xr.span)
+        assert got.resolution == "resolved", (xr.span, got.resolution, got.detail)
+        assert got.quote == xr.quote, (xr.span, got.quote[:60], xr.quote[:60])
     for s in secs[:12]:
         print(f"  §{s.section_idx} p{s.page_start}-{s.page_end} {s.title!r} ({len(s.text)} chars)")
     for t in tbls[:5]:

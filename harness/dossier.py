@@ -28,9 +28,28 @@ import re
 from pathlib import Path
 
 from . import state
+from . import provenance as provenance_mod
 from .config import Config
 
 BADGE = {"RED": "🔴 RED", "GREEN": "🟢 GREEN"}
+# The REVIEW-level triage, which has three levels and is not the binary verdict. Kept as
+# its own table because routing them through `BADGE` rendered every YELLOW paper as
+# "STALE — re-run this paper": five of the seven corpus papers, each reported as a broken
+# artifact rather than as what the triage actually said about it.
+TRIAGE_BADGE = {"RED": "🔴 RED", "YELLOW": "🟡 YELLOW", "GREEN": "🟢 GREEN"}
+
+
+def triage_badge(triage: str) -> str:
+    """The triage badge, or '—' for a report written before the triage existed."""
+    return TRIAGE_BADGE.get((triage or "").strip(), "—")
+
+
+def heading_badge(report: dict) -> str:
+    """The badge a per-paper section is headed with: the triage when the report carries
+    one, and the binary verdict otherwise. A report predating the triage still reads as
+    what it decided rather than as an em dash."""
+    t = (report.get("triage") or "").strip()
+    return TRIAGE_BADGE[t] if t in TRIAGE_BADGE else badge(report.get("verdict") or "")
 
 
 def badge(verdict: str) -> str:
@@ -146,17 +165,20 @@ def provenance_caveat(report: dict) -> str:
     # spec refused by `authorize` (verdict `blocked`, no seeds run) or one whose run ended
     # INCONCLUSIVE still had the right provenance — asserting "a real reproduction verdict"
     # for either would claim an execution, or a resolution, that did not happen.
-    executed = bool(p.get("seeds_run"))
+    executed = bool(p.get("seeds_run")) or int(p.get("executions") or 0) > 0
+    if not executed:
+        return ("⚠️ A probe/reimplementation route was prepared but no process executed. "
+                "It produced no measurement and cannot support a conclusion about the "
+                "paper.")
     resolved = rec_status in ("RESOLVED_VERIFIED", "FAILED_REPRODUCTION")
-    if prov in ("repo_exec", "driver") and executed and resolved:
+    if provenance_mod.admits(prov) and executed and resolved:
         whose = ("the authors' own checkout (AUTHOR_REPOSITORY)" if prov == "repo_exec"
                 else "an INDEPENDENT_REIMPLEMENTATION of the paper's method — not the "
                      "authors' code")
         return (f"This probe ran {whose}, so its reconciliation against "
                 f"the cited cell is a real reproduction verdict.")
-    if prov in ("repo_exec", "driver"):
-        why = (f"verdict `{p.get('verdict') or '?'}`, no process executed" if not executed
-              else f"reconciliation `{rec_status or 'not recorded'}`")
+    if provenance_mod.admits(prov):
+        why = f"reconciliation `{rec_status or 'not recorded'}`"
         return (f"⚠️ This probe's provenance ({prov}) would admit a real reproduction "
                 f"verdict, but none was reached ({why}). Nothing about the paper's own "
                 f"code follows from this.")
@@ -177,17 +199,61 @@ def provenance_caveat(report: dict) -> str:
             "seed-noise floor and nothing about the paper. It reproduces no claim.")
 
 
+def category_counts(report: dict) -> dict[str, int]:
+    """Findings per scientific category, read off `scientific_findings`.
+
+    Falls back to counting nothing rather than re-deriving the classification: this
+    module's whole contract is that it copies. A report written before the taxonomy
+    existed shows an empty category cell, which is honest, where a re-derivation here
+    would be a second classifier disagreeing with the first.
+    """
+    out: dict[str, int] = {}
+    for sf in report.get("scientific_findings") or []:
+        k = sf.get("scientific_class") or ""
+        if k:
+            out[k] = out.get(k, 0) + 1
+    return out
+
+
+def resolution_counts(report: dict) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for sf in report.get("scientific_findings") or []:
+        k = sf.get("resolution_status") or "NOT_INVESTIGATED"
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
+def _abbrev(counter: dict[str, int]) -> str:
+    """`{"CONFOUND": 2, "OVERSTATED_CLAIM": 1}` -> "2 confound, 1 overstated claim"."""
+    if not counter:
+        return "—"
+    return ", ".join(f"{n} {k.replace('_', ' ').lower()}"
+                     for k, n in sorted(counter.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
 def matrix(reports: list[dict]) -> list[list[str]]:
-    """The multi-paper evaluation matrix, header row first."""
-    rows = [["Paper", "Venue", "Validity Threats", "Repo / Code", "Probe Status", "Verdict"]]
+    """The multi-paper evaluation matrix, header row first.
+
+    Leads with the SCIENTIFIC CATEGORIES, because that is what the review produces. The
+    triage level follows as a routing column and the binary verdict after it; neither is
+    a summary of the findings and putting either first said otherwise.
+    """
+    rows = [["Paper", "Venue", "Findings by category", "Settled", "Repo / Code",
+             "Probe Status", "Triage", "Verdict"]]
     for r in reports:
-        c = counts(r)
+        res = resolution_counts(r)
+        settled = sum(n for k, n in res.items() if k.startswith("RESOLVED"))
         rows.append([
             f"`{r['paper_id']}`",
             venue_of(r["paper_id"]) or "—",
-            f"{c['FATAL']} FATAL / {c['MAJOR']} MAJOR / {c['MINOR']} MINOR",
+            _abbrev(category_counts(r)),
+            f"{settled}/{sum(res.values())}" if res else "—",
             repo_status(r),
             probe_status(r),
+            # Read from the report, and STALE only when the report carries no triage at
+            # all — a pre-triage artifact. YELLOW is a live level and must never render
+            # as stale, which is what routing it through `badge` used to do.
+            triage_badge(r.get("triage") or ""),
             badge(r.get("verdict") or ""),
         ])
     return rows
@@ -269,7 +335,7 @@ def render_markdown(reports: list[dict], missing: list[str]) -> str:
     for r in reports:
         c = counts(r)
         L += [
-            f"## {badge(r.get('verdict',''))} — `{r['paper_id']}`",
+            f"## {heading_badge(r)} — `{r['paper_id']}`",
             "",
             f"**{r.get('title') or r['paper_id']}**",
             "",
@@ -279,7 +345,11 @@ def render_markdown(reports: list[dict], missing: list[str]) -> str:
             f"{r.get('n_tables', 0)} tables · {r.get('n_numbers', 0)} reported numbers · "
             f"lenses: {', '.join(r.get('lenses_run') or []) or '(none)'}",
             "",
-            f"Findings: {c['FATAL']} FATAL / {c['MAJOR']} MAJOR / {c['MINOR']} MINOR"
+            f"Findings by category: {_abbrev(category_counts(r))}",
+            "",
+            f"Resolution: {_abbrev(resolution_counts(r))}",
+            "",
+            f"Severity: {c['FATAL']} FATAL / {c['MAJOR']} MAJOR / {c['MINOR']} MINOR"
             + (f" · {r.get('dropped_findings')} dropped as unsubstantiated"
                if r.get("dropped_findings") else " · 0 dropped"),
             "",
@@ -506,10 +576,29 @@ if __name__ == "__main__":       # self-check: python -m harness.dossier
     }
 
     rows = matrix([fake])
+    cols = {name: i for i, name in enumerate(rows[0])}
     assert rows[0][0] == "Paper" and len(rows) == 2
-    assert rows[1][2] == "0 FATAL / 1 MAJOR / 1 MINOR", rows[1]
-    assert rows[1][4] == "within_noise (synthesized) · INCONCLUSIVE", rows[1]
-    assert rows[1][5] == "🟢 GREEN"
+    assert rows[1][cols["Findings by category"]] == "—", (
+        "a report with no scientific_findings shows an empty category cell rather than "
+        "a re-derived one; this module copies and does not classify")
+    assert rows[1][cols["Probe Status"]] == "within_noise (synthesized) · INCONCLUSIVE", rows[1]
+    assert rows[1][cols["Verdict"]] == "🟢 GREEN"
+    assert rows[1][cols["Triage"]] == "—", "no triage in this artifact, so no triage badge"
+
+    # --- YELLOW is a live level and must never render as a stale artifact --------------
+    assert triage_badge("YELLOW") == "🟡 YELLOW"
+    assert "STALE" not in triage_badge("YELLOW")
+    yellow = dict(fake, triage="YELLOW",
+                  scientific_findings=[{"scientific_class": "CONFOUND",
+                                        "resolution_status": "UNRESOLVED"},
+                                       {"scientific_class": "CONFOUND",
+                                        "resolution_status": "RESOLVED_FROM_PAPER"},
+                                       {"scientific_class": "OVERSTATED_CLAIM",
+                                        "resolution_status": "UNRESOLVED"}])
+    row = matrix([yellow])[1]
+    assert row[cols["Triage"]] == "🟡 YELLOW"
+    assert row[cols["Findings by category"]] == "2 confound, 1 overstated claim"
+    assert row[cols["Settled"]] == "1/3"
 
     md = render_markdown([fake], ["ghost"])
     assert "Executive Review Dossier" in md

@@ -301,7 +301,7 @@ def _qualified() -> ProbeSpec:
         resources=ResourceCapability(state="satisfied", reason="fits"))
 
 
-def test_no_runtime_demand_reaches_selection_or_authorization(tmp_path):
+def test_no_runtime_demand_reaches_selection_or_authorization(confined_local, tmp_path):
     """The load-bearing test. Every rule here is report-only, so a demand cannot be the
     reason a reproduction is refused — and cannot be the reason one is permitted either.
 

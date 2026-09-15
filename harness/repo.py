@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from typing import Callable, Protocol
 
 from .artifacts import CommitVerification, ExecCapability, PaperDoc, RepoAcquisition
 from .config import Config
@@ -334,26 +335,80 @@ def _git(args: list[str], cwd: Path | None, timeout: int) -> subprocess.Complete
                           errors="replace", timeout=timeout)
 
 
+class GitTree(Protocol):
+    """The three reads commit verification needs, over a checkout wherever it lives.
+
+    Extracted so `verify_commit` is written ONCE. Its logic is the fail-closed half of the
+    execution guarantee — a redirected `.git`, an assume-unchanged path, an uninspectable
+    tree and a modified tree each block, each for a stated reason — and a remote backend
+    that reimplemented it would be a second copy of the most safety-critical function in
+    this module, free to drift from the first.
+
+    So the reads are abstracted and the reasoning is shared: the same function certifies a
+    checkout on this disk and a checkout inside a sandbox, and a new backend supplies three
+    methods rather than a second opinion about what 'clean' means.
+    """
+
+    path: str
+
+    def git(self, args: list[str], timeout: int = 60) -> tuple[int, str, str]:
+        """(returncode, stdout, stderr) for `git <args>` inside the checkout."""
+        ...
+
+    def is_dir(self) -> bool:
+        """Is there a checkout here at all?"""
+        ...
+
+    def is_file(self, relpath: str) -> bool:
+        """Is `<checkout>/<relpath>` a regular file? Used only for `.git`."""
+        ...
+
+
+class LocalGitTree:
+    """A checkout on this machine. What every path did before the protocol existed."""
+
+    def __init__(self, repo: str | Path) -> None:
+        self.path = str(repo)
+        self._repo = Path(repo)
+
+    def git(self, args: list[str], timeout: int = 60) -> tuple[int, str, str]:
+        try:
+            p = _git(args, self._repo, timeout)
+        except (OSError, subprocess.SubprocessError) as e:
+            return 128, "", str(e)
+        return p.returncode, p.stdout or "", p.stderr or ""
+
+    def is_dir(self) -> bool:
+        return self._repo.is_dir()
+
+    def is_file(self, relpath: str) -> bool:
+        return (self._repo / relpath).is_file()
+
+
+def _tree(repo: str | Path, tree: GitTree | None) -> GitTree:
+    return tree if tree is not None else LocalGitTree(repo)
+
+
 _SHA = re.compile(r"^[0-9a-f]{7,40}$")
 
 
-def head_commit(repo: Path) -> str:
+def head_commit(repo: Path, tree: GitTree | None = None) -> str:
     """The full 40-character SHA at HEAD, or '' if the directory is not a checkout."""
-    p = _git(["rev-parse", "HEAD"], repo, 30)
-    sha = (p.stdout or "").strip()
-    return sha if p.returncode == 0 and _SHA.fullmatch(sha) else ""
+    rc, out, _ = _tree(repo, tree).git(["rev-parse", "HEAD"], 30)
+    sha = (out or "").strip()
+    return sha if rc == 0 and _SHA.fullmatch(sha) else ""
 
 
-def is_shallow(repo: Path) -> bool:
-    p = _git(["rev-parse", "--is-shallow-repository"], repo, 30)
-    return (p.stdout or "").strip() == "true"
+def is_shallow(repo: Path, tree: GitTree | None = None) -> bool:
+    rc, out, _ = _tree(repo, tree).git(["rev-parse", "--is-shallow-repository"], 30)
+    return rc == 0 and (out or "").strip() == "true"
 
 
 class TreeUninspectable(RuntimeError):
     """`git status` did not run, so nothing is known about the working tree."""
 
 
-def dirty_files(repo: Path) -> list[str]:
+def dirty_files(repo: Path, tree: GitTree | None = None) -> list[str]:
     """Paths that differ from HEAD. A clean SHA over a modified tree is not the audited code.
 
     RAISES rather than returning [] when `git status` fails. It used to return the empty
@@ -374,15 +429,15 @@ def dirty_files(repo: Path) -> list[str]:
     `submodule.<name>.ignore` in `.gitmodules` or the local config, which makes plain
     `git status` silently stop reporting that submodule's own modifications.
     """
-    p = _git(["status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"],
-             repo, 60)
-    if p.returncode != 0:
+    rc, out, err = _tree(repo, tree).git(
+        ["status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"], 60)
+    if rc != 0:
         raise TreeUninspectable(
-            f"`git status` exited {p.returncode} in {repo}: {(p.stderr or '').strip()[:200]}")
-    return sorted(line[3:].strip() for line in (p.stdout or "").splitlines() if line.strip())
+            f"`git status` exited {rc} in {repo}: {(err or '').strip()[:200]}")
+    return sorted(line[3:].strip() for line in (out or "").splitlines() if line.strip())
 
 
-def linked_git_dir(repo: Path) -> bool:
+def linked_git_dir(repo: Path, tree: GitTree | None = None) -> bool:
     """True when `repo/.git` is a FILE — a worktree/submodule redirect — not a directory.
 
     `acquire()` only ever produces a real `git clone`, whose `.git` is always a directory.
@@ -392,10 +447,10 @@ def linked_git_dir(repo: Path) -> bool:
     tampering or an unexpected acquisition path, the tree cannot be certified clean from
     here, so this counts as uninspectable rather than as evidence either way.
     """
-    return (repo / ".git").is_file()
+    return _tree(repo, tree).is_file(".git")
 
 
-def locked_index_paths(repo: Path) -> list[str]:
+def locked_index_paths(repo: Path, tree: GitTree | None = None) -> list[str]:
     """Tracked paths marked assume-unchanged or skip-worktree.
 
     Both bits exist to make git STOP reporting a path's modifications in `status` — that
@@ -404,11 +459,11 @@ def locked_index_paths(repo: Path) -> list[str]:
     exact mechanism designed to hide this from it, so their presence at all makes the tree
     uninspectable rather than clean.
     """
-    p = _git(["ls-files", "-v"], repo, 30)
-    if p.returncode != 0:
+    rc, stdout, _ = _tree(repo, tree).git(["ls-files", "-v"], 30)
+    if rc != 0:
         return []
     out = []
-    for line in (p.stdout or "").splitlines():
+    for line in (stdout or "").splitlines():
         line = line.rstrip("\n")
         if not line:
             continue
@@ -443,7 +498,8 @@ def fetch_revision(cfg: Config, dest: Path, url: str, sha: str) -> tuple[bool, s
     return True, ""
 
 
-def verify_commit(repo: str | Path, expected: str) -> CommitVerification:
+def verify_commit(repo: str | Path, expected: str,
+                  tree: GitTree | None = None) -> CommitVerification:
     """Is the checkout about to run the one that was audited? Fresh, at the point of use.
 
     Not a comparison of two recorded strings. `acq.commit` says what arrived when git last
@@ -461,15 +517,23 @@ def verify_commit(repo: str | Path, expected: str) -> CommitVerification:
     `unknown` blocks. "We never wrote down which commit we audited" is not evidence that
     this is that commit, and the cost of guessing wrong is a reproduction verdict about
     code the audit never read.
+
+    `tree` is how a REMOTE checkout is certified by this same function rather than by a
+    second copy of it. Passing a `GitTree` over a sandbox makes every check below run
+    inside that sandbox — the same four outcomes, the same fail-closed branches, the same
+    sentences — so a remote reproduction rests on the identical guarantee a local one
+    does. `repo` is still carried for the messages, which name the checkout a reader
+    would go and look at.
     """
     ver = CommitVerification(expected=(expected or "").strip().lower())
     path = Path(repo) if repo else None
-    if not path or not path.is_dir():
+    checkout = _tree(path or Path("."), tree)
+    if not path or not checkout.is_dir():
         ver.state, ver.reason = "unknown", "there is no checkout on disk to verify"
         return ver
 
-    ver.actual = head_commit(path)
-    ver.shallow = is_shallow(path)
+    ver.actual = head_commit(path, checkout)
+    ver.shallow = is_shallow(path, checkout)
     if not ver.actual:
         ver.state = "unknown"
         ver.reason = f"'{path}' is not a git checkout, so its commit cannot be established"
@@ -500,7 +564,7 @@ def verify_commit(repo: str | Path, expected: str) -> CommitVerification:
     # detects (git status running and reporting nothing), so both are checked BEFORE it,
     # fail-closed, for the same reason: neither leaves this harness able to say the tree it
     # is about to certify is the tree `git status` actually inspected.
-    if linked_git_dir(path):
+    if linked_git_dir(path, checkout):
         ver.state = "unknown"
         ver.reason = (
             f"HEAD is the audited commit {ver.actual[:12]}, but '{path}/.git' is a file, not "
@@ -508,7 +572,7 @@ def verify_commit(repo: str | Path, expected: str) -> CommitVerification:
             f"produces on its own. The checkout cannot be shown to be an independent tree, so "
             f"it cannot be certified clean.")
         return ver
-    locked = locked_index_paths(path)
+    locked = locked_index_paths(path, checkout)
     if locked:
         ver.state = "unknown"
         ver.reason = (
@@ -519,7 +583,7 @@ def verify_commit(repo: str | Path, expected: str) -> CommitVerification:
         return ver
 
     try:
-        ver.dirty_files = dirty_files(path)
+        ver.dirty_files = dirty_files(path, checkout)
     except TreeUninspectable as e:
         # Fails CLOSED. Not knowing whether the tree is clean is not the same as knowing
         # it is, and this is the branch that used to certify: `dirty_files` returned [] on
@@ -792,8 +856,14 @@ def declared_platform(repo: Path) -> str:
     return ""
 
 
+# `missing_imports`, or whatever answers the same question somewhere else. Signature is
+# (interpreter, repo_root, modules) -> the modules that interpreter cannot resolve.
+ImportResolver = Callable[[str, Path, list[str]], list[str]]
+
+
 def assess_capability(acq: RepoAcquisition, interpreter: str, harness_python: str,
-                      flag: str = "seed", platform: str = "") -> ExecCapability:
+                      flag: str = "seed", platform: str = "",
+                      resolve_imports: ImportResolver | None = None) -> ExecCapability:
     """Can this machine give the repository a fair run? Decided before anything executes.
 
     Ordered from the most fundamental blocker outward, so the reported reason is the root
@@ -803,7 +873,17 @@ def assess_capability(acq: RepoAcquisition, interpreter: str, harness_python: st
     `established` False never accuses the paper of anything. It records that this runner
     could not mount the experiment, which is the fact the reconciliation needs in order
     to refuse to convict.
+
+    `resolve_imports` is the one check here that cannot be answered by reading files. The
+    others are static — a declared platform, the entrypoint's module-level imports, the
+    repository's own argument definitions — and read the same bytes wherever the checkout
+    sits. Resolving a module means ASKING an interpreter, and for a remote backend that
+    interpreter is not on this machine: running the default resolver against a Linux venv
+    path from a Windows host fails to start and reports every dependency missing, which
+    would refuse a perfectly capable session as `dependency_missing`. So the question is
+    delegated, and the backend that owns the interpreter answers it.
     """
+    resolve_imports = resolve_imports or missing_imports
     # The platform compared against is the one the RUN will see, supplied by the execution
     # backend, not the one this process happens to be on. They coincide under the local
     # backend and diverge the moment a Linux container backend exists — at which point a
@@ -844,19 +924,30 @@ def assess_capability(acq: RepoAcquisition, interpreter: str, harness_python: st
         return cap
 
     cap.checked_imports = entrypoint_imports(repo_path, acq.entrypoint)
-    cap.missing_dependencies = missing_imports(interpreter, repo_path, cap.checked_imports)
+    cap.missing_dependencies = resolve_imports(interpreter, repo_path, cap.checked_imports)
     if cap.missing_dependencies:
         cap.reason_code = "dependency_missing"
         cap.detail = ("the entrypoint imports modules the built environment cannot resolve: "
                       + ", ".join(cap.missing_dependencies[:8]))
         return cap
 
-    cap.accepts_seed_argument = accepts_argument(repo_path, acq.entrypoint, flag)
-    if not cap.accepts_seed_argument:
-        cap.reason_code = "invalid_invocation"
-        cap.detail = (f"this harness would pass --{flag}, which does not appear anywhere in the "
-                      f"repository's argument definitions; the command is ours, not theirs")
-        return cap
+    # The check is about the invocation this harness WILL make, not about a flag it might
+    # have made up. An empty `flag` means the caller has established that no seed will be
+    # passed — the case is a deterministic quantity, a count of what a generator produces,
+    # which has no seed-to-seed distribution and for which `--seed` would be exactly the
+    # invented argument this check exists to refuse. Requiring the repository to accept an
+    # argument nobody is going to send it is checking the wrong invocation, and it blocked
+    # the one shape the prose path was built to reach.
+    if flag:
+        cap.accepts_seed_argument = accepts_argument(repo_path, acq.entrypoint, flag)
+        if not cap.accepts_seed_argument:
+            cap.reason_code = "invalid_invocation"
+            cap.detail = (f"this harness would pass --{flag}, which does not appear anywhere in "
+                          f"the repository's argument definitions; the command is ours, not theirs")
+            return cap
+    else:
+        cap.accepts_seed_argument = None
+        cap.detail = "no seed is passed for this target, so no seed argument is required of the repository"
 
     cap.established, cap.reason_code = True, "established"
     cap.detail = "environment built, dependencies resolvable, and the invocation is one the repo accepts"

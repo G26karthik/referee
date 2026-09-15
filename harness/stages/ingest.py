@@ -120,10 +120,19 @@ def run_ingest(cfg: Config, paper_path: str) -> dict:
     doc_path = root / "paper" / "doc.json"
     if same and doc_path.exists():
         d = state.read_json(doc_path)
+        # A cached document is NOT re-parsed, deliberately. Every `F<n>`, `T<i>:r<r>:c<c>`
+        # and `P<i>:<a>-<b>` in this project's lens files was minted against exactly this
+        # doc.json, and re-parsing it under a newer extractor would leave those references
+        # pointing at different objects — the harness would then attest to the contents of
+        # something nobody cited. So the version is REPORTED and nothing is rebuilt: the
+        # caller learns the parse is older than the current extractor and decides.
+        recorded = int(d.get("extraction_version") or 1)
         return {"cached": True, "paper_id": pid, "title": d.get("title", ""),
                 "content_sha": d.get("content_sha", "") or sha,
                 "sections": len(d.get("sections", [])), "tables": len(d.get("tables", [])),
                 "numbers": len(d.get("reported_numbers", [])),
+                "extraction_version": recorded,
+                "stale_extraction": recorded != pdf.EXTRACTION_VERSION,
                 "repo_url": d.get("repo_url", "") or None, "doc": "paper/doc.json"}
 
     pages = pdf.page_texts(src)
@@ -131,6 +140,10 @@ def run_ingest(cfg: Config, paper_path: str) -> dict:
     tables = pdf.extract_tables(src, pages)
     figures = pdf.extract_figures(pages)
     equations = pdf.extract_equations(pages)
+    # What the prose CITES, never what the paper contains: `extract_crossrefs` is handed
+    # the sections and nothing else, so it cannot compare a citation against a recovered
+    # label set. See `harness.artifacts.CrossRef`.
+    crossrefs = pdf.extract_crossrefs(sections)
     numbers = pdf.table_numbers(tables) + pdf.prose_numbers(sections)
     title = pdf.guess_title(pages) or src.stem
 
@@ -146,7 +159,9 @@ def run_ingest(cfg: Config, paper_path: str) -> dict:
     doc = PaperDoc(paper_id=pid, title=title, source_path=str(src), content_sha=sha,
                    n_pages=len(pages),
                    sections=sections, tables=tables, figures=figures, equations=equations,
-                   reported_numbers=numbers)
+                   reported_numbers=numbers, crossrefs=crossrefs,
+                   body_end_section_idx=pdf.references_boundary(sections),
+                   extraction_version=pdf.EXTRACTION_VERSION)
     # The repository the paper advertises, ranked by how strongly the surrounding text
     # marks it as the authors' own. Recorded at ingest so S3 never re-opens the PDF, and
     # so a reader can see which URL the harness would clone before anything is fetched.
@@ -160,10 +175,17 @@ def run_ingest(cfg: Config, paper_path: str) -> dict:
         cfg, pid, artifact_type="paper_ingested", phase="ingest",
         headers={"title": title[:80], "pages": len(pages), "sections": len(sections),
                  "tables": len(tables), "numbers": len(numbers),
+                 "figures": len(figures), "equations": len(equations),
+                 "crossrefs": len(crossrefs),
+                 "extraction_version": pdf.EXTRACTION_VERSION,
                  "table_numbers": sum(1 for n in numbers if n.table_ref)},
         path=str(doc_path),
     )
     return {"paper_id": pid, "title": title, "pages": len(pages), "content_sha": sha,
             "sections": len(sections), "tables": len(tables), "numbers": len(numbers),
+            "figures": len(figures), "equations": len(equations),
+            "crossrefs": len(crossrefs),
+            "body_end_section_idx": doc.body_end_section_idx,
+            "extraction_version": pdf.EXTRACTION_VERSION, "stale_extraction": False,
             "table_numbers": sum(1 for n in numbers if n.table_ref),
             "repo_url": doc.repo_url or None, "doc": "paper/doc.json"}

@@ -68,15 +68,37 @@ def _write(cfg: Config, report: dict) -> None:
 # --------------------------------------------------------------------------- #
 # matrix
 # --------------------------------------------------------------------------- #
-def test_matrix_has_the_requested_columns():
+def test_matrix_leads_with_scientific_categories_not_a_colour():
     rows = dossier.matrix([_report("acl")])
-    assert rows[0] == ["Paper", "Venue", "Validity Threats", "Repo / Code",
-                       "Probe Status", "Verdict"]
+    assert rows[0] == ["Paper", "Venue", "Findings by category", "Settled", "Repo / Code",
+                       "Probe Status", "Triage", "Verdict"]
+    # The categories come before either colour: what the review found is the result, and
+    # the triage level only routes a human's attention to it.
+    assert rows[0].index("Findings by category") < rows[0].index("Triage")
+    assert rows[0].index("Triage") < rows[0].index("Verdict")
 
 
-def test_matrix_counts_each_severity_separately():
-    rows = dossier.matrix([_report("cvpr", fatal=2, major=14, minor=6)])
-    assert rows[1][2] == "2 FATAL / 14 MAJOR / 6 MINOR"
+def test_matrix_counts_each_scientific_category_separately():
+    r = _report("cvpr", fatal=2, major=14, minor=6)
+    r["scientific_findings"] = (
+        [{"scientific_class": "CONFOUND", "resolution_status": "UNRESOLVED"}] * 3
+        + [{"scientific_class": "CONTRADICTION", "resolution_status": "RESOLVED_FROM_PAPER"}])
+    rows = dossier.matrix([r])
+    assert rows[1][2] == "3 confound, 1 contradiction"
+    assert rows[1][3] == "1/4"
+
+
+def test_a_yellow_paper_is_not_reported_as_a_stale_artifact():
+    """YELLOW is a live triage level. Routing it through the binary-verdict badge table
+    rendered five of the seven corpus papers as "STALE — re-run this paper"."""
+    r = _report("iclr")
+    r["triage"] = "YELLOW"
+    row = dossier.matrix([r])[1]
+    assert row[6] == "🟡 YELLOW"
+    assert "STALE" not in " ".join(row)
+    assert dossier.triage_badge("YELLOW") == "🟡 YELLOW"
+    # and a report predating the triage says so, rather than claiming GREEN
+    assert dossier.triage_badge("") == "—"
 
 
 def test_probe_status_carries_provenance_and_reconciliation():
@@ -149,7 +171,18 @@ def test_a_refused_probe_is_not_claimed_as_a_real_verdict():
         r["probe"]["seeds_run"] = []
         md = dossier.render_markdown([r], [])
         assert "is a real reproduction verdict" not in md
-        assert "Nothing about the paper's own code follows" in md
+        assert "no process executed" in md
+
+
+def test_not_started_synthesized_probe_never_claims_it_ran_at_toy_scale():
+    r = _report("x", provenance="synthesized", reconciliation=None)
+    r["probe"]["verdict"] = "not_started"
+    r["probe"]["seeds_run"] = []
+    r["probe"]["executions"] = 0
+    md = dossier.render_markdown([r], [])
+    assert "A probe/reimplementation route was prepared but no process executed" in md
+    for false_claim in ("run at toy scale", "ran at toy scale", "returned"):
+        assert false_claim not in md
 
 
 def test_an_inconclusive_reconciliation_is_not_claimed_as_a_real_verdict():

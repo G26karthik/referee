@@ -1,0 +1,13 @@
+# Line endings are LF in the repository, on every platform.
+#
+# 46 of 75 source files had drifted to CRLF and the rest were LF — the signature of
+# editing on Windows with nothing declaring the intent. Python parses either identically,
+# so the drift was invisible in behaviour and noisy in every diff. This pins it.
+* text=auto eol=lf
+
+# Artifacts that are bytes, not text. Normalizing these would corrupt them.
+*.pdf binary
+*.zip binary
+*.png binary
+*.jpg binary
+*.db binary

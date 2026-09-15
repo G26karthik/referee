@@ -40,10 +40,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import audit_driver, grade_driver, state
+from . import assessment, audit_driver, grade_driver, state
 from .artifacts import (PHASES, CaseState, PaperDoc, PhaseEvent, ProbeResult)
 from .config import Config
 from .stages import audit as audit_stage
+from .stages import discover as discover_stage
 from .stages import grade as grade_stage
 from .stages import ingest as ingest_stage
 from .stages import probe as probe_stage
@@ -395,6 +396,67 @@ def _phase_grade(cfg: Config, case: CaseState, *, auto_grade: bool = False, **_)
              f"they will count at their lens-asserted severity", detail)
 
 
+def _phase_assess(cfg: Config, case: CaseState, **_) -> PhaseOutcome:
+    """Has the paper's own evidence already settled it? Asked BEFORE anything expensive.
+
+    Pure and model-free, over the kept findings alone. It cannot fail for a reason worth
+    retrying and it cannot abstain: every paper gets an answer, and the answer is False
+    for most of them.
+
+    What a True answer stops is the INVESTIGATION BRANCH — acquisition, static audit,
+    identity, resources, execution. What it does not stop is the review: discovery, the
+    report, the ledger and the four pure layers all still run, because the referee record
+    has to be complete whatever the outcome. See `harness/assessment.py`.
+    """
+    doc_path = state.project_dir(cfg, case.paper_id) / "paper" / "doc.json"
+    if not doc_path.exists():
+        return PhaseOutcome("error", "no ingested paper to assess findings against")
+    doc = PaperDoc(**state.read_json(doc_path))
+    reports, _dropped, _invalid = audit_stage.load_reports(cfg, case.paper_id, doc)
+    # Grades are attached here rather than read raw, because the gate reads COUNTED
+    # severity: a lens-asserted FATAL the blinded grader demoted must not stop a paper,
+    # and `counted_severity` is written by `stages.grade.attach`.
+    from .stages import grade as grade_stage
+    grade_stage.attach(cfg, case.paper_id, doc, reports)
+    findings = [f for r in reports for f in r.findings]
+
+    case.assessment = assessment.assess(findings)
+    established = case.assessment.material_failure_established
+    return PhaseOutcome(
+        "ok",
+        ("a material failure is already established from the paper itself; the "
+         "investigation branch will not run. " + case.assessment.reason)
+        if established else case.assessment.reason,
+        {"material_failure_established": established,
+         "basis": case.assessment.basis,
+         "counted_fatal": list(case.assessment.counted_fatal_ids)})
+
+
+def _phase_discover(cfg: Config, case: CaseState, **_) -> PhaseOutcome:
+    """Ask what this paper offers to check, before anything expensive happens.
+
+    Deterministic and model-free, so it cannot fail for a reason worth retrying. It also
+    cannot ABSTAIN: a paper with nothing addressable still produces a target set, whose
+    `extraction_coverage` says how much of the paper was reachable at all. That
+    distinction is the point — "no targets" and "extraction recovered no tables" look
+    identical from the outside and mean opposite things.
+    """
+    # ONE BIT from the ASSESS phase. The planner receives a bool and does no reasoning
+    # about severity, so the signature discipline that makes a paper-specific rule
+    # inexpressible in it still holds.
+    res = discover_stage.run(
+        cfg, case.paper_id,
+        investigation_open=assessment.investigation_open(case.assessment))
+    if "error" in res:
+        return PhaseOutcome("error", res["error"])
+    return PhaseOutcome(
+        "ok",
+        f"{res['objects']} object(s) discovered, {res['addressable']} addressable; "
+        f"{res['resolved_without_execution']} resolved without execution, "
+        f"{res['requires_execution']} would require one",
+        res)
+
+
 def _phase_probe(cfg: Config, case: CaseState, *, force_probe: bool = False,
                  skip_probe: bool = False, **_) -> PhaseOutcome:
     """Request reproduction. Whether anything runs is settled below this function.
@@ -415,14 +477,40 @@ def _phase_probe(cfg: Config, case: CaseState, *, force_probe: bool = False,
                             {"skipped": "--skip-probe"}, "skipped")
     if done and not force_probe:
         existing = ProbeResult(**state.read_json(root / "runs" / case.paper_id / "probe_results.json"))
+        # `discover` just recomputed `targets.json` from scratch this invocation and knows
+        # nothing about a prior execution; re-attach the cached outcome(s) onto it now,
+        # rather than let a real execution silently vanish from the funnel counts because
+        # this phase is about to return without calling `probe_stage.run`.
+        probe_stage.resync_cached_outcomes(cfg, case.paper_id)
         return PhaseOutcome("ok", "reproduction already ran for this paper",
                             {"cached": True}, _reproduction_class(existing))
 
-    reports, _, _ = audit_stage.load_reports(cfg, case.paper_id, doc)
-    verifiable = [f for r in reports for f in r.findings if f.verifiable_by_experiment]
-    if not verifiable and not force_probe:
-        return PhaseOutcome("abstain", "no lens marked a finding as settleable by reproduction",
-                            {"skipped": "nothing settleable"}, "nothing_settleable")
+    # The gate is the PLANNER's, not a lens's. It used to be
+    # `any(f.verifiable_by_experiment)` — an unchecked model boolean standing as the sole
+    # entry to the whole execution half of the system. What decides now is whether any
+    # target survived discovery, prioritisation and the trigger gate with
+    # `requires_execution` set, which is a conjunction of structural facts about the
+    # paper and the artifact. A paper whose every question was settled from its own
+    # printed content abstains here for a GOOD reason, and the outcome says so.
+    ts = discover_stage.load(cfg, case.paper_id)
+    executable = [p for p in ts.plans if p.requires_execution] if ts else []
+    if ts is not None and not executable and not force_probe:
+        resolved = ts.extraction_coverage.get("targets_resolved_without_execution", 0)
+        blocked = ts.extraction_coverage.get("targets_blocked_before_execution", 0)
+        return PhaseOutcome(
+            "abstain",
+            f"no target justified an execution: {len(ts.objects)} object(s) discovered, "
+            f"{resolved} settled against the paper itself, {blocked} blocked before "
+            f"execution by specification, artifact or environment",
+            {"skipped": "no execution justified", "objects": len(ts.objects),
+             "resolved_without_execution": resolved, "blocked_before_execution": blocked},
+            "no_execution_justified")
+    if ts is None:
+        reports, _, _ = audit_stage.load_reports(cfg, case.paper_id, doc)
+        verifiable = [f for r in reports for f in r.findings if f.verifiable_by_experiment]
+        if not verifiable and not force_probe:
+            return PhaseOutcome("abstain", "no lens marked a finding as settleable by reproduction",
+                                {"skipped": "nothing settleable"}, "nothing_settleable")
 
     try:
         res = probe_stage.run(cfg, case.paper_id)
@@ -443,9 +531,17 @@ def _phase_report(cfg: Config, case: CaseState, **_) -> PhaseOutcome:
     res = report_stage.run_report(cfg, case.paper_id)
     if "error" in res:
         return PhaseOutcome("error", res["error"])
-    case.verdict = res["verdict"]
+    # The case carries the REVIEW-level triage, because that is what a reader of a batch
+    # summary is asking for: which papers need a human. The binary claim decision is not
+    # lost — it is `verdict` in the report JSON, unchanged, and triage RED is exactly it.
+    case.verdict = res.get("triage") or res["verdict"]
+    # WHAT HAPPENS TO THE PAPER, carried up so a batch summary can answer it without
+    # re-opening eight reports. Read, never decided: `stages.report` folded it and
+    # `harness.disposition` owns the rule.
+    case.disposition = res.get("disposition") or "NOT_REVIEWED"
+    case.disposition_basis = res.get("disposition_basis") or "NONE"
     case.report_path = res["report_md"]
-    return PhaseOutcome("ok", res["reason"], res)
+    return PhaseOutcome("ok", res.get("triage_reason") or res["reason"], res)
 
 
 _HANDLERS = {
@@ -453,6 +549,8 @@ _HANDLERS = {
     "audit": _phase_audit,
     "collect": _phase_collect,
     "grade": _phase_grade,
+    "assess": _phase_assess,
+    "discover": _phase_discover,
     "probe": _phase_probe,
     "report": _phase_report,
 }
@@ -532,7 +630,13 @@ def drive(cfg: Config, case: CaseState, *, max_steps: int = 40, **opts) -> CaseS
     means something is wrong, and stopping is better than spinning.
     """
     if case.status == "complete":
-        case = rewind(case, "probe" if opts.get("force_probe") else "collect")
+        # `--force-probe` rewinds to DISCOVER, not to probe. The probe consumes the target
+        # set, so forcing a re-probe without re-deriving it runs the new code against the
+        # previous run's targets — the stale-target defect `ProbeSpec.written_by` exists to
+        # prevent, reintroduced one level up at the phase boundary. Observed: a re-run
+        # after a discovery fix pursued the pre-fix target list and never saw the target
+        # the fix had found.
+        case = rewind(case, "discover" if opts.get("force_probe") else "collect")
     for _ in range(max_steps):
         before = (case.phase, case.status, case.attempts.get(case.phase, 0))
         case = step(cfg, case, **opts)
@@ -559,7 +663,17 @@ def drive_all(cfg: Config, sources: list[str], **opts) -> list[CaseState]:
     paper reaching `error` has no effect on any other — a bad PDF is a fact about that
     PDF.
     """
-    cases = [open_case(cfg, s) for s in sources]
+    # Rewound exactly as `drive` rewinds a single case. Without this a batch re-review of
+    # finished papers returned whatever reports were already on disk — including after the
+    # code that produced them had changed, and including when `--force-probe` was passed —
+    # while re-running the same papers ONE AT A TIME re-derived them. Two entry points to
+    # the same operation disagreeing about whether it re-derives is the kind of difference
+    # nobody notices until a batch silently reports the previous release's verdicts.
+    resume_at = "discover" if opts.get("force_probe") else "collect"
+    cases = []
+    for s in sources:
+        case = open_case(cfg, s)
+        cases.append(rewind(case, resume_at) if case.status == "complete" else case)
     for _ in range(len(PHASES) * (2 + max(0, cfg.audit_retries, cfg.grade_retries)) + 4):
         active = [c for c in cases if not c.terminal and c.status != "waiting"]
         if not active:
@@ -597,7 +711,7 @@ def summarize(cases: list[CaseState]) -> dict:
 # Entry points
 # --------------------------------------------------------------------------- #
 _STAGE_LABEL = {"ingest": "S1 ingest", "audit": "S2 audit", "collect": "S2 verify",
-                "probe": "S3 verify", "report": "S4 report"}
+                "assess": "S2 assess", "probe": "S3 verify", "report": "S4 report"}
 
 
 def _detail(case: CaseState, phase: str) -> dict:
@@ -698,9 +812,18 @@ if __name__ == "__main__":  # self-check: python -m harness.controller
     from .artifacts import Reconciliation
 
     # --- phase ordering -----------------------------------------------------------------
-    assert PHASES == ("ingest", "audit", "collect", "grade", "probe", "report", "done")
+    assert PHASES == ("ingest", "audit", "collect", "grade", "assess", "discover",
+                      "probe", "report", "done")
     assert _next_phase("ingest") == "audit" and _next_phase("done") == "done"
-    assert _next_phase("collect") == "grade" and _next_phase("grade") == "probe"
+    assert _next_phase("collect") == "grade" and _next_phase("grade") == "assess"
+    # ASSESS sits between grading and discovery because that is the only point where
+    # "has the paper already settled this?" can be asked with COUNTED severity final and
+    # nothing expensive yet spent.
+    assert _next_phase("assess") == "discover"
+    # `discover` sits between grading and the probe because that is the only point where
+    # "is an experiment justified?" can be asked with the cheap reasoning already done and
+    # the expensive part not yet started.
+    assert _next_phase("discover") == "probe"
     assert RETRYABLE == ("audit", "grade"), \
         "only a delegated lens or a delegated grade may be re-attempted"
 

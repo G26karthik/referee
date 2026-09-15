@@ -231,14 +231,14 @@ def test_a_closed_gate_refuses_before_anything_else_is_considered():
     assert auth.failure_class == "execution_unauthorized"
 
 
-def test_a_command_that_is_not_the_authors_code_may_not_run_as_theirs():
+def test_a_command_that_is_not_the_authors_code_may_not_run_as_theirs(confined_local):
     spec = _qualified()
     spec.provenance = "synthesized"
     auth = authorize(_cfg(allow_repo_exec=True), spec, local_backend(), commit=_verified())
     assert not auth.allowed and auth.decision == "provenance_insufficient"
 
 
-def test_unproven_identity_blocks_a_fully_capable_run():
+def test_unproven_identity_blocks_a_fully_capable_run(confined_local):
     spec = _repo_spec()
     spec.capability = _capable()
     auth = authorize(_cfg(allow_repo_exec=True), spec, local_backend(), commit=_verified())
@@ -251,7 +251,7 @@ def test_unproven_identity_blocks_a_fully_capable_run():
     ("metric_identity", "metric_unbound"),
     ("configuration", "configuration_unmatched"),
 ])
-def test_every_link_of_the_identity_chain_is_independently_required(missing, expected):
+def test_every_link_of_the_identity_chain_is_independently_required(confined_local, missing, expected):
     """Metric binding in particular is not optional. A run that succeeds while the metric
     is unbound has measured something — just not the quantity the cell reports."""
     spec = _qualified()
@@ -260,7 +260,7 @@ def test_every_link_of_the_identity_chain_is_independently_required(missing, exp
     assert not auth.allowed and auth.failure_class == expected
 
 
-def test_an_incapable_environment_blocks_an_otherwise_identified_run():
+def test_an_incapable_environment_blocks_an_otherwise_identified_run(confined_local):
     spec = _identified(_repo_spec())
     spec.capability = ExecCapability(established=False, reason_code="dependency_missing",
                                      detail="torch is not importable")
@@ -269,7 +269,7 @@ def test_an_incapable_environment_blocks_an_otherwise_identified_run():
     assert "torch" in auth.detail
 
 
-def test_capability_that_was_never_assessed_is_not_capability():
+def test_capability_that_was_never_assessed_is_not_capability(confined_local):
     spec = _identified(_repo_spec())
     spec.capability = None
     auth = authorize(_cfg(allow_repo_exec=True), spec, local_backend(), commit=_verified())
@@ -303,7 +303,7 @@ def test_an_unavailable_backend_refuses_but_is_not_an_absent_one():
     assert auth.decision != absent.decision
 
 
-def test_every_condition_together_is_what_authorizes():
+def test_every_condition_together_is_what_authorizes(confined_local):
     auth = authorize(_cfg(allow_repo_exec=True), _qualified(), local_backend(), commit=_verified())
     assert auth.allowed and auth.decision == "authorized" and auth.failure_class == "none"
     assert auth.backend == "local"
@@ -343,7 +343,7 @@ def test_no_unauthorized_decision_can_convict_or_acquit():
             assert rec.status == "INCONCLUSIVE", f"{decision} / {values}: {rec.reason}"
 
 
-def test_an_authorized_run_still_reconciles_normally():
+def test_an_authorized_run_still_reconciles_normally(confined_local):
     """The gate adds a precondition; it does not disable the arithmetic behind it."""
     auth = authorize(_cfg(allow_repo_exec=True), _qualified(), local_backend(), commit=_verified())
     assert reconcile(_qualified(), [59.30, 59.26], 0.10, [0, 1],

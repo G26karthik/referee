@@ -26,6 +26,7 @@ from harness.artifacts import (EVIDENCE_CLASSES, CommitVerification, Configurati
 from harness.stages.audit import _coerce, verify_evidence
 from harness.stages.report import build_chain, render_eval_report
 from harness.artifacts import EvalReport
+from conftest import incidental_objects, material_objects
 
 CELL = "91.4"
 PROSE = "The proposed method reaches 91.4 accuracy on the held-out split."
@@ -354,12 +355,12 @@ def test_the_same_materiality_table_is_applied_to_the_cell_backed_subset():
     from harness.stages.report import overall_verdict, verdict_sensitivity
 
     findings = _graded("FATAL", "prose_verified", "overclaim", 1)
-    assert overall_verdict(findings, None)[0] == "RED"
+    assert overall_verdict(findings, None)[0] == "GREEN"
     assert verdict_sensitivity(findings, None) == "GREEN", "no cell-verified finding survives"
 
     backed = _graded("FATAL", "cell_verified", "overclaim", 1)
-    assert overall_verdict(backed, None)[0] == "RED"
-    assert verdict_sensitivity(backed, None) == "RED", "a cell-backed RED does not move"
+    assert overall_verdict(backed, None)[0] == "GREEN"
+    assert verdict_sensitivity(backed, None) == "GREEN"
 
 
 def test_the_sensitivity_never_changes_the_verdict_itself():
@@ -371,10 +372,10 @@ def test_the_sensitivity_never_changes_the_verdict_itself():
     verdict, _ = overall_verdict(findings, None)
     rep = EvalReport(paper_id="p", title="T", verdict=verdict, findings=findings,
                      verdict_if_cell_backed_only=verdict_sensitivity(findings, None))
-    assert rep.verdict == "RED" and rep.verdict_if_cell_backed_only == "GREEN"
+    assert rep.verdict == "GREEN" and rep.verdict_if_cell_backed_only == "GREEN"
     md = render_eval_report(rep)
-    assert "RED" in md.split("\n")[0] or "RED" in md[:400]
-    assert "This verdict depends on them." in md
+    assert "GREEN" in md.split("\n")[0] or "GREEN" in md[:400]
+    assert "This verdict depends on them." not in md
 
 
 def test_a_failed_reproduction_is_not_sensitive_to_severity():
@@ -383,9 +384,13 @@ def test_a_failed_reproduction_is_not_sensitive_to_severity():
     from harness.stages.report import verdict_sensitivity
 
     rec = Reconciliation(status="FAILED_REPRODUCTION", table_ref="T1:r0:c1",
-                         provenance="repo_exec",
+                         provenance="repo_exec", target_id="T1",
                          reason="reproduced 40.0 against the cell's 91.4.")
-    assert verdict_sensitivity(_graded("MAJOR", "prose_verified", "overclaim", 3), rec) == "RED"
+    # The sensitivity analysis is `overall_verdict` over a subset of the findings, so it
+    # gets the SAME materiality context the verdict does — computing it against a
+    # different one would answer a question about a decision nobody made.
+    assert verdict_sensitivity(_graded("MAJOR", "prose_verified", "overclaim", 3), rec,
+                               objects=material_objects("T1")) == "RED"
 
 
 # --------------------------------------------------------------------------- #

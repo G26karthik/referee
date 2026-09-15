@@ -17,7 +17,7 @@ import pytest
 from pathlib import Path
 
 from harness.audit_driver import AuditDriverError, parse_lens_json
-from harness.pdf import _body_runs, _caption_side, _pair
+from harness.pdf import _NO_CAPTION, _body_runs, _Caption, _caption_side, _pair
 from harness.stages.audit import _flat, _substantiated
 
 
@@ -42,7 +42,11 @@ ABOVE_SPAN = [(110.0, 120.0), (134.0, 144.0), (148.0, 214.0),      # caption 7, 
               (304.0, 314.0), (328.0, 338.0), (342.0, 432.0),      # caption 8, body B
               (523.0, 533.0), (547.0, 557.0), (561.0, 651.0)]      # caption 9, body C
 
-CAPTIONS = ["Table 7: A", "Table 8: B", "Table 9: C"]
+# `_pair` moves whole captions around, and a caption is now (printed number, verbatim
+# line) rather than one reconstructed string — see `pdf._Caption` for the false quotation
+# that split cost. The pairing logic below is unchanged; only the type it carries is.
+CAPTIONS = [_Caption("7", "Table 7: A"), _Caption("8", "Table 8: B"),
+            _Caption("9", "Table 9: C")]
 
 
 def _spans(runs, is_caption, span):
@@ -81,6 +85,11 @@ def test_an_uncaptioned_body_is_left_unlabelled_rather_than_stealing_a_neighbour
 
     Two bodies, one caption below the SECOND one. The first body has no caption of its
     own; it must come back blank, and the caption must land on the body it names.
+
+    The blank is now `_NO_CAPTION` rather than `""`: an unpaired body carries no printed
+    number either, and `extract_tables` records it as `label=""` with
+    `caption_source="none"` so the fact that this extractor could not name the table is
+    stated instead of being papered over with a neighbour's number.
     """
     gapped = [True, True, False, True, True, False]
     caption = [False, False, False, False, False, True]
@@ -89,7 +98,9 @@ def test_an_uncaptioned_body_is_left_unlabelled_rather_than_stealing_a_neighbour
     runs = _body_runs(gapped, caption)
     assert runs == [(0, 2), (3, 5)]
     body_spans = [(span[s][0], span[e - 1][1]) for s, e in runs]
-    assert _pair(body_spans, [span[5]], ["Table 8: B"]) == ["", "Table 8: B"]
+    got = _pair(body_spans, [span[5]], [_Caption("8", "Table 8: B")])
+    assert got == [_NO_CAPTION, _Caption("8", "Table 8: B")]
+    assert got[0].text == "" and got[0].label == ""
 
 
 def test_each_caption_is_used_at_most_once():
@@ -216,6 +227,13 @@ def test_captions_below_on_the_real_pdf_that_exposed_this():
     must hold 11.0% and Tables 8 and 9 must hold 19.5% — that Tables 8 and 9 are
     identical is a property of the paper, not of this parser, and the test asserts it so
     that a future change cannot quietly "fix" the duplication by mislabelling again.
+
+    The caption is now carried as (printed number, verbatim line). These three lines
+    happen to be printed with a colon, so the verbatim text is character-for-character
+    what the reconstruction used to produce — which is exactly why this page could never
+    have exposed the injected colon, and why
+    `tests/test_extraction_fidelity.test_a_table_caption_is_text_the_paper_actually_contains`
+    is swept over whole papers instead.
     """
     pdfplumber = pytest.importorskip("pdfplumber")
     paper = Path(__file__).resolve().parent.parent / "papers" / "sanchez24a_ICML.pdf"
@@ -228,10 +246,44 @@ def test_captions_below_on_the_real_pdf_that_exposed_this():
     with pdfplumber.open(str(paper)) as pdf:
         found = _unruled_tables(pdf.pages[25], _page_captions(pages[25]))
 
-    labels = [c for c, _ in found]
-    assert labels == ["Table 7: CodeGen-350M-mono results",
-                      "Table 8: CodeGen-2B-mono results",
-                      "Table 9: CodeGen-6B-mono results"]
+    assert [c.text for c, _ in found] == ["Table 7: CodeGen-350M-mono results",
+                                          "Table 8: CodeGen-2B-mono results",
+                                          "Table 9: CodeGen-6B-mono results"]
+    assert [c.label for c, _ in found] == ["7", "8", "9"], (
+        "the printed number must survive OUTSIDE the caption text, so an unlabelled "
+        "table can be reported as unlabelled")
     first = [g[2][1] for _, g in found]      # gamma=1.0, temperature=0.2, k=1
     assert first == ["11.0%", "19.5%", "19.5%"], (
         "Table 7 must not be swallowed and its label must not shift onto Table 8")
+
+
+def test_an_in_text_reference_on_that_same_page_is_not_offered_as_a_caption():
+    """The third defect on the page that exposed the first two.
+
+    `_page_captions` collected any line beginning "Table N", so an in-text reference was
+    handed to `_pair` as a candidate name for a body — and `_pair` cannot tell the
+    difference, it only measures distance. The fix is upstream, in the regex: a caption
+    prints a delimiter immediately after its number and a citation does not.
+
+    Asserted on the real page rather than on a fixture: the caption LINES recovered here
+    must be exactly as many as the page prints, and each recovered label must be a
+    number that page's captions actually carry.
+    """
+    pytest.importorskip("pdfplumber")
+    paper = Path(__file__).resolve().parent.parent / "papers" / "sanchez24a_ICML.pdf"
+    if not paper.exists():
+        pytest.skip("papers/sanchez24a_ICML.pdf is not present in this checkout")
+
+    from harness.pdf import _page_captions, _TABLE_LINE_SHAPED, _norm, page_texts
+
+    pages = page_texts(str(paper))
+    shaped = [_norm(r) for p in pages for r in p.splitlines()
+              if _TABLE_LINE_SHAPED.match(_norm(r))]
+    captions = [c for p in pages for c in _page_captions(p)]
+    assert shaped, "the paper cites its own tables somewhere"
+    assert len(captions) <= len(shaped), (
+        "the strict rule may only REMOVE candidates — it can never manufacture one, "
+        "which is what makes it unable to invent provenance")
+    for cap in captions:
+        assert cap.text.startswith(("Table", "table", "Tab.")), cap.text
+        assert cap.label and (cap.label.isdigit() or cap.label.isupper()), cap.label

@@ -269,23 +269,77 @@ def test_an_admissible_provenance_still_convicts(provenance):
     from harness.artifacts import Reconciliation
     from harness.stages.report import claim_status, overall_verdict
 
-    rec = Reconciliation(status="FAILED_REPRODUCTION", provenance=provenance, reason="x")
-    assert overall_verdict([], rec)[0] == "RED"
-    assert claim_status([], rec)[0] == "VERIFIED_FAILURE"
+    from harness.artifacts import DiscoveredObject
+
+    # The materiality context, explicit: establishing a defect is Tier 1 and convicts
+    # nothing on its own, so the target this reconciled against is given the basis that
+    # makes a central claim depend on it (`harness.materiality`). Without that this test
+    # would be asserting the old "any established failure convicts" rule.
+    rec = Reconciliation(status="FAILED_REPRODUCTION", provenance=provenance, reason="x",
+                         target_id="T")
+    objects = [DiscoveredObject(target_id="T", materiality_basis="ABSTRACT_CLAIM")]
+    assert overall_verdict([], rec, objects=objects)[0] == "RED"
+    assert claim_status([], rec, objects=objects)[0] == "VERIFIED_FAILURE"
 
 
 def test_the_two_ceilings_name_the_same_set():
-    """`report.ADMISSIBLE_REPRODUCTION_PROVENANCE` and the reconciler's own check must not
-    drift apart — two ceilings that disagree are one ceiling and one hole."""
+    """Every enforcement site is the SAME OBJECT, not a copy of the same tuple.
+
+    This test used to grep `inspect.getsource(local_exec.reconcile)` for the literal
+    `'spec.provenance not in ("driver", "repo_exec")'`. That checked one of the sites and
+    checked it as text: it passed while seven other modules each carried their own copy of
+    the rule, and it would have kept passing if any of those seven had been edited. Eight
+    copies of one rule are one rule and seven holes.
+
+    `harness/provenance.py` now owns it, and the assertion is identity. A ninth site that
+    writes the tuple out again fails the source sweep below.
+    """
     import inspect
 
-    from harness import local_exec
-    from harness.stages.report import ADMISSIBLE_REPRODUCTION_PROVENANCE
+    from harness import (artifacts, backends, dossier, evaluation, ledger, local_exec,
+                         provenance, taxonomy)
+    from harness.stages import report as report_stage
 
-    src = inspect.getsource(local_exec.reconcile)
-    assert 'spec.provenance not in ("driver", "repo_exec")' in src, \
-        "the reconciler's ceiling moved; update report.ADMISSIBLE_REPRODUCTION_PROVENANCE too"
-    assert set(ADMISSIBLE_REPRODUCTION_PROVENANCE) == {"driver", "repo_exec"}
+    assert provenance.ADMISSIBLE_REPRODUCTION_PROVENANCE == ("driver", "repo_exec", "reimpl_exec")
+    # the two public re-exports are the object itself, not an equal tuple
+    assert report_stage.ADMISSIBLE_REPRODUCTION_PROVENANCE \
+        is provenance.ADMISSIBLE_REPRODUCTION_PROVENANCE
+    assert taxonomy.ADMISSIBLE_REPRODUCTION_PROVENANCE \
+        is provenance.ADMISSIBLE_REPRODUCTION_PROVENANCE
+    assert ledger._ADMISSIBLE is provenance.ADMISSIBLE_REPRODUCTION_PROVENANCE
+    assert report_stage.PROVENANCE_LABEL is provenance.PROVENANCE_LABEL
+
+    # and no module writes the rule out for itself again
+    for mod in (artifacts, backends, dossier, evaluation, ledger, local_exec, taxonomy,
+                report_stage):
+        src = inspect.getsource(mod)
+        # the tuple literal may appear only where it is DEFINED, which is not any of these
+        for literal in ('("driver", "repo_exec")', '("repo_exec", "driver")'):
+            occurrences = [ln for ln in src.splitlines()
+                           if literal in ln and "ADMISSIBLE_REPRODUCTION_PROVENANCE ==" not in ln]
+            assert not occurrences, (
+                f"{mod.__name__} carries its own copy of the ceiling: {occurrences}")
+
+
+@pytest.mark.parametrize("provenance", ["synthesized", "template", "", "paper", " driver"])
+def test_a_synthesized_resolved_verified_cannot_read_as_support(provenance):
+    """The ceiling in the ACQUITTING direction, which was single-enforced.
+
+    Invariant 3 says only the authors' own code, or a sealed human reproduction, may
+    reconcile a printed quantity "in either direction". The convicting half was checked
+    twice — at the reconciler and again at `claim_status` / `overall_verdict`. The
+    acquitting half was checked only at the reconciler, which refuses to EMIT
+    RESOLVED_VERIFIED on an inadmissible provenance. So a hand-edited or upstream-buggy
+    `probe_results.json` reached `VERIFIED_SUPPORT` — the one state that unlocks the words
+    verified / supported / confirmed in the decision block.
+    """
+    from harness.artifacts import Reconciliation
+    from harness.stages.report import claim_status
+
+    rec = Reconciliation(status="RESOLVED_VERIFIED", provenance=provenance, reason="x")
+    status, why = claim_status([], rec)
+    assert status == "NOT_VERIFIED", f"{provenance} acquitted a paper"
+    assert "nothing positively reproduced" in why
 
 
 # --------------------------------------------------------------------------- #
@@ -346,3 +400,158 @@ def test_the_support_row_is_present_for_every_claim_status():
         rep = EvalReport(paper_id="p", title="T", verdict="GREEN", verdict_reason="r",
                          claim_status=status, lenses_run=["protocol"])
         assert "**Supporting evidence**" in render_eval_report(rep), status
+
+
+def test_zero_process_report_labels_a_prepared_route_not_what_ran():
+    from harness.artifacts import EvalReport, ProbeResult
+    from harness.stages.report import render_eval_report
+    rep = EvalReport(
+        paper_id="p", title="T", verdict="GREEN", verdict_reason="r",
+        execution_provenance="INDEPENDENT_REIMPLEMENTATION",
+        probe=ProbeResult(paper_id="p", provenance="reimpl_exec", executions=0,
+                          seeds_run=[], verdict="blocked"))
+    md = render_eval_report(rep)
+    assert "**Prepared route**" in md
+    assert "**What ran**" not in md
+
+
+def test_zero_grade_candidates_are_not_reported_as_a_closed_gate():
+    from harness.artifacts import EvalReport
+    from harness.stages.report import render_eval_report
+    rep = EvalReport(paper_id="p", title="T", verdict="GREEN", verdict_reason="r",
+                     grade_coverage={"candidates": 0, "graded": 0, "pending": 0})
+    md = render_eval_report(rep)
+    assert "no grader call was needed" in md
+    assert "Grading is off" not in md
+
+
+# --------------------------------------------------------------------------- #
+# F. the harness's own noise floor may not convict a paper
+# --------------------------------------------------------------------------- #
+# `write_probe` falls back to DEFAULT_TEMPLATE when a spec carries neither `script` nor
+# `command`, and that template runs two IDENTICAL arms: it measures this machine's seed
+# noise and the accuracy of `load_digits`. It is meant to be reached under provenance
+# `template`, which the ceiling refuses.
+#
+# A hand-written `runs/<pid>/spec.json` declaring `"provenance": "driver"` with neither
+# field reached it as well. `driver` is admissible, so `reconcile` compared the noise
+# floor's own accuracy against the paper's printed cell, and `overall_verdict` read
+# nothing about calibration at all — so a review could be RED on a calibration run
+# against a paper nobody had executed.
+def _incomplete_driver_spec(tmp_path):
+    from harness.artifacts import ProbeSpec
+    return ProbeSpec(
+        paper_id="p", finding_id="f1", claim="the method reaches 0.83",
+        provenance="driver", arms=["baseline", "treatment"], seeds=[0, 1],
+        metric="accuracy", dataset="cifar100", table_ref="T1:r0:c0",
+        claimed_value=0.83, claimed_raw="0.83",
+        cwd=str(tmp_path), script="", command=[])
+
+
+def test_a_spec_claiming_an_admissible_provenance_with_no_program_is_refused(tmp_path):
+    """The primary guard, at the runner. There is nothing here to attribute to anyone."""
+    from harness.config import Config
+    from harness.local_exec import run_probe
+
+    cfg = Config(projects_dir=tmp_path / "projects")
+    spec = _incomplete_driver_spec(tmp_path)
+    res = run_probe(cfg, tmp_path, spec)
+    assert res.verdict == "blocked"
+    assert res.authorization is not None
+    assert res.authorization.allowed is False
+    assert res.authorization.decision == "spec_incomplete"
+    assert "neither a script nor a command" in res.authorization.detail
+    # nothing was started, so nothing can have been measured
+    assert res.seeds_run == [] and not res.executions
+    # and the reconciliation records the refusal rather than a reproduction verdict:
+    # INCONCLUSIVE is the right value here — something was attempted and refused, which
+    # is a different fact from NOT_ATTEMPTED — and neither verdict may appear
+    assert res.reconciliation is not None
+    assert res.reconciliation.status == "INCONCLUSIVE"
+    assert res.reconciliation.status not in ("FAILED_REPRODUCTION", "RESOLVED_VERIFIED")
+
+
+@pytest.mark.parametrize("provenance", ["driver", "repo_exec"])
+def test_the_refusal_covers_every_provenance_the_ceiling_admits(provenance, tmp_path):
+    from harness.config import Config
+    from harness.local_exec import run_probe
+
+    cfg = Config(projects_dir=tmp_path / "projects")
+    spec = _incomplete_driver_spec(tmp_path)
+    spec.provenance = provenance
+    assert run_probe(cfg, tmp_path, spec).authorization.decision == "spec_incomplete"
+
+
+@pytest.mark.parametrize("provenance", ["template", "synthesized"])
+def test_the_legitimate_calibration_path_is_untouched(provenance, tmp_path):
+    """The noise floor still runs. It has always been useful and has never been
+    admissible: the refusal is about a spec ASSERTING an admissible provenance while
+    containing no program, not about calibration itself."""
+    from harness.config import Config
+    from harness.local_exec import run_probe
+
+    cfg = Config(projects_dir=tmp_path / "projects")
+    spec = _incomplete_driver_spec(tmp_path)
+    spec.provenance = provenance
+    res = run_probe(cfg, tmp_path, spec)
+    assert res.authorization is None or res.authorization.decision != "spec_incomplete"
+
+
+@pytest.mark.parametrize("status", ["FAILED_REPRODUCTION", "RESOLVED_VERIFIED"])
+@pytest.mark.parametrize("provenance", ["driver", "repo_exec"])
+def test_a_calibration_run_can_neither_convict_nor_acquit(status, provenance):
+    """The second guard, at the reporting layer, in BOTH directions.
+
+    Reached only if an artifact was hand-edited or an upstream branch is wrong, and
+    neither is a reason to decide anything about a paper from two runs of the same
+    program.
+    """
+    from harness.artifacts import ProbeResult, Reconciliation
+    from harness.stages.report import (claim_status, is_calibration, overall_verdict,
+                                       triage)
+
+    rec = Reconciliation(status=status, provenance=provenance, reason="x")
+    probe = ProbeResult(paper_id="p", calibration=True, verdict="calibration",
+                        provenance=provenance, reconciliation=rec)
+    assert is_calibration(probe)
+    assert claim_status([], rec, probe=probe)[0] == "NOT_VERIFIED"
+    assert overall_verdict([], rec, probe=probe)[0] == "GREEN"
+    assert triage([], rec, probe=probe)[0] == "GREEN"
+    for why in (claim_status([], rec, probe=probe)[1],
+                overall_verdict([], rec, probe=probe)[1]):
+        assert "measures this machine" in why
+
+
+def test_calibration_is_read_from_the_runners_own_flag_and_falls_back_safely():
+    """A result written before `calibration` existed still has to be recognised."""
+    from harness.artifacts import ProbeResult
+    from harness.stages.report import is_calibration
+
+    assert not is_calibration(None)
+    assert is_calibration(ProbeResult(paper_id="p", calibration=True))
+    assert not is_calibration(ProbeResult(paper_id="p", calibration=False,
+                                          verdict="calibration")), (
+        "the runner's explicit False wins: it ran a real program")
+    legacy = ProbeResult(paper_id="p", verdict="calibration")
+    legacy.calibration = None
+    assert is_calibration(legacy), "a legacy result is recognised by its verdict"
+
+
+def test_an_admissible_reproduction_that_really_ran_still_convicts():
+    """The guard on the guard. Closing the calibration hole must not make RED
+    unreachable through the one route that is meant to reach it."""
+    from harness.artifacts import ProbeResult, Reconciliation
+    from harness.stages.report import claim_status, overall_verdict
+
+    from harness.artifacts import DiscoveredObject
+
+    rec = Reconciliation(status="FAILED_REPRODUCTION", provenance="repo_exec", reason="x",
+                         target_id="T")
+    probe = ProbeResult(paper_id="p", calibration=False, verdict="detectable",
+                        provenance="repo_exec", reconciliation=rec)
+    # Materiality supplied explicitly — see `harness.materiality`. Tier 1 (an admissible
+    # reproduction really failed) is what this test guards; Tier 2 is what lets it reach
+    # the paper level at all.
+    objects = [DiscoveredObject(target_id="T", materiality_basis="ABSTRACT_CLAIM")]
+    assert claim_status([], rec, probe=probe, objects=objects)[0] == "VERIFIED_FAILURE"
+    assert overall_verdict([], rec, probe=probe, objects=objects)[0] == "RED"

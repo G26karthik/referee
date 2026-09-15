@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import subprocess
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -31,6 +30,7 @@ from harness.repo import TreeUninspectable
 from harness.stages.audit import source_units, verify_evidence
 from harness.stages.ingest import _same_paper_by_content, allocate_paper_id
 from harness.stages.report import _chain_block, overall_verdict
+from conftest import incidental_objects, material_objects
 
 
 def _cfg(tmp_path: Path, **over) -> Config:
@@ -467,10 +467,12 @@ def test_a_driver_failure_is_not_attributed_to_the_authors():
     exactly that spec as `not_repo_execution`."""
     spec = ProbeSpec(paper_id="t", provenance="driver", script="print(1)",
                      table_ref="T1:r0:c1", claimed_cell_value="59.28", arms=["a"],
-                     **_ESTABLISHED_IDENTITY)
+                     target_id="T1", **_ESTABLISHED_IDENTITY)
     rec = reconcile(spec, [12.0, 12.1, 11.9], 0.01, [0, 1, 2])
     assert rec.status == "FAILED_REPRODUCTION"
-    verdict, why = overall_verdict([], rec)
+    # Materiality explicit: WHO ran is what this test is about, and a paper-level verdict
+    # additionally needs a central claim to depend on the target (`harness.materiality`).
+    verdict, why = overall_verdict([], rec, objects=material_objects("T1"))
     assert verdict == "RED"
     assert "not the authors' checkout" in why
     assert "paper's own code" not in why
@@ -479,12 +481,14 @@ def test_a_driver_failure_is_not_attributed_to_the_authors():
 def test_a_repo_exec_failure_is_attributed_to_the_repository():
     spec = ProbeSpec(paper_id="t", provenance="repo_exec", command=["python", "e.py"],
                      table_ref="T1:r0:c1", claimed_cell_value="59.28", arms=["a"],
+                     target_id="T1",
                      experiment=_est(ExperimentIdentity),
                      metric_identity=_est(MetricIdentity),
                      configuration=_est(ConfigurationIdentity))
     rec = reconcile(spec, [12.0, 12.1, 11.9], 0.01, [0, 1, 2])
     assert rec.status == "FAILED_REPRODUCTION"
-    assert "audited repository" in overall_verdict([], rec)[1]
+    assert "audited repository" in overall_verdict(
+        [], rec, objects=material_objects("T1"))[1]
 
 
 @pytest.mark.parametrize("status,expect_verdict", [
@@ -529,7 +533,7 @@ def _verified() -> CommitVerification:
     return CommitVerification(state="verified", expected="a" * 40, actual="a" * 40)
 
 
-def test_an_assessment_for_one_backend_does_not_authorize_another():
+def test_an_assessment_for_one_backend_does_not_authorize_another(confined_local):
     """Capability and resources are assessed against the backend `select_for` chose and
     recorded on `spec.backend`. `authorize` read the records without checking they were
     about the backend in front of it — so an 8 GiB `satisfied` could authorize a run on a
@@ -541,14 +545,14 @@ def test_an_assessment_for_one_backend_does_not_authorize_another():
     assert auth.failure_class == "execution_unauthorized", "a fact about us, not the paper"
 
 
-def test_a_matching_backend_is_still_authorized():
+def test_a_matching_backend_is_still_authorized(confined_local):
     cfg = Config.load()
     cfg.allow_repo_exec = True
     auth = authorize(cfg, _qualified("local"), local_backend(), commit=_verified())
     assert auth.allowed and auth.decision == "authorized"
 
 
-def test_a_spec_with_no_planned_backend_is_still_authorized():
+def test_a_spec_with_no_planned_backend_is_still_authorized(confined_local):
     """A spec that never recorded a backend cannot contradict one. The check is for a
     MISMATCH, not for a missing field — tightening that would refuse every hand-written
     spec.json, which is a documented channel."""
@@ -609,9 +613,9 @@ def test_a_driver_verdict_does_not_contradict_its_own_wording():
     stands — and the sentence has to say what stands, plus what is not machine-checked."""
     spec = ProbeSpec(paper_id="t", provenance="driver", script="print(1)",
                      table_ref="T1:r0:c1", claimed_cell_value="59.28", arms=["a"],
-                     **_ESTABLISHED_IDENTITY)
+                     target_id="T1", **_ESTABLISHED_IDENTITY)
     rec = reconcile(spec, [12.0, 12.1, 11.9], 0.01, [0, 1, 2])
-    verdict, why = overall_verdict([], rec)
+    verdict, why = overall_verdict([], rec, objects=material_objects("T1"))
     assert verdict == "RED"
     assert "not machine-checked" in why, "the caveat a reader needs"
     assert "not established as a failure" not in why, "it must not contradict the verdict"

@@ -27,6 +27,7 @@ from harness.repo import (accepts_argument, assess_capability, declared_platform
                           entrypoint_imports)
 from harness.stages.probe import plan_execution
 from harness.stages.report import overall_verdict
+from conftest import incidental_objects, material_objects
 
 CELL = "59.28"
 
@@ -37,6 +38,11 @@ def _spec(provenance: str = "repo_exec", capability: ExecCapability | None = Non
     already established, the same way a real `repo_exec` spec would once `plan_execution`
     promoted it. Identity itself is tested in `test_experiment_identity.py`."""
     return ProbeSpec(paper_id="p", table_ref="T1:r0:c1", claimed_cell_value=CELL,
+                     # `target_id` as production sets it: `local_exec.reconcile`
+                     # stamps it onto every reconciliation, and it is the join the
+                     # paper-level decision uses to ask whether a central claim
+                     # depends on this target (`harness.materiality`).
+                     target_id="T1",
                      provenance=provenance, capability=capability,
                      experiment=ExperimentIdentity(state="established", reason="fixture"),
                      metric_identity=MetricIdentity(state="established", reason="fixture"),
@@ -116,7 +122,8 @@ def test_a_crash_after_the_experiment_began_is_a_failed_reproduction():
                   failure="exit 1: RuntimeError: CUDA out of memory", evidence=_ran())
     assert r.status == "FAILED_REPRODUCTION"
     assert r.failure_class == "runtime_failure" and r.reached_experiment is True
-    assert overall_verdict([], r)[0] == "RED", "a genuine runtime failure must still escalate"
+    assert overall_verdict([], r, objects=material_objects(r.target_id))[0] == "RED", (
+        "a genuine runtime failure on a material target must still escalate")
 
 
 def test_a_long_timeout_is_our_clock_and_convicts_nobody():
@@ -146,7 +153,7 @@ def test_success_with_a_mismatching_result_is_still_a_failed_reproduction():
     r = reconcile(_spec(capability=_capable()), [64.10, 64.20], 0.10, [0, 1])
     assert r.status == "FAILED_REPRODUCTION"
     assert r.failure_class == "none", "a mismatch is not a crash; it has no failure class"
-    assert overall_verdict([], r)[0] == "RED"
+    assert overall_verdict([], r, objects=material_objects(r.target_id))[0] == "RED"
 
 
 def test_a_successful_run_needs_no_capability_record():
@@ -511,4 +518,4 @@ def test_a_genuine_scientific_mismatch_is_still_convictable():
     rec = reconcile(_spec(capability=_capable()), [64.10, 64.20], 0.10, [0, 1], evidence=_ran())
     assert rec.status == "FAILED_REPRODUCTION"
     assert rec.failure_class == "none", "a mismatch is not a crash"
-    assert overall_verdict([], rec)[0] == "RED"
+    assert overall_verdict([], rec, objects=material_objects(rec.target_id))[0] == "RED"

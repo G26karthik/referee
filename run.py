@@ -6,6 +6,7 @@
     python run.py stage <ingest|audit|grade|probe|report> --paper <pdf-or-id>
     python run.py list
     python run.py status <paper-id>
+    python run.py sandbox [--release]      # leased remote machines
 
 `review` is the entrypoint. Everything else is a way to look at what it did, or to
 re-run one stage by hand while debugging.
@@ -72,15 +73,32 @@ def cmd_review(args: argparse.Namespace) -> int:
             print(f"\n{res['next']}")
             return 2
         if res.get("verdict_contested"):
-            print("\n🚩 CONTESTED — the independent substantive read disagrees sharply "
+            print("\nCONTESTED - the independent substantive read disagrees sharply "
                  "with this verdict; see the report.")
         if unmet := _detail(res, "S4 report").get("self_audit_failed"):
-            print(f"\n⚠️  Reviewer self-audit: {len(unmet)} check(s) unmet "
+            print(f"\nWARNING: reviewer self-audit: {len(unmet)} check(s) unmet "
                  f"({', '.join(unmet)}) — see '## Reviewer self-audit' in the report. "
                  f"The verdict is unaffected; the review is not claiming to be complete.")
-        print(f"\n=== {res['verdict']} — {res['title']} ===")
-        print(f"{res['reason']}\n")
-        print(Path(res["report_md"]).read_text(encoding="utf-8"))
+        cats = _detail(res, "S4 report").get("scientific_classes") or {}
+        summary = ", ".join(f"{n} {k.replace('_', ' ').lower()}"
+                            for k, n in cats.items()) or "no findings survived verification"
+        print(f"\n=== {res['title']} ===")
+        # THE DISPOSITION FIRST, because it is the one line a caller acts on. It is not a
+        # verdict and does not replace the colour — see `harness/disposition.py` — it says
+        # what happens to the paper now.
+        rep = _detail(res, "S4 report")
+        if disp := rep.get("disposition"):
+            basis = rep.get("disposition_basis") or "NONE"
+            print(f"disposition : {disp}" + (f"  (established by {basis})"
+                                             if basis != "NONE" else ""))
+            print(f"              {rep.get('disposition_reason', '')}")
+        print(f"{summary}\n")
+        # The REVIEWER report, not the machine trace. The two are separate artifacts and
+        # printing the trace to a terminal is what invariant 19 exists to stop; the trace
+        # is on disk at `report_md` for anyone tracing a line of this.
+        review = res.get("reviewer_report_md") or res.get("report_md")
+        print(Path(review).read_text(encoding="utf-8"))
+        print(f"machine trace: {res['report_md']}")
         if res.get("verdict_contested"):
             return 3
         return 0
@@ -98,10 +116,13 @@ def cmd_review(args: argparse.Namespace) -> int:
     if corpus:
         print(f"\n=== CORPUS: {corpus.get('summary', '')} ===")
         for e in corpus.get("entries", []):
-            extra = e.get("verdict") or e.get("failure_kind") or ""
+            # DISPOSITION, not verdict. `state` says how the run ended and `disposition`
+            # says what happens to the paper; a batch summary that printed only the first
+            # made STOP_MATERIAL_FAILURE and BLOCKED_ARTIFACT both read as `completed`.
+            extra = e.get("disposition") or e.get("verdict") or e.get("failure_kind") or ""
             note = f" · {e['resume_after']}" if e.get("resume_after") else ""
             print(f"  {e['state']:<13} {(e.get('paper_id') or e['source'])[:34]:<34} "
-                  f"{extra:<20} {e.get('reason', '')[:70]}{note}")
+                  f"{extra:<26} {e.get('reason', '')[:60]}{note}")
         if not corpus.get("complete"):
             print(f"  ⚠️  {corpus['requested'] - corpus['counts'].get('completed', 0)} of "
                   f"{corpus['requested']} requested paper(s) did NOT complete.")
@@ -119,7 +140,7 @@ def cmd_review(args: argparse.Namespace) -> int:
     contested = [r.get("paper_id") or r.get("input") for r in res["results"]
                 if r.get("verdict_contested")]
     for pid in contested:
-        print(f"🚩 contested : {pid:<28} independent read disagrees sharply with the verdict")
+        print(f"contested : {pid:<28} independent read disagrees sharply with the verdict")
 
     if d := res.get("dossier"):
         if d.get("skipped"):
@@ -177,7 +198,8 @@ def cmd_accept(args: argparse.Namespace) -> int:
             take(src, f"lens:{lens}",
                  lambda raw, ln=lens: str(audit_stage.accept_lens(
                      cfg, args.paper, ln, raw, reviewer=args.reviewer,
-                     tool_policy=args.tool_policy)["findings"]) + " finding(s)")
+                     tool_policy=args.tool_policy,
+                     mode=args.mode)["findings"]) + " finding(s)")
 
     # Grades live one level down, keyed by candidate slug rather than by lens name, so
     # this takes whatever is there instead of iterating a known vocabulary.
@@ -186,15 +208,18 @@ def cmd_accept(args: argparse.Namespace) -> int:
         take(src, f"grade:{src.stem}",
              lambda raw, s=src.stem: grade_stage.accept_grade(
                  cfg, args.paper, s, raw, grader=args.reviewer,
-                 tool_policy=args.tool_policy)["verdict"])
+                 tool_policy=args.tool_policy, mode=args.mode)["verdict"])
 
     # The whole-paper read: one per paper, so a single staged file rather than a directory.
     if (src := root / "reports" / ".staged" / "substantive.json").exists():
         take(src, "whole-paper",
              lambda raw: verdict_driver.accept_verdict(
                  cfg, args.paper, raw, reader=args.reviewer,
-                 tool_policy=args.tool_policy)["verdict"])
+                 tool_policy=args.tool_policy, mode=args.mode)["verdict"])
 
+    from harness import delegation
+    if accepted:
+        print(f"mode     : {args.mode} — {delegation.ISOLATION_CLAIM.get(args.mode, '?')}")
     for label, what in accepted.items():
         print(f"accepted : {label:<34} {what}")
     for label, why in refused.items():
@@ -214,6 +239,50 @@ def cmd_dossier(args: argparse.Namespace) -> int:
     return 0 if res["papers"] else 1
 
 
+def cmd_preflight(args: argparse.Namespace) -> int:
+    """Is every requested paper a distinct document, and which id will each get?
+
+    Runs before a batch, spends nothing, and reviews nothing. Exit 0 when every requested
+    file is a distinct document; exit 2 when the batch is refused, which happens when two
+    requested files are byte-identical or a file cannot be read.
+
+    A duplicate is refused rather than reviewed twice because it inflates every corpus
+    count silently: `allocate_paper_id` correctly recognises the second file as the same
+    document and resumes its project, which is right per paper and invisible in aggregate.
+    An eight-file request that is seven documents produces seven reviews and a claim about
+    eight papers.
+    """
+    from harness import preflight
+    from harness.config import BASE_DIR
+    cfg = Config.load()
+    papers_dir = BASE_DIR / "papers"
+    sources = args.paper or sorted(str(p) for p in papers_dir.glob("*.pdf"))
+    if not sources:
+        print(f"no PDFs to check: pass --paper, or put some in {papers_dir}")
+        return 2
+    res = preflight.run(cfg, sources, Path(args.out) if args.out else None)
+    print(preflight.render(res))
+    print(f"\nwritten: {res['paths']['md']}\n         {res['paths']['json']}")
+    return 0 if res["ok"] else 2
+
+
+def cmd_evaluate(args: argparse.Namespace) -> int:
+    """System metrics over the reviewed corpus. Counts artifacts; runs no stage.
+
+    Deliberately separate from `dossier`, which is a reader's summary of the papers. This
+    is a summary of the SYSTEM — how much of each paper it could address, how often it
+    judged an experiment necessary, which gate stopped the rest — and it reports nothing
+    it cannot count. See `harness/evaluation.LIMITATIONS` for what is absent and why.
+    """
+    from harness import evaluation
+    cfg = Config.load()
+    res = evaluation.run(cfg, args.papers or reviewed_papers(cfg),
+                         Path(args.out) if args.out else None)
+    print(evaluation.render(res))
+    print(f"\nwritten: {res['paths']['md']}\n         {res['paths']['json']}")
+    return 0 if res["papers_measured"] else 1
+
+
 def reviewed_papers(cfg: Config) -> list[str]:
     """Every case that has an ingested paper.
 
@@ -229,6 +298,47 @@ def cmd_stage(args: argparse.Namespace) -> int:
     """Run ONE stage and print its compact result. For debugging, not for review."""
     print(json.dumps(STAGES[args.name](Config.load(), args.paper), indent=2, default=str))
     return 0
+
+
+def cmd_sandbox(args: argparse.Namespace) -> int:
+    """Show or release leased remote machines. The one command that is about money.
+
+    `stages/probe.run` releases a paper's sandbox in a `finally`, so under normal
+    operation there is nothing here to do. This exists for the case that `finally` cannot
+    cover — the process was killed, the host lost power, the provider was unreachable at
+    teardown — because a sandbox nobody released keeps billing until its own timeout and
+    nothing else in this harness would ever mention it again.
+
+    `status` contacts no provider: an operator asking what might still be running needs
+    the answer when the network is down too, and `release` is what actually checks.
+    """
+    from harness import sandbox as sandbox_mod
+
+    cfg = Config.load()
+    ok, why = sandbox_mod.driver_status(cfg)
+    print(f"driver  : {'usable' if ok else 'unusable — ' + why}")
+    print(f"reserve : {sandbox_mod.spec_from_config(cfg).describe()}")
+    print(f"backend : SH_EXEC_BACKEND={cfg.exec_backend}  "
+          f"sandbox gate {'OPEN' if cfg.allow_sandbox else 'closed'}  "
+          f"repo-exec gate {'OPEN' if cfg.allow_repo_exec else 'closed'}")
+
+    sessions = sandbox_mod.list_sessions(cfg.projects_dir)
+    if not sessions:
+        print("\nno sandbox sessions are recorded")
+        return 0
+    print(f"\n{len(sessions)} recorded session(s):")
+    for s in sessions:
+        cost = sandbox_mod.lease_cost_usd(s.spec, s.age_seconds)
+        print(f"  {s.sandbox_id:<26} {s.paper_id[:30]:<30} {s.commit[:12]:<13} "
+              f"{s.spec.gpu_kind or 'no GPU':<10} {s.age_seconds:>9.0f}s  ~${cost:.4f}")
+    if not args.release:
+        print("\n(pass --release to terminate them)")
+        return 0
+    failures = 0
+    for sandbox_id, released, detail in sandbox_mod.release_all(cfg.projects_dir):
+        print(f"  {'released' if released else 'FAILED  '} {sandbox_id:<26} {detail}")
+        failures += 0 if released else 1
+    return 1 if failures else 0
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -265,6 +375,14 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    # Windows consoles often default to cp1252 while reviewer reports contain Unicode
+    # status badges. Keep the report artifact unchanged, but ensure printing it cannot
+    # turn a completed review into a process error on a legacy console.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
     p = argparse.ArgumentParser(prog="single-harness")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -297,8 +415,21 @@ def main() -> int:
     ac.add_argument("--reviewer", default="", help="what produced these, for the sidecar")
     ac.add_argument("--tool-policy", default="unrecorded",
                     help="what isolation the reviewer actually ran under. Defaults to "
-                         "'unrecorded' rather than to anything reassuring: unlike the "
-                         "auto-audit path, nothing here can prove a sandbox was enforced.")
+                         "'unrecorded' rather than to anything reassuring: only the "
+                         "CLI_SUBPROCESS mode can prove a sandbox was enforced, and "
+                         "`harness.delegation` forces this back to 'unrecorded' for every "
+                         "other mode rather than trusting what is passed here.")
+    ac.add_argument("--mode", default="MANUAL",
+                    choices=["CLI_SUBPROCESS", "SESSION_SUBAGENT", "MANUAL"],
+                    help="HOW these artifacts were produced. MANUAL is the default because "
+                         "it claims the least: a human, or an agent this harness knows "
+                         "nothing about. SESSION_SUBAGENT means an isolated subagent the "
+                         "controlling session dispatched autonomously, one per task — real "
+                         "context isolation, no provable filesystem sandbox. "
+                         "CLI_SUBPROCESS is a reviewer process this harness spawned and "
+                         "confined itself, and is the only mode entitled to report an "
+                         "enforced tool policy. The three are distinct provenance classes "
+                         "and are never pooled.")
     ac.set_defaults(func=cmd_accept)
 
     ds = sub.add_parser("dossier", help="consolidate finished reports")
@@ -306,12 +437,28 @@ def main() -> int:
     ds.add_argument("--out")
     ds.set_defaults(func=cmd_dossier)
 
+    pf = sub.add_parser("preflight",
+                        help="check a batch is N distinct papers before reviewing it")
+    pf.add_argument("--paper", nargs="*", help="PDF paths (default: every PDF in papers/)")
+    pf.add_argument("--out")
+    pf.set_defaults(func=cmd_preflight)
+
+    ev = sub.add_parser("evaluate", help="system metrics over the reviewed corpus")
+    ev.add_argument("papers", nargs="*", help="case ids (default: every reviewed paper)")
+    ev.add_argument("--out")
+    ev.set_defaults(func=cmd_evaluate)
+
     st = sub.add_parser("stage", help="run ONE stage by hand (debugging)")
     st.add_argument("name", choices=sorted(STAGES))
     st.add_argument("--paper", required=True, help="PDF path (ingest) or case id")
     st.set_defaults(func=cmd_stage)
 
     sub.add_parser("list", help="list reviewed papers").set_defaults(func=cmd_list)
+
+    sb = sub.add_parser("sandbox", help="show or release leased remote machines")
+    sb.add_argument("--release", action="store_true",
+                    help="terminate every recorded session (safe to run twice)")
+    sb.set_defaults(func=cmd_sandbox)
 
     sp = sub.add_parser("status", help="one paper's controller state and history")
     sp.add_argument("paper_id")

@@ -48,8 +48,8 @@ def test_parse_magnitude_degrades_never_raises(text, expected):
 # --------------------------------------------------------------------------- #
 # verdict rule
 # --------------------------------------------------------------------------- #
-def test_one_fatal_is_red():
-    assert overall_verdict([f("a", severity="FATAL")])[0] == "RED"
+def test_one_fatal_is_not_red_without_deterministic_evidence():
+    assert overall_verdict([f("a", severity="FATAL")])[0] == "GREEN"
 
 
 @pytest.mark.parametrize("n", [1, 3, 10, 40, 500])
@@ -75,12 +75,11 @@ def test_no_number_of_minors_ever_reaches_red(n):
     assert overall_verdict([f(str(i)) for i in range(n)])[0] == "GREEN"
 
 
-def test_a_single_counted_fatal_is_red_and_says_which_lens():
-    """The one finding-shaped route to RED. FATAL is defined as 'the central claim does
-    not stand' — rejection by definition, which is what RED is reserved for."""
+def test_a_single_model_fatal_has_no_rejection_authority():
+    """A model FATAL remains a concern until deterministic evidence establishes failure."""
     verdict, reason = overall_verdict([f("a", lens="protocol", severity="FATAL")])
-    assert verdict == "RED"
-    assert "protocol" in reason and "FATAL" in reason
+    assert verdict == "GREEN"
+    assert "protocol" not in reason or "FATAL" not in reason
 
 
 def test_green_never_reads_as_a_certificate():

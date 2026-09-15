@@ -25,6 +25,7 @@ from harness.config import Config
 from harness.local_exec import StartupEvidence, json_metric, parse_cell_number, reconcile, resolve_command
 from harness.stages.probe import cell_contents, plan_execution
 from harness.stages.report import overall_verdict
+from conftest import incidental_objects, material_objects
 
 PID = "coderepro"
 
@@ -314,13 +315,25 @@ def _rec(status: str, provenance: str = "repo_exec") -> Reconciliation:
     # unrecorded provenance has not established WHO ran, so it cannot convict. The real
     # `local_exec.reconcile` always stamps it, so a fixture without it is an artifact the
     # system never emits.
+    # `target_id` for the same reason: `local_exec.reconcile` stamps it on every
+    # reconciliation it emits (16 of 16 on the corpus), and it is what the paper-level
+    # decision joins against to ask whether a central claim depends on this target.
     return Reconciliation(table_ref="T1:r0:c1", status=status, reason="r", noise_band=0.1,
-                          provenance=provenance)
+                          provenance=provenance, target_id="T1")
 
 
 def test_a_failed_reproduction_turns_the_verdict_red_on_its_own():
-    verdict, reason = overall_verdict([], _rec("FAILED_REPRODUCTION"))
+    """…on a target a central claim is established to depend on. Establishing the defect
+    is Tier 1; `harness.materiality` is what lets it reach the paper level."""
+    verdict, reason = overall_verdict([], _rec("FAILED_REPRODUCTION"),
+                                      objects=material_objects("T1"))
     assert verdict == "RED" and "Failed code reproduction" in reason
+
+    # The same established defect, on a target no central claim was established to depend
+    # on: still established and reported, and it does not reject the paper.
+    green, why = overall_verdict([], _rec("FAILED_REPRODUCTION"),
+                                 objects=incidental_objects("T1"))
+    assert green == "GREEN" and "did not establish" in why
 
 
 @pytest.mark.parametrize("status", ["INCONCLUSIVE", "RESOLVED_VERIFIED", "NOT_ATTEMPTED"])

@@ -1,7 +1,30 @@
 """Prompts for S2 — the four blinded adversarial audit lenses.
 
-Each lens is a separate sealed session that sees the same `PaperDoc` render and
-nothing else: not the other lenses' findings, not the harness, not the filesystem.
+Each lens is a separate session that sees this `PaperDoc` render, and — through
+`--add-dir` — the one PDF it was rendered from. WHAT ENFORCES THAT, and what does not,
+because the sentence that used to stand here ("a sealed session that sees the same
+`PaperDoc` render and nothing else: not the other lenses' findings, not the harness, not
+the filesystem") was false by construction and nothing in the test suite could tell:
+
+  ENFORCED BY THIS HARNESS   one subprocess per lens, so four readings cannot share a
+                             context and echo each other; an empty scratch directory as
+                             cwd, so a relative read finds nothing;
+                             `tests/test_delegation_path.py` asserts both from inside a
+                             stand-in reviewer, which is where the claim is checkable.
+  ENFORCED BY FLAGS WE PASS  `--allowedTools` (the grant), `--disallowedTools` (every
+                             other tool this harness can name), `--restricted`,
+                             `--strict-mcp-config` and `--settings` with a document
+                             `harness.audit_driver` owns and hashes. The last three exist
+                             because an ALLOW list denies nothing on its own, and because
+                             a user-level `CLAUDE.md`, hooks, plugins and MCP servers
+                             reach a session regardless of its cwd.
+  STILL A CLI PROMISE        that the CLI honours those flags. This harness records what
+                             it passed (`tool_policy_detail` on every sidecar) and cannot
+                             verify from outside what the CLI then did with it.
+
+None of it applied to the readings behind the shipped corpus: all 28 lens sidecars there
+record `written_by: manual_accept` and `tool_policy: unrecorded`, which is why
+`manuscript/check_claims.py` forces the manuscript to say so.
 
 THE SHAPE OF THIS PROMPT IS THE REASONING PIPELINE, in order:
 
@@ -360,10 +383,36 @@ you write directly is discarded unread, however well-formed.
  "notes": "what you actually checked versus skimmed"}"""
 
 
+# THE PANEL, and what its diversity is and is not. `model` and `tools` here are read by
+# `audit_driver.lens_confinement` and reach the command line; for a long time `model` was
+# declared and unread, so all four lenses ran on whatever the CLI defaulted to — four
+# readings from one model presented as a panel, invisible precisely because the key
+# existed. The corpus records the same collapse from the other side: `reviewer:
+# claude-sonnet-5` on all four lenses, including `overclaim`, whose declared model here is
+# `opus`.
+#
+# THE CEILING, stated rather than implied: this is one vendor's CLI, so "independent"
+# means four separate processes with four separate contexts and two distinct model names.
+# It is not cross-family diversity, and no arrangement of this table would make it so.
+# `audit_driver` records the model each call actually reported (`envelope.model_reported`)
+# so the panel's real composition is a fact on disk rather than a property of this table.
+# EVERY LENS IS READ-ONLY, AND `WebSearch` IS NOT ON THIS TABLE.
+#
+# `overclaim` held it. A lens reads the paper's own text, which `SECURITY` below states is
+# untrusted data, and an outbound-request capability in the hands of a reader of untrusted
+# text is an exfiltration and injection channel whose only mitigation was an instruction in
+# the same prompt the untrusted text arrives in. Instructions are not enforcement.
+#
+# It also bought nothing the evidence model would accept: `_EVIDENCE` already tells every
+# lens that external literature is NEVER a finding's primary evidence, because it has no
+# page in this paper to cite. So the capability could not produce admissible evidence and
+# could produce a request shaped by the paper. Literature grounding belongs to the
+# `LITERATURE_SEARCH` route, with its own retrieval record and its own admissibility —
+# not inside a reader of the document it would be searching about.
 LENSES: dict[str, dict] = {
     "overclaim": {
         "model": "opus",
-        "tools": ["Read", "WebSearch"],
+        "tools": ["Read"],
         "focus": """\
 Audit, in this order:
   A. PREMISE. Is the stated reason the method should work actually sound? Distinguish
@@ -378,12 +427,15 @@ Audit, in this order:
      believe (see GRADING's "absence of evidence" rule).
   C. BASELINE MISREPRESENTATION. Is the baseline the standard one, tuned as carefully
      as the proposed method? A weakened, undertuned, or outdated baseline manufactures
-     a gain. Use WebSearch to check what the standard baseline number actually is on
-     this benchmark, and cite what you find as EXTERNAL LITERATURE (see PROVENANCE) —
-     never as something this paper itself states.
-  D. PRIOR ART. Search for work that already does this. Cite anything you find by
-     title and venue/arXiv id, as external literature. Recent (last ~18 months) work
-     counts.""",
+     a gain. Judge this from what the PAPER supplies: the baseline's stated
+     configuration, its cited source, and whether the paper reports tuning it at all.
+     You have no search tool and must not assert an external number from memory as
+     though it were checked — if the paper does not say how the baseline was obtained,
+     that omission is itself the finding, and it is a SPECIFICATION gap.
+  D. PRIOR ART. Out of scope for this lens: assessing novelty needs a literature
+     search this review does not perform, and a recollection is not a citation. If the
+     paper's own related-work section understates a named prior method, that is a claim
+     about THIS paper's text and you may raise it with the quote.""",
     },
     "protocol": {
         "model": "sonnet",

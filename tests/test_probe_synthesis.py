@@ -28,6 +28,7 @@ from harness.config import Config
 from harness.local_exec import _AUX, reconcile
 from harness.stages.probe import synthesize_probe
 from harness.stages.report import overall_verdict
+from conftest import incidental_objects, material_objects
 
 PID = "synth"
 
@@ -213,6 +214,8 @@ def _rec(provenance: str, values: list[float]) -> Reconciliation:
     """Identity established by default (C4): this section tests the PROVENANCE ceiling,
     not identity resolution — see test_experiment_identity.py for that gate."""
     return reconcile(ProbeSpec(paper_id=PID, table_ref="T1:r0:c1", claimed_cell_value="59.28",
+                               # stamped onto the reconciliation, as production does
+                               target_id="T1",
                                provenance=provenance,
                                experiment=ExperimentIdentity(state="established", reason="fixture"),
                                metric_identity=MetricIdentity(state="established", reason="fixture"),
@@ -258,7 +261,9 @@ def test_a_synthesized_probe_cannot_drive_the_red_verdict():
 
     convicting = _rec("repo_exec", [64.10, 64.20])
     assert convicting.status == "FAILED_REPRODUCTION"
-    assert overall_verdict(findings, convicting)[0] == "RED", "the authors' code still can"
+    assert overall_verdict(findings, convicting,
+                           objects=material_objects("T1"))[0] == "RED", (
+        "the authors' code still can, on a target a central claim rests on")
 
 
 # --------------------------------------------------------------------------- #

@@ -86,13 +86,44 @@ def test_a_paper_with_no_urls_at_all_yields_nothing():
     ("9.14e3±8.38e2", 9140.0),
     ("-1.5E-3", -0.0015),
     ("12.196 ± 0.207", 12.196),          # plain decimals unaffected
-    ("253.6% 114.8% 74.2%", 253.6),
+    # Three columns extraction ran together. This used to read 253.6 — the FIRST number
+    # of three — and that value was reconciled against a measured metric and printed to a
+    # reviewer as the quantity the paper states. A cell this harness cannot segment is a
+    # cell whose quantity it does not know, so it is refused. See `parse_cell_number`.
+    ("253.6% 114.8% 74.2%", None),
     ("52.7", 52.7),
     ("1,234.5", 1234.5),
     ("", None),
+    # A mean fused with its standard deviation by extraction. `acl`'s Table 2 is written
+    # entirely in this shape, and `60.357.47` read as 60.357 is the number the manuscript
+    # printed as a paper's own claim.
+    ("60.357.47", None),
+    ("65.4132.53", None),
+    # Two adjacent cells run together. The leading value is recoverable and must still be
+    # refused: the string reports two quantities, not one.
+    ("1.23e4±3.29e2 9.14e3±8.38e2", None),
+    ("12.5 [11.0, 14.0]", 12.5),         # a stated interval reports one quantity
 ])
 def test_parse_cell_number(cell: str, expected):
     assert parse_cell_number(cell) == expected
+
+
+def test_a_cell_reporting_more_than_one_quantity_is_refused_rather_than_guessed():
+    """The cell-side half of the rule `claims.parse_quantity` has always applied.
+
+    `parse_quantity` refuses a span that reports no single number ("anything else yields
+    nothing"). The cell path had no such rule and took the leading run of digits, which is
+    the positional coincidence invariant 18 forbids on the output side, applied to the
+    paper's side of the same comparison. Every execution this harness ever performed
+    reached the reconciler through it.
+    """
+    for merged in ("60.357.47", "253.6% 114.8% 74.2%", "1.23e4±3.29e2 9.14e3±8.38e2"):
+        assert parse_cell_number(merged) is None, merged
+    # and the refusal is narrow: single quantities, and a quantity stated with its own
+    # uncertainty, still parse.
+    for ok, want in (("60.35", 60.35), ("61.4 ± 0.3", 61.4), ("1.01e4±6.31e2", 10100.0),
+                     ("95.3%", 95.3), ("2,900 test cases", 2900.0)):
+        assert parse_cell_number(ok) == want, ok
 
 
 def test_the_exponent_is_not_dropped_from_a_reconciled_cell():

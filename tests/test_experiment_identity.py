@@ -25,6 +25,7 @@ from harness.experiment_id import (cell_basis, harvest_candidates, identities_es
                                    resolve_metric)
 from harness.local_exec import StartupEvidence, reconcile
 from harness.stages.report import overall_verdict
+from conftest import incidental_objects, material_objects
 
 # A results table shaped like APT's Table 3: a ratio column carrying its own 100% row.
 RELATIVE = Table(
@@ -221,6 +222,7 @@ def _established() -> tuple[ExperimentIdentity, MetricIdentity, ConfigurationIde
 
 def _spec(experiment=None, metric=None, config=None, provenance="repo_exec") -> ProbeSpec:
     return ProbeSpec(paper_id="p", table_ref="T1:r0:c1", claimed_cell_value="59.28",
+                     target_id="T1",   # stamped onto the reconciliation, as in production
                      provenance=provenance, command=["python", "t.py"],
                      experiment=experiment, metric_identity=metric, configuration=config)
 
@@ -259,7 +261,7 @@ def test_full_identity_plus_capability_plus_runtime_failure_still_convicts():
                   evidence=StartupEvidence(saw_contract_line=True, stdout_lines=30,
                                            ran_seconds=120.0))
     assert r.status == "FAILED_REPRODUCTION" and r.failure_class == "runtime_failure"
-    assert overall_verdict([], r)[0] == "RED"
+    assert overall_verdict([], r, objects=material_objects(r.target_id))[0] == "RED"
 
 
 def test_full_identity_with_a_matching_result_verifies():

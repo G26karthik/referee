@@ -35,6 +35,7 @@ from .backends import ExecRequest, ExecutionBackend, authorize, backend_for
 from .repo import verify_commit
 from .experiment_id import identities_established
 from .config import Config
+from . import comparison as comparison_mod, provenance as provenance_mod
 
 _METRIC = re.compile(r"^SH_METRIC\s+arm=(\S+)\s+seed=(-?\d+)\s+value=([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*$")
 _DEVICE = re.compile(r"^SH_DEVICE\s+(\S+)\s*$")
@@ -51,6 +52,38 @@ _AUX = re.compile(r"^SH_AUX\s+key=(\S+)\s+arm=(\S+)\s+seed=(-?\d+)\s+value=([-+]
 # magnitude off a printed cell is the worst available failure for this function, because
 # the result still looks like a number and still divides cleanly by a noise band.
 _LEADING_NUMBER = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
+# TWO decimal points inside one token. This is not a number any paper prints; it is what
+# extraction produces when it fuses a mean with the standard deviation printed beside it,
+# and the fusion is invisible because the result still parses as a float. Measured over
+# the eight-paper corpus: 15 of 2,862 table cells carry this signature, and `acl`'s
+# Table 2 is written entirely in it — `60.357.47` is 60.35 and 7.47, `65.4132.53` is
+# 65.41 and 32.53. Reading the leading run of digits off `60.357.47` yields 60.357, a
+# quantity that appears nowhere in the paper, and that value was then reconciled against
+# a measured metric and printed to a reviewer as "the printed value". Refusing costs
+# 0.5% of cells and is the only honest answer: a cell this harness cannot segment is a
+# cell whose quantity it does not know.
+_MERGED_DECIMALS = re.compile(r"\d+\.\d+\.\d")
+# 2,900 -> 2900, and ONLY there. Stripping every comma would also erase the separator in
+# `12.5 [11.0, 14.0]`, turning a recognised interval into an unparseable run of numbers.
+# `claims.py` draws the line in the same place, for the same reason.
+_CELL_THOUSANDS = re.compile(r"(?<=\d),(?=\d{3}\b)")
+# The two shapes in which a cell reports ONE quantity using more than one number: a value
+# with its uncertainty after a plus-minus sign, and a value with its uncertainty or
+# interval in brackets. The leading number is the reported quantity in both, which is why
+# these are admitted while a bare run of several numbers is not. Both tolerate scientific
+# notation, because `2024-icml-sapg` writes every cell as `1.01e4±6.31e2` and dropping the
+# exponent here would reintroduce the factor-of-10,000 error the comment above describes.
+#
+# These FULL-MATCH the whole cell rather than its prefix. Anchoring only the front admits
+# `1.23e4±3.29e2 9.14e3±8.38e2` — two adjacent cells extraction ran together, which occurs
+# in `2024-icml-sapg` — and would hand back the first cell's value as though the string
+# reported one quantity. A shape is a shape only if it accounts for every character.
+_NUM = r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?"
+_VALUE_WITH_UNCERTAINTY = re.compile(
+    rf"^\s*({_NUM})\s*%?\s*(?:"
+    rf"(?:±|\+/-|\+-)\s*{_NUM}\s*%?"
+    rf"|[\(\[]\s*{_NUM}(?:\s*(?:,|±|–|—|-|to)\s*{_NUM})?\s*[\)\]]\s*%?"
+    rf")\s*$")
 # A repo that does not implement the SH_METRIC contract usually still prints a JSON
 # summary. These are the keys worth reading, in preference order.
 _JSON_METRIC_KEYS = ("value", "metric", "score", "result", "accuracy", "acc", "top1",
@@ -156,13 +189,13 @@ def render_default(spec: ProbeSpec) -> str:
     return body
 
 
-def write_probe(root: Path, spec: ProbeSpec) -> Path:
+def write_probe(root: Path, spec: ProbeSpec, out_dir: Path | None = None) -> Path:
     """Materialize `runs/<paper_id>/probe.py`. Returns its path.
 
     When `spec.command` is set the code under test is the paper's own checkout, so
     nothing is generated — the returned path is only used to locate the run directory.
     """
-    path = root / "runs" / spec.paper_id / "probe.py"
+    path = (out_dir or (root / "runs" / spec.paper_id)) / "probe.py"
     path.parent.mkdir(parents=True, exist_ok=True)
     if not spec.command:
         path.write_text(spec.script or render_default(spec), encoding="utf-8")
@@ -189,9 +222,43 @@ def resolve_command(cfg: Config, spec: ProbeSpec, script: Path, seed: int,
 
 
 def parse_cell_number(text: str) -> float | None:
-    """The magnitude a table cell reports, or None if the cell holds no number."""
-    m = _LEADING_NUMBER.search((text or "").replace(",", ""))
-    return float(m.group()) if m else None
+    """The quantity a table cell reports, or None when the cell reports no single one.
+
+    This used to be `_LEADING_NUMBER.search(...)` — the first run of digits in the string,
+    whatever else the string contained. That is the positional coincidence invariant 18
+    forbids on the output side, applied to the paper's side of the same comparison, and it
+    was reached by the reconciler on every execution this harness has ever performed.
+
+    What it produced, measured on the shipped corpus: `acl`'s Table 2 cell `60.357.47` —
+    a mean of 60.35 fused with a standard deviation of 7.47 by extraction — was read as
+    **60.357**, a number that appears nowhere in that paper, and was then compared against
+    a measured metric and printed to a reviewer under the heading "printed value". APT's
+    `253.6% 114.8% 74.2%`, three separate columns collapsed into one string, was read as
+    253.6 the same way. `claims.parse_quantity` has refused exactly this since it was
+    written ("anything else yields nothing"); the cell path never had the rule.
+
+    So it has it now, in three tiers:
+
+      1. a token carrying two decimal points is an extraction fusion, never a printed
+         number, and is REFUSED outright;
+      2. a cell whose leading number is followed by an uncertainty — `61.4 ± 0.3`,
+         `1.01e4±6.31e2`, `59.3 (0.4)` — reports one quantity and yields its leading
+         number, because which number is the value is unambiguous in that shape;
+      3. exactly one number yields that number, and anything else is REFUSED.
+
+    Measured cost of the refusal over the eight-paper corpus: of 2,862 table cells, 814
+    carry one number and 73 carry a recognised uncertainty shape, both admitted; 15 carry
+    the fusion signature and 127 carry several numbers in no recognised shape, both now
+    refused. A refused cell loses a target. A mis-segmented cell loses the review's
+    honesty, and it does so silently, because the wrong answer is still a float.
+    """
+    raw = _CELL_THOUSANDS.sub("", (text or ""))
+    if _MERGED_DECIMALS.search(raw):
+        return None
+    if (m := _VALUE_WITH_UNCERTAINTY.match(raw)):
+        return float(m.group(1))
+    nums = _LEADING_NUMBER.findall(raw)
+    return float(nums[0]) if len(nums) == 1 else None
 
 
 def printed_precision_half_width(text: str) -> float:
@@ -217,24 +284,49 @@ def printed_precision_half_width(text: str) -> float:
     return 0.5 * (10 ** exponent)
 
 
-def json_metric(stdout: str, metric: str = "", strict: bool = False) -> float | None:
-    """Last JSON object on stdout that carries a usable metric, as a float.
+# Keys whose VALUE names which experiment an output object belongs to. An object carrying
+# one of these can be matched against the target, which is what makes a parse
+# target-aware rather than positional.
+_TARGET_KEYS = ("split", "dataset", "task", "subset", "benchmark", "eval_set", "config",
+                "experiment", "model")
+# Keys whose value is a nested object of results. A metric found inside one of these was
+# published under a structured schema rather than shouted at the top level.
+_CONTAINER_KEYS = ("results", "metrics", "summary", "final", "eval", "test", "scores")
+# Keys whose value NAMES the metric the object reports, e.g. {"metric":"accuracy","value":..}.
+_NAMING_KEYS = ("metric", "name", "metric_name", "key")
 
-    The fallback for repositories that do not implement the SH_METRIC contract. Scans
-    from the end so a final summary wins over per-epoch logging.
+# The preference order. A parse from a higher tier wins outright; disagreement WITHIN the
+# winning tier is refused rather than resolved by position. `positional` exists only to be
+# reported and is never authoritative — see `parse_metric`.
+METRIC_TIERS = ("target_bound", "named_artifact", "structured", "identity", "positional")
 
-    `strict` is what a bound `MetricIdentity.output_key` means: ONLY that key is
-    accepted, because the whole point of establishing which output corresponds to the
-    cited metric is to stop here from mining a generic "value"/"score"/"mean" out of
-    whichever number happens to parse when the bound key is not the one present. Without
-    `strict` — no metric identity was established to bind a key at all — the generic
-    key list is the best-effort fallback this always was, for callers that never had a
-    binding to lose.
+
+@dataclass(frozen=True)
+class MetricParse:
+    """What a stdout scan concluded about the target's metric, and how it concluded it.
+
+    `authoritative` is the field that matters. A value this harness would print but must
+    not reconcile against a printed cell is exactly the failure mode `parse_quantity` and
+    the provenance ceiling exist to prevent elsewhere, and it is the failure mode a
+    last-JSON-object-wins scan produces: a number that looks right, divides cleanly by a
+    noise band, and came from whichever line the repository happened to print last.
     """
-    if strict and not metric:
-        return None
-    keys = ([metric.lower()] if metric else []) + ([] if strict else list(_JSON_METRIC_KEYS))
-    for line in reversed((stdout or "").splitlines()):
+
+    value: float | None = None
+    tier: str = ""
+    ambiguous: bool = False
+    candidates: tuple[tuple[str, float], ...] = ()
+    detail: str = ""
+
+    @property
+    def authoritative(self) -> bool:
+        return (self.value is not None and not self.ambiguous
+                and self.tier in ("target_bound", "named_artifact", "structured", "identity"))
+
+
+def _json_objects(stdout: str) -> list[dict]:
+    out = []
+    for line in (stdout or "").splitlines():
         line = line.strip()
         if not (line.startswith("{") and line.endswith("}")):
             continue
@@ -242,13 +334,116 @@ def json_metric(stdout: str, metric: str = "", strict: bool = False) -> float | 
             data = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             continue
-        if not isinstance(data, dict):
+        if isinstance(data, dict):
+            out.append(data)
+    return out
+
+
+def _number(v) -> float | None:
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _tiered(obj: dict, key: str, experiment_hint: str) -> list[tuple[str, float]]:
+    """Every (tier, value) this object offers for `key`, most authoritative first."""
+    lowered = {str(k).lower(): v for k, v in obj.items()}
+    hint = (experiment_hint or "").lower()
+    found: list[tuple[str, float]] = []
+
+    top = _number(lowered.get(key))
+    if top is not None:
+        matched = any(
+            isinstance(lowered.get(tk), str) and hint and
+            (lowered[tk].lower() in hint or hint in lowered[tk].lower())
+            for tk in _TARGET_KEYS)
+        if matched:
+            found.append(("target_bound", top))
+        named = any(isinstance(lowered.get(nk), str) and lowered[nk].lower() == key
+                    for nk in _NAMING_KEYS)
+        if named:
+            found.append(("named_artifact", top))
+        found.append(("identity", top))
+
+    for ck in _CONTAINER_KEYS:
+        inner = lowered.get(ck)
+        if isinstance(inner, dict):
+            v = _number({str(k).lower(): x for k, x in inner.items()}.get(key))
+            if v is not None:
+                found.append(("structured", v))
+    return found
+
+
+def parse_metric(stdout: str, key: str, experiment_hint: str = "") -> MetricParse:
+    """The target's metric from a repository's stdout, or a refusal that says why.
+
+    **Positional coincidence may never establish a reconciliation.** The old scan took the
+    last JSON object carrying a usable key. That is right for per-epoch logging followed
+    by a summary and wrong for a summary followed by a per-class breakdown reusing the
+    same key, and nothing on stdout distinguishes the two cases — so the answer depended
+    on what the repository happened to print last, which is not evidence.
+
+    What replaces it is a preference order over how a value was IDENTIFIED, and a refusal
+    when the winning tier disagrees with itself:
+
+      target_bound    the object names the split/dataset/task and it matches the target
+      named_artifact  the object names the metric it reports, and it is this one
+      structured      the value came from a results/metrics/summary object
+      identity        the bound key at the top level, and nothing else to go on
+
+    Two objects in the winning tier reporting different numbers is an AMBIGUITY, not a
+    tie to be broken. A repository that wants a reconciliation can emit the `SH_METRIC`
+    contract line, which is checked before this is ever reached.
+    """
+    if not key:
+        return MetricParse(detail="no metric identity was established, so no key is bound; "
+                                  "a generic scan for whatever number parses is exactly the "
+                                  "guess this refuses to make")
+    key = key.lower()
+    per_tier: dict[str, list[float]] = {}
+    for obj in _json_objects(stdout):
+        for tier, value in _tiered(obj, key, experiment_hint):
+            per_tier.setdefault(tier, []).append(value)
+
+    for tier in METRIC_TIERS:
+        values = per_tier.get(tier) or []
+        if not values:
             continue
-        lowered = {str(k).lower(): v for k, v in data.items()}
+        distinct = sorted(set(values))
+        candidates = tuple((tier, v) for v in distinct)
+        if len(distinct) > 1:
+            return MetricParse(
+                value=None, tier=tier, ambiguous=True, candidates=candidates,
+                detail=(f"{len(distinct)} different values for '{key}' were reported at the "
+                        f"same identification tier ({tier}): "
+                        f"{', '.join(str(v) for v in distinct)}. Which one corresponds to the "
+                        f"cited quantity is not decidable from stdout, and taking the last is "
+                        f"positional coincidence rather than evidence."))
+        return MetricParse(value=distinct[0], tier=tier, candidates=candidates,
+                           detail=f"'{key}' identified at tier {tier}")
+    return MetricParse(detail=f"no JSON object on stdout reported '{key}'")
+
+
+def json_metric(stdout: str, metric: str = "", strict: bool = False) -> float | None:
+    """Last JSON object on stdout that carries a usable metric, as a float.
+
+    **Diagnostic only.** Kept because a report is more useful when it can say what the run
+    printed, and because the generic key list is the only thing available when no metric
+    identity was established. What it must never do is establish a reconciliation: the
+    execution path calls `parse_metric` instead, which refuses a positional answer.
+
+    `strict` is what a bound `MetricIdentity.output_key` means: ONLY that key is
+    accepted, because the whole point of establishing which output corresponds to the
+    cited metric is to stop here from mining a generic "value"/"score"/"mean" out of
+    whichever number happens to parse when the bound key is not the one present.
+    """
+    if strict and not metric:
+        return None
+    keys = ([metric.lower()] if metric else []) + ([] if strict else list(_JSON_METRIC_KEYS))
+    for obj in reversed(_json_objects(stdout)):
+        lowered = {str(k).lower(): v for k, v in obj.items()}
         for key in keys:
-            v = lowered.get(key)
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
-                return float(v)
+            v = _number(lowered.get(key))
+            if v is not None:
+                return v
     return None
 
 
@@ -419,6 +614,21 @@ def reached_experiment(evidence: StartupEvidence) -> bool:
     return long_enough and evidence.stdout_lines >= _MIN_OUTPUT_LINES
 
 
+def _addressed(spec: ProbeSpec) -> str:
+    """How to NAME what a reconciliation is about, in a refusal a human will read.
+
+    A prose-stated total is not "the cited cell", and saying so in a refusal would tell a
+    reader the harness was looking somewhere it was not.
+    """
+    ref = spec.claim_ref or spec.table_ref
+    if not ref:
+        return "the cited quantity"
+    kind = spec.claim_kind or ("table_cell" if spec.table_ref else "")
+    noun = {"table_cell": "cell", "prose_claim": "prose claim", "figure": "figure",
+            "equation": "equation", "section_span": "section"}.get(kind, "quantity")
+    return f"the {noun} at {ref}"
+
+
 def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
               seeds_run: list[int], failure: str = "",
               evidence: StartupEvidence | None = None,
@@ -444,6 +654,9 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
     """
     evidence = evidence or StartupEvidence()
     rec = Reconciliation(table_ref=spec.table_ref, finding_id=spec.finding_id,
+                         claim_ref=spec.claim_ref or spec.table_ref,
+                         claim_kind=spec.claim_kind or ("table_cell" if spec.table_ref else ""),
+                         target_id=spec.target_id,
                          metric=spec.metric, claimed_raw=spec.claimed_cell_value,
                          provenance=spec.provenance,
                          noise_band=round(noise_band, 6), seeds_run=sorted(seeds_run))
@@ -461,7 +674,7 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
             f"the repository was not executed, so nothing was reproduced: "
             f"{authorization.detail} (decision '{authorization.decision}'). No reproduction "
             f"verdict is drawn, because a refusal by this harness is not evidence about "
-            f"{spec.table_ref or 'the cited cell'}."
+            f"{_addressed(spec)}."
         )
         return rec
 
@@ -471,6 +684,25 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
     if rec.claimed_value is not None and rec.reproduced_value is not None:
         rec.delta_error = round(abs(rec.reproduced_value - rec.claimed_value), 6)
 
+    # --- WHAT IDENTITY ACTUALLY SAID, recorded before any branch can return -----------
+    # These three used to be assigned BELOW the provenance ceiling, which returns for
+    # every synthesized and template probe — so on every such reconciliation they kept
+    # their field defaults, and the default is the string "unmapped". A default is not a
+    # measurement, and this one was read as one: over the eight-paper corpus all 16
+    # reconciliations reported `unmapped` on all three states while the specs that
+    # produced them recorded `no_candidate` (the cited row is a third-party baseline the
+    # authors' code does not implement), `ambiguous` (84 advertised commands could emit
+    # the metric) and `unmapped`. Three different findings about three repositories,
+    # flattened into one word by the order of two blocks.
+    #
+    # Assigning them here changes no decision — `identities_established` below is still
+    # what gates, and the ceiling still returns first — and it makes the record say which
+    # of the identity failures actually occurred, which is the difference between "we did
+    # not look" and "we looked and the cell is not something their code produces".
+    rec.experiment_state = spec.experiment.state if spec.experiment else "unmapped"
+    rec.metric_state = spec.metric_identity.state if spec.metric_identity else "unmapped"
+    rec.configuration_state = spec.configuration.state if spec.configuration else "unmapped"
+
     # --- the provenance ceiling ---------------------------------------------------
     # A synthesized probe is OUR reimplementation of the paper's formulation, run at toy
     # scale on synthetic data. Its number is real and its noise band is real, but it is
@@ -479,7 +711,7 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
     # this harness exists to catch other people making — and letting it ACQUIT would be
     # worse, because a toy that happens to land near the printed number would launder a
     # claim nobody checked. Only code the authors wrote may reconcile against their cell.
-    if spec.provenance not in ("driver", "repo_exec"):
+    if not provenance_mod.admits(spec.provenance):
         rec.status = "INCONCLUSIVE"
         near = ("" if rec.delta_error is None else
                 f" (|delta| {rec.delta_error:.4f} against a 2-sigma band of {noise_band:.4f})")
@@ -487,10 +719,64 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
             f"the probe that ran was {spec.provenance}, not the paper's own code: "
             f"{'a mechanism reimplementation at toy scale' if spec.provenance == 'synthesized' else 'the identical-arms noise-floor template'}. "
             f"Its result{near} is evidence about the mechanism, not a reproduction of the "
-            f"value printed at {spec.table_ref or 'the cited cell'}, so no reproduction "
+            f"value printed at {_addressed(spec)}, so no reproduction "
             f"verdict is drawn. Open SH_ALLOW_REPO_EXEC to reconcile against the authors' code."
         )
         return rec
+
+    # --- the reimplementation conformance precondition (decision 1) -------------------
+    # `reimpl_exec` has no repository experiment to bind against — there is no repository,
+    # which is the reason this route exists at all — so `identities_established` further
+    # below, which asks whether a REPO COMMAND emits the cited quantity, does not apply to
+    # it and is skipped for this provenance. The question a reconstruction has to answer
+    # instead is whether EVERY required ingredient the paper specifies was actually
+    # realized in the code that ran, bound to both a paper locator and a verified
+    # implementation locator — that is exactly what `ReimplementationConformance` records.
+    # A nonconformant reconstruction settles nothing: any disagreement it produced would be
+    # a disagreement with the reimplementer's own invention, never a finding about the
+    # paper's stated method.
+    if spec.provenance == "reimpl_exec":
+        conf = spec.reimplementation_conformance
+        if conf is None or not conf.established:
+            rec.status = "INCONCLUSIVE"
+            rec.failure_class = "reimplementation_nonconformant"
+            rec.reason = (
+                f"this reconstruction is not fully conformant, so no verdict is drawn about "
+                f"{_addressed(spec)}: "
+                f"{(conf.reason if conf is not None else 'no ReimplementationConformance was recorded for this spec')}. "
+                f"A disagreement from an unbound reconstruction would be a disagreement with "
+                f"the reimplementer's own invention, not a finding about the paper's stated "
+                f"method."
+            )
+            return rec
+
+    # --- WHICH COMPARISON THIS IS, and whether this system can perform it -------------
+    # The arithmetic below is ONE comparison: a measured quantity against the one the paper
+    # printed. Nothing in the record used to say so, and nothing checked that it was the
+    # right comparison for the target — every route ended here and was reconciled against a
+    # cell, including routes whose evidence is a difference between two arms the paper
+    # printed neither of.
+    #
+    # Applied AFTER the ceiling and identically to every kind, so a synthesized probe still
+    # reports the ceiling rather than a comparison class: which comparison was intended
+    # cannot rescue a program that was never entitled to reconcile anything.
+    if spec.comparison is not None:
+        rec.comparison_kind = spec.comparison.kind
+        rec.comparison_state = spec.comparison.state
+        if not comparison_mod.admits_verdict(spec.comparison):
+            rec.status = "INCONCLUSIVE"
+            rec.failure_class = "comparison_unestablished"
+            rec.reason = (
+                f"this target needed a "
+                f"{spec.comparison.kind.lower().replace('_', ' ')} comparison and this "
+                f"review could not carry one out: {spec.comparison.reason} Whatever ran "
+                f"has measured something; there is nothing here to hold it against, so no "
+                f"verdict is drawn about {_addressed(spec)}.")
+            return rec
+    elif spec.provenance:
+        # A spec built before this layer existed, or by hand. The comparison it gets is the
+        # one this function has always performed, recorded so the trace says which.
+        rec.comparison_kind = "AGAINST_PRINTED_VALUE"
 
     # --- the identity precondition ------------------------------------------------
     # Capability asks whether the code CAN run. Identity asks whether running it answers
@@ -499,28 +785,38 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
     # applies to success and failure alike, and sits after the provenance ceiling so a
     # synthesized probe still reports the ceiling rather than an identity class.
     #
-    # Applied to BOTH provenances the ceiling above admits, not only `spec.command`. A
-    # `driver` spec can carry a hand-written `script` with no `command` at all — a human
-    # wrote `spec.json` and pointed it at real code — and gating this check on
-    # `spec.command` let exactly that spec skip straight to the arithmetic below with
-    # experiment/metric/configuration identity never assessed. Provenance says WHOSE code
-    # ran; identity says whether running it answers the cited cell, and a driver script is
-    # not exempt from the second question just because a human, not the planner, wrote it.
-    # The scientific prerequisites are the same regardless of who authored the probe.
-    rec.experiment_state = spec.experiment.state if spec.experiment else "unmapped"
-    rec.metric_state = spec.metric_identity.state if spec.metric_identity else "unmapped"
-    rec.configuration_state = spec.configuration.state if spec.configuration else "unmapped"
-    proven, failure_class, why = identities_established(
-        spec.experiment, spec.metric_identity, spec.configuration)
-    if not proven:
-        rec.status = "INCONCLUSIVE"
-        rec.failure_class = failure_class
-        rec.reason = (
-            f"the executed program was not bound to the cited cell, so its output cannot "
-            f"be compared with {spec.table_ref or 'it'}: {why}. A run that succeeds without "
-            f"this binding has measured something, but not the thing the paper printed."
-        )
-        return rec
+    # Applied to every provenance the ceiling above admits EXCEPT `reimpl_exec`, not only
+    # to `spec.command`. A `driver` spec can carry a hand-written `script` with no
+    # `command` at all — a human wrote `spec.json` and pointed it at real code — and
+    # gating this check on `spec.command` let exactly that spec skip straight to the
+    # arithmetic below with experiment/metric/configuration identity never assessed.
+    # Provenance says WHOSE code ran; identity says whether running it answers the cited
+    # cell, and a driver script is not exempt from the second question just because a
+    # human, not the planner, wrote it. The scientific prerequisites are the same
+    # regardless of who authored the probe.
+    #
+    # `reimpl_exec` is the one exception, and it is an exception rather than a gap: there
+    # is no repository command for `identities_established` to ask about — the check it
+    # performs (`ExperimentIdentity`/`MetricIdentity`/`ConfigurationIdentity` all binding a
+    # REPO COMMAND to the cited cell) is not a question a from-scratch reconstruction can
+    # even be asked. The reconformance precondition just above is what stands in its place
+    # for this provenance, and it is at least as strict: it requires every required
+    # ingredient bound AND VERIFIED, not merely one command among several.
+    #
+    # The three states themselves are recorded further up, before the ceiling, so that a
+    # refused probe still carries what identity found rather than a field default.
+    if spec.provenance != "reimpl_exec":
+        proven, failure_class, why = identities_established(
+            spec.experiment, spec.metric_identity, spec.configuration)
+        if not proven:
+            rec.status = "INCONCLUSIVE"
+            rec.failure_class = failure_class
+            rec.reason = (
+                f"the executed program was not bound to the cited cell, so its output cannot "
+                f"be compared with {_addressed(spec)}: {why}. A run that succeeds without "
+                f"this binding has measured something, but not the thing the paper printed."
+            )
+            return rec
 
     # --- the capability precondition ----------------------------------------------
     # A crash is a failed reproduction only if the code was actually run. Three things
@@ -603,7 +899,7 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
     if rec.claimed_value is None:
         rec.status = "INCONCLUSIVE"
         rec.reason = (f"no number could be parsed out of the cited cell "
-                      f"{spec.table_ref or '(none cited)'}, so there is no claim to reconcile")
+                      f"{spec.claim_ref or spec.table_ref or '(none cited)'}, so there is no claim to reconcile")
         return rec
 
     ratio = _scale_ratio(rec.claimed_value, rec.reproduced_value)
@@ -631,7 +927,37 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
         f"leaving an effective |delta| of {effective_delta:.4f})"
         if rec.claimed_precision else "")
 
-    if noise_band <= 0:
+    # A quantity with no seed-to-seed variance BY CONSTRUCTION is not a very precise
+    # measurement and it is not a degenerate one either — it is a different kind of
+    # quantity. A count of the items a generator produces has no distribution to have a
+    # band; the right tolerance for it is the precision the paper printed, which
+    # `claimed_precision` already carries.
+    #
+    # Narrow on purpose, and the narrowness is the safety argument. It requires the METRIC
+    # IDENTITY to have established that the cited quantity is a `count`, which
+    # `experiment_id` only concludes for a prose composition naming a population. For a
+    # stochastic metric, zero measured variance means the opposite thing — the seed never
+    # reached the model — and that case still refuses below, unchanged.
+    deterministic_count = (
+        noise_band <= 0
+        and spec.metric_identity is not None
+        and spec.metric_identity.established
+        and spec.metric_identity.cell_quantity == "count"
+        and len(rec.seeds_run) > 1
+        and rec.reproduced_std == 0.0)
+
+    if deterministic_count:
+        within = effective_delta <= 0
+        rec.status = "RESOLVED_VERIFIED" if within else "FAILED_REPRODUCTION"
+        rec.reason = (
+            f"reproduced a count of {rec.reproduced_value:g} against the stated "
+            f"{rec.claimed_value:g}, identically across {len(rec.seeds_run)} seeds. A count "
+            f"has no seed-to-seed distribution, so the tolerance is the precision the paper "
+            f"printed rather than a 2-sigma band: |delta| {rec.delta_error:.4f}"
+            f"{precision_note} "
+            + ("is within it. The stated total stands."
+               if within else "exceeds it."))
+    elif noise_band <= 0:
         rec.status = "INCONCLUSIVE"
         rec.reason = (f"seed-to-seed noise measured as zero over {len(rec.seeds_run)} seeds, so "
                       f"the `<= 2 sigma` test has no band to test against. Delta was "
@@ -646,6 +972,19 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
         rec.reason = (f"reproduced {rec.reproduced_value:g} against the cell's "
                       f"{rec.claimed_value:g}: |delta| {rec.delta_error:.4f}{precision_note} "
                       f"exceeds the 2-sigma band {noise_band:.4f} over {len(rec.seeds_run)} seeds.")
+    if spec.provenance == "reimpl_exec" and rec.status in ("RESOLVED_VERIFIED", "FAILED_REPRODUCTION"):
+        # Decision 1's wording requirement, applied regardless of which branch above set
+        # the verdict: a conformant reconstruction's disagreement is a finding about the
+        # paper's STATED METHOD, and must never be read as the authors' own code failing —
+        # it is not the authors' own code. `harness.provenance.PROVENANCE_LABEL` already
+        # keeps `execution_provenance` from saying AUTHOR_REPOSITORY; this keeps the
+        # reconciliation's own sentence from implying it too.
+        rec.reason += (
+            " This ran as a governed reconstruction this harness's driver wrote and bound "
+            "to the paper ingredient-by-ingredient (INDEPENDENT_REIMPLEMENTATION), not the "
+            "authors' own code: this is a finding about whether the paper's stated method "
+            "reproduces, never a statement that the authors' code failed."
+        )
     return rec
 
 
@@ -679,23 +1018,32 @@ def _noise(per_seed: dict[str, dict[int, float]], arms: list[str]) -> tuple[floa
     return (max(spreads) if spreads else 0.0), "unpaired (wider arm spread)"
 
 
-def verify_execution_commit(spec: ProbeSpec) -> CommitVerification | None:
+def verify_execution_commit(spec: ProbeSpec,
+                            backend: ExecutionBackend | None = None) -> CommitVerification | None:
     """Re-check, at the moment of execution, that the checkout is the audited commit.
 
     Returns None for a probe this harness authored — there is no repository involved, so
     there is no commit to be wrong about. For a repository run it reads the working tree
-    on disk NOW rather than trusting the SHA recorded during planning, because the whole
-    failure being closed is that planning and execution can see different code: a default
-    branch moves, a cached checkout is refreshed, and the second run executes something
-    the first run's audit never read while still carrying that audit's findings.
+    NOW rather than trusting the SHA recorded during planning, because the whole failure
+    being closed is that planning and execution can see different code: a default branch
+    moves, a cached checkout is refreshed, and the second run executes something the first
+    run's audit never read while still carrying that audit's findings.
+
+    The tree it reads is the BACKEND's, not necessarily this disk's. Verifying a directory
+    on the operator's machine and then running somewhere else would leave the executed
+    tree unverified while the record said otherwise — so the backend names the checkout it
+    will actually run, and a backend that cannot produce one fails closed (see
+    `ExecutionBackend.commit_tree`).
     """
     if not spec.command:
         return None
-    return verify_commit(spec.cwd, spec.commit)
+    tree = backend.commit_tree(spec.cwd) if backend is not None else None
+    return verify_commit(spec.cwd, spec.commit, tree=tree)
 
 
 def _blocked(cfg: Config, root: Path, spec: ProbeSpec, auth: ExecAuthorization,
-             seconds: float, commit: CommitVerification | None = None) -> ProbeResult:
+             seconds: float, commit: CommitVerification | None = None,
+             out_dir: Path | None = None) -> ProbeResult:
     """The result of a run that was refused. Nothing executed; nothing is concluded.
 
     A distinct verdict rather than a reused one. 'failed' would say the probe ran and
@@ -717,11 +1065,11 @@ def _blocked(cfg: Config, root: Path, spec: ProbeSpec, auth: ExecAuthorization,
                 f"No process was started, so no measurement exists and no claim about "
                 f"the paper is drawn from this."),
     )
-    if spec.table_ref or spec.claimed_cell_value:
+    if spec.claim_ref or spec.table_ref or spec.claimed_cell_value:
         result.reconciliation = reconcile(spec, [], 0.0, [], authorization=auth)
     # `script_path` stays empty: no probe was written, and naming a file that does not
     # exist would invite a reader to go looking for the code that ran.
-    out_dir = root / "runs" / spec.paper_id
+    out_dir = out_dir or (root / "runs" / spec.paper_id)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "probe_results.json").write_text(
         json.dumps(result.model_dump(), indent=2, ensure_ascii=False), encoding="utf-8")
@@ -729,7 +1077,8 @@ def _blocked(cfg: Config, root: Path, spec: ProbeSpec, auth: ExecAuthorization,
 
 
 def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
-              backend: ExecutionBackend | None = None) -> ProbeResult:
+              backend: ExecutionBackend | None = None,
+              out_dir: Path | None = None) -> ProbeResult:
     """Write the probe, run every (arm, seed) through the backend, aggregate.
 
     The backend is asked for, not assumed: `backend_for` returns the local one for code
@@ -744,13 +1093,46 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
     process is started, no arms are measured, and the reconciliation is INCONCLUSIVE.
     """
     t0 = time.time()
+    # A SPEC THAT CLAIMS AN ADMISSIBLE PROVENANCE AND CONTAINS NO PROGRAM IS REFUSED.
+    #
+    # `write_probe` falls back to DEFAULT_TEMPLATE when a spec carries neither `script`
+    # nor `command`, and that template runs two IDENTICAL arms: it measures this machine's
+    # seed noise floor and nothing about any paper. It is meant to be reached with
+    # provenance `template`, which the ceiling refuses, so its number settles nothing.
+    #
+    # A hand-written `runs/<pid>/spec.json` declaring `"provenance": "driver"` with neither
+    # field reached it too — and `driver` is admissible, so the noise floor's own accuracy
+    # was reconciled against the paper's printed cell and was eligible to produce
+    # FAILED_REPRODUCTION. `reconcile` cannot catch it: the ceiling is the only guard it
+    # applies before the identity gate, and this spec passes the ceiling by assertion.
+    # `overall_verdict` could not catch it either, because nothing there reads
+    # `ProbeResult.calibration`. So a review could be RED on the harness's own calibration
+    # run against a paper nobody had executed.
+    #
+    # Refused here rather than downgraded, because there is nothing to downgrade: a spec
+    # that says it is a human reproduction of the paper's method and contains no program
+    # is malformed, not weak. `report.overall_verdict` refuses a calibration
+    # reconciliation as well, so the hole is closed on both sides of the seam.
+    if provenance_mod.admits(spec.provenance) and not (spec.script or "").strip() \
+            and not spec.command:
+        blocked_auth = ExecAuthorization(
+            allowed=False, decision="spec_incomplete",
+            detail=(f"this spec declares provenance '{spec.provenance}', which the "
+                    f"provenance ceiling admits, and carries neither a script nor a "
+                    f"command. There is no program here to attribute to the authors or to "
+                    f"a reviewer: running it would execute this harness's identical-arms "
+                    f"noise-floor template and then reconcile its number against the "
+                    f"paper's printed cell."))
+        return _blocked(cfg, root, spec, blocked_auth, round(time.time() - t0, 1),
+                        verify_execution_commit(spec, backend), out_dir=out_dir)
     backend = backend or backend_for(cfg, spec)
-    commit = verify_execution_commit(spec)
+    commit = verify_execution_commit(spec, backend)
     auth = authorize(cfg, spec, backend, commit=commit)
     if not auth.allowed or backend is None:
-        return _blocked(cfg, root, spec, auth, round(time.time() - t0, 1), commit)
+        return _blocked(cfg, root, spec, auth, round(time.time() - t0, 1), commit,
+                        out_dir=out_dir)
 
-    script = write_probe(root, spec)
+    script = write_probe(root, spec, out_dir)
     out_dir = script.parent
 
     records: list[ExecutionRecord] = []
@@ -775,7 +1157,14 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
             # the one question a reproduction verdict has to survive.
             record = ExecutionRecord(
                 seed=seed, arm=arm, backend=p.backend, argv=p.argv, cwd=p.cwd,
-                environment=p.environment, interpreter=spec.interpreter, commit=spec.commit,
+                environment=p.environment, interpreter=spec.interpreter,
+                provenance=spec.provenance,
+                # The commit identifies the authors' code, so it is written when the
+                # authors' code is what ran and left blank otherwise. It used to be
+                # stamped unconditionally: every synthesized diagnostic in the shipped
+                # corpus carries the cloned repository's SHA, which is the one identity
+                # that record is not evidence of.
+                commit=(spec.commit if spec.provenance == "repo_exec" else ""),
                 started_at=p.started_at, ended_at=p.ended_at, seconds=p.seconds,
                 launched=p.launched, completed=p.completed, timed_out=p.timed_out,
                 returncode=p.returncode, stdout=p.stdout, stderr=p.stderr, error=p.error)
@@ -851,11 +1240,30 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
                 # the cited cell reports and the reconciler is authorized to compare.
                 bound_key = (spec.metric_identity.output_key
                              if spec.metric_identity and spec.metric_identity.established else "")
-                if bound_key and (v := json_metric(p.stdout or "", bound_key, strict=True)) is not None:
-                    per_seed.setdefault(arm, {})[seed] = v
-                    record.metric = v
+                # Target-aware, and refusing rather than guessing. The hint comes only from
+                # a configuration identity that was actually ESTABLISHED — `spec.dataset`
+                # would be wrong here, because it defaults to the noise-floor template's
+                # own toy dataset and would match a repository's output object for reasons
+                # that have nothing to do with the cited cell.
+                hint = " ".join(
+                    v for v in (spec.configuration.matched or {}).values()
+                    if isinstance(v, str)) if (
+                        spec.configuration and spec.configuration.established) else ""
+                parsed = parse_metric(p.stdout or "", bound_key, hint)
+                if parsed.authoritative and parsed.value is not None:
+                    per_seed.setdefault(arm, {})[seed] = parsed.value
+                    record.metric = parsed.value
                     evidence.saw_json_metric = True
                     metric_captured = True
+                elif parsed.ambiguous:
+                    # The run produced numbers and none of them is identifiably THE one.
+                    # Recorded on the attempt so the report can say so, and deliberately
+                    # NOT captured: an ambiguous metric reconciled against a printed cell
+                    # is the positional coincidence this refuses to make.
+                    mislabelled.append(parsed.detail)
+                    log.append({"seed": seed, "arm": arm, "rc": p.returncode,
+                                "metric_ambiguous": parsed.detail,
+                                "candidates": [v for _, v in parsed.candidates]})
             if p.returncode != 0:
                 err = (p.stderr or "").strip()[-400:]
                 if metric_captured:
@@ -985,7 +1393,7 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
     # S3d — reconcile against the cited cell, but only when a cell was actually cited.
     # A probe with no `table_ref` was never pointed at a number, so producing a
     # reconciliation for it would be inventing the thing being checked.
-    if spec.table_ref or spec.claimed_cell_value:
+    if spec.claim_ref or spec.table_ref or spec.claimed_cell_value:
         repro_arm = spec.arms[-1] if spec.arms else ""
         measured = per_seed.get(repro_arm) or {}
         if not measured:
@@ -1067,6 +1475,26 @@ if __name__ == "__main__":  # self-check: python -m harness.local_exec
     assert parse_cell_number("n/a") is None
     assert json_metric('noise\n{"epochs": 90}\n{"accuracy": 0.91}\n') == 0.91
     assert json_metric('{"lr": 0.1}') is None, "a hyperparameter blob is not a metric"
+
+    # --- target-aware metric binding ---------------------------------------------------
+    one = parse_metric('{"eval_accuracy": 0.87}', "eval_accuracy")
+    assert one.authoritative and one.value == 0.87 and one.tier == "identity"
+
+    two = parse_metric('{"eval_accuracy": 0.81}\n{"eval_accuracy": 0.87}', "eval_accuracy")
+    assert two.ambiguous and two.value is None and not two.authoritative, (
+        "two numbers under one key at one tier is an ambiguity, not a tie to be broken")
+
+    # a split-bound object outranks a bare one, and the ambiguity disappears
+    bound = parse_metric('{"eval_accuracy": 0.81}\n{"split":"cifar100-test","eval_accuracy":0.87}',
+                         "eval_accuracy", "cifar100-test resnet")
+    assert bound.authoritative and bound.value == 0.87 and bound.tier == "target_bound"
+
+    nested = parse_metric('{"results": {"eval_accuracy": 0.9}}', "eval_accuracy")
+    assert nested.authoritative and nested.tier == "structured"
+
+    assert not parse_metric('{"eval_accuracy": 0.9}', "").authoritative, \
+        "no bound key means no authoritative parse, whatever stdout says"
+    assert not parse_metric('{"loss": 0.2}', "eval_accuracy").authoritative
 
     ok = reconcile(_spec("59.28"), [59.30, 59.26], 0.10, [0, 1])
     assert ok.status == "RESOLVED_VERIFIED", ok.reason

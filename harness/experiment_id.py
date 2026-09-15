@@ -56,7 +56,38 @@ _OUTPUT_QUANTITY: tuple[tuple[str, str], ...] = (
     ("eval_loss", "loss"), ("loss", "loss"), ("perplexity", "loss"),
     ("eval_accuracy", "accuracy"), ("accuracy", "accuracy"), ("eval_f1", "accuracy"),
     ("f1", "accuracy"), ("exact_match", "accuracy"),
+    # A COUNT. Reachable only from the prose path below, because `_quantity_of` — which is
+    # what a cell's quantity comes from — never returns "count": a table column headed
+    # "N" is not evidence that the column reports the same population a sentence counts.
+    ("n_cases", "count"), ("num_cases", "count"), ("n_examples", "count"),
+    ("num_examples", "count"), ("n_samples", "count"), ("num_samples", "count"),
+    ("n_items", "count"), ("total_cases", "count"), ("n_total", "count"),
+    ("count", "count"), ("total", "count"),
 )
+
+# What a PROSE span counts, when it states a composition. Deliberately a separate table
+# from `_QUANTITY_WORDS`: a sentence saying "58 topics x 5 templates x 10 instances =
+# 2,900 test cases" names a population, and a population is a different kind of quantity
+# from an accuracy. Keeping them apart means adding this cannot change how any cell is
+# read, which is the property that let it be added at all.
+_COUNT_WORDS = ("case", "cases", "instance", "instances", "example", "examples",
+                "sample", "samples", "question", "questions", "problem", "problems",
+                "item", "items", "pair", "pairs", "prompt", "prompts", "task", "tasks",
+                "scenario", "scenarios", "record", "records", "test", "tests")
+
+
+def prose_quantity(text: str) -> str:
+    """'count' when a prose span states how many of something there are, else ''.
+
+    A count is the one quantity a composition claim can carry, and a composition claim is
+    the one prose shape `harness.claims.parse_quantity` will admit — so this is narrow by
+    construction rather than by restraint. A sentence naming an accuracy is NOT read here:
+    an accuracy stated in prose has no column header, no basis and no baseline row, and
+    binding an executed number to it would be exactly the unearned identity this layer
+    exists to refuse.
+    """
+    low = (text or "").lower()
+    return "count" if any(re.search(rf"\b{re.escape(w)}\b", low) for w in _COUNT_WORDS) else ""
 # ANY info string, not only the four shell-ish ones. A README that opens a ```python
 # block before its ```-only command block used to shift every fence boundary by one:
 # the pattern could not open on ```python, so it opened on that block's CLOSING fence
@@ -184,7 +215,14 @@ def harvest_candidates(repo: Path, limit: int = 400) -> list[CandidateCommand]:
     return unique[:limit]
 
 
-def _target_file(repo: Path, cmd: CandidateCommand) -> Path | None:
+def target_file(repo: Path, cmd: CandidateCommand) -> Path | None:
+    """The file on disk a candidate command actually invokes, or None.
+
+    Public because `harness.alignment` needs the same lookup — a script's declared
+    configuration (`--sparsity 0.5`, a referenced config file) lives in the FILE this
+    resolves to, not in `cmd.argv`, which for a `scripts_dir` candidate is only
+    `["bash", "scripts/prune_0.5.sh"]`.
+    """
     for token in cmd.argv[1:]:
         candidate = repo / token
         if candidate.is_file():
@@ -198,7 +236,7 @@ def describe_command(repo: Path, cmd: CandidateCommand, depth: int = 2) -> Candi
     Follows one hop from a shell script into the python it invokes, because a script's
     own text says little and the module it calls says everything.
     """
-    path = _target_file(repo, cmd)
+    path = target_file(repo, cmd)
     if path is None:
         return cmd
     try:
@@ -226,6 +264,17 @@ def describe_command(repo: Path, cmd: CandidateCommand, depth: int = 2) -> Candi
     cmd.emits = sorted(set(emits))
     quantities = sorted({q for k, q in _OUTPUT_QUANTITY if k in cmd.emits})
     cmd.label = ", ".join(quantities) or "unknown"
+
+    # Step 7 — two additive passes over the SAME candidate, corroboration first so
+    # `declared_configuration`'s Tier-1 script-text read and `corroborate`'s own file
+    # read are not the reason for import ordering here (they read independently).
+    # Deferred: `harness.alignment` reads `target_file` from this module, so importing
+    # it at module load time would be circular; by the time `describe_command` is ever
+    # CALLED, both modules have finished loading.
+    from .alignment import candidates as alignment_candidates
+    from .alignment import evaluator as alignment_evaluator
+    alignment_evaluator.corroborate(repo, cmd)
+    alignment_candidates.declared_configuration(repo, cmd)
     return cmd
 
 
@@ -263,11 +312,56 @@ def repo_implements(repo: Path, method: str) -> bool:
 # --------------------------------------------------------------------------- #
 # Resolution
 # --------------------------------------------------------------------------- #
-def resolve_metric(doc: PaperDoc, table_ref: str, cmd: CandidateCommand | None) -> MetricIdentity:
+def _prose_metric(quote: str, cmd: CandidateCommand | None, ref: str) -> MetricIdentity:
+    """Bind an executed COUNT to a prose-stated total, or refuse for a named reason.
+
+    The prose analogue of the cell path below, and no weaker than it. A cell earns its
+    quantity from a column header and its basis from whether the column contains a 100%
+    row; a prose composition earns its quantity from what the sentence says it counts and
+    its basis from the fact that a count has no baseline to be normalised against. Both
+    then require a command that emits the SAME quantity, from the same table of output
+    keys, and refuse identically when none does.
+    """
+    ident = MetricIdentity(cell_basis="absolute")
+    ident.cell_quantity = prose_quantity(quote)
+    ident.evidence.append(IdentityEvidence(
+        quote=(quote or "")[:160], source_ref=ref,
+        note=f"prose quantity '{ident.cell_quantity or 'unknown'}', basis 'absolute'"))
+    if not ident.cell_quantity:
+        ident.state = "unmapped"
+        ident.reason = ("the prose states a total but does not name a population this harness "
+                        "can identify, and a quantity that cannot be named cannot be bound to "
+                        "an executed output")
+        return ident
+    if cmd is None:
+        ident.state, ident.reason = "no_candidate", "no command was identified to emit a count"
+        return ident
+    matches = [(k, q) for k, q in _OUTPUT_QUANTITY if k in cmd.emits and q == "count"]
+    if not matches:
+        ident.state = "no_candidate"
+        ident.output_quantity = cmd.label
+        ident.reason = (f"the command emits {cmd.label or 'nothing recognisable'} "
+                        f"({', '.join(cmd.emits) or 'no known keys'}) and the claim reports a "
+                        f"count; these are different quantities")
+        return ident
+    ident.output_key, ident.output_quantity, ident.output_basis = matches[0][0], "count", "absolute"
+    ident.state = "established"
+    ident.reason = (f"the claim states an absolute count and the command emits "
+                    f"'{ident.output_key}', the same quantity on the same basis")
+    ident.evidence.append(IdentityEvidence(
+        quote=ident.output_key, source_ref=cmd.source_ref,
+        note=f"command emits '{ident.output_key}', quantity 'count'"))
+    return ident
+
+
+def resolve_metric(doc: PaperDoc, table_ref: str, cmd: CandidateCommand | None,
+                   claim_ref: str = "", claim_quote: str = "") -> MetricIdentity:
     """Bind the executed output to the cell's quantity AND basis, or refuse."""
     ident = MetricIdentity()
     m = re.fullmatch(r"T(\d+):r(\d+):c(\d+)", (table_ref or "").strip())
     if not m:
+        if claim_quote and (claim_ref or "").startswith("P"):
+            return _prose_metric(claim_quote, cmd, claim_ref)
         ident.state, ident.reason = "unmapped", "no cell address to bind a metric to"
         return ident
     table = next((t for t in doc.tables if t.table_idx == int(m.group(1))), None)
@@ -329,12 +423,61 @@ def resolve_metric(doc: PaperDoc, table_ref: str, cmd: CandidateCommand | None) 
     return ident
 
 
+def _prose_experiment(repo: Path, quote: str, ref: str, finding_id: str) -> ExperimentIdentity:
+    """Which advertised command produces a prose-stated COUNT — or that none does.
+
+    Structurally the same refusal ladder as the cell path: harvest what the repository
+    advertises, keep only what emits the right quantity, and refuse when none does or when
+    more than one could, because choosing between two commands that both fit is a guess.
+
+    What has no analogue here is the ROW METHOD check. A cited table row names a method,
+    and a repository that does not implement that method cannot produce the row; a prose
+    total names a population instead, so there is no method to look for. That is a real
+    difference in what the paper stated, not a check being skipped — and it is why a prose
+    target still has to clear metric identity and configuration identity below.
+    """
+    ident = ExperimentIdentity(finding_id=finding_id, table_ref=ref)
+    if not prose_quantity(quote):
+        ident.state, ident.reason = "unmapped", (
+            "the prose claim does not name a population, so there is no experiment to "
+            "identify for it")
+        return ident
+    candidates = [describe_command(repo, c) for c in harvest_candidates(repo)]
+    ident.considered = len(candidates)
+    fitting = [c for c in candidates
+               if any(q == "count" for k, q in _OUTPUT_QUANTITY if k in c.emits)]
+    for c in candidates:
+        if c not in fitting:
+            ident.rejected.append(f"{c.source_ref}: emits {c.label or 'unknown'}")
+    if not fitting:
+        ident.state = "no_candidate"
+        ident.reason = (f"none of the {len(candidates)} advertised command(s) emits a count, so "
+                        f"nothing in this checkout produces the total the paper states")
+        return ident
+    if len({" ".join(c.argv) for c in fitting}) > 1:
+        ident.state, ident.command = "ambiguous", None
+        ident.reason = (f"{len(fitting)} advertised commands could produce the count; choosing "
+                        f"between them would be a guess, so none is chosen "
+                        f"({', '.join(c.source_ref for c in fitting[:4])})")
+        return ident
+    ident.command = fitting[0]
+    ident.state = "established"
+    ident.evidence.append(IdentityEvidence(
+        quote=" ".join(ident.command.argv), source_ref=ident.command.source_ref,
+        note="the only advertised command emitting a count"))
+    ident.reason = f"one advertised command emits a count: {' '.join(ident.command.argv)}"
+    return ident
+
+
 def resolve_experiment(doc: PaperDoc, repo: Path, table_ref: str,
-                       finding_id: str = "") -> ExperimentIdentity:
+                       finding_id: str = "", claim_ref: str = "",
+                       claim_quote: str = "") -> ExperimentIdentity:
     """Which advertised command produces the cited cell — or that none does."""
     ident = ExperimentIdentity(finding_id=finding_id, table_ref=table_ref)
     m = re.fullmatch(r"T(\d+):r(\d+):c(\d+)", (table_ref or "").strip())
     if not m:
+        if claim_quote and (claim_ref or "").startswith("P"):
+            return _prose_experiment(repo, claim_quote, claim_ref, finding_id)
         ident.state, ident.reason = "unmapped", "no cell address to identify an experiment for"
         return ident
     table = next((t for t in doc.tables if t.table_idx == int(m.group(1))), None)
@@ -372,11 +515,46 @@ def resolve_experiment(doc: PaperDoc, repo: Path, table_ref: str,
                         f"{cell_quantity or 'the cell’s quantity'}")
         return ident
     if len({" ".join(c.argv) for c in fitting}) > 1:
+        # Step 7 — before refusing, ask whether the fitting candidates say WHICH
+        # configuration each one runs under, and whether the cited row asks for a
+        # specific one. Deferred import: see `describe_command`'s note on the cycle.
+        from .alignment import configuration as alignment_configuration
+
+        expected, expected_evidence = alignment_configuration.expected_fields(
+            table, row, int(m.group(3)))
+        narrowed, dropped = ({}, {}) if not expected else \
+            alignment_configuration.narrow(fitting, expected)
+        if expected and len(narrowed) == 1:
+            chosen = narrowed[0]
+            fields_str = ", ".join(f"{k}={v}" for k, v in expected.items())
+            ident.command = chosen
+            ident.state = "established"
+            ident.evidence.append(IdentityEvidence(
+                quote=" ".join(chosen.argv), source_ref=chosen.source_ref,
+                note=f"the only one of {len(fitting)} candidates emitting {cell_quantity} "
+                     f"whose declared configuration matches the cited row ({fields_str})"))
+            for field, ref in expected_evidence.items():
+                ident.evidence.append(IdentityEvidence(
+                    quote=f"{field}={expected[field]}", source_ref=ref,
+                    note="the cited row's own configuration, matched against the chosen "
+                         "command's declared configuration"))
+            ident.reason = (
+                f"{len(fitting)} advertised commands could produce {cell_quantity}; "
+                f"configuration matching narrowed them to one by {fields_str}"
+                + (f" (excluded: {'; '.join(dropped.values())})" if dropped else ""))
+            return ident
+
         ident.state = "ambiguous"
         ident.command = None
+        narrowing_note = (
+            f" Configuration matching narrowed {len(fitting)} to {len(narrowed)} "
+            f"({', '.join(f'{k}={v}' for k, v in expected.items())}) but could not reach "
+            f"one; {'; '.join(dropped.values()) or 'none excluded'}."
+            if expected and len(narrowed) < len(fitting) else "")
         ident.reason = (f"{len(fitting)} advertised commands could produce {cell_quantity}; "
                         f"choosing between them would be a guess, so none is chosen "
-                        f"({', '.join(c.source_ref for c in fitting[:4])})")
+                        f"({', '.join(c.source_ref for c in fitting[:4])})."
+                        f"{narrowing_note}")
         return ident
 
     ident.command = fitting[0]
@@ -388,13 +566,47 @@ def resolve_experiment(doc: PaperDoc, repo: Path, table_ref: str,
     return ident
 
 
+def _prose_configuration(quote: str, cmd: CandidateCommand | None,
+                         ref: str) -> ConfigurationIdentity:
+    """The configuration a prose-stated COUNT is produced under.
+
+    The seed-policy question, which dominates the cell path below, has no purchase here
+    and saying so is more honest than inventing an answer: a count of the items a
+    generator produces is not a measurement with seed-to-seed variance, so there is no
+    protocol to match and `seed_policy_match` stays None rather than True. What IS
+    required is the composition itself — the operands the paper multiplied are the
+    configuration, and they are already re-verified by `harness.claims.parse_quantity`.
+    """
+    ident = ConfigurationIdentity()
+    if cmd is None or not prose_quantity(quote):
+        ident.state = "unmapped"
+        ident.reason = "no command, or no population named, to match a configuration against"
+        return ident
+    ident.matched["quantity"] = "count"
+    ident.seed_policy_paper = "a stated total; not a seed-dependent measurement"
+    ident.seed_policy_repo = (f"{cmd.seed_flag} accepted" if cmd.seed_flag
+                              else "no seed argument found")
+    ident.seed_policy_match = None
+    ident.evidence.append(IdentityEvidence(
+        quote=(quote or "")[:160], source_ref=ref,
+        note="the composition the paper printed is the configuration under test"))
+    ident.state = "established"
+    ident.reason = ("the claim states how many items a generator produces; the configuration "
+                    "is the composition the paper itself printed, and a count has no "
+                    "seed-dependent protocol to match")
+    return ident
+
+
 def resolve_configuration(doc: PaperDoc, table_ref: str, cmd: CandidateCommand | None,
-                          harness_seeds: int = 5) -> ConfigurationIdentity:
+                          harness_seeds: int = 5, claim_ref: str = "",
+                          claim_quote: str = "") -> ConfigurationIdentity:
     """Dataset/model/schedule and, above all, the seed policy — matched or explicitly not."""
     ident = ConfigurationIdentity()
     m = re.fullmatch(r"T(\d+):r(\d+):c(\d+)", (table_ref or "").strip())
     table = (next((t for t in doc.tables if t.table_idx == int(m.group(1))), None) if m else None)
     if table is None or cmd is None:
+        if claim_quote and (claim_ref or "").startswith("P"):
+            return _prose_configuration(claim_quote, cmd, claim_ref)
         ident.state = "unmapped"
         ident.reason = "no cell or no command to match a configuration against"
         return ident
@@ -450,12 +662,22 @@ def resolve_configuration(doc: PaperDoc, table_ref: str, cmd: CandidateCommand |
 
 
 def resolve(doc: PaperDoc, repo: Path, table_ref: str, finding_id: str = "",
-            harness_seeds: int = 5) -> tuple[ExperimentIdentity, MetricIdentity,
-                                             ConfigurationIdentity]:
-    """The whole chain. Each link is independent and each may abstain on its own."""
-    experiment = resolve_experiment(doc, repo, table_ref, finding_id)
-    metric = resolve_metric(doc, table_ref, experiment.command)
-    configuration = resolve_configuration(doc, table_ref, experiment.command, harness_seeds)
+            harness_seeds: int = 5, claim_ref: str = "",
+            claim_quote: str = "") -> tuple[ExperimentIdentity, MetricIdentity,
+                                            ConfigurationIdentity]:
+    """The whole chain. Each link is independent and each may abstain on its own.
+
+    `claim_ref`/`claim_quote` open the PROSE path — a `P<i>:<a>-<b>` address minted by
+    `harness.claims`, whose span states a composition. Each of the three links takes that
+    path only when there is no cell address, and each refuses on its own terms there; a
+    prose target that cannot bind a command is `no_candidate` exactly as a cell target
+    would be, and `identities_established` below ANDs the three the same way regardless of
+    which path produced them.
+    """
+    experiment = resolve_experiment(doc, repo, table_ref, finding_id, claim_ref, claim_quote)
+    metric = resolve_metric(doc, table_ref, experiment.command, claim_ref, claim_quote)
+    configuration = resolve_configuration(doc, table_ref, experiment.command, harness_seeds,
+                                          claim_ref, claim_quote)
     return experiment, metric, configuration
 
 

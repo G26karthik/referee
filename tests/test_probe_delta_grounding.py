@@ -23,9 +23,9 @@ import json
 
 import pytest
 
-from harness import state
-from harness.artifacts import (ArmStats, Finding, PaperDoc, ProbeResult, QuantFinding,
-                               Table)
+from harness import claims, state
+from harness.artifacts import (ArmStats, ClaimRef, DiscoveredObject, Finding, PaperDoc,
+                               ProbeResult, QuantFinding, ReviewQuestion, Table, TargetSet)
 from harness.config import Config
 from harness.stages import probe as probe_stage
 from harness.stages.report import _probe_block
@@ -190,6 +190,30 @@ def test_a_harness_written_spec_is_re_derived_against_the_current_audit(cfg: Con
     assert spec2.finding_id == "overclaim-02", "must not stay on a finding that no longer exists"
     assert spec2.table_ref == "T1:r0:c1"
     assert spec2.claimed_cell_value == "22.22"
+
+
+def test_selected_target_cannot_inherit_another_findings_claim_or_value(cfg: Config):
+    from harness.stages import audit as audit_stage
+    doc = _doc_with_two_cells()
+    audit_stage.accept_lens(cfg, PID, "overclaim", json.dumps({
+        "lens": "overclaim", "findings": [
+            {"finding_id": "overclaim-01", "severity": "MAJOR", "title": "first",
+             "statement": "first claim", "target": "first claim", "evidence_quote": "11.11",
+             "evidence_ref": "T0:r0:c1", "verifiable_by_experiment": True},
+            {"finding_id": "overclaim-02", "severity": "MAJOR", "title": "second",
+             "statement": "second claim", "target": "second claim", "evidence_quote": "22.22",
+             "evidence_ref": "T1:r0:c1", "verifiable_by_experiment": True}],
+        "unasked_question": "", "notes": ""}))
+    ref = ClaimRef(ref="T1:r0:c1", kind="table_cell", quote="22.22",
+                   resolution="resolved", quantity=claims.parse_quantity("22.22"))
+    target = DiscoveredObject(target_id="T2", question_id="Q2", ref=ref,
+                              claim_text="second claim")
+    q = ReviewQuestion(question_id="Q2", from_finding="overclaim-02", claim_ref=ref)
+    state.write_json(state.project_dir(cfg, PID) / "discovery" / "targets.json",
+                     TargetSet(paper_id=PID, objects=[target], questions=[q]).model_dump())
+    spec = probe_stage.build_spec(cfg, PID, doc, target)
+    assert (spec.finding_id, spec.claim, spec.table_ref, spec.claimed_cell_value) == (
+        "overclaim-02", "second claim", "T1:r0:c1", "22.22")
 
 
 def test_a_genuine_human_override_survives_across_runs(cfg: Config):

@@ -1,9 +1,21 @@
-"""S3 — decide what to reproduce, then hand it to the local runner.
+"""S3 — run what the review decided to run, and record how each target ended.
 
-The probe targets the highest-ranked finding the lenses marked
-`verifiable_by_experiment`. If none is marked, it still runs: a probe with no
-intervention measures this machine's seed-noise floor, which is the number every
-"is this gain real?" question divides by — worth having even with nothing to test.
+**What decides the targets.** `harness.stages.discover` does, before this stage is
+reached: it discovers what is addressable, `harness.priority` orders it, and
+`harness.planner` decides which of it justifies an execution. This stage pursues that
+list, in that order, up to `cfg.max_targets`, and writes one `TargetOutcome` per target.
+Every target keeps INDEPENDENT state, so a paper whose first target is blocked by hardware
+and whose second reproduces reports both.
+
+What this module used to do instead was one line — take the highest-ranked finding a lens
+had marked `verifiable_by_experiment`, and stop. One target, chosen by an unchecked model
+boolean, ordered by a report display sort, with no fallback when it blocked. That line
+survives as `finding_target` in `build_spec`, reached only when no target set exists on
+disk.
+
+If nothing justifies an execution the stage still runs: a probe with no intervention
+measures this machine's seed-noise floor, which is the number every "is this gain real?"
+question divides by — worth having even with nothing to test.
 
 A hand-written `spec.json` under `runs/<paper_id>/` overrides all of this, which is
 how the driver supplies a faithful reproduction of the paper's actual setup.
@@ -28,10 +40,13 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .. import (backends, code_audit, experiment_id, probe_synth, reimplement,
+from .. import (backends, claims, code_audit, comparison as comparison_mod,
+                exhaustion, experiment_id, materiality, planner, probe_synth,
+                provenance as provenance_mod, reimplement, reimplement_driver,
                 repo as repo_mod, resources as resources_mod, state)
-from ..artifacts import (CodeAudit, Finding, PaperDoc, ProbeSpec,
-                         ReimplementationReadiness, RepoAcquisition)
+from ..artifacts import (CodeAudit, DiscoveredObject, Finding, PaperDoc, PlanDecision,
+                         ProbeResult, ProbeSpec, ReimplementationReadiness,
+                         RepoAcquisition, TargetOutcome)
 from ..config import Config
 from ..local_exec import run_probe as _run
 from . import audit as audit_stage
@@ -63,7 +78,24 @@ def grounded_claimed_delta(doc: PaperDoc, finding: Finding | None) -> float | No
     return None
 
 
-def build_spec(cfg: Config, pid: str, doc: PaperDoc) -> ProbeSpec:
+def grounded_quantity(target) -> tuple[float | None, str]:
+    """(value, verbatim) the discovered target's own address reports.
+
+    The general replacement for `grounded_claimed_delta`'s cell-only chain. The quantity
+    was parsed by `harness.claims.parse_quantity` at discovery time, from the text at an
+    address the harness re-derived — so a prose-stated total reaches the reconciler by
+    exactly the same route a cell does, and by no weaker one. `parse_quantity` refuses
+    every span that reports more than one number, which is what keeps this from becoming
+    the prose-shaped version of a positional guess.
+    """
+    ref = getattr(target, "ref", None)
+    q = getattr(ref, "quantity", None) if ref else None
+    if q is None or q.value is None:
+        return None, ""
+    return q.value, (q.raw or "")
+
+
+def build_spec(cfg: Config, pid: str, doc: PaperDoc, target=None) -> ProbeSpec:
     """The spec to run, with `claimed_delta` allowed only where it is grounded.
 
     Two invariants, applied to the hand-written and generated paths alike, so a stale
@@ -76,9 +108,26 @@ def build_spec(cfg: Config, pid: str, doc: PaperDoc) -> ProbeSpec:
     override = root / "runs" / pid / "spec.json"
 
     reports, _, _ = audit_stage.load_reports(cfg, pid, doc)
+    # THE FALLBACK, not the selector. This line used to BE the selector — one target, from
+    # an unchecked lens boolean, ordered by a report display sort — and it is kept only for
+    # a project with no target set on disk (one reviewed before the discovery phase
+    # existed, or a direct call to this function). When `target` is supplied, discovery,
+    # prioritisation and the trigger gate have already chosen, and their choice stands.
     candidates = [f for f in report_stage.rank([f for r in reports for f in r.findings])
                   if f.verifiable_by_experiment]
-    target = candidates[0] if candidates else None
+    finding_target = candidates[0] if candidates else None
+    target_finding_id = ""
+    if target is not None and getattr(target, "question_id", ""):
+        tset_path = root / "discovery" / "targets.json"
+        if tset_path.exists():
+            raw_ts = state.read_json(tset_path)
+            qrow = next((q for q in raw_ts.get("questions", [])
+                         if q.get("question_id") == target.question_id), {})
+            target_finding_id = (qrow.get("from_finding")
+                                 or next(iter(qrow.get("source_finding_ids") or []), ""))
+            if target_finding_id:
+                finding_target = next(
+                    (f for f in candidates if f.finding_id == target_finding_id), None)
 
     # `written_by == "harness"` marks OUR OWN previous output — set only at the bottom of
     # `run()`, below, right before it persists the spec it just built. A human-authored
@@ -105,8 +154,13 @@ def build_spec(cfg: Config, pid: str, doc: PaperDoc) -> ProbeSpec:
         # run after run instead of freezing on whichever finding was verifiable first.
         spec = ProbeSpec(
             paper_id=pid, written_by="harness",
-            finding_id=target.finding_id if target else "",
-            claim=(target.target or target.statement) if target else "",
+            finding_id=(target_finding_id or
+                        (finding_target.finding_id if finding_target and target is None else "")),
+            claim=((getattr(target, "claim_text", "") or
+                    getattr(getattr(target, "ref", None), "quote", ""))
+                   if target is not None else
+                   ((finding_target.target or finding_target.statement)
+                    if finding_target else "")),
             seeds=list(range(max(3, min(cfg.seeds, 5)))),
         )
 
@@ -115,7 +169,8 @@ def build_spec(cfg: Config, pid: str, doc: PaperDoc) -> ProbeSpec:
     # and so on collide readily; a bare-id map silently kept whichever lens was loaded
     # last, so the probe could anchor to a different finding than the one it targeted.
     by_id = {(f.lens, f.finding_id): f for r in reports for f in r.findings}
-    anchor = next((f for (_, fid), f in by_id.items() if fid == spec.finding_id), None) or target
+    anchor = (next((f for (_, fid), f in by_id.items() if fid == spec.finding_id), None)
+              or finding_target)
 
     if not (spec.script or "").strip() and not spec.command:
         # Identical arms measure this machine, not the paper. Carrying a claimed delta
@@ -135,6 +190,32 @@ def build_spec(cfg: Config, pid: str, doc: PaperDoc) -> ProbeSpec:
             spec.table_ref = ref
     if spec.table_ref and not spec.claimed_cell_value:
         spec.claimed_cell_value = cell_contents(doc, spec.table_ref)
+
+    # A DISCOVERED target overrides the finding-derived address, because it carries one
+    # the harness minted and re-derived rather than one a lens wrote. This is the whole of
+    # the prose path: `ClaimRef.quote` is the verbatim span, `ClaimRef.quantity` the number
+    # `parse_quantity` refused to guess at, and neither had any way to reach a ProbeSpec
+    # before. A cell target still lands in `table_ref` as well, so nothing keyed on a cell
+    # address loses it.
+    if target is not None and getattr(target, "ref", None) is not None:
+        ref_obj = target.ref
+        spec.target_id = getattr(target, "target_id", "")
+        spec.claim_ref = ref_obj.ref
+        spec.claim_kind = ref_obj.kind
+        # The selected target is authoritative.  Keeping the first globally ranked
+        # finding's claim/value here contaminated later targets (APT T1 carried T2's
+        # 46.8 value and contradiction id), making alignment evidence about the wrong
+        # experiment.
+        spec.claim = getattr(target, "claim_text", "") or ref_obj.quote
+        if ref_obj.kind == "table_cell":
+            spec.table_ref = ref_obj.ref
+        value, raw = grounded_quantity(target)
+        if value is not None:
+            spec.claimed_cell_value = raw or ref_obj.quote
+        if getattr(target, "metric", ""):
+            spec.metric = target.metric
+    elif not spec.claim_ref and spec.table_ref:
+        spec.claim_ref, spec.claim_kind = spec.table_ref, "table_cell"
     return spec
 
 
@@ -234,10 +315,19 @@ def write_reimplementation_prompt(root: Path, pid: str, doc: PaperDoc, spec: Pro
 
     The same shape as `audit/prompts/<lens>.md` and `reports/verdict_prompt.md`, for the
     same reason: a phase that can only proceed through a model must still leave something
-    on disk a person can pick up, or the manual path is not first-class. There is
-    deliberately NO fourth driver — a reimplementation is written into
-    `runs/<pid>/spec.json` and sealed by `run.py accept`, which routes it down the
-    existing `driver` provenance the ceiling already admits.
+    on disk a person can pick up, or the manual path is not first-class. This is the
+    MANUAL channel — an operator who wants to review a reconstruction themselves before
+    sealing it still writes into `runs/<pid>/spec.json` and seals it with `run.py accept`
+    under the existing `driver` provenance, unconditionally admissible, exactly as before.
+
+    Step 8 added an AUTOMATED channel alongside this one, not in place of it:
+    `harness.reimplement_driver` delegates the writing, and machine-VERIFIES every
+    required ingredient's binding before sealing it as `reimpl_exec` — the provenance
+    `local_exec.reconcile` and `backends.authorize` both refuse to let settle anything
+    without `ReimplementationConformance.established`. The two channels are deliberately
+    unmerged: a human reviewing their own reconstruction before sealing it is a different,
+    and adequate, discipline from a model's unreviewed output, which is why only the
+    second needs the extra machine check.
 
     What the brief does NOT do is supply anything the paper omitted. It lists the
     ingredients WITH THEIR LOCATORS so the implementer works from the paper, and it says
@@ -391,8 +481,17 @@ def plan_execution(cfg: Config, spec: ProbeSpec, acq: RepoAcquisition,
     spec.commit = (audit.commit if audit is not None else "") or acq.commit
 
     if doc is not None:
+        # `claim_ref`/`claim_quote` carry a PROSE target into the identity layer. Without
+        # them a prose-addressed spec arrived with `table_ref=""` and every link answered
+        # "no cell address", so the one shape this pipeline was extended to reach would
+        # have been blocked at the last gate before execution.
+        claim_quote = ""
+        if spec.claim_ref and spec.claim_kind == "prose_claim":
+            resolved = claims.resolve(doc, spec.claim_ref)
+            claim_quote = resolved.quote if resolved.resolved else ""
         spec.experiment, spec.metric_identity, spec.configuration = experiment_id.resolve(
-            doc, Path(acq.path), spec.table_ref, spec.finding_id, harness_seeds=len(spec.seeds))
+            doc, Path(acq.path), spec.table_ref, spec.finding_id, harness_seeds=len(spec.seeds),
+            claim_ref=spec.claim_ref, claim_quote=claim_quote)
         # Re-scope the runtime demands now that identity has run. The static audit reads the
         # tree BEFORE any experiment is identified, so everything it found was labelled
         # repository-scoped; only here is there a file to bind against. `source_ref` is the
@@ -441,8 +540,25 @@ def plan_execution(cfg: Config, spec: ProbeSpec, acq: RepoAcquisition,
     spec.backend = backend.name
     # Capability is asked of the BACKEND, so it is judged against the platform the run
     # would actually see rather than against whatever platform this process is on.
-    spec.capability = backend.capability(acq, acq.env_path, cfg.python)
-    spec.commit_state = repo_mod.verify_commit(acq.path, spec.commit).state
+    #
+    # The seed flag is dropped for a target whose quantity is a COUNT. Such a target is a
+    # count of what the repository's own generator produces: it has no seed-to-seed
+    # distribution, this harness passes no `--seed` for it, and demanding that the
+    # repository accept one would refuse the run over an argument nobody sends. The two
+    # runs still happen — running the generator twice and getting the same count is the
+    # evidence that the quantity is deterministic, which is what `local_exec.reconcile`
+    # requires before it will compare a count against a printed precision.
+    is_count = bool(spec.metric_identity and spec.metric_identity.established
+                    and spec.metric_identity.cell_quantity == "count")
+    spec.capability = backend.capability(acq, acq.env_path, cfg.python,
+                                         flag="" if is_count else "seed")
+    # Verified against the tree the BACKEND will run, not against a same-named directory
+    # on this disk. Under the local backend those are the same thing and this is exactly
+    # what it always did; under a remote one, certifying the local checkout and then
+    # running elsewhere would leave the executed tree unverified while the record said
+    # `verified` — see `ExecutionBackend.commit_tree`.
+    spec.commit_state = repo_mod.verify_commit(
+        acq.path, spec.commit, tree=backend.commit_tree(acq.path)).state
     proven, _cls, _why = experiment_id.identities_established(
         spec.experiment, spec.metric_identity, spec.configuration)
 
@@ -490,7 +606,527 @@ def plan_execution(cfg: Config, spec: ProbeSpec, acq: RepoAcquisition,
     return spec
 
 
+# How an execution ended, in the target vocabulary. Keyed on the RECONCILIATION's own
+# status and failure class, both of which are written by the deterministic layer — so a
+# disposition is a re-labelling of an existing decision and never a second one.
+_DISPOSITION_FOR_RECONCILIATION = {
+    "RESOLVED_VERIFIED": "REPRODUCED",
+    "FAILED_REPRODUCTION": "FAILED_REPRODUCTION",
+    "NOT_ATTEMPTED": "NOT_ATTEMPTED",
+}
+# INCONCLUSIVE splits by WHY, because "the hardware is not here", "the gate refused" and
+# "it ran and settled nothing" are three different facts and only the last one is about
+# the experiment. None of the three is about the paper — invariants 4 to 7.
+_DISPOSITION_FOR_FAILURE_CLASS = {
+    "resources_insufficient": "RESOURCE_BLOCKED",
+    "execution_unauthorized": "AUTHORIZATION_BLOCKED",
+    "dependency_missing": "ENVIRONMENT_BLOCKED",
+    "environment_failure": "ENVIRONMENT_BLOCKED",
+    "platform_incompatible": "ENVIRONMENT_BLOCKED",
+    "setup_failure": "ENVIRONMENT_BLOCKED",
+    "infrastructure_failure": "ENVIRONMENT_BLOCKED",
+    "experiment_unidentified": "IDENTITY_BLOCKED",
+    "metric_unbound": "IDENTITY_BLOCKED",
+    "configuration_unmatched": "IDENTITY_BLOCKED",
+    # The right program, and nothing to hold its output against. Kept apart from the three
+    # identity classes above because those blame the artifact and this one does not.
+    "comparison_unestablished": "COMPARISON_BLOCKED",
+    "commit_mismatch": "ARTIFACT_BLOCKED",
+    "backend_unavailable": "ENVIRONMENT_BLOCKED",
+    "credentials_unavailable": "ENVIRONMENT_BLOCKED",
+}
+
+
+def outcome_for(target_id: str, result: ProbeResult, action: str, route: str) -> TargetOutcome:
+    """One target's terminal state, read off the ProbeResult the runner already wrote.
+
+    Decides nothing. `disposition` comes from the reconciliation's own status, and
+    `provenance` from the spec that ran, so the provenance ceiling reaches
+    `TargetOutcome.establishes_failure` intact.
+    """
+    rec = result.reconciliation
+    status = rec.status if rec else "NOT_ATTEMPTED"
+    disposition = _DISPOSITION_FOR_RECONCILIATION.get(status, "")
+    if not disposition:
+        disposition = _DISPOSITION_FOR_FAILURE_CLASS.get(
+            (rec.failure_class if rec else "") or "", "INCONCLUSIVE")
+    # WHAT IDENTITY FOUND, read off the spec the runner actually ran rather than off the
+    # reconciliation. The reconciliation's copy is now populated before the provenance
+    # ceiling returns, but the spec is the primary record and it survives even when no
+    # reconciliation was produced at all (a refused run writes none).
+    identity_state = ""
+    if result.experiment is not None:
+        identity_state = result.experiment.state or ""
+    elif rec is not None:
+        identity_state = rec.experiment_state or ""
+
+    return TargetOutcome(
+        target_id=target_id, disposition=disposition, action=action, route=route,
+        provenance=result.provenance, reconciliation=rec, identity_state=identity_state,
+        failure_class=(rec.failure_class if rec else "none"),
+        reason=(rec.reason if rec else result.reason) or result.reason,
+        # How many processes this target actually STARTED, read off the runner's own
+        # count rather than inferred from the disposition. The funnel's "launched" term
+        # has to come from the execution record: a target can be AUTHORIZATION_BLOCKED
+        # having started nothing, and a target can be INCONCLUSIVE having started three
+        # processes, and only this number tells those apart.
+        launched=result.executions,
+        execution_ref=result.script_path or "", attempts=1)
+
+
+def resync_cached_outcomes(cfg: Config, pid: str) -> dict:
+    """Re-attach already-produced `TargetOutcome`s onto a freshly discovered target set.
+
+    `discover` recomputes objects and plans from scratch on every `review` invocation —
+    reasonably, since a new grade or a new lens finding can change what is checkable — but
+    it runs BEFORE this stage and writes nothing about execution. When the controller
+    finds a cached `probe_results.json` and skips `run()` entirely (the whole point of the
+    cache: no repeat execution), the `discovery/targets.json` THIS invocation's `discover`
+    pass just wrote never receives that target's outcome, so every count that reads
+    `target_set.outcomes` (`CaseLedger.efficiency`, `evaluate`'s funnel) reports it as never
+    launched — despite `runs/<pid>/probe_results.json` still holding a valid record.
+
+    This repeats the bookkeeping `_review` does after a fresh run, reading every result
+    from disk instead of running anything. It spends no execution and changes no
+    experimental record; it only repairs `TargetOutcome`s to agree with the cached
+    `ProbeResult`s that already exist.
+    """
+    from . import discover as discover_stage
+    root = state.project_dir(cfg, pid)
+    primary_path = root / "runs" / pid / "probe_results.json"
+    if not primary_path.exists():
+        return {"resynced": 0, "reason": "no cached probe result"}
+
+    target_set, pairs, deferred = _executable_targets(cfg, pid)
+    if target_set is None or not pairs:
+        return {"resynced": 0, "reason": "no executable target this discover pass"}
+
+    outcomes: list[TargetOutcome] = []
+    primary_obj, primary_plan = pairs[0]
+    primary_result = ProbeResult(**state.read_json(primary_path))
+    primary_outcome_path = (root / "runs" / pid / "targets" /
+                            primary_obj.target_id / "outcome.json")
+    if primary_outcome_path.exists():
+        outcomes.append(TargetOutcome(**state.read_json(primary_outcome_path)))
+    else:
+        outcomes.append(outcome_for(primary_obj.target_id, primary_result,
+                                    primary_plan.action, primary_plan.route))
+
+    for obj, plan in pairs[1:]:
+        cached_outcome = root / "runs" / pid / "targets" / obj.target_id / "outcome.json"
+        cached = root / "runs" / pid / "targets" / obj.target_id / "probe_results.json"
+        if cached_outcome.exists():
+            outcomes.append(TargetOutcome(**state.read_json(cached_outcome)))
+        elif cached.exists():
+            tres = ProbeResult(**state.read_json(cached))
+            outcomes.append(outcome_for(obj.target_id, tres, plan.action, plan.route))
+        else:
+            # A current plan must have a current outcome.  Legacy runs did not persist
+            # blocked secondary outcomes, so cached discovery used to silently lose them
+            # and violate the warranted-target conservation identity.  Do not invent the
+            # old blocker; record the bookkeeping boundary explicitly.
+            outcomes.append(TargetOutcome(
+                target_id=obj.target_id, disposition="NOT_ATTEMPTED",
+                action=plan.action, route=plan.route, launched=0,
+                reason=("a cached primary result exists, but this target has no durable "
+                        "result or outcome record. This is a legacy harness persistence "
+                        "boundary, not evidence about the paper.")))
+
+    for obj, plan in deferred:
+        outcomes.append(TargetOutcome(
+            target_id=obj.target_id, disposition="BUDGET_DEFERRED",
+            action=plan.action, route=plan.route, launched=0,
+            reason=(f"an experiment is warranted for this target and this run's budget "
+                    f"of {cfg.max_targets} target(s) was already spent on "
+                    f"higher-priority ones. A limit of this run, not of the paper.")))
+
+    # Discovery is recomputed before cached probe resync, so the runtime Step-6
+    # AUTHOR_CODE_EXECUTION -> INDEPENDENT_RECONSTRUCTION re-plan is not present in the
+    # new TargetSet. Recreate it only from durable identity evidence and a durable
+    # reconstruction outcome; otherwise cached refreshes turn an exhausted author-code
+    # route back into NOT_TRIED and attach the reconstruction result to the wrong route.
+    by_pair = {obj.target_id: (obj, plan) for obj, plan in pairs}
+    for out in outcomes:
+        pair = by_pair.get(out.target_id)
+        if pair is None or out.route != "INDEPENDENT_RECONSTRUCTION":
+            continue
+        obj, plan = pair
+        if plan.route != "AUTHOR_CODE_EXECUTION":
+            continue
+        spec_path = (root / "runs" / pid / "spec.json" if obj is primary_obj else
+                     root / "runs" / pid / "targets" / obj.target_id / "spec.json")
+        if not spec_path.exists():
+            continue
+        fallback = replan_after_author_code_exhausted(
+            obj, plan, ProbeSpec(**state.read_json(spec_path)))
+        if fallback is not None:
+            target_set.plans.append(fallback)
+
+    keep = [o for o in target_set.outcomes if o.target_id not in {x.target_id for x in outcomes}]
+    target_set.outcomes = keep + outcomes
+    by_outcome = {o.target_id: o.disposition for o in outcomes}
+    for obj in target_set.objects:
+        if obj.target_id in by_outcome:
+            obj.status = by_outcome[obj.target_id]
+    discover_stage.sync_questions(target_set)
+    exhaustion.refresh(target_set, cfg)
+    state.write_json(root / "discovery" / "targets.json", target_set.model_dump())
+    return {"resynced": len(outcomes), "pursued": len(pairs), "deferred": len(deferred)}
+
+
+def _executable_targets(cfg: Config, pid: str):
+    """(target, plan) pairs the planner authorised for execution, in priority order.
+
+    Non-material targets are capped by `cfg.max_targets`. The cap is a budget applied to
+    an ALREADY ordered list, so the targets it drops are the least useful ones rather than
+    whichever came last. A target whose stored materiality basis is recognised by
+    `materiality.is_material` bypasses that numeric cap: silently deferring the paper's
+    material question because three less consequential targets happened to rank ahead of
+    it would turn an efficiency setting into a scientific policy.
+
+    Returns (target_set, pursued, deferred). The third is what the budget dropped and it
+    is returned rather than discarded: a target the planner judged worth running and this
+    run did not reach is a different fact from one the planner refused, and a funnel that
+    cannot tell them apart makes the budget look like a decision. `SH_MAX_TARGETS` is
+    documented as a budget and not a gate, and this is what makes that checkable.
+    """
+    from . import discover as discover_stage
+    ts = discover_stage.load(cfg, pid)
+    if ts is None:
+        return None, [], []
+    plans = {p.target_id: p for p in ts.plans if p.requires_execution}
+    material_questions = {q.question_id for q in ts.questions if q.materiality == "CENTRAL"}
+    pairs = [(o, plans[o.target_id]) for o in ts.objects if o.target_id in plans]
+    cap = max(1, cfg.max_targets)
+    pursued = []
+    deferred = []
+    non_material_pursued = 0
+    for obj, plan in pairs:
+        basis = getattr(obj, "materiality_basis", "") or "NONE"
+        if (materiality.is_material(basis)
+                or bool(obj.question_id and obj.question_id in material_questions)):
+            pursued.append((obj, plan))
+        elif non_material_pursued < cap:
+            pursued.append((obj, plan))
+            non_material_pursued += 1
+        else:
+            deferred.append((obj, plan))
+    return ts, pursued, deferred
+
+
 def run(cfg: Config, pid: str) -> dict:
+    """S3 for one paper. Wraps `_review` so a leased machine is always given back.
+
+    The `finally` is not tidiness. A backend that leases remote compute bills from the
+    moment it is created until something terminates it, and every other failure path in
+    this stage is designed to be survivable — a blocked target ends that target, a fault
+    pursuing one target is recorded and the paper continues. Those same guarantees mean an
+    exception can leave this function without ever reaching a teardown that was written
+    inline, and the cost of that is money accruing on a machine nobody is watching.
+    Backends that lease nothing return `False` from `release` and this costs a no-op.
+    """
+    try:
+        return _review(cfg, pid)
+    finally:
+        try:
+            released, detail = backends.select_backend(cfg).release(
+                state.project_dir(cfg, pid), pid)
+            if released:
+                state.append_log(cfg, pid, artifact_type="sandbox_release", phase="probe",
+                                 headers={"detail": detail}, path="")
+        except Exception:                                # noqa: BLE001
+            # A teardown that raises must not replace the review's own outcome — including
+            # its own exception, which is the thing the caller needs to see.
+            pass
+
+
+def admissible_if_it_succeeds(cfg: Config, spec: ProbeSpec) -> tuple[bool, str]:
+    """May a process be started for this spec at all?
+
+    THE RULE: a process is started only for a spec whose result would be ADMISSIBLE if it
+    succeeded. `provenance.admits` already refuses `synthesized` and `template` in both
+    directions at the reconciler — so running one is spending compute on a number that was
+    inadmissible before the first process existed.
+
+    That is not a hypothetical. Over the eight-paper corpus the probe stage ran 160
+    processes across 16 targets, every one of them the same harness-authored diagnostic,
+    every one refused afterwards at the ceiling. The refusals were correct; the spend was
+    not, and the sixteen plausible-looking deltas it produced are the table the
+    admissibility rule then had to catch.
+
+    `SH_DIAGNOSTIC_MODE` re-enables the diagnostic explicitly. When it does, the result is
+    written as a `DiagnosticRun` and never as a `TargetOutcome`, so it stays out of the
+    funnel and out of every decision function.
+    """
+    if provenance_mod.admits(spec.provenance):
+        return True, ""
+    if cfg.diagnostic_mode:
+        return True, "diagnostic mode"
+    return False, (
+        f"the only program available for this target was {spec.provenance or 'unset'}, "
+        f"which the provenance ceiling does not admit against a printed quantity in "
+        f"either direction. Running it could not have produced evidence about this paper, "
+        f"so nothing was started. Set SH_DIAGNOSTIC_MODE=1 to run it as a diagnostic; its "
+        f"result is recorded separately and settles nothing.")
+
+
+def _not_started(obj, plan, why: str,
+                 disposition: str = "IDENTITY_BLOCKED") -> TargetOutcome:
+    """A target whose only available program could never have spoken. Nothing ran.
+
+    IDENTITY_BLOCKED rather than INCONCLUSIVE, and the difference is the whole point:
+    INCONCLUSIVE means "it ran and settled nothing", and claiming that for a run that
+    never existed is the same overstatement in miniature that `launched` exists to
+    prevent. `launched=0` is a measurement here, not a default.
+
+    `disposition` is a parameter because the two reasons a process is not started are two
+    different facts. IDENTITY_BLOCKED says the program that would have run was not bound
+    to what was printed; COMPARISON_BLOCKED says it was, and its output would have had
+    nothing to be held against. Reporting the second as the first would blame the artifact
+    for a limit of this review's arithmetic.
+    """
+    return TargetOutcome(
+        target_id=obj.target_id, disposition=disposition,
+        action=plan.action, route=plan.route, launched=0, reason=why)
+
+
+def _superseded_by_established_failure(obj, plan, stopper) -> TargetOutcome:
+    """Record an expensive target that no longer needs to be pursued.
+
+    This is neither a refusal nor an attempt: another target has already established the
+    material paper-level failure, so spending on this one cannot change the review's
+    decision.  Kept in one helper so the pre-acquisition stop and the between-target stop
+    produce exactly the same durable state.
+    """
+    return TargetOutcome(
+        target_id=obj.target_id,
+        disposition="SUPERSEDED_BY_ESTABLISHED_FAILURE",
+        action=plan.action, route=plan.route, launched=0,
+        reason=(f"a material failure was already established on target "
+                f"{getattr(stopper, 'target_id', '?')}, so no further expensive "
+                f"experiment was started for this paper; this target was not refused "
+                f"and was not attempted"))
+
+
+def establish_comparison(spec: ProbeSpec, route: str) -> ProbeSpec:
+    """Record what this spec's result would be held against, from the ROUTE it took.
+
+    Derived rather than assumed, which is the whole of the correction: every execution in
+    this system ended at `local_exec.reconcile`, and `reconcile` performs exactly one
+    comparison — a measured number against a quantity the paper printed. For an
+    AUTHOR_CODE_EXECUTION that is the right comparison. For a FOCUSED_VALIDATION_EXPERIMENT
+    it is not a comparison at all: an attribution experiment holds one arm against another
+    and the paper printed neither, so reconciling either against a cell answers a question
+    nobody asked.
+
+    Attached to the spec whether or not it is established, for the same reason capability
+    and identity are: "we could not have compared it either" is more useful to a reader
+    than leaving the question unanswered.
+    """
+    spec.comparison = comparison_mod.derive(
+        route,
+        printed_value_available=bool((spec.claimed_cell_value or "").strip()),
+        arms_specified=len(spec.arms or []))
+    return spec
+
+
+def may_be_compared(spec: ProbeSpec) -> tuple[bool, str]:
+    """May a process start, given what its result could be held against?
+
+    The same rule `admissible_if_it_succeeds` applies to provenance, one question earlier:
+    a run whose output could not be compared with anything was inadmissible before the
+    first process existed, so starting it spends compute on a number that cannot speak.
+
+    A spec with no comparison recorded passes. That is deliberate and it is what keeps
+    every hand-written `spec.json` and every fixture behaving exactly as it did — the
+    gates already in front of them (provenance, identity, capability, resources, commit)
+    are untouched.
+    """
+    c = spec.comparison
+    if comparison_mod.admits_verdict(c):
+        return True, ""
+    assert c is not None                      # admits_verdict(None) is True
+    return False, (
+        f"a {c.kind.lower().replace('_', ' ')} comparison would be needed to answer this "
+        f"target and this review could not carry one out: {c.reason} Nothing was started, "
+        f"because a run whose result has nothing to be held against cannot produce "
+        f"evidence about this paper.")
+
+
+# --------------------------------------------------------------------------- #
+# STEP 6 — route fallback: AUTHOR_CODE_EXECUTION identity failure re-plans
+# --------------------------------------------------------------------------- #
+# A DECIDED failure to bind, not merely "not yet assessed". `unmapped` means identity was
+# never reached (no checkout, the gate shut, an earlier precondition failing first) and is
+# not grounds for a fallback: the fallback is for a route this review genuinely TRIED and
+# could not bind, not one it never got to.
+_IDENTITY_FAILURE_STATES = ("ambiguous", "no_candidate", "unsupported")
+
+
+def identity_failed(spec: ProbeSpec) -> bool:
+    """Did identity resolution conclude the checkout could not be bound to the cited
+    claim — on any of the three axes: which command, which quantity, which configuration?
+
+    Read from what `plan_execution` already wrote onto the spec (`experiment_id.resolve`'s
+    output); this function decides nothing on its own and adds no new judgement.
+    """
+    for ident in (spec.experiment, spec.metric_identity, spec.configuration):
+        if ident is not None and ident.state in _IDENTITY_FAILURE_STATES:
+            return True
+    return False
+
+
+def replan_after_author_code_exhausted(
+        obj: DiscoveredObject, plan: PlanDecision, spec: ProbeSpec) -> PlanDecision | None:
+    """Step 6's re-plan: fall back to INDEPENDENT_RECONSTRUCTION once identity has
+    genuinely failed to bind the authors' checkout to the cited claim.
+
+    Discovery cannot decide this — whether AUTHOR_CODE_EXECUTION binds is a fact only a
+    real checkout establishes, which is why `discovery._routes` can only OFFER
+    INDEPENDENT_RECONSTRUCTION alongside it (when the paper's own specification is
+    complete) and never CHOOSE between them. This function is where the choice is made,
+    once the fact discovery could not know is in hand.
+
+    Three conditions, all required: the target's ORIGINAL plan chose AUTHOR_CODE_EXECUTION
+    (a re-plan of anything else is not this fallback); the object's own routes offer
+    INDEPENDENT_RECONSTRUCTION (which — see `discovery._routes` — only happens when the
+    paper specifies enough, so this function never invents a route discovery refused);
+    and identity genuinely failed rather than being merely unassessed.
+
+    `plan.superseded_by` is set on the ORIGINAL PlanDecision to the fallback's route —
+    mutated, not replaced, so the attempt that was actually tried first stays in the
+    record. The caller is responsible for appending the returned fallback into
+    `TargetSet.plans`; this function only decides and narrates, exactly as
+    `harness.planner.plan` does everywhere else.
+    """
+    if plan.route != "AUTHOR_CODE_EXECUTION":
+        return None
+    if "INDEPENDENT_RECONSTRUCTION" not in obj.routes:
+        return None
+    if not identity_failed(spec):
+        return None
+    fallback = planner.plan(
+        obj, artifact_available=True, specification_complete=True,
+        investigation_open=True, author_code_exhausted=True, attempt=plan.attempt + 1)
+    plan.superseded_by = fallback.route
+    return fallback
+
+
+def _fallback_note(cfg: Config, fallback_plan: PlanDecision | None) -> str:
+    """A short, honest suffix for a target outcome's `reason`, or '' when no fallback
+    applied. Reached only when `attempt_reimplementation_fallback` returned None — a
+    fallback the planner itself refused is reported with the planner's own reason; one it
+    approved but that did not actually run names the CURRENT reason why, from the same
+    gates `attempt_reimplementation_fallback` and `backends.authorize` read, rather than
+    the pre-Step-8 claim that no driver for the route existed at all."""
+    if fallback_plan is None:
+        return ""
+    if fallback_plan.requires_execution:
+        ok, why = reimplement_driver.available(cfg)
+        if not ok:
+            detail = f"no reviewer is configured to write one ({why})"
+        elif not cfg.allow_reimplementation_exec:
+            detail = "SH_ALLOW_REIMPLEMENTATION_EXEC is not set"
+        else:
+            detail = ("either it did not produce a conformant reconstruction, or this "
+                     "backend's isolation is insufficient to run one — see "
+                     "backends.authorize's 'reimpl_exec' branch")
+        return (f" A fallback to {fallback_plan.route} (attempt {fallback_plan.attempt}) "
+                f"was also considered, because the paper specifies enough to attempt one; "
+                f"it did not run: {detail}.")
+    return (f" A fallback to {fallback_plan.route} (attempt {fallback_plan.attempt}) was "
+           f"considered and refused: {fallback_plan.reason}")
+
+
+def _direct_reconstruction_note(cfg: Config, plan: PlanDecision | None) -> str:
+    """Why a directly planned reconstruction did not run.
+
+    `_fallback_note` deliberately describes a second attempt after authors' code was
+    exhausted.  A plan whose *first* route is INDEPENDENT_RECONSTRUCTION is not a
+    fallback, and calling it one obscures the more important fact that the planner chose
+    this route outright.  Keep the gate diagnosis identical while naming the attempt
+    honestly.
+    """
+    if plan is None:
+        return ""
+    if plan.requires_execution:
+        ok, why = reimplement_driver.available(cfg)
+        if not ok:
+            detail = f"no reviewer is configured to write one ({why})"
+        elif not cfg.allow_reimplementation_exec:
+            detail = "SH_ALLOW_REIMPLEMENTATION_EXEC is not set"
+        else:
+            detail = ("either it did not produce a conformant reconstruction, or this "
+                      "backend's isolation is insufficient to run one — see "
+                      "backends.authorize's 'reimpl_exec' branch")
+        return (f" The planned {plan.route} route (attempt {plan.attempt}) did not run: "
+                f"{detail}.")
+    return (f" The planned {plan.route} route (attempt {plan.attempt}) was refused: "
+            f"{plan.reason}")
+
+
+def _full_paper_text(doc: PaperDoc) -> str:
+    """Every section, joined — the same text `write_reimplementation_prompt` shows a
+    human implementer, so the automated and manual PATH B channels work from identical
+    evidence."""
+    parts = []
+    for s in doc.sections:
+        parts.append(f"### {s.title or f'section {s.section_idx}'}  [s{s.section_idx}]\n"
+                     + " ".join(s.text.split()))
+    return "\n\n".join(parts)
+
+
+def attempt_reimplementation_fallback(
+        cfg: Config, root: Path, pid: str, doc: PaperDoc, base_spec: ProbeSpec,
+        fallback_plan: PlanDecision | None, out_dir: Path | None = None) -> ProbeResult | None:
+    """Execute Step 6's INDEPENDENT_RECONSTRUCTION fallback with Step 8's governed
+    reconstruction, when one is available or can be produced. Returns None — never a
+    placeholder result — whenever no CONFORMANT sealed reconstruction exists to run, so
+    every existing caller's refusal/deferral path is exactly what it falls back to.
+
+    Spends no execution deciding: `reimplement.assess` is pure, `load_accepted` only reads
+    disk, and `reimplement_driver.run` degrades to None with its gate shut exactly like
+    every other delegation driver in this pipeline (`allow_reimplementation_driver` is off
+    by default). The eventual `_run` call still goes through the ordinary authorization
+    path — `backends.authorize`'s `reimpl_exec` branch — so a sealed but non-conformant, or
+    conformant-but-under-insufficient-isolation, reconstruction is refused there exactly as
+    any other inadmissible spec would be; this function only avoids attempting one that
+    plainly cannot even be produced.
+    """
+    if fallback_plan is None or not fallback_plan.requires_execution:
+        return None
+    readiness = reimplement.assess(doc)
+    if not readiness.established:
+        return None
+    target_id = base_spec.target_id or "default"
+    sealed = reimplement_driver.load_accepted(cfg, pid, target_id)
+    if sealed is None:
+        ok, _why = reimplement_driver.available(cfg)
+        if not ok:
+            return None
+        brief = reimplement_driver.build_brief(
+            readiness, paper_title=doc.title, claim=base_spec.claim,
+            table_ref=base_spec.table_ref, claimed_cell_value=base_spec.claimed_cell_value,
+            paper_text=_full_paper_text(doc))
+        sealed = reimplement_driver.run(cfg, brief, readiness, pid=pid, target_id=target_id)
+    if sealed is None:
+        return None
+    script, conf = sealed
+    fspec = ProbeSpec(
+        paper_id=pid, target_id=target_id, finding_id=base_spec.finding_id,
+        claim=base_spec.claim, claim_ref=base_spec.claim_ref, claim_kind=base_spec.claim_kind,
+        table_ref=base_spec.table_ref, claimed_cell_value=base_spec.claimed_cell_value,
+        metric=base_spec.metric or "accuracy", seeds=list(base_spec.seeds) or [0, 1, 2],
+        arms=["reproduction"], script=script, provenance="reimpl_exec",
+        reimplementation_conformance=conf, written_by="harness")
+    fspec = establish_comparison(fspec, fallback_plan.route)
+    fdir = out_dir or (root / "runs" / pid / "reimplementation")
+    fdir.mkdir(parents=True, exist_ok=True)
+    state.write_json(fdir / f"{target_id}.spec.json", fspec.model_dump())
+    return _run(cfg, root, fspec, out_dir=fdir)
+
+
+def _review(cfg: Config, pid: str) -> dict:
     root = state.project_dir(cfg, pid)
     doc_path = root / "paper" / "doc.json"
     if not doc_path.exists():
@@ -498,7 +1134,47 @@ def run(cfg: Config, pid: str) -> dict:
     doc = PaperDoc(**state.read_json(doc_path))
     state.set_phase(cfg, pid, "probe")
 
-    spec = build_spec(cfg, pid, doc)
+    from . import discover as discover_stage
+
+    target_set, pairs, deferred = _executable_targets(cfg, pid)
+    # Discovery can itself finish a deterministic paper-only check (notably an arithmetic
+    # recheck) while also finding separate targets worth executing.  That established
+    # failure is already in `TargetSet.outcomes` before this stage starts.  Apply the same
+    # Tier-1-plus-Tier-2 primitive used between executions *before* even constructing the
+    # primary probe or acquiring a repository: acquisition, static audit, identity and
+    # execution are all parts of the expensive branch which can no longer change the
+    # paper-level decision.  The targets still receive terminal outcomes so reporting and
+    # ledger accounting remain complete.
+    initial_stopper = (materiality.material_target_failure(
+        target_set.objects, target_set.outcomes) if target_set is not None else None)
+    if initial_stopper is not None and (pairs or deferred):
+        superseded = [_superseded_by_established_failure(obj, plan, initial_stopper)
+                      for obj, plan in pairs + deferred]
+        superseded_ids = {out.target_id for out in superseded}
+        target_set.outcomes = [out for out in target_set.outcomes
+                               if out.target_id not in superseded_ids] + superseded
+        by_outcome = {out.target_id: out.disposition for out in superseded}
+        for obj in target_set.objects:
+            if obj.target_id in by_outcome:
+                obj.status = by_outcome[obj.target_id]
+        target_set.extraction_coverage["targets_superseded_by_established_failure"] = sum(
+            1 for out in target_set.outcomes
+            if out.disposition == "SUPERSEDED_BY_ESTABLISHED_FAILURE")
+        discover_stage.sync_questions(target_set)
+        exhaustion.refresh(target_set, cfg)
+        state.write_json(root / "discovery" / "targets.json", target_set.model_dump())
+        return {
+            "paper_id": pid,
+            "verdict": "not_started",
+            "reason": (f"a material failure was already established on target "
+                       f"{getattr(initial_stopper, 'target_id', '?')}; all pending expensive "
+                       f"targets were recorded as superseded and no acquisition or execution "
+                       f"was started"),
+            "executions": 0,
+            "superseded_targets": len(superseded),
+        }
+    primary = pairs[0][0] if pairs else None
+    spec = build_spec(cfg, pid, doc, primary)
     # S3a/S3b run before execution is planned, because what the static audit finds is
     # useful even when every execution gate is shut — and because deciding what to run
     # requires knowing what was acquired.
@@ -507,14 +1183,193 @@ def run(cfg: Config, pid: str) -> dict:
     # execution planning so the authors' own entrypoint still wins when it is available.
     spec = synthesize_probe(cfg, doc, spec, acq)
     spec = plan_execution(cfg, spec, acq, doc, audit, root=root)
+    # WHAT ITS RESULT WOULD BE HELD AGAINST, from the route the planner chose. Attached
+    # whether or not it is established; only the gate below reads it.
+    if pairs:
+        spec = establish_comparison(spec, pairs[0][1].route)
 
     state.write_json(root / "runs" / pid / "spec.json", spec.model_dump())
-    result = _run(cfg, root, spec)
+
+    # THE RULE: nothing starts unless its result could speak. See
+    # `admissible_if_it_succeeds` for what this stopped costing, and `may_be_compared` for
+    # the same question asked one step earlier — a run whose output has nothing to be held
+    # against cannot produce evidence however impeccable the program that produced it.
+    comparable, uncomparable_why = may_be_compared(spec)
+    if not comparable:
+        may_run, refusal = False, uncomparable_why
+    else:
+        may_run, refusal = admissible_if_it_succeeds(cfg, spec)
+    # STEP 6 — the re-plan primitive, consulted once identity has had a real checkout to
+    # bind against. `None` on every path where AUTHOR_CODE_EXECUTION was not the route, or
+    # identity did bind, or the object never offered a fallback in the first place.
+    original_plan = pairs[0][1] if pairs else None
+    direct_reconstruction = bool(
+        original_plan is not None
+        and original_plan.route == "INDEPENDENT_RECONSTRUCTION")
+    fallback_plan = replan_after_author_code_exhausted(
+        pairs[0][0], original_plan, spec) if pairs else None
+    if fallback_plan is not None and target_set is not None:
+        target_set.plans.append(fallback_plan)
+    reconstruction_plan = original_plan if direct_reconstruction else fallback_plan
+    reconstruction_result = None
+    if comparable and (direct_reconstruction or not may_run):
+        reconstruction_result = attempt_reimplementation_fallback(
+            cfg, root, pid, doc, spec, reconstruction_plan)
+    if direct_reconstruction and reconstruction_result is not None:
+        result = reconstruction_result
+    elif direct_reconstruction:
+        # The discover-time route was reconstruction itself.  Never run the base
+        # synthesized/repository-shaped spec merely because it happens to pass its own
+        # gates: that would execute a different route from the one the planner recorded.
+        result = ProbeResult(
+            paper_id=pid, verdict="not_started", provenance="reimpl_exec",
+            reason=(uncomparable_why if not comparable else
+                    _direct_reconstruction_note(cfg, reconstruction_plan).strip()),
+            executions=0, script_path="")
+    elif may_run:
+        result = _run(cfg, root, spec)
+    elif reconstruction_result is not None:
+        result = reconstruction_result
+    else:
+        # A ProbeResult that records the refusal and no execution. `executions=0` is the
+        # measurement the funnel reads, and it is correct: nothing was started.
+        result = ProbeResult(
+            paper_id=pid, verdict="not_started", provenance=spec.provenance,
+            reason=refusal, executions=0, script_path="",
+            experiment=spec.experiment, metric_identity=spec.metric_identity,
+            configuration=spec.configuration, capability=spec.capability,
+            resources=spec.resources, commit_state=spec.commit_state,
+            backend=spec.backend)
     result.repo, result.code_audit = acq, audit
     # `_run` already wrote the file; rewrite it now that acquisition and the static
     # audit are attached, so `probe_results.json` is the whole of S3 rather than a
     # torso the report has to reassemble.
     state.write_json(root / "runs" / pid / "probe_results.json", result.model_dump())
+
+    # --- the remaining targets ---------------------------------------------------------
+    # One blocked target used to end the paper's reproduction. It no longer does: the
+    # checkout and the static audit are already in hand, so every further target costs
+    # only its own run, and each keeps INDEPENDENT state. A paper whose first target is
+    # blocked by hardware and whose second reproduces reports both, and the report has to
+    # explain both rather than whichever happened to be first.
+    outcomes: list[TargetOutcome] = []
+    if target_set is not None and pairs:
+        if reconstruction_result is not None and reconstruction_plan is not None:
+            outcomes.append(outcome_for(pairs[0][0].target_id, reconstruction_result,
+                                        reconstruction_plan.action,
+                                        reconstruction_plan.route))
+        elif may_run and not direct_reconstruction:
+            outcomes.append(outcome_for(pairs[0][0].target_id, result,
+                                        pairs[0][1].action, pairs[0][1].route))
+        else:
+            note = (_direct_reconstruction_note(cfg, reconstruction_plan)
+                    if direct_reconstruction else
+                    (_fallback_note(cfg, fallback_plan) if comparable else ""))
+            outcomes.append(_not_started(
+                pairs[0][0], pairs[0][1],
+                (uncomparable_why if not comparable else refusal + note),
+                ("AUTHORIZATION_BLOCKED" if direct_reconstruction and comparable
+                 else "IDENTITY_BLOCKED" if comparable else "COMPARISON_BLOCKED")))
+        for obj, plan in pairs[1:]:
+            # THE DYNAMIC EARLY STOP, and the only place it exists. `harness/assessment.py`
+            # stops BEFORE investigation, from findings already counted at grade time; it
+            # runs once and knows nothing about what execution then established. So a
+            # target that proved a material failure on the authors' own code did not stop
+            # the next three targets cloning, planning, authorizing and launching.
+            #
+            # The condition is deliberately the SAME CALL `claim_status` makes, so this
+            # adds no second rule about what a material failure is: Tier 1
+            # (`establishes_failure`, which carries the provenance ceiling) AND Tier 2
+            # (materiality). A BLOCKER cannot reach it because a blocker does not
+            # establish anything, and an established NON-material defect cannot reach it
+            # because `material_target_failure` returns None for one — which are the two
+            # things this stop must never do.
+            stopper = materiality.material_target_failure(target_set.objects, outcomes)
+            if stopper is not None:
+                outcomes.append(_superseded_by_established_failure(obj, plan, stopper))
+                continue
+            try:
+                other = build_spec(cfg, pid, doc, obj)
+                other.written_by = "harness"
+                other = synthesize_probe(cfg, doc, other, acq)
+                other = plan_execution(cfg, other, acq, doc, audit, root=root)
+                other = establish_comparison(other, plan.route)
+                tdir = root / "runs" / pid / "targets" / obj.target_id
+                state.write_json(tdir / "spec.json", other.model_dump())
+                # STEP 6 — the same re-plan, per remaining target. `plan` here is the
+                # target's ORIGINAL discover-time decision, exactly as for the primary.
+                other_fallback = replan_after_author_code_exhausted(obj, plan, other)
+                if other_fallback is not None:
+                    target_set.plans.append(other_fallback)
+                other_direct_reconstruction = plan.route == "INDEPENDENT_RECONSTRUCTION"
+                other_reconstruction = (plan if other_direct_reconstruction
+                                        else other_fallback)
+                comparable_here, why_here = may_be_compared(other)
+                if not comparable_here:
+                    outcomes.append(_not_started(obj, plan, why_here, "COMPARISON_BLOCKED"))
+                    continue
+                ok_here, why_here = admissible_if_it_succeeds(cfg, other)
+                if other_direct_reconstruction or not ok_here:
+                    other_reconstruction_result = attempt_reimplementation_fallback(
+                        cfg, root, pid, doc, other, other_reconstruction,
+                        out_dir=tdir / "reimplementation")
+                    if (other_reconstruction_result is not None
+                            and other_reconstruction is not None):
+                        state.write_json(tdir / "probe_results.json",
+                                         other_reconstruction_result.model_dump())
+                        outcomes.append(outcome_for(
+                            obj.target_id, other_reconstruction_result,
+                            other_reconstruction.action, other_reconstruction.route))
+                        continue
+                    note = (_direct_reconstruction_note(cfg, other_reconstruction)
+                            if other_direct_reconstruction else
+                            _fallback_note(cfg, other_fallback))
+                    outcomes.append(_not_started(
+                        obj, plan, why_here + note,
+                        ("AUTHORIZATION_BLOCKED" if other_direct_reconstruction
+                         else "IDENTITY_BLOCKED")))
+                    continue
+                tres = _run(cfg, root, other, out_dir=tdir)
+                state.write_json(tdir / "probe_results.json", tres.model_dump())
+                outcomes.append(outcome_for(obj.target_id, tres, plan.action, plan.route))
+            except Exception as e:                # noqa: BLE001
+                # A fault pursuing one target is not evidence about the paper and must not
+                # cost the paper its other targets — the same rule `_phase_probe` applies
+                # to the stage as a whole, applied per target.
+                outcomes.append(TargetOutcome(
+                    target_id=obj.target_id, disposition="INCONCLUSIVE",
+                    action=plan.action, route=plan.route,
+                    reason=f"pursuing this target raised {type(e).__name__}: {e}. Recorded as "
+                           f"inconclusive; a fault in this harness is not evidence about the "
+                           f"paper."))
+        for obj, plan in deferred:
+            # Warranted, ordered, and past this run's budget. Recorded with its own
+            # disposition so the review can say "we judged this worth running and did not
+            # reach it", which is neither a refusal nor a blocked target.
+            outcomes.append(TargetOutcome(
+                target_id=obj.target_id, disposition="BUDGET_DEFERRED",
+                action=plan.action, route=plan.route, launched=0,
+                reason=(f"an experiment is warranted for this target and this run's budget "
+                        f"of {cfg.max_targets} target(s) was already spent on "
+                        f"higher-priority ones. A limit of this run, not of the paper.")))
+        # Persist every secondary outcome, including pre-launch blockers. Cached reviews
+        # can then reconstruct the exact route ledger without silently turning a prior
+        # attempt into NOT_TRIED merely because no ProbeResult was produced.
+        for out in outcomes:
+            odir = root / "runs" / pid / "targets" / out.target_id
+            state.write_json(odir / "outcome.json", out.model_dump())
+        keep = [o for o in target_set.outcomes if o.target_id not in {x.target_id for x in outcomes}]
+        target_set.outcomes = keep + outcomes
+        by_outcome = {o.target_id: o.disposition for o in outcomes}
+        for obj in target_set.objects:
+            if obj.target_id in by_outcome:
+                obj.status = by_outcome[obj.target_id]
+        # The questions were written before anything ran and still say NOT_INVESTIGATED.
+        # Re-fold them over the outcomes as they now stand — the same call `discover`
+        # makes, which is why it is a fold and not an accumulation.
+        discover_stage.sync_questions(target_set)
+        exhaustion.refresh(target_set, cfg)
+        state.write_json(root / "discovery" / "targets.json", target_set.model_dump())
 
     rec = result.reconciliation
     state.append_log(
