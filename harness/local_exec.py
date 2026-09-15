@@ -1157,6 +1157,7 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
             # the one question a reproduction verdict has to survive.
             record = ExecutionRecord(
                 seed=seed, arm=arm, backend=p.backend, argv=p.argv, cwd=p.cwd,
+                launch_argv=list(getattr(p, "launch_argv", []) or []),
                 environment=p.environment, interpreter=spec.interpreter,
                 provenance=spec.provenance,
                 # The commit identifies the authors' code, so it is written when the

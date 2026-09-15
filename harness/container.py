@@ -41,6 +41,7 @@ import json
 import re
 import shutil
 import subprocess
+import uuid
 
 # The container path the paper's `runs/<pid>` directory is mounted at. One mount covers
 # both halves the run needs — `repo/` (the audited checkout) and `env/` (the interpreter
@@ -179,17 +180,54 @@ def to_container_path(host_path: str, host_mount: str) -> str:
     return f"{MOUNT}/{hp[len(hm) + 1:]}"
 
 
+def container_name(pid: str = "", label: str = "") -> str:
+    """A unique, greppable name for one run's container.
+
+    Named rather than anonymous because an anonymous container cannot be killed by the
+    code that started it: `subprocess.run(timeout=...)` kills the docker CLIENT, and the
+    container it asked for goes on running. See `remove`.
+    """
+    slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", f"{pid}-{label}".strip("-"))[:80].strip("-")
+    return f"sh-{slug}-{uuid.uuid4().hex[:12]}" if slug else f"sh-{uuid.uuid4().hex[:12]}"
+
+
+def remove(name: str) -> tuple[bool, str]:
+    """Force-remove a container by name. Returns whether it is gone, and the detail.
+
+    THE BUG THIS EXISTS FOR. `subprocess.run(argv, timeout=t)` kills `docker run`, the
+    client. The container keeps running, holding the GPU and the CPU it reserved, while
+    the harness records `timed_out=True` and moves on to the next seed. The next seed then
+    contends with a process this harness believes it stopped, and `resources()` measures a
+    machine that is already busy. A timeout that does not stop the work is not a timeout.
+
+    Absent is success: a container that already exited under `--rm` is gone, which is the
+    outcome asked for.
+    """
+    if not name:
+        return False, "no container name to remove"
+    rc, out, err = _run(["docker", "rm", "--force", name], timeout=30)
+    if rc == 0:
+        return True, f"removed container {name}"
+    detail = (err or out).strip()
+    if "No such container" in detail or "no such container" in detail:
+        return True, f"container {name} had already exited"
+    return False, f"could not remove container {name}: {detail[:200]}"
+
+
 def run_argv(argv: list[str], *, host_mount: str, workdir: str = "", image: str = "",
              gpus: bool = False, env: dict | None = None,
-             network: bool = True) -> list[str]:
+             network: bool = True, name: str = "") -> list[str]:
     """The full `docker run` command line for one process. Pure; starts nothing.
 
     Separate from `execute` so that what a container run actually IS can be asserted by a
-    test on a host with no Docker at all — including the two properties that matter and
-    are easy to lose: `--rm` so a review never accumulates containers, and a workdir
-    inside the mount rather than on the host.
+    test on a host with no Docker at all — including the three properties that matter and
+    are easy to lose: `--rm` so a review never accumulates containers, a workdir inside
+    the mount rather than on the host, and a `--name` so that a timeout has something to
+    kill.
     """
     out = ["docker", "run", "--rm", "-v", f"{host_mount}:{MOUNT}"]
+    if name:
+        out += ["--name", name]
     if workdir:
         out += ["-w", workdir]
     if gpus:

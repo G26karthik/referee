@@ -123,6 +123,12 @@ class ExecOutcome:
     backend: str = ""
     error: str = ""                      # why it did not launch, when launched is False
     argv: list[str] = field(default_factory=list)
+    # The command line this HARNESS issued, when that differs from the one the process
+    # received. Empty for a backend that runs argv directly; for a container it is the
+    # whole `docker run` line, which carries the image, the mount and the network policy.
+    # Without it a container record says `python train.py` and names neither the image nor
+    # the isolation the verdict depends on.
+    launch_argv: list[str] = field(default_factory=list)
     cwd: str = ""
     environment: str = ""                # the backend's own account of where this ran
     started_at: str = ""                 # UTC ISO-8601
@@ -444,7 +450,7 @@ class LocalBackend(ExecutionBackend):
         halfway through a seed loop, and the caller needs every ending as data."""
         started, t0 = _utc(), time.time()
         env = {**os.environ, **req.env} if req.env else None
-        stamp = dict(backend=self.name, argv=list(req.argv), cwd=req.cwd,
+        stamp: dict = dict(backend=self.name, argv=list(req.argv), cwd=req.cwd,
                      environment=self.environment(), started_at=started)
         try:
             p = subprocess.run(req.argv, cwd=req.cwd or None, capture_output=True, text=True,
@@ -710,7 +716,7 @@ class ContainerBackend(ExecutionBackend):
         """Run one process in a container. Never raises; every ending comes back as data."""
         started, t0 = _utc(), time.time()
         mount = str(Path(req.cwd).parents[0]) if req.cwd else ""
-        stamp = dict(backend=self.name, argv=list(req.argv), cwd=req.cwd,
+        stamp: dict = dict(backend=self.name, argv=list(req.argv), cwd=req.cwd,
                      environment=self.environment(), started_at=started)
         if not req.cwd.startswith(container_mod.MOUNT):
             # The argv and cwd are built upstream from what `provision` returned, which is
@@ -722,19 +728,33 @@ class ContainerBackend(ExecutionBackend):
                                       f"{container_mod.MOUNT}, so this command was not "
                                       f"prepared for a container"), **stamp)
         host_mount = getattr(self, "_host_mount", "") or mount
+        name = container_mod.container_name(getattr(self, "_pid", ""), req.label)
         argv = container_mod.run_argv(
             list(req.argv), host_mount=host_mount, workdir=req.cwd,
             image=getattr(self, "_image_name", container_mod.DEFAULT_IMAGE),
-            gpus=self._gpu()[0], env=dict(req.env or {}), network=False)
+            gpus=self._gpu()[0], env=dict(req.env or {}), network=False, name=name)
+        # The command this harness actually issued. `argv` above is the command the
+        # PROCESS received, which is what makes records comparable across backends; it is
+        # not the invocation, and a reviewer re-deriving a verdict by hand needs the image,
+        # the mount and the network policy that produced it.
+        stamp["launch_argv"] = list(argv)
         try:
             p = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
                                errors="replace", timeout=req.timeout_s)
         except subprocess.TimeoutExpired as e:
+            # Killing `docker run` kills the client, not the container. Without this the
+            # container runs on holding the GPU it reserved while the harness records a
+            # timeout and starts the next seed against a machine it believes is free.
+            killed, detail = container_mod.remove(name)
             return ExecOutcome(launched=True, completed=False, timed_out=True,
                                stdout=_text(e.stdout), stderr=_text(e.stderr),
                                seconds=round(time.time() - t0, 3), ended_at=_utc(),
-                               error=f"timeout after {req.timeout_s}s", **stamp)
+                               error=(f"timeout after {req.timeout_s}s; {detail}"
+                                      if killed else
+                                      f"timeout after {req.timeout_s}s; THE CONTAINER MAY "
+                                      f"STILL BE RUNNING: {detail}"), **stamp)
         except OSError as e:
+            container_mod.remove(name)
             return ExecOutcome(launched=False, completed=False,
                                seconds=round(time.time() - t0, 3), ended_at=_utc(),
                                error=f"could not start the container: {e}", **stamp)

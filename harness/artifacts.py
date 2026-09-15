@@ -1609,6 +1609,14 @@ class ExecutionRecord(_Base):
     arm: str = ""
     backend: str = ""
     argv: list[str] = Field(default_factory=list, description="the command as the backend received it")
+    launch_argv: list[str] = Field(
+        default_factory=list,
+        description="the command line this harness ISSUED, when it differs from the one the "
+                    "process received. Empty for a backend that runs argv directly; for a "
+                    "container it is the whole docker run line. Without it a containerised "
+                    "record names the script but not the image, the mount or the network "
+                    "policy, and the isolation a verdict depends on is absent from the "
+                    "artifact the verdict must be re-derivable from.")
     cwd: str = Field(default="", description="working directory the process actually ran in")
     interpreter: str = Field(default="", description="the python that ran it, when one did")
     environment: str = Field(
