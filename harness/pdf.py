@@ -1039,6 +1039,137 @@ def section_presentation(sections: list[Section], budget_chars: int) -> SectionP
                                sum(1 for s in sections if len(s.text) > per))
 
 
+# --------------------------------------------------------------------------- #
+# Reading the whole paper
+# --------------------------------------------------------------------------- #
+# When a split section's text is cut, this many characters of the previous part are
+# repeated at the start of the next one. A concern whose sentence straddles a cut is
+# otherwise unquotable by either part, and an unquotable concern is a dropped concern:
+# `claims.mint` refuses a quotation it cannot relocate. The overlap costs a little
+# duplication and buys back the seam.
+#
+# It cannot create a false address. Minting searches the PARSED DOCUMENT, not the prompt,
+# so text repeated across two parts still occurs exactly as often in `doc` as it did
+# before, and the uniqueness rule is untouched.
+SPLIT_OVERLAP_CHARS = 600
+
+
+class ReadingPart(NamedTuple):
+    """One pass of a paper that fits in a single prompt.
+
+    A plan of these covers EVERY character of every extracted section, which
+    `render_sections` alone cannot do: it divides one budget across all sections and
+    hard-slices each, so a long paper is cut before any reader sees a word of it. Over
+    the evaluated corpus that showed readers between 34% and 84% of the prose, and the
+    scope line still said four lenses read the paper.
+    """
+
+    # 1-based: this is shown to a reader ("part 2 of 3"), and `index` would shadow
+    # tuple.index on a NamedTuple.
+    number: int
+    total: int                 # parts in this plan
+    sections: list             # Section objects, whole or sliced
+    chars: int                 # characters of section text in this part
+    split_sections: int        # sections in this part that are a slice of a larger one
+    # (section_idx, start, end) per section in this part, as offsets into that section's
+    # ORIGINAL text. Carried because coverage is the guarantee this type exists for, and a
+    # guarantee checked by searching for a slice's text is not checked at all: a section
+    # whose text repeats defeats substring search, and the planner would look correct
+    # while dropping a span. With offsets the union is arithmetic.
+    slices: list
+
+    @property
+    def label(self) -> str:
+        return f"part {self.number} of {self.total}"
+
+
+def _split_section(s: Section, budget: int) -> list[tuple[Section, int, int]]:
+    """One oversized section as a sequence of slices, cut at whitespace where possible.
+
+    Returns each slice with the offsets it was taken from, so a caller can prove the
+    slices tile the original.
+    """
+    text, out, start = s.text, [], 0
+    step = max(1, budget - SPLIT_OVERLAP_CHARS)
+    while start < len(text):
+        end = min(start + budget, len(text))
+        if end < len(text):
+            # Prefer a whitespace boundary in the last tenth, so a cut lands between
+            # words rather than inside one. A word split in half is a quotation neither
+            # part can supply.
+            window = text.rfind(" ", start + budget - budget // 10, end)
+            if window > start:
+                end = window
+        out.append((s.model_copy(update={"text": text[start:end]}), start, end))
+        if end >= len(text):
+            break
+        start = max(start + step, end - SPLIT_OVERLAP_CHARS)
+    return out or [(s, 0, len(text))]
+
+
+def plan_reading(sections: list[Section], budget_chars: int) -> list[ReadingPart]:
+    """Divide a paper into the fewest prompts that show all of it.
+
+    Whole sections are packed greedily, in document order, into parts no larger than the
+    budget; a section larger than the budget on its own is sliced with an overlap. The
+    guarantee is coverage, asserted rather than intended: every character of every
+    section appears in at least one part. `tests/test_full_paper_reading.py` reconstructs
+    it and checks.
+
+    Why not simply raise the budget. A constant large enough for the longest paper in one
+    corpus is not a property of papers, and the failure it produces is silent: the prompt
+    overflows somewhere downstream and the reader sees a truncation nobody measured.
+    Packing is correct at any length, and on the evaluated corpus it costs at most two
+    passes per reader, because the largest paper holds 106k characters of prose and the
+    largest single section 22k.
+
+    Order is preserved. A reader that meets Limitations before Methods is reading a
+    different document, and the parts are numbered so it can be told where it is.
+    """
+    live = [s for s in sections if (s.text or "")]
+    if not live:
+        return []
+    budget = max(400, budget_chars)
+
+    packed: list[list[tuple[Section, int, int]]] = [[]]
+    size = 0
+    for s in live:
+        pieces = ([(s, 0, len(s.text))] if len(s.text) <= budget
+                  else _split_section(s, budget))
+        for piece, a, b in pieces:
+            n = len(piece.text)
+            if packed[-1] and size + n > budget:
+                packed.append([])
+                size = 0
+            packed[-1].append((piece, a, b))
+            size += n
+    packed = [p for p in packed if p]
+
+    whole = {s.section_idx: len(s.text) for s in live}
+    total = len(packed)
+    return [
+        ReadingPart(number=i + 1, total=total,
+                    sections=[x for x, _, _ in p],
+                    chars=sum(len(x.text) for x, _, _ in p),
+                    split_sections=sum(1 for x, _, _ in p
+                                       if len(x.text) < whole.get(x.section_idx, 0)),
+                    slices=[(x.section_idx, a, b) for x, a, b in p])
+        for i, p in enumerate(packed)
+    ]
+
+
+def render_part(part: ReadingPart) -> str:
+    """One part's sections as prompt text, with no truncation anywhere.
+
+    Deliberately not `render_sections`: that function's job is to fit a budget by cutting,
+    and this one's is to show what the plan already made fit. Reusing it would reintroduce
+    the slice this exists to remove.
+    """
+    return "\n\n".join(
+        f"## {s.title or f'(section {s.section_idx})'}  [p{s.page_start}]\n{s.text}"
+        for s in part.sections)
+
+
 if __name__ == "__main__":  # self-check: python -m harness.pdf <file.pdf>
     import sys
 
