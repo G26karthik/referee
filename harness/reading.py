@@ -88,10 +88,11 @@ def _clip(text: str, limit: int = ANCHOR_SECTION_CHARS) -> str:
 def anchors(doc: PaperDoc) -> AnchorPacket:
     """The packet every part carries.
 
-    The abstract and conclusion locators are `harness.materiality`'s, deliberately. A
-    second spelling of "which section is the abstract" is how the two drift, and
-    `discovery._centrality` is the standing example: it reads `doc.sections[0]`, which is
-    the untitled front-matter block, and fired on 0 of 878 objects across the corpus.
+    The abstract and conclusion locators are `harness.materiality`'s, deliberately: a
+    second spelling of "which section is the abstract" is how the two drift. `discovery`
+    carried one until recently — it read `doc.sections[0]`, the untitled front-matter
+    block — and there is now exactly one locator in the harness. This module uses it
+    rather than adding a third.
     """
     a_idx = materiality_mod.abstract_section_idx(doc)
     c_idx = materiality_mod.conclusion_section_idx(doc)
@@ -178,6 +179,85 @@ def plan(doc: PaperDoc, budget_chars: int) -> ReadingPlan:
             parts=n,
             synthesis_required=n > 1,
         ))
+
+
+# --------------------------------------------------------------------------- #
+# Within-lens cross-part synthesis
+# --------------------------------------------------------------------------- #
+# What the synthesis pass is asked to look for. Named rather than left to the model,
+# because an open-ended "find anything else" invites invention, and every one of these is
+# a relationship BETWEEN two spans that a part-local reader structurally could not see.
+SYNTHESIS_TARGETS = (
+    "cross-section contradictions",
+    "abstract or conclusion inconsistent with the body",
+    "a table disagreeing with the prose that cites it",
+    "a method described one way and evaluated another",
+    "an appendix result inconsistent with the main text",
+    "duplicated concerns that are one concern and should merge",
+    "a concern whose significance changes once another section is taken into account",
+)
+
+
+class SynthesisBrief(NamedTuple):
+    """The whole input to one lens's cross-part synthesis. Nothing else reaches it.
+
+    Three exclusions make this a synthesis rather than a second opinion. It sees no other
+    lens's output, so cross-lens independence is untouched. It sees no hidden reasoning,
+    only candidates that already carry a quotation. And it sees no decision, grade or
+    outcome, so it cannot be steered by what the harness has concluded so far.
+    """
+
+    paper_id: str
+    lens: str
+    anchor: AnchorPacket
+    candidates: list          # dicts: part, section_idx, page, ref, quote, statement
+    parts_read: int
+
+    def render(self) -> str:
+        rows = []
+        for c in self.candidates:
+            where = f"part {c.get('part', '?')} · section {c.get('section_idx', '?')}"
+            if c.get("page"):
+                where += f" · p{c['page']}"
+            if c.get("ref"):
+                where += f" · {c['ref']}"
+            rows.append(f"- [{where}] {c.get('description', '').strip()}\n"
+                        f"  quoted: \"{(c.get('quote') or '').strip()}\"")
+        asks = "\n".join(f"  - {t}" for t in SYNTHESIS_TARGETS)
+        return (f"{self.anchor.render()}\n\n"
+                f"## Your own observations across {self.parts_read} parts of this paper\n"
+                + ("\n".join(rows) if rows else "- (none)")
+                + f"\n\n## What to look for now\n{asks}\n")
+
+
+def synthesis_brief(paper_id: str, lens: str, anchor: AnchorPacket,
+                    per_part_findings: dict[int, list]) -> SynthesisBrief:
+    """Assemble one lens's own grounded observations across its own parts.
+
+    `per_part_findings` maps a part number to that part's findings. A finding with no
+    evidence quotation is dropped here rather than passed on: the synthesis reasons over
+    what can be relocated in the paper, and an unquoted observation is exactly the fluent
+    assertion this system refuses everywhere else.
+    """
+    out = []
+    for part in sorted(per_part_findings):
+        for f in per_part_findings[part] or []:
+            quote = (getattr(f, "evidence_quote", "") or "").strip()
+            if not quote:
+                continue
+            out.append({
+                "part": part,
+                "section_idx": getattr(f, "section_idx", None),
+                "page": getattr(f, "page", None),
+                "ref": getattr(f, "evidence_ref", "") or "",
+                "quote": quote,
+                # `statement` is the finding's own prose; `title` is its short form and
+                # is the fallback, because a finding with neither says nothing at all.
+                "statement": (getattr(f, "statement", "") or getattr(f, "title", "") or ""),
+                "finding_id": getattr(f, "finding_id", "") or "",
+            })
+    return SynthesisBrief(paper_id=paper_id, lens=lens, anchor=anchor,
+                          candidates=out, parts_read=len(per_part_findings))
 
 
 def render_part(part, anchor: AnchorPacket) -> str:
