@@ -472,14 +472,31 @@ def _launched(report, outcomes) -> int:
 
 
 def _check_pointers(report) -> tuple[bool, str]:
+    """EVERY pointer, which is what the guarantee is called.
+
+    A concern can depend on more than one location — the abstract against the conclusion,
+    the prose against the cell it summarises — and each side carries its own quotation,
+    its own reference and its own harness-written evidence class. Checking the primary
+    citation alone would let a cross-section finding satisfy a guarantee whose name
+    promises all of them, which is the exact shape of overclaim this module exists to
+    refuse. `stages/audit._coerce` already drops such a finding whole, so a failure here
+    means that drop did not happen.
+    """
     fs = list(getattr(report, "findings", None) or [])
-    bad = [getattr(f, "finding_id", "") or "(unnamed)" for f in fs
-           if getattr(f, "evidence_class", "") not in _VERIFIED_EVIDENCE]
+    bad, sides = [], 0
+    for f in fs:
+        classes = [getattr(f, "evidence_class", "")]
+        for side in (getattr(f, "additional_evidence", None) or []):
+            sides += 1
+            classes.append(getattr(side, "evidence_class", ""))
+        if any(c not in _VERIFIED_EVIDENCE for c in classes):
+            bad.append(getattr(f, "finding_id", "") or "(unnamed)")
     dropped = int(getattr(report, "dropped_findings", 0) or 0)
     if bad:
-        return False, (f"{len(bad)} of {len(fs)} kept finding(s) carry no verified "
-                       f"evidence class: {', '.join(bad[:4])}")
-    return True, f"{len(fs)} kept finding(s), all re-verified; {dropped} discarded"
+        return False, (f"{len(bad)} of {len(fs)} kept finding(s) carry an unverified "
+                       f"evidence pointer: {', '.join(bad[:4])}")
+    return True, (f"{len(fs)} kept finding(s) carrying {len(fs) + sides} evidence "
+                  f"pointer(s), all re-verified; {dropped} discarded")
 
 
 def _check_provenance(report, outcomes) -> tuple[bool, str]:

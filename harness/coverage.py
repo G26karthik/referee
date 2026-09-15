@@ -60,8 +60,8 @@ import os
 import re
 
 from . import claims, pdf
-from .artifacts import (CoverageReport, PaperDoc, ReviewSurface, Section,
-                        SURFACE_KINDS)
+from .artifacts import (CoverageReport, PaperDoc, ReadingRecord, ReviewSurface,
+                        Section, SURFACE_KINDS)
 
 # The lens prompt's own budget, mirrored rather than imported. `stages/audit.py` is a
 # STAGE — it pulls in the drivers, the config and the prompt package — and a pure
@@ -135,21 +135,37 @@ def kind_of(address: str = "") -> str:
 # The denominator
 # --------------------------------------------------------------------------- #
 def prose_presented(sections: list[Section], budget: int) -> tuple[int, int, int]:
-    """(presented, total, truncated_sections) for the lens prompt's section budget.
+    """(presented, total, sections_truncated) UNDER THE OLD TRUNCATING RENDERER.
 
-    DELEGATES to `pdf.section_presentation`, which is computed by the same arithmetic
-    `pdf.render_sections` uses, so the number reported here and the text a lens was
-    actually given cannot disagree.
+    Kept, and no longer on the path that produces a review's coverage number. It measures
+    `pdf.render_sections`, which divides one budget across every section and hard-slices
+    each — the mechanism `harness.reading` replaced, and the one that showed readers 33%
+    to 84% of the evaluated corpus's prose. `prose_visible` below is what a review now
+    reports.
 
-    This function had its own copy of that arithmetic, and two copies of one rule are one
-    rule and one place to drift — the same lesson `_REFS_TITLES` teaches in the external
-    repository this layer borrowed its posture from, where one tuple is the single source
-    for both a scan boundary and a word count "so the two checks can never disagree".
-    The signature is kept so callers do not change.
+    Retained rather than deleted because it is the BASELINE: the difference between what
+    these two functions return on the same paper is the whole measured effect of reading
+    in parts, and a claim about that effect needs both halves computable. It still
+    delegates to `pdf.section_presentation` so it cannot drift from the renderer it
+    describes.
     """
     from .pdf import section_presentation
     p = section_presentation(list(sections or []), int(budget))
     return p.presented_chars, p.total_chars, p.sections_truncated
+
+
+def prose_visible(doc: PaperDoc, budget: int) -> tuple[int, int, int]:
+    """(visible, total, parts) — what a reader was ACTUALLY carried, under the plan.
+
+    Delegates to `harness.reading.plan`, the same call `stages/audit` makes to build the
+    prompts, so the number a review PRINTS is computed from the same traversal the readers
+    were given rather than from a second model of it. That is the property
+    `prose_presented` had against `render_sections` and it is the property that matters:
+    a coverage figure derived independently of the prompts is a figure about nothing.
+    """
+    from .reading import plan as reading_plan
+    cov = reading_plan(doc, int(budget)).coverage
+    return cov.part_local_chars, cov.extracted_prose_chars, cov.parts
 
 
 def _prose_quantity_addresses(doc: PaperDoc) -> list[str]:
@@ -248,20 +264,26 @@ def surface(doc: PaperDoc) -> ReviewSurface:
     for kind in addresses.values():
         by_kind[kind] = by_kind.get(kind, 0) + 1
 
-    presented, total, _truncated = prose_presented(list(doc.sections), budget_chars())
+    presented, total, parts = prose_visible(doc, budget_chars())
     return ReviewSurface(
         paper_id=doc.paper_id, content_sha=doc.content_sha,
         addresses=list(addresses), by_kind=by_kind,
         table_cells_nonempty=by_kind.get("table_cell", 0), table_cells_total=cells_total,
         sections=sections, prose_chars_total=total, prose_chars_presented=presented,
+        reading_parts=parts,
         surface_empty=not addresses,
     )
 
 
 def truncated_sections(doc: PaperDoc) -> int:
-    """How many sections the lens prompt cut. Reported beside the fraction because "38% of
-    the prose" and "24 of 56 sections were truncated" are different facts about the same
-    budget, and a reader needs the second to know whether the loss was spread or local."""
+    """How many sections the OLD truncating renderer would cut at the current budget.
+
+    A measurement of the alternative, not of this run: nothing is truncated under the
+    reading plan. Kept because it is the other half of the comparison — "38% of the prose,
+    and 24 of 56 sections cut" says whether the loss was spread or local, and that is what
+    a reader needs to judge how much the replacement was worth. It is deliberately not
+    printed in a review, where it would read as a property of the review that produced it.
+    """
     return prose_presented(list(doc.sections), budget_chars())[2]
 
 
@@ -321,7 +343,8 @@ def _fold_all(addresses: tuple[str, ...], units: set[str]) -> tuple[set[str], li
 
 
 def measure(surf: ReviewSurface, *, addressed: tuple[str, ...] = (),
-            examined: tuple[str, ...] = ()) -> CoverageReport:
+            examined: tuple[str, ...] = (),
+            reading: ReadingRecord | None = None) -> CoverageReport:
     """Two numerators over one denominator, from plain address STRINGS.
 
     The numerators arrive as strings and never as objects, so nothing about how they were
@@ -370,6 +393,11 @@ def measure(surf: ReviewSurface, *, addressed: tuple[str, ...] = (),
         addressed_rate=None if empty else len(named_addressed) / size,
         examined_rate=None if empty else len(named_examined) / size,
         prose_presented_fraction=fraction,
+        # Carried through, not recomputed. It is produced by `stages/audit.reading_record`,
+        # which can see which readings were actually completed — a fact about the review,
+        # and therefore a fact this function must receive rather than derive, for the same
+        # reason its numerators arrive as strings.
+        reading=reading,
         by_kind_addressed=by_kind_addressed,
     )
 
@@ -391,10 +419,16 @@ def _self_check() -> None:
         assert f"import {forbidden}" not in src and f"{forbidden}(" not in src, forbidden
 
     mp = inspect.signature(measure).parameters
-    assert list(mp) == ["surf", "addressed", "examined"], mp
+    assert list(mp) == ["surf", "addressed", "examined", "reading"], mp
     for name in ("addressed", "examined"):
         assert mp[name].kind is inspect.Parameter.KEYWORD_ONLY, name
         assert "tuple[str" in str(mp[name].annotation), mp[name].annotation
+    # `reading` is the one argument that is neither a numerator nor a denominator: it is a
+    # record of HOW THE PAPER WAS READ, which this function carries through untouched. It
+    # is a typed record and not a `TargetSet`, so the guarantee above is unchanged — no
+    # count derived from the review's own results can reach the denominator through it.
+    assert mp["reading"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert "ReadingRecord" in str(mp["reading"].annotation), mp["reading"].annotation
 
     # --- an empty surface is unmeasurable, and never perfect ---------------------------
     empty = surface(PaperDoc(paper_id="empty"))
@@ -521,16 +555,22 @@ def _self_check() -> None:
     # characters per section, and dropping the floor here would report a presented
     # fraction smaller than the one the lens was actually given.
     assert prose_presented(many, 1) == (6 * _MIN_PER_SECTION, 6 * 900, 6)
-    # and the fraction MOVES with the budget, or it is not measuring what a lens saw
+    # WHAT THE BUDGET NOW BOUNDS. It used to bound how much of the paper a reader saw;
+    # it bounds how many passes the paper takes. The fraction stays 1.0 at every budget,
+    # which is the whole point, so the thing that must still MOVE with the budget is the
+    # part count — and a check that no longer moves with its input is a check that has
+    # stopped testing anything.
     os.environ[_BUDGET_ENV] = "1000"
     try:
         tight = surface(PaperDoc(paper_id="t", sections=many))
-        assert tight.prose_chars_presented < total
-        assert measure(tight).prose_presented_fraction < 1.0
+        assert tight.reading_parts > 1, "a small budget buys more passes, not less paper"
+        assert measure(tight).prose_presented_fraction == 1.0, (
+        "the budget bounds how many passes a paper takes, and no longer how much of it "
+        "a reader is shown")
     finally:
         del os.environ[_BUDGET_ENV]
-    assert surface(PaperDoc(paper_id="t", sections=many)).prose_chars_presented > \
-        tight.prose_chars_presented, "raising the budget must raise the presented prose"
+    assert surface(PaperDoc(paper_id="t", sections=many)).reading_parts < \
+        tight.reading_parts, "raising the budget must lower the number of passes"
     assert measure(surf).prose_presented_fraction is not None
     assert measure(empty).prose_presented_fraction is None, "0 of 0 chars is not 1.0"
 

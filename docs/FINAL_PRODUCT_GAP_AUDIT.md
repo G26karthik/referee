@@ -290,10 +290,38 @@ across four separate lists, e.g. `harness/materiality.py:313-330` linear-scans f
 
 `_centrality` (`harness/discovery.py:76-102`) reads four booleans:
 
-- `in_abstract` — computed as `ref.section_idx == doc.sections[0].section_idx`
-  (`harness/discovery.py:393`). Section 0 is the untitled front-matter block, not the
-  abstract. The code's own comment (`harness/discovery.py:386-392`) records that this
-  **fired on 0 of 878 objects across the eight-paper corpus**. It is a live defect.
+- `in_abstract` — read the untitled front-matter block rather than the abstract
+  (`ref.section_idx == doc.sections[0].section_idx`). **Fixed**: `discovery` now uses
+  `materiality.abstract_section_idx`, the harness's single abstract locator.
+
+  **AND THE FIX CHANGED NOTHING, WHICH IS THE INTERESTING PART.** The re-derivation was
+  run over the eight-paper corpus before the locators were unified:
+
+  ```
+  legacy abstract locator (doc.sections[0]):     0 / 706 discovered objects
+  corrected abstract locator (materiality):      0 / 706 discovered objects
+  ```
+
+  No object's centrality moves in either spelling, so **the defect did not materially
+  affect the v2 run** and nothing in that corpus is restated because of it. The reason it
+  fires on nothing is structural: discovered objects come from table cells and parsed
+  quantities, and an abstract carries prose. `in_abstract` contributes nothing to
+  centrality on real papers however it is spelled.
+
+  What the null result actually demonstrates is larger than the bug it closes.
+  **Object-level centrality is not a reliable representation of claim importance.** Of
+  four inputs, one fires on nothing, one is a sentence-shape test, one is extractor
+  bookkeeping, and the remaining one is a count of which addresses a lens chose to attack
+  — so on this corpus centrality is very close to a record of where the panel looked.
+  24 of 706 objects are CENTRAL.
+
+  **The response is not another heuristic weight.** Adding a fifth boolean would move the
+  number without making it mean anything, and the measurement above is the evidence that
+  tuning this family of inputs is the wrong move: the family measures the wrong thing.
+  What importance actually is — which claims the paper's argument depends on — is a
+  relation between claims, and representing it is §12 of the brief, the claim/evidence
+  graph. Until that exists and has been measured against the current rule on all eight
+  papers, the decision rule stays where it is.
 - `anchored_by_confirmed` / `anchored_by_any` — whether a lens cited this address. A
   citation count, not an importance measure. `harness/materiality.py:20-23` records that
   **105 of 112 CENTRAL objects are CENTRAL only because a lens attacked the address.**

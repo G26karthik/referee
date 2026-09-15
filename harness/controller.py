@@ -57,6 +57,12 @@ from .stages import report as report_stage
 # out or hit a transient failure is not that — the same prompt run again may well
 # succeed, whether it is auditing a lens or independently grading a candidate.
 RETRYABLE = ("audit", "grade")
+# How many dispatch rounds one audit phase may run. Two is what the design needs — the
+# parts, then each lens's synthesis over its own parts — and the third is slack for a
+# reading that failed in the first round and succeeded in the second, which shifts the
+# synthesis one round later. Not a budget: the loop already stops the moment a round
+# fills nothing.
+_MAX_AUDIT_ROUNDS = 3
 
 
 @dataclass(frozen=True)
@@ -194,16 +200,20 @@ def _phase_audit(cfg: Config, case: CaseState, *, auto_audit: bool = False, **_)
     if "error" in res:
         return PhaseOutcome("error", res["error"])
     case.awaiting = list(res["awaiting"])
-    if not case.awaiting:
-        return PhaseOutcome("ok", "every lens already has a result",
+    deferred = list(res.get("deferred") or [])
+    if not case.awaiting and not deferred:
+        return PhaseOutcome("ok", "every reading already has a result",
                             {"complete": res["complete"]})
 
     if not auto_audit:
+        pending = case.awaiting + deferred
         return PhaseOutcome(
             "waiting",
-            f"{len(case.awaiting)} lens(es) have no result: {', '.join(case.awaiting)}. "
-            f"Prompts are in audit/prompts/; run with --auto-audit to delegate them.",
-            {"awaiting": case.awaiting, "prompts": res["prompts"]})
+            f"{len(pending)} reading(s) have no result: {', '.join(pending)}. "
+            f"Prompts are in audit/prompts/; run with --auto-audit to delegate them."
+            + (f" {len(deferred)} of them is a cross-part synthesis whose prompt is written "
+               f"once its own parts are in." if deferred else ""),
+            {"awaiting": case.awaiting, "deferred": deferred, "prompts": res["prompts"]})
 
     ok, why = audit_driver.available(cfg)
     if not ok:
@@ -216,15 +226,44 @@ def _phase_audit(cfg: Config, case: CaseState, *, auto_audit: bool = False, **_)
     meta = state.load_meta(cfg, case.paper_id)
     pdf_path = meta.get("paper_path") or ""
     pdf_dir = str(Path(pdf_path).resolve().parent) if pdf_path else ""
-    filled = audit_driver.fill(cfg, case.paper_id, case.awaiting, res["prompts"], pdf_dir=pdf_dir)
-    after = audit_stage.run_audit(cfg, case.paper_id)
-    case.awaiting = list(after.get("awaiting", []))
+
+    # ROUNDS, because a long paper's readings have one real dependency: a lens's cross-part
+    # synthesis reads that lens's own part outputs, so its prompt does not exist until they
+    # do. One pass would fill the parts, find the synthesis newly awaiting, and report the
+    # phase as incomplete — spending a retry attempt on a dependency that is working
+    # exactly as designed. The loop advances only while the awaiting set actually shrinks,
+    # so a genuinely stuck reading still stops here rather than spinning, and a paper that
+    # fits in one pass runs exactly one round as it always did.
+    filled = {"filled": [], "failed": {}, "rate_limited": {}, "blocked": {}, "kinds": {}}
+    after = res
+    for _ in range(_MAX_AUDIT_ROUNDS):
+        pending = list(after.get("awaiting") or [])
+        if not pending:
+            break
+        round_result = audit_driver.fill(cfg, case.paper_id, pending, after["prompts"],
+                                         pdf_dir=pdf_dir, units=after.get("units"))
+        filled["filled"] += round_result["filled"]
+        for bucket in ("failed", "rate_limited", "blocked", "kinds"):
+            filled[bucket].update(round_result.get(bucket) or {})
+        after = audit_stage.run_audit(cfg, case.paper_id)
+        if not round_result["filled"]:
+            break                                # no progress; another round cannot help
+        # A reading that failed in an earlier round and succeeded in none is still failed;
+        # one that has since been produced is not.
+        done_now = set(after.get("complete") or [])
+        for bucket in ("failed", "rate_limited", "blocked", "kinds"):
+            filled[bucket] = {k: v for k, v in filled[bucket].items() if k not in done_now}
+
+    case.awaiting = list(after.get("awaiting", [])) + list(after.get("deferred") or [])
     detail = {"filled": filled["filled"], "failed": filled["failed"],
               "rate_limited": filled["rate_limited"], "blocked": filled.get("blocked", {}),
-              "kinds": filled.get("kinds", {}), "awaiting": case.awaiting}
+              "kinds": filled.get("kinds", {}), "awaiting": case.awaiting,
+              "parts": after.get("parts"),
+              "reader_visible_fraction": after.get("reader_visible_fraction")}
     _record_failure(case, filled.get("kinds", {}))
     if not case.awaiting:
-        return PhaseOutcome("ok", f"delegated and filled {len(filled['filled'])} lens(es)", detail)
+        return PhaseOutcome("ok", f"delegated and filled {len(filled['filled'])} reading(s) "
+                                  f"across {after.get('parts', 1)} part(s) of the paper", detail)
 
     # A failure a LATER attempt could satisfy (an account limit, a 429, an overloaded
     # upstream) or one that will fail identically forever (no CLI, unauthenticated, a
@@ -235,6 +274,13 @@ def _phase_audit(cfg: Config, case: CaseState, *, auto_audit: bool = False, **_)
     # happens before the handler is even invoked. This handler is the only place that can
     # know which of the three kinds of failure it met.
     unretryable = {**filled["rate_limited"], **filled.get("blocked", {})}
+    if not (unretryable or filled["failed"]):
+        # Every dispatched reading succeeded and something is still awaiting: the only way
+        # that happens is a dependency this phase ran out of rounds for. Waiting, not
+        # retrying — the next invocation picks up where this one stopped, and a retry
+        # budget is for failures (invariant 14).
+        return PhaseOutcome("waiting", f"{len(case.awaiting)} reading(s) still to run: "
+                                       f"{', '.join(case.awaiting)}", detail)
     if unretryable:
         case.attempts["audit"] = max(0, case.attempts.get("audit", 1) - 1)
         hints = [v.get("reset_hint", "") for v in filled.get("kinds", {}).values()]
@@ -610,6 +656,25 @@ def step(cfg: Config, case: CaseState, **opts) -> CaseState:
         case.blocked_reason = ""
         case.phase = _next_phase(case.phase)
         if case.phase == "done":
+            missing = audit_stage.missing_reading_artifacts(cfg, case.paper_id)
+            if missing:
+                # A review may not finish over readings it does not have. This is the
+                # audit phase's own completeness condition asked again at the last
+                # possible moment, because by here the case may have been resumed,
+                # rewound, or driven from a cached state that never re-entered `audit` —
+                # and the finished report gives a reader no way to tell. The parts alone
+                # still produce findings, still grade and still render; what is missing
+                # is a pass this review says it performs.
+                case.phase, case.status = "audit", "waiting"
+                case.blocked_reason = (
+                    f"{len(missing)} required reading artifact(s) are missing, so this "
+                    f"review cannot be completed as the one it describes: "
+                    f"{', '.join(missing[:8])}"
+                    + (f" (+{len(missing) - 8} more)" if len(missing) > 8 else ""))
+                case.history.append(PhaseEvent(
+                    phase="done", outcome="waiting", reason=case.blocked_reason,
+                    detail={"missing": missing}, attempt=attempt, ts=state.now()))
+                return save_case(cfg, case)
             case.status = "complete"
 
     return save_case(cfg, case)

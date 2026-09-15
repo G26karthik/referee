@@ -632,14 +632,31 @@ HARNESS_OWNED_FINDING_KEYS: tuple[str, ...] = (
     "calc_class", "origin_consistency", "finding_class", "counted_severity",
     "grade_state", "binding_cap", "derivation", "grader_evidence_class",
     "grader_verified_observation", "evidence_ceiling", "evidence_sources", "grade",
+    # Reading-provenance and identity, added with the part/synthesis split. `source_part`
+    # says which reading produced a concern and `merged_from` which concerns were folded
+    # into it — both facts about how the review was conducted, and both would be a reading
+    # describing its own conduct if they came from the file. `cross_section` is derived
+    # from whether `additional_evidence` actually verified, so a reading asserting it
+    # would be asserting that a second location was checked.
+    "source_part", "merged_from", "cross_section",
 )
+# The same rule one level down. A `Finding` carries `additional_evidence`, each entry of
+# which has its own `evidence_class` and `verified_observation`, and those are the harness's
+# words for the same reason the top-level pair is: the machine half of a citation must not
+# be writable by the thing being checked. `strip_harness_keys` walks into the list, because
+# a rule enforced only at the top level is a rule with a nested hole in it.
+POINTER_OWNED_KEYS: tuple[str, ...] = ("evidence_class", "verified_observation")
+# Report-level, and harness-written for the same reason: `merged_duplicates` counts what
+# deduplication folded, which happens after a reading has finished.
+HARNESS_OWNED_REPORT_KEYS: tuple[str, ...] = ("merged_duplicates",)
 # `evidence_origin` is deliberately ABSENT from that tuple even though `Finding` describes
 # it as harness-written. `_coerce` reads the lens's own claimed origin back and compares it
 # with the origin derived from the reference's shape, which is the only way
 # `origin_consistency == "corrected"` is ever produced. Stripping it would silently turn
 # that check off — a mechanism that still runs, still passes, and can no longer fail.
 _FINDING_ALLOWED = frozenset(Finding.model_fields) - frozenset(HARNESS_OWNED_FINDING_KEYS)
-_LENS_ALLOWED = frozenset(LensReport.model_fields)
+_LENS_ALLOWED = frozenset(LensReport.model_fields) - frozenset(HARNESS_OWNED_REPORT_KEYS)
+_POINTER_ALLOWED = frozenset(("role", "evidence_quote", "evidence_ref"))
 
 
 def strip_harness_keys(data: dict) -> tuple[dict, int, int]:
@@ -673,6 +690,23 @@ def strip_harness_keys(data: dict) -> tuple[dict, int, int]:
                 kept[key] = value
             else:
                 unknown += 1
+        sides = kept.get("additional_evidence")
+        if isinstance(sides, list):
+            clean_sides = []
+            for side in sides:
+                if not isinstance(side, dict):
+                    unknown += 1
+                    continue
+                keep_side: dict = {}
+                for key, value in side.items():
+                    if key in POINTER_OWNED_KEYS:
+                        stripped += 1
+                    elif key in _POINTER_ALLOWED:
+                        keep_side[key] = value
+                    else:
+                        unknown += 1
+                clean_sides.append(keep_side)
+            kept["additional_evidence"] = clean_sides
         out_findings.append(kept)
     if "findings" in clean:
         clean["findings"] = out_findings
@@ -855,6 +889,21 @@ def parse_lens_report(text: str, lens: str) -> tuple[LensReport, dict]:
                 f"findings[{i}] ({f.get('finding_id') or 'unnamed'}) carries an "
                 f"evidence_quote but no evidence_ref; a quote with no location cannot be "
                 f"verified and must not be persisted")
+        # Same rule for every further side of a multi-location concern. Letting one
+        # through would make the second half of a cross-section claim exactly the
+        # unlocatable assertion the schema was extended to replace.
+        for j, side in enumerate(f.get("additional_evidence") or []):
+            if not isinstance(side, dict):
+                raise AuditDriverError(f"findings[{i}].additional_evidence[{j}] is not an object")
+            if not (side.get("evidence_quote") or "").strip():
+                raise AuditDriverError(
+                    f"findings[{i}].additional_evidence[{j}] carries no evidence_quote; a "
+                    f"further location with nothing quoted from it names nothing")
+            if not (side.get("evidence_ref") or "").strip():
+                raise AuditDriverError(
+                    f"findings[{i}].additional_evidence[{j}] carries an evidence_quote but "
+                    f"no evidence_ref; the second half of a cross-section concern has to be "
+                    f"as locatable as the first")
 
     # INVARIANT 2, at the boundary where the artifact is minted rather than only where the
     # verdict is computed. See `HARNESS_OWNED_FINDING_KEYS`.
@@ -869,7 +918,7 @@ def parse_lens_report(text: str, lens: str) -> tuple[LensReport, dict]:
 
 
 def run_lens(cfg: Config, pid: str, lens: str, prompt: Path, out: Path, *,
-            pdf_dir: str = "") -> dict:
+            pdf_dir: str = "", unit_id: str = "") -> dict:
     """Run the configured reviewer for one lens. Returns a record; raises on failure.
 
     The reviewer writes to a STAGING path, never to `audit/<lens>.json`, and its output
@@ -907,8 +956,13 @@ def run_lens(cfg: Config, pid: str, lens: str, prompt: Path, out: Path, *,
     if out.exists():
         out.unlink()                             # never let a stale file look like success
     staged = out.with_suffix(".staged")
-    rejected = out.with_name(f"{lens}.rejected.txt")
-    raw_kept = out.with_name(f"{lens}.raw.txt")
+    # Named off the OUTPUT rather than off the lens. A paper read in parts writes four
+    # readings of one lens into one directory, and a rejection file named for the lens
+    # would let part 3's unusable output overwrite part 2's — losing the evidence of the
+    # first failure at the moment a second one makes it interesting. Identical for a
+    # single-pass lens, whose output stem is the lens name.
+    rejected = out.with_name(f"{out.stem}.rejected.txt")
+    raw_kept = out.with_name(f"{out.stem}.raw.txt")
     for p_ in (staged, rejected, raw_kept):
         p_.unlink(missing_ok=True)
 
@@ -1008,7 +1062,8 @@ def run_lens(cfg: Config, pid: str, lens: str, prompt: Path, out: Path, *,
         state.write_json(out, report.model_dump())
 
         record = {
-            "lens": lens, "paper_id": pid, "command": cmd, "returncode": p.returncode,
+            "lens": lens, "unit_id": unit_id or lens,
+            "paper_id": pid, "command": cmd, "returncode": p.returncode,
             "seconds": round(time.time() - started, 1), "findings": len(report.findings),
             "written_by": "audit_driver",
             # TWO REPRESENTATIONS OF ONE FACT, on purpose — see `Confinement.summary`.
@@ -1042,7 +1097,7 @@ def run_lens(cfg: Config, pid: str, lens: str, prompt: Path, out: Path, *,
 
 
 def fill(cfg: Config, pid: str, awaiting: list[str], prompts: dict[str, str],
-        pdf_dir: str = "") -> dict:
+        pdf_dir: str = "", units: list[dict] | None = None) -> dict:
     """Attempt every pending lens. Partial success is success for the lenses that worked.
 
     THE BUCKETS ARE THE RETRY POLICIES, not the exception classes. `rate_limited` holds
@@ -1057,14 +1112,25 @@ def fill(cfg: Config, pid: str, awaiting: list[str], prompts: dict[str, str],
     """
     filled, failed, rate_limited, blocked, kinds = [], {}, {}, {}, {}
     audit_dir = state.project_dir(cfg, pid) / "audit"
-    for lens in awaiting:
-        prompt = Path(prompts[lens])
+    # `awaiting` holds READING UNIT ids, which are lens names on a paper that fits in one
+    # pass and `<lens>/part-02` or `<lens>/synthesis` on one that does not. `units` maps
+    # each to the lens it belongs to and the file it writes; without it the unit id IS the
+    # lens name and the output is `audit/<lens>.json`, which is the historical behaviour
+    # and what every caller that does not read in parts still gets.
+    by_unit = {u["unit_id"]: u for u in (units or [])}
+    for unit_id in awaiting:
+        spec = by_unit.get(unit_id, {})
+        lens = spec.get("lens", unit_id)
+        out_path = Path(spec["out"]) if spec.get("out") else audit_dir / f"{unit_id}.json"
+        prompt = Path(prompts[unit_id])
         try:
-            rec = run_lens(cfg, pid, lens, prompt, audit_dir / f"{lens}.json", pdf_dir=pdf_dir)
-            filled.append(lens)
+            rec = run_lens(cfg, pid, lens, prompt, out_path, pdf_dir=pdf_dir,
+                           unit_id=unit_id)
+            filled.append(unit_id)
             detail = rec.get("tool_policy_detail") or {}
             state.append_log(cfg, pid, artifact_type="audit_auto", phase="audit",
-                             headers={"lens": lens, "findings": rec["findings"],
+                             headers={"lens": lens, "unit": unit_id,
+                                      "findings": rec["findings"],
                                       "seconds": rec["seconds"],
                                       # WHICH MODEL and WHETHER CONFINED, in the case
                                       # history itself. The history line used to carry
@@ -1077,10 +1143,10 @@ def fill(cfg: Config, pid: str, awaiting: list[str], prompts: dict[str, str],
                                       "confinement_enforced": bool(detail.get("enforced")),
                                       "harness_keys_stripped": rec.get(
                                           "harness_keys_stripped", 0)},
-                             path=str(audit_dir / f"{lens}.json"))
+                             path=str(out_path))
         except AuditDriverError as e:
-            kinds[lens] = {"kind": e.kind, "retry": e.retry, "reset_hint": e.reset_hint}
-            {"later": rate_limited, "never": blocked}.get(e.retry, failed)[lens] = str(e)
+            kinds[unit_id] = {"kind": e.kind, "retry": e.retry, "reset_hint": e.reset_hint}
+            {"later": rate_limited, "never": blocked}.get(e.retry, failed)[unit_id] = str(e)
     return {"filled": filled, "failed": failed, "rate_limited": rate_limited,
             "blocked": blocked, "kinds": kinds}
 

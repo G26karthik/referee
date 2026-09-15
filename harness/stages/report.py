@@ -1767,6 +1767,37 @@ def _bounded(text: str, limit: int = _MAX_REVIEW_CHARS) -> str:
     return text
 
 
+def _reading_clause(cov) -> str:
+    """How much of the paper the readers were carried, and how it was traversed.
+
+    Says the fraction AND the mechanism, because the two answer different questions a
+    reader of a review actually has. "Shown 38% of the extracted section text" was the
+    honest sentence while one budget was divided across every section and each was
+    hard-sliced; it is the wrong sentence now, and printing it would understate a review
+    exactly as badly as the old scope line overstated one.
+
+    The anchor cost is named rather than hidden. A paper read in parts re-carries a small
+    packet — title, abstract, conclusion, outline — in every pass so that a cross-section
+    comparison stays available to a part-local reader, and that repetition is a real cost
+    this design pays. A coverage figure that quietly excluded it would be a coverage
+    figure with a subsidy in it.
+    """
+    if cov is None or cov.prose_presented_fraction is None:
+        return ""
+    rec = getattr(cov, "reading", None)
+    parts = getattr(rec, "number_of_parts", 0) or 0
+    clause = (f", and were carried {cov.prose_presented_fraction:.0%} of the extracted "
+              f"section text")
+    if not rec or parts <= 1:
+        return clause + " in a single pass"
+    overhead = rec.anchor_repeat_fraction
+    return (clause + f" in {parts} bounded parts, each repeating the paper's title, "
+            f"abstract, conclusion and section outline"
+            + (f" at a cost of {overhead:.1%} of the prose" if overhead is not None else "")
+            + f"; {rec.lens_syntheses_completed} of {rec.lens_syntheses_required} "
+              f"cross-part syntheses completed")
+
+
 def render_reviewer_report(report: EvalReport, target_set=None) -> str:
     """The one-to-two page report a human reviewer reads. NOT the evidence ledger.
 
@@ -2042,9 +2073,7 @@ def render_reviewer_report(report: EvalReport, target_set=None) -> str:
           f"- review path: **{art_path}** — {_ARTIFACT_GLOSS.get(art_state, art_state)}",
           f"- {len(report.lenses_run)} independent lens(es) read the paper: "
           f"{', '.join(report.lenses_run) or 'none'}"
-          + (f", and were shown {cov.prose_presented_fraction:.0%} of the extracted "
-             f"section text (the lens prompt has a character budget)"
-             if cov is not None and cov.prose_presented_fraction is not None else ""),
+          + _reading_clause(cov),
           f"- {report.dropped_findings} finding(s) were dropped because their evidence could "
           f"not be re-verified against the paper",
           # The funnel, in the reader's words, with the two terms that used to be conflated
@@ -2275,7 +2304,13 @@ def run_report(cfg: Config, pid: str) -> dict:
     report.document_observations = list(docintegrity.observe(doc))
     surf = coverage_mod.surface(doc)
     addressed, examined = coverage_numerators(target_set)
-    report.coverage = coverage_mod.measure(surf, addressed=addressed, examined=examined)
+    # HOW THE PAPER WAS READ, produced by the stage that built the prompts and carried
+    # through rather than re-derived here. `measure` cannot compute it: which lens
+    # syntheses were actually completed is a fact about artifacts on disk, and a coverage
+    # layer that went looking for them would be a coverage layer reading the review.
+    report.coverage = coverage_mod.measure(
+        surf, addressed=addressed, examined=examined,
+        reading=artifacts_mod.ReadingRecord(**audit_stage.reading_record(cfg, pid, doc)))
 
     report.outcome = outcome_mod.derive(
         report, target_set, unchecked_central=len(unchecked_central(objects, outcomes)))

@@ -131,6 +131,8 @@ papers → controller → ingest → audit → collect → grade → assess → 
 |---|---|---|---|---|
 | ingest | `stages/ingest.py` | PDF → `paper/doc.json` | nothing (deterministic) | `error` on an unreadable PDF |
 | audit | `stages/audit.py` + `audit_driver.py` | doc → `audit/<lens>.json` ×4 | the four lenses judge | `waiting`, resumable |
+| ↳ parts | `reading.py` + `pdf.plan_reading` | doc → N bounded passes per lens | nothing; a traversal | — |
+| ↳ synthesis | `reading.synthesis_brief` | one lens's own verified observations → one cross-part pass | proposes only | — |
 | collect | `stages/audit.load_reports` | lens files → verified findings | quote ≟ paper | drops the finding, counts it |
 | grade | `stages/grade.py` + `grade_driver.py` | serious findings → `audit/grade/<slug>.json` | a second, blinded reviewer per candidate | `ok` with partial coverage — never blocks a report by default |
 | assess | `assessment.py` | findings + grades → `CaseState.assessment` | has a material failure already been established, and is the investigation still open | never blocks; `investigation_open` is an INPUT to `planner.classify` |
@@ -431,7 +433,33 @@ Do not weaken these to make more papers executable or more findings reportable.
     non-guarantees are printed: issue recall is neither claimed nor measurable, accuracy is
     unmeasured for want of adjudicated ground truth, novelty is not checked at all, and
     nothing in a review says the paper is correct.
-29. **A batch's paper count is checked before it is spent.** `harness/preflight.py`
+29. **A cross-section concern cites every side, and every side resolves alone.**
+    `Finding.additional_evidence` carries the further locations one concern depends on,
+    each with its own quotation and reference, each re-verified against the parsed paper
+    independently. A concern with a side that does not resolve is DROPPED WHOLE and
+    counted — never kept with the half that happened to check out. Written as one
+    quotation plus prose asserting that another section disagrees, such a concern is
+    unfalsifiable: the second half names nothing a reader can open, and it would have
+    arrived through the cross-part synthesis, which exists to find exactly these. The
+    confidence ceiling is computed from the WEAKEST side (`weakest_evidence_class`),
+    because a concern is only as checkable as its least checkable half — and deliberately
+    NOT by passing the extra citations to `grading.evidence_support` as corroborating
+    sources, which would let one reader lift its own ceiling by citing twice.
+
+30. **Deduplication is over resolved addresses and closed vocabulary, never over text.**
+    Two concerns are one concern when the same lens raised them, they classify themselves
+    identically in every closed vocabulary, and they were established from exactly the
+    same ordered set of locations. The key is the lens's own classification and not
+    `scientific_class`, which is a SUMMARY of it: on `apt-icml`, `protocol-03` (Table 2
+    prints 100.0% where Table 11 shows the same computation) and `protocol-09` (the
+    abstract normalises against LoRA+Prune, not fine-tuning) anchor on the same quoted row
+    of page 20 and both summarise to CONTRADICTION. Keyed on the summary, the review lost
+    one of them. Over-merging DELETES a real concern and leaves a merged id as its only
+    trace; under-merging reports one concern twice, which a reader can see and the
+    synthesis is asked to fold. The key errs toward the second. Over the evaluated corpus
+    it now merges 0 of 227 findings, which is correct: each lens there read once.
+
+31. **A batch's paper count is checked before it is spent.** `harness/preflight.py`
     answers, per requested file, which `paper_id` it will get, whether that id already
     holds a DIFFERENT document, and whether another requested file is the SAME document —
     all from the PDF's bytes. Two different papers that slugify identically are fine and
@@ -453,10 +481,13 @@ Do not weaken these to make more papers executable or more findings reportable.
 discovered on PATH — as **one subprocess per lens**, which is stronger isolation than
 four lenses read in one session. It is opt-in because it spends tokens.
 
-Without it, `review` writes `audit/prompts/<lens>.md`, exits 2, and resumes when the
-lens files exist. If you fill them yourself, **run each lens in a separate turn**: four
-independent readings are four pieces of evidence; one context that remembers the
-previous three is one reading echoed four times.
+Without it, `review` writes the prompts, exits 2, and resumes when the reading files
+exist. If you fill them yourself, **run each lens in a separate turn**: four independent
+readings are four independent PROPOSAL STREAMS, and one context that remembers the
+previous three is one reading echoed four times. (They are not four pieces of evidence —
+nothing a lens writes is evidence until the harness re-verifies its quotation.) The parts
+of ONE lens are a different matter and are blind to each other for a different reason; see
+the reading design above.
 
 Abstention is an outcome, not a failure. A paper with no repository, an ambiguous
 experiment or a 24 GiB demand on an 8 GiB card still gets a complete review;
@@ -484,6 +515,44 @@ finish, the `failure_kind` that stopped it.
 
 Never edit `projects/<pid>/audit/prompts/*.md` — regenerated every run.
 
+**A LONG PAPER IS READ IN PARTS, AND THE PARTS ARE BLIND TO EACH OTHER.** A paper that
+fits in one pass is unchanged: one prompt, one `audit/<lens>.json`, no synthesis, four
+model calls. A paper that does not is traversed in N bounded parts per lens, and then one
+cross-part synthesis per lens:
+
+```
+audit/prompts/<lens>/part-01.md          audit/<lens>/parts/part-01.json
+audit/prompts/<lens>/synthesis.md        audit/<lens>/parts/part-01.driver.json
+audit/reading/<lens>/part-01.manifest.json   audit/<lens>/synthesis.json
+                                         audit/<lens>.json        <- COMPOSED
+```
+
+The composed lens file is what every later stage reads, so nothing downstream knows or
+cares how the paper was traversed. Its `.driver.json` carries `written_by:
+composed_from_parts` and names every part's own sealed sidecar, so provenance is by
+reference rather than weakened.
+
+Three properties, and each is checked against the prompt bytes rather than asserted
+(`tests/test_part_audit_stage.py`):
+
+  * **A part never sees another part's findings.** What crosses a part boundary is the
+    ANCHOR PACKET — title, abstract, conclusion, section outline — extracted, identical in
+    every part, and carrying no model output. It exists so the comparison the
+    contradiction lens was built for survives splitting.
+  * **A lens never sees another lens's anything**, exactly as before. Splitting a paper
+    did not cost this and is not permitted to.
+  * **The synthesis proposes and decides nothing.** Its input is the anchors plus that
+    lens's own candidates that ALREADY passed quotation verification; it may merge,
+    connect, propose, or WITHDRAW. Everything it returns passes the same verification,
+    the same evidence ceiling, the same caps, and the same blinded grading as a part
+    reader's concern — and the grader is never told which pass produced what it is
+    weighing.
+
+Stated for a paper: *each scientific lens is isolated from the other lenses; long papers
+are traversed in bounded parts without exposing one part's model findings to the next; and
+a final lens-local synthesis combines only quotation-grounded observations from that lens
+to recover cross-section relationships.*
+
 ## Execution gates
 
 | gate | env var | default | permits |
@@ -501,10 +570,12 @@ Never edit `projects/<pid>/audit/prompts/*.md` — regenerated every run.
 | alignment trial | `SH_ALLOW_ALIGNMENT_TRIAL` | off | probing a candidate command's `--help` surface. **Gates nothing today: `alignment/trial.py` has no production caller** (see Known limitations) |
 | diagnostic | `SH_DIAGNOSTIC_MODE` | off | running an inadmissible probe anyway and recording its result SEPARATELY, where it settles nothing |
 
-`SH_AUDIT_BUDGET_CHARS` lives outside `Config` (`stages/audit.SECTION_BUDGET_CHARS`) and
-decides how much of the paper a lens is shown. It is the ceiling on recall, and
-`coverage.budget_chars` re-reads the same variable so the number a review PRINTS is the
-number the prompt USED.
+`SH_AUDIT_BUDGET_CHARS` lives outside `Config` and now decides how much of the paper one
+PASS carries, not how much of the paper a lens is shown — lowering it buys more parts, not
+less paper. There is exactly one reader of the variable, `coverage.budget_chars`;
+`stages/audit.budget_chars` delegates to it at call time, so the budget a review PRINTS
+and the budget its prompts were built at cannot differ. `stages/audit.SECTION_BUDGET_CHARS`
+is the default (70,000), not the live value.
 
 `SH_MAX_TARGETS` (default 3) is a BUDGET, not a gate: which targets are worth pursuing is
 `planner`'s decision and the order is `priority`'s, so lowering it drops the least useful
@@ -780,13 +851,28 @@ were current.
   blockers (see `docs/HARNESS_ARCHITECTURE.md` §6).
 - Commit pinning is second-run-onward — the first acquisition of a paper is an unpinned
   depth-1 clone of the default branch.
-- **The lenses read a truncated paper, and now say so.** `pdf.render_sections` divides
-  `SECTION_BUDGET_CHARS` across sections, so a long paper is cut before any lens reads a
-  word of it. Measured presented fraction over the shipped corpus: 0.384, 0.411, 0.489,
-  0.589, up to 0.745. The review's scope line said "4 independent lens(es) read the paper"
-  and now adds the fraction. This is the ceiling on any recall claim this system makes and
-  it was unmeasured until `pdf.section_presentation` existed. Nothing raises the budget:
-  the number is reported, not fixed.
+- **The lenses read a truncated paper. They no longer do, and the replacement has its
+  own costs.** `pdf.render_sections` divided `SECTION_BUDGET_CHARS` equally across sections
+  and hard-sliced each, so a long paper was cut before any lens read a word of it:
+  0.335 on `acl`, 0.407 on `sanchez24a-icml`, up to 0.841, measured. `harness/reading.py`
+  replaces the cut with a PLAN — the fewest bounded parts that tile the paper — and
+  `reader_visible_fraction` is **1.000 on all twelve documents in this repository**. The
+  old number is still computable (`coverage.prose_presented`) because it is the baseline
+  the claim is made against.
+
+  What it costs, measured rather than estimated:
+
+  | | before | after |
+  |---|---|---|
+  | prose a reader is carried | 0.335-0.841 | 1.000 |
+  | model calls, paper that fits | 4 | 4 |
+  | model calls, paper that does not | 4 | 12 (4 lenses x 2 parts + 4 syntheses) |
+  | repeated-anchor overhead, corpus-wide | - | 3.17% of prose |
+
+  Five of the twelve need two parts; none needs three. The ceiling that remains is
+  EXTRACTION, which is unmeasured rather than measured-and-good: `extracted_text_fraction`
+  reads 1.000 everywhere because it asks only whether prose was recovered from each page,
+  and how much of each page was recovered has no denominator this artifact can compute.
 - **Structural coverage is not issue recall and the gap is not small.** Over the seven
   shipped documents, 33% of the addressable surface got an address and 1.8% had a route
   pursued. Those are honest numbers about a first-pass screen and they are not a statement

@@ -40,8 +40,9 @@ from pathlib import Path
 import pytest
 
 from harness import claims, coverage, discovery, grading, pdf, planner, priority
-from harness.artifacts import (CoverageReport, PaperDoc, ReviewSurface, SURFACE_KINDS,
-                               Equation, Figure, QuantFinding, Section, Table)
+from harness.artifacts import (CoverageReport, PaperDoc, ReadingRecord, ReviewSurface,
+                               SURFACE_KINDS, Equation, Figure, QuantFinding, Section,
+                               Table)
 from harness.stages import audit as audit_stage
 from harness.stages import report as report_stage
 
@@ -52,10 +53,12 @@ _HAS_REAL = _REAL.is_file()
 needs_real = pytest.mark.skipif(not _HAS_REAL,
                                 reason="the sanchez24a-icml doc is not present")
 
-# The fraction of each paper's extracted prose that `pdf.render_sections` actually places
-# in a lens prompt. Asserted, not merely recorded: if extraction or the budget changes,
-# the review's "4 independent lens(es) read the paper" bullet is bounded by a different
-# number and someone has to know.
+# THE BASELINE, and no longer what a review reports. This is the fraction of each
+# paper's extracted prose that `pdf.render_sections` placed in a lens prompt — the
+# truncating renderer `harness.reading` replaced. It is kept and still asserted because it
+# is the "before" half of a measured claim: the effect of reading a paper in bounded parts
+# is the difference between these numbers and 1.0, and a claim about that effect needs
+# both halves computable rather than one of them remembered.
 #
 # AND SOMEONE DID. These were first measured under extraction version 1 as
 # {sanchez 0.384, acl 0.411, iclr 0.489, apt 0.589}. The v2 re-parse changed how many
@@ -171,10 +174,17 @@ def test_the_coverage_module_imports_nothing_that_could_hand_it_a_finding():
     assert "from .stages" not in src, "a pure measurement module may not import a stage"
     # The whole import surface, pinned: `Finding`, `TargetSet` and the rest of the
     # review's own vocabulary are not in it, and adding one is a visible edit here.
-    assert "from .artifacts import (CoverageReport, PaperDoc, ReviewSurface, Section,\n" \
-           "                        SURFACE_KINDS)" in src
+    assert "from .artifacts import (CoverageReport, PaperDoc, ReadingRecord, ReviewSurface,\n" \
+           "                        Section, SURFACE_KINDS)" in src
     assert "from . import claims, pdf" in src, "claims for the address grammar, pdf for "\
                                                "the lens budget, and nothing else"
+    # `harness.reading` is reached, function-locally, exactly as `pdf` is. It is admissible
+    # here for the reason `pdf` is: its whole input is a `PaperDoc` and its whole output is
+    # a traversal of that document, so it can no more hand this module a finding than the
+    # extractor can. Pinned so that adding a second, freer import is a visible edit.
+    assert "from .reading import plan as reading_plan" in src
+    for banned in ("Finding", "TargetSet", "DiscoveredObject", "TargetOutcome"):
+        assert f"import {banned}" not in src and f", {banned}" not in src, banned
 
 
 def test_a_numerator_reaches_the_denominator_only_as_an_address_string():
@@ -183,10 +193,19 @@ def test_a_numerator_reaches_the_denominator_only_as_an_address_string():
     targets_discovered` came to divide one list by itself. Addresses are strings, and an
     object is refused rather than stringified into an off-surface row."""
     params = inspect.signature(coverage.measure).parameters
-    assert list(params) == ["surf", "addressed", "examined"], params
+    assert list(params) == ["surf", "addressed", "examined", "reading"], params
     for name in ("addressed", "examined"):
         assert params[name].kind is inspect.Parameter.KEYWORD_ONLY
         assert "tuple[str" in str(params[name].annotation), params[name].annotation
+    # The one argument that is neither numerator nor denominator. It describes HOW THE
+    # PAPER WAS READ and is carried through untouched; it is a `ReadingRecord` and not a
+    # `TargetSet`, so no count derived from the review's own results can reach the
+    # denominator through it. A record is a fact about the reading, not about the findings.
+    assert params["reading"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert "ReadingRecord" in str(params["reading"].annotation)
+    assert not any(field in ReadingRecord.model_fields
+                   for field in ("findings", "targets", "addressed", "examined",
+                                 "severity", "verdict"))
 
     doc = _paper()
     surf = coverage.surface(doc)
@@ -430,8 +449,17 @@ def test_measuring_a_paper_does_not_change_it():
 
 def test_the_address_set_is_a_function_of_the_document_and_not_of_the_lens_budget():
     """Prevents a denominator that moves with this harness's configuration: the audit
-    budget bounds what a lens READ, and reporting it as part of the paper's surface would
-    make coverage a property of `SH_AUDIT_BUDGET_CHARS`."""
+    budget bounds how the paper is traversed, and reporting it as part of the paper's
+    surface would make coverage a property of `SH_AUDIT_BUDGET_CHARS`.
+
+    WHAT THE BUDGET BOUNDS HAS CHANGED, and the assertion changed with it. It used to
+    bound how much of the paper a reader was shown, so a narrow budget lowered
+    `prose_chars_presented`; it now bounds how many bounded passes the paper is read in,
+    so a narrow budget raises `reading_parts` and the prose carried is the same. Both
+    facts are asserted, because "the denominator does not move" is only half of what this
+    test is for — the other half is that the budget still moves SOMETHING, or it has
+    stopped being a budget.
+    """
     import os
     doc = _paper()
     doc.sections.append(Section(section_idx=2, title="Long", page_start=3, text="z" * 9000))
@@ -443,7 +471,9 @@ def test_the_address_set_is_a_function_of_the_document_and_not_of_the_lens_budge
         del os.environ["SH_AUDIT_BUDGET_CHARS"]
     assert narrow.addresses == wide.addresses
     assert narrow.by_kind == wide.by_kind and narrow.sections == wide.sections
-    assert narrow.prose_chars_presented < wide.prose_chars_presented
+    assert narrow.prose_chars_presented == wide.prose_chars_presented == \
+        wide.prose_chars_total, "a narrower budget must not cost a reader any of the paper"
+    assert narrow.reading_parts > wide.reading_parts == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -633,17 +663,25 @@ def test_the_presented_prose_arithmetic_reproduces_what_the_lens_prompt_contains
 
 
 @needs_real
-@pytest.mark.parametrize("pid,expected", sorted(_MEASURED_PRESENTED.items()))
-def test_a_truncated_section_is_not_counted_as_prose_the_lens_read(pid, expected):
-    """Prevents the review's "4 independent lens(es) read the paper" bullet standing
-    unqualified: the lens prompt divides a character budget across sections, so on `acl`
-    the four lenses were shown 34% of the extracted prose. This is the ceiling on any
-    recall claim this system makes and it was unmeasured before this module existed.
+@pytest.mark.parametrize("pid,baseline", sorted(_MEASURED_PRESENTED.items()))
+def test_the_whole_paper_now_reaches_a_reader_on_every_corpus_document(pid, baseline):
+    """The measurement this work exists for, on the real documents, in both directions.
 
-    The pinned numbers belong to an EXTRACTION VERSION, which is asserted below. They were
-    first measured under v1 and every one of them moved under v2, because v2 changed how
-    many sections a paper has and the budget is divided per section. A number pinned
-    without its version is a number that silently stops meaning what it says.
+    BEFORE: `pdf.render_sections` divides one character budget across every section and
+    hard-slices each, so on `acl` the four lenses were shown 34% of the extracted prose
+    while the review's scope bullet said they read the paper. Those fractions are pinned
+    in `_MEASURED_PRESENTED_V2` and are still asserted here, because a claim about an
+    improvement needs its baseline to be computable rather than remembered.
+
+    AFTER: `harness.reading.plan` traverses the same document in bounded parts that tile
+    it, so every character of every extracted section reaches some pass. The assertion is
+    exact — 1.0, not "higher than before" — because the guarantee is coverage and a
+    guarantee stated as an inequality is a guarantee nobody can fail.
+
+    The pinned baselines belong to an EXTRACTION VERSION, which is checked below. They
+    were first measured under v1 and every one moved under v2, because v2 changed how many
+    sections a paper has and the old budget was divided per section. A number pinned
+    without its version silently stops meaning what it says.
     """
     if not Path(f"projects/{pid}/paper/doc.json").is_file():
         pytest.skip(f"{pid} is not present")
@@ -651,30 +689,42 @@ def test_a_truncated_section_is_not_counted_as_prose_the_lens_read(pid, expected
     if int(doc.extraction_version or 1) != _MEASURED_UNDER_EXTRACTION_VERSION:
         pytest.skip(f"{pid} is extraction v{doc.extraction_version}; these fractions were "
                     f"measured under v{_MEASURED_UNDER_EXTRACTION_VERSION}")
+    # the baseline, still reproducible from the renderer it describes
+    old, total, cut = coverage.prose_presented(list(doc.sections), coverage.budget_chars())
+    assert total and old / total == pytest.approx(baseline, abs=0.002)
+    assert cut > 0, "the baseline is a truncation, so something must have been truncated"
+
     rep = coverage.measure(coverage.surface(doc))
-    assert rep.prose_presented_fraction == pytest.approx(expected, abs=0.002)
-    assert coverage.truncated_sections(doc) > 0
-    # and the property the numbers are evidence FOR, which holds whatever they are
-    assert 0.0 < rep.prose_presented_fraction < 1.0, (
-        "a lens was shown either none of the paper or all of it, so the scope bullet's "
-        "qualification would be meaningless")
+    assert rep.prose_presented_fraction == 1.0, (
+        f"{pid}: a reader must be carried the whole of what extraction recovered")
+    assert coverage.surface(doc).reading_parts >= 1
 
 
-def test_raising_the_lens_budget_raises_the_presented_fraction():
-    """Prevents a ceiling that does not track the thing it measures: if the fraction does
-    not move with `SH_AUDIT_BUDGET_CHARS`, it is not measuring what a referee could see."""
+def test_lowering_the_lens_budget_costs_passes_and_never_paper():
+    """Prevents the budget quietly becoming a recall ceiling again.
+
+    The old assertion here was that the presented fraction RISES with the budget, which
+    was the correct check while the budget decided how much of a paper a reader saw. It is
+    the wrong check now and keeping it would have been worse than deleting it: it would
+    have passed on any implementation that still truncated. What must hold instead is that
+    the fraction is 1.0 at every budget — including one far too small for the paper — and
+    that the cost of a small budget shows up as more passes.
+    """
     import os
     doc = PaperDoc(paper_id="long", n_pages=2, sections=[
         Section(section_idx=i, title=f"S{i}", page_start=1, text="y" * 4000)
         for i in range(8)])
-    seen = []
+    fractions, parts = [], []
     for budget in ("4000", "16000", "64000"):
         os.environ["SH_AUDIT_BUDGET_CHARS"] = budget
         try:
-            seen.append(coverage.measure(coverage.surface(doc)).prose_presented_fraction)
+            surf = coverage.surface(doc)
+            fractions.append(coverage.measure(surf).prose_presented_fraction)
+            parts.append(surf.reading_parts)
         finally:
             del os.environ["SH_AUDIT_BUDGET_CHARS"]
-    assert seen == sorted(seen) and seen[0] < seen[-1] == 1.0, seen
+    assert fractions == [1.0, 1.0, 1.0], fractions
+    assert parts == sorted(parts, reverse=True) and parts[0] > parts[-1] == 1, parts
 
 
 def test_a_paper_with_no_prose_reports_no_presented_fraction_rather_than_a_full_one():

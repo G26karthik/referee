@@ -488,6 +488,34 @@ class Grade(_Base):
     notes: str = ""
 
 
+class EvidencePointer(_Base):
+    """One SIDE of a concern that lives in more than one place in the paper.
+
+    A cross-section concern — the abstract asserts what the conclusion concedes, a table
+    disagrees with the prose that cites it — has two locations and is only checkable if
+    both of them are. Written as one quotation plus prose asserting that some other
+    section disagrees, it is unfalsifiable: the second half names nothing a reader can
+    open, so the claim rests on the model's word for what the rest of the paper says.
+    That is precisely the shape of assertion this harness refuses everywhere else, and it
+    would have arrived through the cross-part synthesis, which exists to find exactly
+    these relationships.
+
+    So each side carries its own quotation and its own reference, each resolves against
+    the parsed paper independently, and a finding any of whose sides fails to resolve is
+    dropped whole. `role` is the lens's own label for what this side is ("abstract
+    claim", "conclusion concession"); it is prose and decides nothing.
+    """
+
+    role: str = Field(default="", description="the lens's label for this side of the concern")
+    evidence_quote: str = Field(default="", description="verbatim text at this location")
+    evidence_ref: str = Field(default="", description="'p7' | 'T2:r3:c4' | 'F1' | 'E2'")
+    # HARNESS-WRITTEN, exactly as on `Finding` and for the same reason (invariant 2): a
+    # lens must not be able to certify that its own second citation was checked.
+    evidence_class: str = Field(default="", description="WRITTEN BY THE HARNESS: "
+                                                        + " | ".join(EVIDENCE_CLASSES))
+    verified_observation: str = Field(default="", description="WRITTEN BY THE HARNESS")
+
+
 class Finding(_Base):
     """One defect a lens asserts, with the layers of its justification kept apart.
 
@@ -522,6 +550,12 @@ class Finding(_Base):
     verifiable_by_experiment: bool = Field(
         default=False, description="could a reproduction run settle this? drives the S3 trigger"
     )
+    additional_evidence: list[EvidencePointer] = Field(
+        default_factory=list,
+        description="further locations this ONE concern depends on. Empty for an ordinary "
+                    "single-location finding. Every entry is verified exactly as "
+                    "`evidence_quote`/`evidence_ref` are, and a finding with an "
+                    "unresolvable side is dropped rather than kept with one half checked.")
 
     # --- the traceability split -------------------------------------------------------
     claim: str = Field(
@@ -594,6 +628,23 @@ class Finding(_Base):
     origin_consistency: str = Field(
         default="", description="WRITTEN BY THE HARNESS: 'consistent' or 'corrected' against "
                                 "whatever origin the lens itself claimed")
+    cross_section: bool = Field(
+        default=False,
+        description="WRITTEN BY THE HARNESS: true when `additional_evidence` is non-empty, "
+                    "i.e. this concern was established from more than one location. Derived "
+                    "rather than asserted, so it cannot say two locations were checked when "
+                    "one was.")
+    source_part: str = Field(
+        default="",
+        description="WRITTEN BY THE HARNESS: which reading produced this concern — "
+                    "'part-01', 'synthesis', or '' for a paper read in one pass. A fact "
+                    "about how the review was conducted; it reaches no threshold.")
+    merged_from: list[str] = Field(
+        default_factory=list,
+        description="WRITTEN BY THE HARNESS: finding ids folded into this one because they "
+                    "carried the identical resolved address set, lens and scientific class. "
+                    "Deduplication is over ADDRESSES, never over how similar two prose "
+                    "statements sound.")
 
     # --- the independent grader (Stage 3/4) --------------------------------------------
     grade: Grade | None = Field(default=None, description="the blinded second reviewer's claim, "
@@ -659,6 +710,13 @@ class LensReport(_Base):
         default="", description="the obvious baseline/comparison this lens finds conspicuously absent"
     )
     notes: str = Field(default="", description="what the auditor actually checked vs skimmed")
+    merged_duplicates: int = Field(
+        default=0,
+        description="WRITTEN BY THE HARNESS: concerns folded into an earlier one because "
+                    "they resolved to the identical address set under the same lens and the "
+                    "same scientific class. Counted rather than silent: a paper read in "
+                    "parts can raise one concern twice, and a merge that left no trace "
+                    "would look like a reader that found less.")
 
 
 # --------------------------------------------------------------------------- #
@@ -2286,14 +2344,67 @@ class ReviewSurface(_Base):
     prose_chars_total: int = Field(default=0, description="extracted section text, in full")
     prose_chars_presented: int = Field(
         default=0,
-        description="how much of it `pdf.render_sections` actually placed in the lens prompt. "
-                    "The prompt has a character budget divided across sections, so a long "
-                    "paper is TRUNCATED before a lens reads it — the ceiling on any recall "
-                    "claim, and unmeasured until this field existed.")
+        description="how much of it a reading pass actually carried, computed from the same "
+                    "`harness.reading.plan` call that builds the prompts. It is the ceiling "
+                    "on any recall claim. It used to measure `pdf.render_sections`, which "
+                    "divided one budget across every section and hard-sliced each, so a long "
+                    "paper was TRUNCATED before a lens read a word of it; the plan tiles the "
+                    "paper in bounded parts instead, and `coverage.prose_presented` still "
+                    "computes the old number so the difference stays measurable.")
+    reading_parts: int = Field(
+        default=1,
+        description="how many bounded passes the paper was traversed in at this budget. One "
+                    "means it fitted whole and no cross-part synthesis was required.")
     surface_empty: bool = Field(
         default=True,
         description="true when extraction recovered no addressable unit at all. A rate over "
                     "an empty surface is None, never 1.0.")
+
+
+class ReadingRecord(_Base):
+    """HOW THE PAPER WAS READ — seven numbers that answer seven different questions.
+
+    They are separate for the reason the four axes are separate: collapsing them is how
+    "the lenses read the paper" gets printed about a run in which they read a third of it.
+
+    `extracted_text_fraction` is about EXTRACTION and `reader_visible_fraction` is about
+    the READER, and they compose — a page extraction recovered nothing from is invisible
+    to a reader however complete the reading plan is. The first has the PDF's own page
+    count as its denominator, so unlike a rate computed over recovered objects it cannot
+    be raised by a worse extractor.
+
+    `reader_visible_fraction` is the ceiling on any recall claim this system makes, and it
+    is the number this work exists to move: `pdf.render_sections` divided one budget
+    across every section and hard-sliced each, presenting between 0.33 and 0.84 of the
+    extracted prose across the evaluated corpus. `harness.reading` replaces the cut with a
+    plan of bounded parts that tile the paper, and `anchor_repeat_fraction` is what that
+    costs — the stable packet each part re-carries so a cross-section comparison stays
+    available in every pass.
+
+    NONE OF THESE IS ISSUE RECALL. `CoverageReport.semantic_coverage` says so in the same
+    artifact, unconditionally, and for the same reason it always did.
+    """
+
+    extracted_prose_chars: int = 0
+    pages_with_text: int = 0
+    pages_total: int = 0
+    extracted_text_fraction: float | None = Field(
+        default=None, description="pages extraction recovered prose from / pages in the PDF")
+    reader_visible_chars: int = 0
+    reader_visible_fraction: float | None = Field(
+        default=None,
+        description="of the extracted prose, what some reading pass actually carried. "
+                    "1.0 is the target and None — never 1.0 — when there is no prose.")
+    anchor_chars: int = 0
+    anchor_repeat_chars: int = 0
+    anchor_repeat_fraction: float | None = None
+    number_of_parts: int = 1
+    lenses_total: int = 0
+    lenses_completed: int = 0
+    lens_syntheses_required: int = Field(
+        default=0, description="one per lens on a paper read in more than one part, zero "
+                               "otherwise — a paper read whole has nothing to synthesise across")
+    lens_syntheses_completed: int = 0
 
 
 class CoverageReport(_Base):
@@ -2317,7 +2428,17 @@ class CoverageReport(_Base):
     off_surface: list[str] = Field(default_factory=list)
     addressed_rate: float | None = None
     examined_rate: float | None = None
-    prose_presented_fraction: float | None = None
+    prose_presented_fraction: float | None = Field(
+        default=None,
+        description="of the extracted prose, what a reading pass actually carried. The same "
+                    "measurement as `reading.reader_visible_fraction` and computed from the "
+                    "same `harness.reading.plan` call, under the name the frozen evaluation "
+                    "artifacts and the manuscript already use — renaming it would silently "
+                    "change what a published number meant.")
+    reading: ReadingRecord | None = Field(
+        default=None,
+        description="how this paper was read: parts, coverage, anchor cost, and how many "
+                    "lens syntheses were required and completed.")
     by_kind_addressed: dict[str, int] = Field(default_factory=dict)
     # ALWAYS PRESENT, and always this value. Borrowed from the one external repo that got
     # this right: its claim-coverage report carries `semantic_extraction_coverage:

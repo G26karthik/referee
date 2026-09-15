@@ -662,7 +662,17 @@ INVARIANT_DISPOSITION: dict[int, str] = {
         "semantic_coverage. SURFACE_FULLY_EXAMINED already carries the conditional half",
     28: "not reportable as a guarantee: this invariant IS this module. A boolean saying "
         "the guarantees were checked from artifacts would be checked from nothing",
-    29: "not reportable here: a batch's paper count is checked by harness/preflight.py "
+    # A cross-section concern's FURTHER locations are evidence pointers, so they fall
+    # under the guarantee whose name already promises every one of them. `_check_pointers`
+    # walks `additional_evidence`; before it did, a concern could satisfy a guarantee
+    # called EVERY_EVIDENCE_POINTER_RE_VERIFIED with one of its two citations checked.
+    29: "EVERY_EVIDENCE_POINTER_RE_VERIFIED",
+    30: "not reportable as a guarantee: that deduplication keys on resolved addresses and "
+        "closed vocabulary rather than on how two statements read is enforced by the "
+        "construction of the key, so a review cannot fail to apply it. What a review "
+        "reports instead is LensReport.merged_duplicates — the count of concerns actually "
+        "folded — which is a measurement and not a promise",
+    31: "not reportable here: a batch's paper count is checked by harness/preflight.py "
         "BEFORE the pipeline runs, and this artifact is per paper and per run. A "
         "preflight refusal means no review exists to carry a guarantee",
 }
@@ -697,3 +707,32 @@ def test_every_process_guarantee_traces_back_to_an_invariant():
                if not d.startswith("not reportable")}
     assert claimed == set(guarantees.PROCESS_GUARANTEES), (
         claimed ^ set(guarantees.PROCESS_GUARANTEES))
+
+
+def test_a_cross_section_finding_is_checked_on_every_one_of_its_pointers():
+    """The guarantee is called EVERY evidence pointer, so it must mean every one.
+
+    A concern that depends on two locations carries two citations, each with its own
+    harness-written evidence class. Checking only the primary would let such a finding
+    satisfy a promise about all of them with half of them checked — and the half that
+    would go unchecked is exactly the one a cross-part synthesis proposed.
+
+    `stages/audit._coerce` drops such a finding whole before it can reach a report, so a
+    failure here means that drop did not happen. Which is why the check is here as well:
+    a guarantee that trusts an earlier stage to have been correct is checking nothing.
+    """
+    from harness.artifacts import EvidencePointer
+
+    both_good = Finding(
+        finding_id="f-ok", lens="contradiction", evidence_class="prose_verified",
+        additional_evidence=[EvidencePointer(evidence_ref="T1:r0:c0",
+                                             evidence_class="cell_verified")])
+    one_bad = Finding(
+        finding_id="f-half", lens="contradiction", evidence_class="prose_verified",
+        additional_evidence=[EvidencePointer(evidence_ref="p9", evidence_class="unverified")])
+
+    ok, why = guarantees._check_pointers(EvalReport(paper_id="p", findings=[both_good]))
+    assert ok is True and "2 evidence pointer(s)" in why, why
+
+    ok, why = guarantees._check_pointers(EvalReport(paper_id="p", findings=[one_bad]))
+    assert ok is False and "f-half" in why, why

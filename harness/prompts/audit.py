@@ -333,6 +333,16 @@ which items it could not confirm, per finding — so an unmet one is visible eit
 It is cheaper to fix it here."""
 
 _RETURN = """\
+A CONCERN THAT SPANS TWO PLACES CITES BOTH. If what makes something a problem is that
+one passage disagrees with another — the abstract against the conclusion, the prose
+against the cell it summarises, the method against how it was evaluated — then quoting
+one side and ASSERTING the other in prose is not evidence: the second half names nothing
+a reader can open. Put every further location in `additional_evidence`, each with its own
+verbatim quotation and its own reference. Every side is re-checked against the paper
+independently, and a concern with a side that does not resolve is dropped whole rather
+than kept with one half checked. Omit `additional_evidence` entirely for an ordinary
+single-location finding.
+
 SEPARATE EVIDENCE FROM INFERENCE. `claim`, `evidence_quote` and `evidence_ref` say what
 the paper printed; `reasoning`, `conclusion`, `alternative_interpretation`, `steelman`
 and `effect_on_claim` are YOUR argument from it. The harness re-checks the first group
@@ -376,6 +386,9 @@ you write directly is discarded unread, however well-formed.
     "severity_rationale": "why this grade and not the one below it, in terms of IMPACT",
     "recommended_resolution": "what would settle this — a rerun, a clarification, nothing needed",
     "counter_explanations": ["what else could produce the reported result"],
+    "additional_evidence": [{"role": "what this side of the concern is",
+       "evidence_quote": "verbatim text at the OTHER location",
+       "evidence_ref": "p<N> | T<t>:r<r>:c<c> | F<n> | E<n>"}],
     "verifiable_by_experiment": true|false}
  ],
  "unasked_question": "the single most obvious baseline/comparison this paper avoided,
@@ -519,7 +532,15 @@ Audit for:
 
 def build(lens: str, title: str, sections_text: str, tables_text: str,
           claims_text: str, numbers_text: str, figures_text: str = "",
-          equations_text: str = "", pdf_path: str = "") -> str:
+          equations_text: str = "", pdf_path: str = "", reading_note: str = "") -> str:
+    """One lens prompt. `reading_note` says which SPAN of the paper this pass carries.
+
+    Empty for a paper that fits in one pass, which is the historical shape and stays
+    byte-identical. For a paper read in parts it is `part_note(...)`, and that note is the
+    only difference between a part prompt and a whole-paper one: the same lens focus, the
+    same tables, the same evidence rules. A part reader is not a weaker reader; it is a
+    reader with a smaller span and the same standards.
+    """
     spec = LENSES[lens]
     return f"""{SECURITY}
 
@@ -527,6 +548,8 @@ You are auditing ONE paper as lens "{lens}". Judge only this paper.
 
 Paper: {title or "(title not detected)"}
 {f"Original PDF (open it for any table/figure/equation-dependent claim — see SOURCE FIDELITY): {pdf_path}" if pdf_path else ""}
+
+{reading_note}
 
 {STANCE}
 
@@ -574,5 +597,122 @@ YOUR LENS — {lens}
 
 === SECTIONS ===
 {sections_text or "(no section text extracted)"}
+
+{_RETURN.replace("<lens>", lens)}"""
+
+
+# --------------------------------------------------------------------------- #
+# READING A LONG PAPER IN PARTS
+# --------------------------------------------------------------------------- #
+# The paper's title, abstract, conclusion and section outline are repeated identically in
+# every part (see `harness.reading.AnchorPacket`), so the two comparisons a part-local
+# reader would otherwise lose — a body result against the abstract's claim, and against
+# the conclusion's — remain available in every pass. What a part reader cannot see is
+# another part's BODY, and recovering relationships that span parts is what the synthesis
+# pass below exists for.
+_PART_NOTE = """\
+=== WHICH PART OF THE PAPER THIS IS ===
+This paper is longer than one pass, so you are reading {label}. The abstract, conclusion
+and full section outline below describe the WHOLE paper and are identical in every part;
+the sections after them are this part's span only.
+
+Audit what is in front of you. Do not speculate about what the other parts contain, and
+do not raise a concern that something is missing from the paper merely because it is
+missing from this span — an omission you cannot see the rest of the paper to rule out is
+not an omission you have established. A relationship that genuinely spans parts is
+recovered afterwards, in a separate pass over your own observations, so nothing is lost
+by confining yourself here.
+
+You have not been shown any other part's findings, and you will not be. That is
+deliberate: a concern carried forward from an earlier pass would be anchored by the
+earlier pass's framing rather than by this span's own text."""
+
+
+def part_note(label: str) -> str:
+    """The banner distinguishing a part prompt from a whole-paper one."""
+    return _PART_NOTE.format(label=label)
+
+
+_SYNTHESIS_RULES = """\
+=== WHAT THIS PASS IS ===
+You have now read this paper in parts, as lens "{lens}", and each part was read without
+sight of the others. Below are YOUR OWN observations from those parts — every one of them
+already carrying a quotation from the paper — together with the paper's title, abstract,
+conclusion and section outline.
+
+This pass exists for one reason: relationships BETWEEN parts. A part-local reader
+structurally could not see them, and they are among the most important things a referee
+finds.
+
+=== WHAT YOU MAY DO ===
+  * MERGE two observations that are one concern seen twice.
+  * CONNECT observations from different parts into a single cross-section concern.
+  * PROPOSE a concern that only the combination makes visible.
+  * DROP or WEAKEN one of your own earlier observations when another part explains it —
+    a control you thought was missing and found later, a definition that resolves an
+    apparent contradiction. Withdrawing a concern is a result, not a failure, and this is
+    the only pass in which you can do it with the whole paper in view.
+
+=== WHAT THIS PASS IS NOT ===
+You are PROPOSING. This pass has no decision authority of any kind: it does not grade, it
+does not settle, and nothing it produces is treated as established because a synthesis
+said so. Every concern you return goes through exactly the same verification as every
+other — the quotation is re-checked against the parsed paper, an unresolvable one is
+dropped and counted, and severity is capped by the same rules. "These two passages
+conflict" is never itself the evidence. The evidence is the two passages.
+
+So a cross-section concern MUST cite BOTH sides. Put the first in `evidence_quote` /
+`evidence_ref` and every further one in `additional_evidence`. A concern whose second half
+is prose asserting what another section says will be dropped whole, because that half
+names nothing a reader can open.
+
+You are reasoning only over what YOU observed. You have not been shown any other lens's
+work, and you must not speculate about it.
+
+=== WHAT TO LOOK FOR ===
+{targets}
+
+Return the concerns this pass is proposing: the merged ones, the cross-section ones, and
+any earlier one whose significance has changed. An observation that stands unchanged has
+already been recorded and does not need repeating here."""
+
+
+def build_synthesis(lens: str, title: str, brief_text: str, targets: str,
+                    tables_text: str = "", figures_text: str = "",
+                    equations_text: str = "", pdf_path: str = "") -> str:
+    """The cross-part synthesis prompt for ONE lens.
+
+    Deliberately short on lens-specific audit instruction and long on what this pass may
+    not do. The reading already happened; what is new here is a combination step, and the
+    risk a combination step carries is invention — two grounded observations joined by an
+    ungrounded assertion that they conflict. Everything above is aimed at that.
+    """
+    return f"""{SECURITY}
+
+You are lens "{lens}", combining your own observations across the parts of ONE paper.
+
+Paper: {title or "(title not detected)"}
+{f"Original PDF (open it to settle a table/figure/equation-dependent ambiguity — see SOURCE FIDELITY): {pdf_path}" if pdf_path else ""}
+
+{_SYNTHESIS_RULES.format(lens=lens, targets=targets)}
+
+{GRADING}
+
+{RECOMPUTE}
+
+{SOURCE_FIDELITY}
+
+{SELF_AUDIT}
+
+=== TABLES (each cell addressed T<table>:r<row>:c<col>) ===
+{tables_text or "(no tables extracted)"}
+
+=== FIGURE CAPTIONS (addressed F<n>) ===
+{figures_text or "(none extracted)"}
+
+=== EQUATIONS (addressed E<n>) ===
+{equations_text or "(none extracted)"}
+
+{brief_text}
 
 {_RETURN.replace("<lens>", lens)}"""

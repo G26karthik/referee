@@ -1,39 +1,68 @@
-"""S2 — the four-lens audit, driven by the Claude Code session instead of an SDK call.
+"""S2 — the four-lens audit, and how a paper longer than one prompt is read.
 
-`run_audit` does not call a model. It renders one self-contained prompt file per lens
-into `audit/prompts/<lens>.md` and stops. The driver (the interactive session) opens
-one prompt at a time, performs that audit, and writes `audit/<lens>.json`.
+`run_audit` does not call a model. It renders one self-contained prompt per READING UNIT
+and stops. The driver — the interactive session, or a subprocess per unit — opens one
+prompt at a time and returns its JSON, which the harness validates and writes itself.
 
-Working one lens per turn preserves the property the SDK sessions gave for free:
-four independent readings rather than one reading echoed four times. It is weaker
-than process isolation — a single context can remember the previous lens — so the
-prompt says so explicitly and the lenses are ordered to be run separately.
+**A unit is a lens, or a lens and a part of the paper.** A paper that fits in one pass has
+one unit per lens and the artifact layout is exactly what it has always been:
+`audit/prompts/<lens>.md` in, `audit/<lens>.json` out, four model calls. A paper that does
+not fit has N part units per lens plus one cross-part SYNTHESIS unit, and `compose_lens`
+assembles `audit/<lens>.json` from them — so nothing downstream knows or needs to know how
+the paper was traversed.
 
-What is NOT weaker is provenance. `load_reports` re-checks every finding's
-`evidence_quote` against the parsed paper and, when the finding cites a cell, against
-that cell's real contents. The driver is a language model; the harness does not take
-its word for anything it can verify itself.
+Why parts at all. `pdf.render_sections` divided one character budget equally across every
+section and hard-sliced each, so a long paper was cut before any lens read a word of it:
+between 0.335 and 0.841 of the extracted prose across the evaluated corpus, while the
+review's scope line said four lenses read the paper. `harness.reading` replaces the cut
+with a plan of bounded parts that tile the document.
+
+Why a synthesis. Splitting buys coverage and costs the one thing the contradiction lens
+exists for — "the abstract says one thing and the conclusion another" is unraisable when
+the two are in different prompts. Two mechanisms answer it: an ANCHOR PACKET (title,
+abstract, conclusion, outline) repeated identically in every part, extracted and carrying
+no model output; and one synthesis per lens, after that lens has read every part blind,
+over its own already-verified observations. The synthesis PROPOSES and decides nothing.
+
+**Isolation, stated precisely, because it is easy to overclaim.** Between lenses it is
+absolute and unchanged: `overclaim` never sees `protocol`'s output. Between the parts of
+ONE lens it means no part sees another part's findings — so a concern is anchored by the
+span that produced it rather than by an earlier pass's framing. It has never meant that
+one scientific reader must forget the first half of a paper before reading the second,
+and claiming whole-paper review while forbidding that would be the overclaim this system
+exists to catch.
+
+What is NOT weaker anywhere is provenance. `load_reports` re-checks every finding's
+`evidence_quote` against the parsed paper and, when the finding cites a cell, against that
+cell's real contents — every side of a multi-location concern included. A reading is a
+language model; the harness does not take its word for anything it can verify itself.
 """
 from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
+from typing import NamedTuple
 
 import functools
 import hashlib
-import os
 import re
 import time
 
-from .. import audit_driver, delegation, grading, pdf, state, taxonomy
+from .. import audit_driver, delegation, grading, pdf, reading, state, taxonomy
 from ..artifacts import (BASELINE_CLASSES, CANDIDATE_CLASSES, CONFIDENCES, DISCREPANCY_TYPES,
-                         EVIDENCE_ORIGINS, PRIOR_ART_BASES, SEVERITIES, Equation, Figure,
-                         Finding, LensReport, PaperDoc)
+                         EVIDENCE_ORIGINS, PRIOR_ART_BASES, SEVERITIES, Equation,
+                         EvidencePointer, Figure, Finding, LensReport, PaperDoc)
 from ..config import Config
 from ..prompts import audit as P
 
 LENSES = tuple(P.LENSES)
-SECTION_BUDGET_CHARS = int(os.environ.get("SH_AUDIT_BUDGET_CHARS", "70000"))
+# THE DEFAULT, not the live value. `SH_AUDIT_BUDGET_CHARS` is read by `budget_chars()`
+# below, at call time, through `harness.coverage` — one reader of that variable in the
+# whole codebase. Captured at import, as this was, the budget a review PRINTS and the
+# budget the prompts USED could differ whenever the variable was set after this module
+# loaded, which is exactly the drift `coverage.budget_chars` was written to avoid on the
+# other side of the same number.
+SECTION_BUDGET_CHARS = 70_000
 _SEVERITIES = SEVERITIES
 _CELL_REF = re.compile(r"T(\d+):r(\d+):c(\d+)")
 # The four admissible shapes for `evidence_ref`. Anything else — empty, "figure 3",
@@ -48,6 +77,18 @@ _QUOTE_MIN = 8
 # and digit characters only — matched after normalisation, not before.
 _MEANINGLESS_QUOTE = re.compile(r"^[^0-9a-z]*$")
 _WS = re.compile(r"\s+")
+
+
+def budget_chars() -> int:
+    """How much section prose one reading pass may carry, read at call time.
+
+    Delegates to `harness.coverage.budget_chars`, which owns the environment variable and
+    its malformed-value fallback. Two readers of one setting is one setting and one place
+    to drift, and the drift here is invisible: the prompts would be built at one budget
+    and the review would report another.
+    """
+    from .. import coverage as _coverage           # noqa: PLC0415 — one reader of the env
+    return _coverage.budget_chars()
 
 
 def _flat(s: str) -> str:
@@ -146,9 +187,28 @@ def render_numbers(doc: PaperDoc) -> str:
     return "\n".join(out)
 
 
-def context(doc: PaperDoc) -> dict[str, str]:
+def context(doc: PaperDoc, part=None, anchor=None) -> dict[str, str]:
+    """Everything a lens prompt is built from, for one pass over the paper.
+
+    `sections_text` is the only field that depends on WHICH pass this is. Tables, figure
+    captions, equations and the paper's reported quantities are repeated in every part
+    deliberately: they are addressed globally (`T2:r3:c4` means the same thing in every
+    pass), a concern about a cell is only citable by a reader that can see the cell, and
+    the character budget this module owns has only ever governed section prose.
+
+    `part=None` renders the whole paper in one pass. It does NOT fall back to
+    `pdf.render_sections`, which is the function this work exists to stop using: it
+    divides one budget equally across sections and hard-slices each, so it cut a paper
+    that fits — measured at 34% to 84% of the extracted prose across the evaluated corpus.
+    """
+    if part is None:
+        whole = pdf.plan_reading(list(doc.sections), max(400, budget_chars()))
+        sections_text = pdf.render_part(whole[0]) if whole else ""
+    else:
+        sections_text = (reading.render_part(part, anchor) if anchor is not None
+                         else pdf.render_part(part))
     return {
-        "sections_text": pdf.render_sections(doc.sections, SECTION_BUDGET_CHARS),
+        "sections_text": sections_text,
         "tables_text": pdf.render_tables(doc.tables),
         "claims_text": "(none pre-extracted — identify the paper's claims yourself "
                        "from the sections below; that judgement is part of your job)",
@@ -159,7 +219,7 @@ def context(doc: PaperDoc) -> dict[str, str]:
     }
 
 
-def _header(lens: str, pid: str) -> str:
+def _header(lens: str, pid: str, unit_id: str = "", out_name: str = "") -> str:
     """The driver-facing preamble on `audit/prompts/<lens>.md`.
 
     States the ONE rule that holds on every channel — never write `audit/<lens>.json`
@@ -171,16 +231,18 @@ def _header(lens: str, pid: str) -> str:
     instruction it had been given, and was right to; a prompt that describes one
     transport as if it were the only one makes the other look like a violation.
     """
+    out_name = out_name or f"{lens}.json"
+    unit_id = unit_id or lens
     return f"""<!-- generated by `run.py stage audit --paper {pid}` — do not edit -->
 
-# Audit lens: `{lens}`  ·  paper `{pid}`
+# Audit lens: `{unit_id}`  ·  paper `{pid}`
 
 **Driver instructions.** Perform this audit now and return a single JSON object matching
 the schema at the end of this file. Print it to standard output unless whoever dispatched
 you named a different destination — some channels capture stdout, others collect a staged
 file, and either way the harness validates what it receives and writes the result itself.
 
-**Never write `audit/{lens}.json` directly.** That path is the harness's to write, after
+**Never write `{out_name}` directly.** That path is the harness's to write, after
 validation. A file placed there by hand carries no provenance record and is refused by
 `lens_is_accepted`, so it cannot be counted as a lens that ran — see that function for
 why file existence is not provenance.
@@ -196,6 +258,149 @@ contain what it says, is DROPPED. Quote exactly.
 ---
 
 """
+
+
+
+# --------------------------------------------------------------------------- #
+# ONE READING UNIT — a part, a synthesis, or a whole paper
+# --------------------------------------------------------------------------- #
+# A paper that fits in one pass is one unit per lens and the artifact layout is unchanged.
+# A paper that does not is N part units plus one synthesis unit per lens, and the lens
+# file downstream reads is COMPOSED from them (`compose_lens`) rather than written by any
+# single reading. The composition is not a weakening of provenance: each part carries its
+# own sealed sidecar and the composed record names every one of them, so "which reader
+# produced this finding" is answerable per finding rather than per paper.
+UNIT_KINDS = ("whole", "part", "synthesis")
+SYNTHESIS_ID = "synthesis"
+# The `written_by` token on a composed lens file. Distinct from every delegation mode
+# because nothing delegated wrote it — this harness assembled it from artifacts that were
+# themselves sealed, and a reader must be able to tell those two apart.
+COMPOSED_WRITER = "composed_from_parts"
+
+
+def part_id_of(number: int) -> str:
+    """Zero-padded so a directory listing sorts in reading order at 10 parts and beyond."""
+    return f"part-{number:02d}"
+
+
+def _part_number(part_id: str) -> int:
+    """`part-03` -> 3. Returns 0 for anything that is not a part id, including SYNTHESIS_ID."""
+    tail = (part_id or "").rpartition("-")[2]
+    return int(tail) if tail.isdigit() else 0
+
+
+class AuditUnit(NamedTuple):
+    lens: str
+    kind: str                  # whole | part | synthesis
+    part_id: str               # 'part-01' | 'synthesis' | '' for a whole-paper unit
+    prompt_path: Path
+    out_path: Path
+    # Under `audit/reading/`, not beside the output. `audit/*.json` has meant "a lens
+    # result" since this harness existed — `run.py`, the controller's completeness list
+    # and at least one test all read the directory that way — and dropping an input record
+    # into it makes an unaudited paper look like it holds audit artifacts. The input
+    # records get their own tree instead.
+    manifest_path: Path
+
+    @property
+    def unit_id(self) -> str:
+        """Stable across runs, and the key every caller addresses this unit by."""
+        return self.lens if self.kind == "whole" else f"{self.lens}/{self.part_id}"
+
+    @property
+    def sidecar_path(self) -> Path:
+        return self.out_path.with_suffix(".driver.json")
+
+
+def plan_for(doc: PaperDoc) -> reading.ReadingPlan:
+    """The reading strategy for this paper, at the budget the prompts will actually use."""
+    return reading.plan(doc, budget_chars())
+
+
+def units_for(root: Path, lenses: tuple[str, ...], plan: reading.ReadingPlan) -> list[AuditUnit]:
+    """Every reading this paper needs, in dispatch order.
+
+    Parts before that lens's synthesis, and lenses in declaration order. The order matters
+    only for reporting — the parts of one lens are independent of each other and could run
+    in any order or at once — but a synthesis cannot be dispatched before the parts it
+    reads, and `run_audit` refuses to render its prompt until they are sealed.
+    """
+    audit = root / "audit"
+    pdir, mdir = audit / "prompts", audit / "reading"
+    out: list[AuditUnit] = []
+    n = max(1, plan.coverage.parts)
+    for lens in lenses:
+        if n == 1:
+            out.append(AuditUnit(lens, "whole", "", pdir / f"{lens}.md",
+                                 audit / f"{lens}.json",
+                                 mdir / f"{lens}.manifest.json"))
+            continue
+        for i in range(1, n + 1):
+            pid_ = part_id_of(i)
+            out.append(AuditUnit(lens, "part", pid_, pdir / lens / f"{pid_}.md",
+                                 audit / lens / "parts" / f"{pid_}.json",
+                                 mdir / lens / f"{pid_}.manifest.json"))
+        out.append(AuditUnit(lens, "synthesis", SYNTHESIS_ID,
+                             pdir / lens / f"{SYNTHESIS_ID}.md",
+                             audit / lens / f"{SYNTHESIS_ID}.json",
+                             mdir / lens / f"{SYNTHESIS_ID}.manifest.json"))
+    return out
+
+
+def _sealed(path: Path) -> tuple[bool, str]:
+    """Does a sealed provenance sidecar beside `path` describe `path`'s CURRENT bytes?
+
+    The body `lens_is_accepted` had, extracted so a part artifact and a composed lens
+    artifact are held to the identical standard rather than to a second implementation of
+    it. See `lens_is_accepted` for the real six-paper run this check exists because of.
+    """
+    if not path.exists():
+        return False, "no output file"
+    sidecar = path.with_suffix(".driver.json")
+    if not sidecar.exists():
+        return False, ("no provenance sidecar (.driver.json) — most likely side-written "
+                       "by the reviewer instead of produced through the validated staging path")
+    try:
+        rec = state.read_json(sidecar)
+    except Exception:
+        return False, "provenance sidecar is not valid JSON"
+    if not isinstance(rec, dict) or rec.get("written_by") not in _ACCEPTED_WRITERS:
+        return False, (f"provenance sidecar written_by="
+                       f"{rec.get('written_by') if isinstance(rec, dict) else None!r} not recognized")
+    want = rec.get("content_sha256")
+    if not want:
+        return False, "provenance sidecar has no content_sha256"
+    if hashlib.sha256(path.read_bytes()).hexdigest() != want:
+        return False, "output file content changed after its provenance sidecar was written"
+    return True, ""
+
+
+def unit_is_accepted(unit: AuditUnit) -> tuple[bool, str]:
+    """A reading counts only if it is sealed AND was produced against the prompt on disk.
+
+    The second half is what makes resume correct rather than merely cheap. `run_audit`
+    regenerates every prompt on every invocation, so a part whose span moved — because the
+    budget changed, or extraction changed, or an earlier section grew — has a sealed output
+    that answers a question nobody is asking any more. Re-reading it is the only honest
+    option, and `prompt_is_unchanged` reports `unpinned` rather than `changed` for a sidecar
+    written before prompts were fingerprinted, so nothing already on disk is retroactively
+    invalidated.
+
+    A whole-paper unit is deliberately NOT prompt-pinned: that is the historical path, the
+    seven shipped reviews and the evaluated corpus were produced under it, and tightening
+    it here would invalidate them for a reason that has nothing to do with this work.
+    """
+    ok, why = _sealed(unit.out_path)
+    if not ok or unit.kind == "whole":
+        return ok, why
+    fresh, note = audit_driver.prompt_is_unchanged(unit.sidecar_path, unit.prompt_path)
+    if not fresh:
+        return False, note
+    return True, ""
+
+
+def lens_units(units: list[AuditUnit], lens: str) -> list[AuditUnit]:
+    return [u for u in units if u.lens == lens]
 
 
 def lens_is_accepted(root: Path, lens: str) -> tuple[bool, str]:
@@ -224,31 +429,19 @@ def lens_is_accepted(root: Path, lens: str) -> tuple[bool, str]:
     (`_phase_audit` reports `ok` on an empty `awaiting` while `_phase_collect` reports
     `waiting` on the same lens), burning the bounded retry loop for no reason.
     """
-    lens_path = root / "audit" / f"{lens}.json"
-    if not lens_path.exists():
-        return False, "no lens file"
-    driver_path = lens_path.with_suffix(".driver.json")
-    if not driver_path.exists():
-        return False, ("no provenance sidecar (.driver.json) — most likely side-written "
-                       "by the reviewer instead of produced through the validated staging path")
-    try:
-        rec = state.read_json(driver_path)
-    except Exception:
-        return False, "provenance sidecar is not valid JSON"
-    if not isinstance(rec, dict) or rec.get("written_by") not in _ACCEPTED_WRITERS:
-        return False, f"provenance sidecar written_by={rec.get('written_by') if isinstance(rec, dict) else None!r} not recognized"
-    want = rec.get("content_sha256")
-    if not want:
-        return False, "provenance sidecar has no content_sha256"
-    if hashlib.sha256(lens_path.read_bytes()).hexdigest() != want:
-        return False, "lens file content changed after its provenance sidecar was written"
-    return True, ""
+    ok, why = _sealed(root / "audit" / f"{lens}.json")
+    return ok, ("no lens file" if why == "no output file" else why)
 
 
 # Every `written_by` token a validated path can produce, read off the delegation
 # vocabulary rather than written out here. Two copies of this set would let a mode be
 # added to one and refused by the other, which surfaces as "the reviewer never ran".
-_ACCEPTED_WRITERS = tuple(delegation.WRITTEN_BY.values())
+# `COMPOSED_WRITER` joins them because a lens file assembled from sealed part artifacts
+# has provenance — it is just provenance by reference rather than by delegation, and
+# `compose_lens` writes every referenced sidecar's hash into the composed record so the
+# chain is walkable. Without it, a multi-part lens could never satisfy `lens_is_accepted`
+# no matter how well its parts were sealed.
+_ACCEPTED_WRITERS = tuple(delegation.WRITTEN_BY.values()) + (COMPOSED_WRITER,)
 
 
 def accept_lens(cfg: Config, pid: str, lens: str, raw: str, *,
@@ -288,8 +481,276 @@ def accept_lens(cfg: Config, pid: str, lens: str, raw: str, *,
     return record
 
 
+def _locate(quote: str, corpus) -> int | None:
+    """Which parsed section contains this quote, or None. Used only to LABEL a candidate."""
+    q = _flat(quote)
+    if not q:
+        return None
+    return next((idx for idx, unit in _units(corpus) if q in unit), None)
+
+
+def synthesis_inputs(doc: PaperDoc, lens: str,
+                     units: list[AuditUnit]) -> dict[int, list[dict]]:
+    """That lens's own VERIFIED part-local observations, keyed by part number.
+
+    Verified, not merely produced. `load_reports` re-checks every quotation against the
+    parsed paper before a finding reaches a report, and a synthesis reasoning over
+    candidates that had not yet passed that check would be building cross-section concerns
+    on top of quotations which may not be in the paper at all — the one thing this harness
+    never lets a model do. So the same gate runs here, one stage earlier.
+
+    Nothing about another lens, a grade, a target outcome or any decision is reachable
+    from this function's arguments. The exclusion is a signature rather than a convention,
+    which is the same discipline `coverage.surface` and `grading.derive` already have.
+    """
+    corpus = source_units(doc)
+    by_idx = {t.table_idx: t for t in doc.tables}
+    out: dict[int, list[dict]] = {}
+    for unit in units:
+        if unit.lens != lens or unit.kind != "part":
+            continue
+        number = _part_number(unit.part_id)
+        try:
+            data = state.read_json(unit.out_path)
+        except Exception:
+            out[number] = []
+            continue
+        kept: list[dict] = []
+        for f in (data.get("findings") or []) if isinstance(data, dict) else []:
+            if not isinstance(f, dict):
+                continue
+            quote = str(f.get("evidence_quote") or "").strip()
+            ref = str(f.get("evidence_ref") or "").strip()
+            if not _substantiated(quote, ref, corpus, by_idx):
+                continue
+            kept.append({
+                "evidence_quote": quote, "evidence_ref": ref,
+                "statement": str(f.get("statement") or f.get("title") or ""),
+                "finding_id": str(f.get("finding_id") or ""),
+                "section_idx": _locate(quote, corpus),
+                "page": None,
+            })
+        out[number] = kept
+    return out
+
+
+def _write_manifest(unit: AuditUnit, *, pid: str, part, anchor, prompt_text: str,
+                    budget: int, inputs: dict | None = None) -> dict:
+    """WHAT WENT IN, written when the prompt is.
+
+    This is the artifact that makes the isolation claim checkable rather than asserted. It
+    records the span this reading was given — the section ids and the exact character
+    offsets inside each — the digest of the repeated anchor packet, and the digest of the
+    prompt bytes themselves. A test does not have to take the harness's word that part 2
+    never saw part 1's findings: it can hash the prompt this manifest names and read it.
+
+    Deliberately NOT sealed with a `.driver.json`. A seal certifies that an OUTPUT came
+    through a validated path; this is an input record the harness wrote about itself, and
+    sealing it would dress a self-description up as an attestation. The prompt digest is
+    what binds it to the reading, and `unit_is_accepted` checks that digest against the
+    prompt on disk — so a manifest that no longer matches invalidates the reading instead
+    of certifying it.
+    """
+    rec = {
+        "paper_id": pid, "lens": unit.lens, "unit_id": unit.unit_id,
+        "kind": unit.kind, "part_id": unit.part_id,
+        "prompt_path": str(unit.prompt_path),
+        "prompt_sha256": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+        "budget_chars": budget,
+        "anchor_sha256": (hashlib.sha256(anchor.render().encode("utf-8")).hexdigest()
+                          if anchor is not None and unit.kind != "whole" else ""),
+        "section_ids": ([s.section_idx for s in part.sections] if part is not None
+                        else "whole-paper"),
+        "slices": ([list(t) for t in part.slices] if part is not None else []),
+        "part_number": getattr(part, "number", 1) if part is not None else 1,
+        "part_total": getattr(part, "total", 1) if part is not None else 1,
+        "chars": getattr(part, "chars", 0) if part is not None else 0,
+        "ts": state.now(),
+    }
+    if inputs is not None:
+        # The synthesis's inputs, named rather than described: which of that lens's own
+        # candidates reached it, by finding id. A reader can open each one and confirm it
+        # came from this lens and from a part of this paper.
+        rec["synthesis_inputs"] = inputs
+    unit.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    state.write_json(unit.manifest_path, rec)
+    return rec
+
+
+def compose_lens(cfg: Config, pid: str, lens: str,
+                 units: list[AuditUnit]) -> dict | None:
+    """Assemble `audit/<lens>.json` from that lens's sealed part and synthesis artifacts.
+
+    Returns the composed provenance record, or None while any unit is still missing. A
+    lens is never half-composed: a lens file holding three of four parts is
+    indistinguishable downstream from a lens that read the whole paper and found less.
+
+    Composition adds nothing and is deterministic. Every finding is carried through
+    verbatim apart from two harness-written labels — `source_part`, which names the
+    reading that produced it, and a disambiguated `finding_id` where two readings happened
+    to choose the same one. Verification, deduplication, the evidence ceiling, the
+    severity caps and independent grading all still run downstream over the composed file
+    exactly as they do over a single-pass one, so a concern the synthesis proposed is held
+    to the identical standard as one a part reader raised.
+    """
+    mine = [u for u in units if u.lens == lens and u.kind in ("part", "synthesis")]
+    if not mine or not all(unit_is_accepted(u)[0] for u in mine):
+        return None
+    root = state.project_dir(cfg, pid)
+    findings: list[dict] = []
+    composed_from: list[dict] = []
+    seen_ids: set[str] = set()
+    notes: list[str] = []
+    unasked = ""
+    for unit in mine:
+        data = state.read_json(unit.out_path)
+        side = state.read_json(unit.sidecar_path)
+        raw = (data.get("findings") or []) if isinstance(data, dict) else []
+        for i, f in enumerate(raw):
+            if not isinstance(f, dict):
+                continue
+            f = dict(f)
+            fid = str(f.get("finding_id") or "").strip() or f"{lens}-{unit.part_id}-{i + 1:02d}"
+            if fid in seen_ids:
+                fid = f"{unit.part_id}:{fid}"
+            seen_ids.add(fid)
+            f["finding_id"] = fid
+            # HARNESS-WRITTEN. `audit_driver.strip_harness_keys` removes whatever a reading
+            # tried to put here before its artifact was sealed, so this is the only writer.
+            f["source_part"] = unit.part_id
+            findings.append(f)
+        if isinstance(data, dict):
+            note = str(data.get("notes") or "").strip()
+            if note:
+                notes.append(f"[{unit.part_id}] {note}")
+            question = str(data.get("unasked_question") or "").strip()
+            # The synthesis saw this lens's observations from the whole paper, so its
+            # answer to "what comparison did this paper avoid" is the one to keep; a part
+            # reader answered it from one span.
+            if question and (unit.kind == "synthesis" or not unasked):
+                unasked = question
+        composed_from.append({
+            "unit_id": unit.unit_id, "kind": unit.kind, "path": str(unit.out_path),
+            "content_sha256": side.get("content_sha256", ""),
+            "written_by": side.get("written_by", ""),
+            "prompt_sha256": side.get("prompt_sha256", ""),
+            "model_reported": (side.get("envelope") or {}).get("model_reported", ""),
+            "findings": len(raw),
+        })
+    out = root / "audit" / f"{lens}.json"
+    state.write_json(out, {"lens": lens, "schema_version": 2, "findings": findings,
+                           "unasked_question": unasked, "notes": "  ".join(notes)})
+    record = {
+        "lens": lens, "paper_id": pid, "written_by": COMPOSED_WRITER,
+        "content_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
+        "composed_from": composed_from,
+        "parts": sum(1 for u in mine if u.kind == "part"),
+        "synthesis": any(u.kind == "synthesis" for u in mine),
+        "findings": len(findings),
+        # NOT a tool policy this harness enforced. Each reading records its own, and a
+        # composed artifact must not inherit a guarantee it did not produce.
+        "tool_policy": "composed; each reading in composed_from records its own policy",
+        "ts": state.now(),
+    }
+    state.write_json(out.with_suffix(".driver.json"), record)
+    return record
+
+
+def reading_record(cfg: Config, pid: str, doc: PaperDoc,
+                   lenses: tuple[str, ...] = LENSES) -> dict:
+    """How much of this paper reached a reader, and how the reading was carried out.
+
+    Reported as separate numbers for the reason the four axes are kept apart: they answer
+    different questions, and one of them — `reader_visible_fraction` — is the ceiling on
+    every recall claim this system makes. None of them is issue recall, and
+    `CoverageReport.semantic_coverage` says so in the same artifact.
+
+    `extracted_text_fraction` is about EXTRACTION and `reader_visible_fraction` is about
+    the reader, and they compose: a page extraction recovered nothing from is invisible to
+    a reader however complete the reading plan is. Its denominator is the PDF's own page
+    count, so it cannot be inflated by a worse extractor the way a rate computed over
+    recovered objects can.
+
+    WHAT IT DOES NOT SAY, because it reads 1.000 on all twelve documents in this
+    repository and a saturated measure invites over-reading. It says extraction recovered
+    prose covering every page; it says nothing about how much of each page it got, which
+    is the harder question and one this artifact cannot answer — the only denominator for
+    that is the PDF's own text, and comparing against it is a second extraction. What
+    bounds a review is `reader_visible_fraction` over what extraction actually produced,
+    and the extraction ceiling underneath it stays unmeasured rather than
+    measured-and-good.
+    """
+    root = state.project_dir(cfg, pid)
+    plan = plan_for(doc)
+    units = units_for(root, lenses, plan)
+    cov = plan.coverage
+    syntheses = [u for u in units if u.kind == "synthesis"]
+    # EVERY page a recovered section covers, not only the page it starts on. A section
+    # running from page 3 to page 8 makes text available on six pages, and counting its
+    # `page_start` alone reported 11 of 25 pages for `acl` — 44%, against a document every
+    # page of which extraction did recover prose from. A fraction that low would have read
+    # as an extraction defect that is not there.
+    pages: set[int] = set()
+    for sec in doc.sections:
+        if not (sec.text or "").strip():
+            continue
+        last = sec.page_end if sec.page_end >= sec.page_start else sec.page_start
+        pages.update(range(sec.page_start, last + 1))
+    pages.discard(0)
+    return {
+        "extracted_prose_chars": cov.extracted_prose_chars,
+        "pages_with_text": len(pages),
+        "pages_total": doc.n_pages or 0,
+        "extracted_text_fraction": (len(pages) / doc.n_pages) if doc.n_pages else None,
+        "reader_visible_chars": cov.part_local_chars,
+        "reader_visible_fraction": cov.part_local_fraction,
+        "anchor_chars": cov.anchor_chars,
+        "anchor_repeat_chars": cov.anchor_repeat_chars,
+        "anchor_repeat_fraction": cov.anchor_overhead_fraction,
+        "number_of_parts": cov.parts,
+        "lenses_total": len(lenses),
+        "lenses_completed": sum(1 for ln in lenses if lens_is_accepted(root, ln)[0]),
+        "lens_syntheses_required": len(syntheses),
+        "lens_syntheses_completed": sum(1 for u in syntheses if unit_is_accepted(u)[0]),
+    }
+
+
+def missing_reading_artifacts(cfg: Config, pid: str,
+                              lenses: tuple[str, ...] = LENSES) -> list[str]:
+    """Reading units this paper needs and does not have. Empty is the only clean answer.
+
+    Consulted at the LAST gate rather than only at the first. A review whose synthesis
+    never ran has not been conducted the way the review says it was, and the difference is
+    invisible in the finished report: the parts alone still produce findings, still grade,
+    and still render. The audit phase can be resumed, rewound, or skipped past on a cached
+    case, so a completeness check only that phase performs is a completeness check that a
+    resumed run never makes.
+    """
+    root = state.project_dir(cfg, pid)
+    doc_path = root / "paper" / "doc.json"
+    if not doc_path.exists():
+        return ["paper/doc.json"]
+    doc = PaperDoc(**state.read_json(doc_path))
+    units = units_for(root, lenses, plan_for(doc))
+    missing = [u.unit_id for u in units if not unit_is_accepted(u)[0]]
+    missing += [f"{ln}.json" for ln in lenses if not lens_is_accepted(root, ln)[0]]
+    return missing
+
+
 def run_audit(cfg: Config, pid: str, lenses: tuple[str, ...] = LENSES) -> dict:
-    """Write one prompt file per lens. Does not call a model."""
+    """Write one prompt file per reading unit, and compose any lens whose units are in.
+
+    Does not call a model. A paper that fits in one pass produces exactly what it always
+    did: one prompt and one lens file per lens, no synthesis, no extra call. A paper that
+    does not produces N part prompts per lens, then — once those parts are sealed — one
+    synthesis prompt per lens, and finally a composed lens file per lens.
+
+    The synthesis prompt is deliberately not written until its parts exist, and that is a
+    correctness property rather than an optimisation. The brief IS that lens's own
+    part-local observations, so a synthesis prompt written early would be a synthesis over
+    nothing — and a reading that returned no cross-part concerns because it had no inputs
+    is indistinguishable, in the artifact, from one that looked and found none.
+    """
     root = state.project_dir(cfg, pid)
     doc_path = root / "paper" / "doc.json"
     if not doc_path.exists():
@@ -297,36 +758,93 @@ def run_audit(cfg: Config, pid: str, lenses: tuple[str, ...] = LENSES) -> dict:
     doc = PaperDoc(**state.read_json(doc_path))
     state.set_phase(cfg, pid, "audit")
 
-    ctx = context(doc)
+    plan = plan_for(doc)
+    units = units_for(root, lenses, plan)
+    by_number = {part.number: part for part in plan.parts}
     pdir = root / "audit" / "prompts"
     pdir.mkdir(parents=True, exist_ok=True)
-    for lens in lenses:
+
+    written: dict[str, str] = {}
+    deferred: list[str] = []
+    for unit in units:
+        part = by_number.get(_part_number(unit.part_id)) if unit.kind == "part" else None
+        if unit.kind == "synthesis":
+            siblings = [u for u in units if u.lens == unit.lens and u.kind == "part"]
+            if not all(unit_is_accepted(u)[0] for u in siblings):
+                deferred.append(unit.unit_id)
+                continue
+            brief = reading.synthesis_brief(pid, unit.lens, plan.anchor,
+                                            synthesis_inputs(doc, unit.lens, units))
+            ctx = context(doc)
+            body = P.build_synthesis(
+                unit.lens, doc.title, brief.render(),
+                "\n".join(f"  - {t}" for t in reading.SYNTHESIS_TARGETS),
+                tables_text=ctx["tables_text"], figures_text=ctx["figures_text"],
+                equations_text=ctx["equations_text"], pdf_path=ctx["pdf_path"])
+            inputs = {"parts_read": brief.parts_read,
+                      "candidates": len(brief.candidates),
+                      "candidate_finding_ids": [c["finding_id"] for c in brief.candidates]}
+        else:
+            ctx = context(doc, part, plan.anchor if unit.kind == "part" else None)
+            note = P.part_note(part.label) if part is not None else ""
+            body = P.build(unit.lens, doc.title, reading_note=note, **ctx)
+            inputs = None
         # Sanitised at the boundary, not at extraction: `doc.json` stays byte-faithful to
         # what the PDF gave up, and this is where the paper's text leaves the harness for
         # another process's stdin. Real prompts carry these today — each
         # `projects/iclr/audit/prompts/*.md` holds 3 NUL bytes and 30 other control
         # characters, straight out of PDF text extraction. Not a live failure on this
         # host, but a reader that truncates at NUL would fail as "the command exited
-        # without writing anything", which `audit_driver` itself notes is the one shape
-        # of failure it cannot attribute to a cause.
-        body = pdf.sanitise_controls(_header(lens, pid) + P.build(lens, doc.title, **ctx))
-        (pdir / f"{lens}.md").write_text(body, encoding="utf-8")
+        # without writing anything", which `audit_driver` itself notes is the one shape of
+        # failure it cannot attribute to a cause.
+        body = pdf.sanitise_controls(
+            _header(unit.lens, pid, unit.unit_id, unit.out_path.name) + body)
+        unit.prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        unit.prompt_path.write_text(body, encoding="utf-8")
+        written[unit.unit_id] = str(unit.prompt_path)
+        _write_manifest(unit, pid=pid, part=part, anchor=plan.anchor, prompt_text=body,
+                        budget=budget_chars(), inputs=inputs)
 
-    done = [ln for ln in lenses if lens_is_accepted(root, ln)[0]]
-    todo = [ln for ln in lenses if ln not in done]
+    done = [u.unit_id for u in units if unit_is_accepted(u)[0]]
+    todo = [u.unit_id for u in units if u.unit_id not in done and u.unit_id in written]
+
+    # Compose every lens whose readings are all in. Idempotent: the composed bytes are a
+    # pure function of the part artifacts, so re-running writes the same file and the same
+    # seal rather than invalidating what a previous run sealed.
+    composed: dict[str, int] = {}
+    if plan.coverage.parts > 1:
+        for lens in lenses:
+            record = compose_lens(cfg, pid, lens, units)
+            if record:
+                composed[lens] = record["findings"]
+
+    cov = plan.coverage
     state.append_log(
         cfg, pid, artifact_type="audit_prompts", phase="audit",
-        headers={"lenses": list(lenses), "awaiting": todo, "complete": done,
-                 "chars": sum(len((pdir / f'{ln}.md').read_text(encoding='utf-8')) for ln in lenses)},
+        headers={"lenses": list(lenses), "units": [u.unit_id for u in units],
+                 "awaiting": todo, "deferred": deferred, "complete": done,
+                 "parts": cov.parts,
+                 "reader_visible_fraction": cov.part_local_fraction,
+                 "anchor_repeat_fraction": cov.anchor_overhead_fraction,
+                 "chars": sum(len(Path(v).read_text(encoding="utf-8"))
+                              for v in written.values())},
         path=str(pdir),
     )
     return {
         "paper_id": pid, "title": doc.title,
-        "prompts": {ln: str(pdir / f"{ln}.md") for ln in lenses},
-        "awaiting": todo, "complete": done,
-        "next": (f"Read each prompt in audit/prompts/, perform that audit, and write "
-                 f"audit/<lens>.json. Awaiting: {', '.join(todo) or 'none'}.")
-        if todo else "All four lenses have results; run synthesize_report.",
+        "prompts": written,
+        "units": [{"unit_id": u.unit_id, "lens": u.lens, "kind": u.kind,
+                   "part_id": u.part_id, "prompt": str(u.prompt_path),
+                   "out": str(u.out_path)} for u in units],
+        "awaiting": todo, "deferred": deferred, "complete": done,
+        "lenses_complete": [ln for ln in lenses if lens_is_accepted(root, ln)[0]],
+        "composed": composed, "parts": cov.parts,
+        "reader_visible_fraction": cov.part_local_fraction,
+        "next": (f"Read each prompt in audit/prompts/, perform that reading, and return "
+                 f"its JSON. Awaiting: {', '.join(todo) or 'none'}."
+                 + (f" Deferred until their parts are in: {', '.join(deferred)}."
+                    if deferred else ""))
+        if (todo or deferred) else "Every reading is in; run synthesize_report.",
     }
 
 
@@ -493,6 +1011,102 @@ def _substantiated(quote: str, ref: str, corpus: str | Sequence[tuple[int, str]]
     return verify_evidence(quote, ref, corpus, by_idx)[0] != "unverified"
 
 
+def weakest_evidence_class(classes: Sequence[str]) -> str:
+    """The evidence class a MULTI-LOCATION concern is held to: its weakest side.
+
+    A concern that depends on both a table cell and a figure caption is only as checkable
+    as the caption, because a reader who cannot confirm that half cannot confirm the
+    concern. So the confidence ceiling is computed from the weakest side, and the primary
+    citation wins a tie so a single-location finding is unaffected.
+
+    Deliberately NOT the other arrangement. `grading.evidence_support` LIFTS its ceiling
+    one step per additional INDEPENDENT source, and passing a lens's own second citation
+    in as such a source would let one reader corroborate itself — a mechanism that raises,
+    which invariant 11 forbids. Two quotations chosen in one pass by one reader are one
+    reader's judgement cited twice. What they buy is that BOTH halves are checkable, which
+    is the difference between a cross-section concern and an assertion; they do not buy
+    confidence, and here they can only cost it.
+    """
+    order = {c: grading.CONFIDENCE_RANK[grading.EVIDENCE_CONFIDENCE_CEILING.get(c, "HIGH")]
+             for c in classes}
+    return min(classes, key=lambda c: order[c]) if classes else "unverified"
+
+
+def _address_identity(f: Finding) -> tuple:
+    """This concern's IDENTITY: the ordered locations it was established from.
+
+    Ordered rather than a set, because the two halves of a cross-section concern are not
+    interchangeable — "the abstract claims what the conclusion concedes" and its reverse
+    are different readings of the same two spans, and folding them together would report
+    one where a referee raised two.
+
+    The quotation is carried beside the reference because a reference alone is too coarse:
+    `p7` is a whole page, and two genuinely different concerns can cite it.
+    """
+    sides = [(f.evidence_ref, _flat(f.evidence_quote))]
+    sides += [(e.evidence_ref, _flat(e.evidence_quote)) for e in f.additional_evidence]
+    return tuple(sides)
+
+
+def _concern_identity(f: Finding) -> tuple:
+    """WHAT KIND of concern this is, in closed vocabulary only.
+
+    The lens's own classification rather than `scientific_class`, which is a SUMMARY of
+    it: `taxonomy.classify` folds every `discrepancy_type` a contradiction lens can choose
+    onto the single class CONTRADICTION, so two concerns that disagree about what is wrong
+    become one token.
+
+    Measured on the evaluated corpus, that is not hypothetical. `apt-icml` carries
+    `protocol-03` — Table 2 prints 100.0% for merged LoRA's inference time when Table 11
+    shows the same computation — and `protocol-09` — the abstract's speedup is normalised
+    against LoRA+Prune rather than against fine-tuning. Both anchor on the same quoted row
+    of page 20, both summarise to CONTRADICTION, and they are different concerns:
+    GENUINE_CONTRADICTION against DIFFERENT_DENOMINATOR, CONFIRMED_FINDING against
+    PLAUSIBLE_CONCERN. Keyed on the summary, the review lost one of them.
+
+    Which way this errs is the whole design. Keying too finely reports one concern twice,
+    which a reader can see and the synthesis pass is explicitly asked to fold. Keying too
+    coarsely DELETES a real concern from the review and leaves a merged id behind as the
+    only trace. Those are not symmetric, so the key is the finest closed vocabulary
+    available.
+    """
+    return (f.scientific_class, f.discrepancy_type, f.baseline_class,
+            f.candidate_class, f.prior_art_basis)
+
+
+def deduplicate(findings: list[Finding]) -> tuple[list[Finding], int]:
+    """Fold concerns that resolved to the identical address set. (kept, n_merged)
+
+    OVER ADDRESSES AND CLOSED VOCABULARY, NEVER OVER TEXT. Two concerns are the same
+    concern when the same lens raised them, they classify themselves identically, and they
+    were established from exactly the same locations in the paper. They are not the same
+    concern because their prose reads alike: text similarity would merge two real concerns
+    about one table that a reader happened to phrase the same way, and would MISS the case
+    this exists for — one concern raised in two parts, whose statements two independent
+    readings wrote and therefore wrote differently.
+
+    Run AFTER verification, so every address in the key is one that resolved against the
+    paper. Deduplicating earlier would be deduplicating quotations that may not exist.
+
+    The survivor keeps its own identity and records the ids folded into it, so nothing is
+    silently lost: a reader tracing a merged id finds where it went.
+    """
+    kept: list[Finding] = []
+    first_by_key: dict[tuple, Finding] = {}
+    merged = 0
+    for f in findings:
+        key = (f.lens, _concern_identity(f), _address_identity(f))
+        first = first_by_key.get(key)
+        if first is None:
+            first_by_key[key] = f
+            kept.append(f)
+            continue
+        merged += 1
+        if f.finding_id and f.finding_id not in first.merged_from:
+            first.merged_from.append(f.finding_id)
+    return kept, merged
+
+
 def _coerce(lens: str, data, corpus: str | Sequence[tuple[int, str]],
             by_idx: dict, max_page: int = 0, *,
             by_figure: dict[int, Figure] | None = None,
@@ -525,9 +1139,36 @@ def _coerce(lens: str, data, corpus: str | Sequence[tuple[int, str]],
         quote = str(f.get("evidence_quote") or "").strip()
         ref = str(f.get("evidence_ref") or "").strip()
         evidence_class, observation = verify(quote, ref, corpus, by_idx, max_page)
-        if not statement or evidence_class == "unverified":
+        # EVERY SIDE, OR NONE. A concern established from two locations is checkable only
+        # if both are; keeping it with one half verified would publish "the conclusion
+        # concedes X" on the model's word, which is the assertion the whole verification
+        # gate exists to refuse. Dropped whole and counted, exactly like a finding whose
+        # single quotation is not in the paper.
+        extra, extra_holds = [], True
+        for side in (f.get("additional_evidence") or []):
+            if not isinstance(side, dict):
+                extra_holds = False
+                break
+            side_quote = str(side.get("evidence_quote") or "").strip()
+            side_ref = str(side.get("evidence_ref") or "").strip()
+            side_class, side_obs = verify(side_quote, side_ref, corpus, by_idx, max_page)
+            if side_class == "unverified":
+                extra_holds = False
+                break
+            extra.append(EvidencePointer(
+                role=_oneline(str(side.get("role") or ""), 80),
+                evidence_quote=side_quote, evidence_ref=side_ref,
+                evidence_class=side_class, verified_observation=side_obs))
+        if not statement or evidence_class == "unverified" or not extra_holds:
             dropped += 1
             continue
+        if extra:
+            observation = " ".join(
+                [observation] + [f"Further location cited ({e.role or 'unlabelled'}), "
+                                 f"{e.evidence_ref}: {e.verified_observation}" for e in extra])
+            # The class the CAPS are computed from, not the class of the primary citation.
+            evidence_class = weakest_evidence_class(
+                [evidence_class] + [e.evidence_class for e in extra])
         sev = str(f.get("severity") or "").upper()
         sev = sev if sev in _SEVERITIES else "MINOR"
         calc = f.get("independent_calculation")
@@ -566,6 +1207,7 @@ def _coerce(lens: str, data, corpus: str | Sequence[tuple[int, str]],
             counter_explanations=[str(c) for c in (f.get("counter_explanations") or [])
                                  if isinstance(c, (str, int, float))],
             verifiable_by_experiment=bool(f.get("verifiable_by_experiment")),
+            additional_evidence=extra,
             # The lens's own layers, kept apart from each other and from the evidence.
             # Each falls back to `statement` so a file written before the split still
             # produces a complete finding.
@@ -609,12 +1251,19 @@ def _coerce(lens: str, data, corpus: str | Sequence[tuple[int, str]],
             origin_consistency=("consistent"
                                 if _enum(f.get("evidence_origin"), EVIDENCE_ORIGINS)
                                 in ("", _origin_from_ref(ref)) else "corrected"),
+            # DERIVED, so it cannot say two locations were checked when one was.
+            cross_section=bool(extra),
+            # Written by `compose_lens` from which artifact the finding came out of, and
+            # stripped from anything a reading itself submitted (see
+            # `audit_driver.HARNESS_OWNED_FINDING_KEYS`). '' on a paper read in one pass.
+            source_part=_oneline(str(f.get("source_part") or ""), 40),
             finding_class=finding_class, counted_severity=counted_severity,
             binding_cap=binding_cap, derivation=derivation,
             evidence_ceiling=evidence_ceiling, evidence_sources=list(evidence_sources),
         ))
+    findings, merged = deduplicate(findings)
     return LensReport(
-        lens=lens, findings=findings,
+        lens=lens, findings=findings, merged_duplicates=merged,
         unasked_question=str(data.get("unasked_question") or "").strip(),
         notes=str(data.get("notes") or ""),
     ), dropped, True

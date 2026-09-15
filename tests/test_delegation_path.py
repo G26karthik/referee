@@ -1290,9 +1290,22 @@ def test_the_lens_report_schema_still_gates_what_a_sealed_artifact_may_contain()
     `LensReport` or `Finding` tomorrow is accepted without an edit here, and a key on
     neither model is dropped without one.
     """
-    assert audit_driver._LENS_ALLOWED == frozenset(LensReport.model_fields)
+    assert audit_driver._LENS_ALLOWED == (
+        frozenset(LensReport.model_fields)
+        - frozenset(audit_driver.HARNESS_OWNED_REPORT_KEYS))
     assert audit_driver._FINDING_ALLOWED == (
         frozenset(Finding.model_fields) - frozenset(HARNESS_OWNED_FINDING_KEYS))
+    # A report-level field the HARNESS writes is subtracted for the same reason a
+    # finding-level one is. `merged_duplicates` counts what deduplication folded, which
+    # happens after a reading has finished, so a reading supplying it would be describing
+    # work it did not do — and a sealed artifact would carry the number as if checked.
+    for key in audit_driver.HARNESS_OWNED_REPORT_KEYS:
+        assert key in LensReport.model_fields, key
+        assert key not in audit_driver._LENS_ALLOWED, key
+    # The nested rule: an evidence pointer's machine half is the harness's, one level down.
+    assert audit_driver._POINTER_ALLOWED == frozenset(("role", "evidence_quote",
+                                                      "evidence_ref"))
+    assert not (audit_driver._POINTER_ALLOWED & frozenset(audit_driver.POINTER_OWNED_KEYS))
     # And the same for the other two artifacts, whose strip sets are their own schemas —
     # `Grade` is entirely the grader's claim, so nothing on it is harness-owned and the
     # whole model is allowed; `SubstantiveVerdict` likewise.

@@ -87,12 +87,24 @@ def build_prompts(cfg: Config, pid: str, doc: PaperDoc,
     for f in candidates:
         slug = slug_for(f.finding_id)
         sections_text, note = _section_render(doc, f.evidence_ref, cfg.grade_budget_chars)
+        # EVERY SIDE of a multi-location concern, and each side's own section context. A
+        # grader shown one half of "the abstract asserts what the conclusion concedes"
+        # cannot grade it, and would have to take the other half from the first reader —
+        # which is precisely the deference independent grading exists to remove. Nothing
+        # here tells the grader WHICH READING produced the concern: a part reader and a
+        # cross-part synthesis are the same lens under the same rules, and a grader that
+        # knew which had spoken could weigh the pass instead of the argument.
+        for side in f.additional_evidence:
+            more, _note = _section_render(doc, side.evidence_ref, cfg.grade_budget_chars)
+            if more and more not in sections_text:
+                sections_text = f"{sections_text}\n\n{more}"
         body = G.build(
             claim=f.as_claim(), statement=f.statement, target=f.target,
             reasoning=f.as_reasoning(), conclusion=f.as_conclusion(),
             counter_explanations=f.counter_explanations,
             evidence_quote=f.evidence_quote, evidence_ref=f.evidence_ref,
             evidence_class=f.evidence_class, verified_observation=f.verified_observation,
+            additional_evidence=[e.model_dump() for e in f.additional_evidence],
             sections_text=sections_text, tables_text=pdf.render_tables(doc.tables),
             withheld_note=note,
         )

@@ -215,8 +215,35 @@ Print ONLY this JSON to standard output — nothing else, no file:
 def build(claim: str, statement: str, target: str, reasoning: str, conclusion: str,
          counter_explanations: list[str], evidence_quote: str, evidence_ref: str,
          evidence_class: str, verified_observation: str, sections_text: str,
-         tables_text: str, withheld_note: str) -> str:
+         tables_text: str, withheld_note: str,
+         additional_evidence: list[dict] | None = None) -> str:
+    """One blinded grade prompt.
+
+    `additional_evidence` carries the FURTHER locations a multi-location concern depends
+    on. Omitting them would have handed a grader half of a cross-section concern and asked
+    it to weigh the whole: "the abstract asserts what the conclusion concedes", shown only
+    the abstract. The grader would have had to take the second half on the first reader's
+    word, which is the one thing the grader exists not to do.
+
+    What the grader is NOT told is which reading pass produced the concern. A part reader
+    and a cross-part synthesis are the same lens under the same standards, and a grader
+    that knew which had spoken could weigh the pass instead of the argument.
+    """
     counters = "\n".join(f"  - {c}" for c in counter_explanations) or "  (none given)"
+    sides = ""
+    for i, side in enumerate(additional_evidence or [], 1):
+        sides += (f"\n  further location {i}"
+                  f"{f' ({side.get('role')})' if side.get('role') else ''}:\n"
+                  f"    quote: {side.get('evidence_quote', '')!r}\n"
+                  f"    ref: {side.get('evidence_ref', '')}\n"
+                  f"    evidence_class (HARNESS-VERIFIED): {side.get('evidence_class', '')}\n"
+                  f"    verified_observation (HARNESS-WRITTEN): "
+                  f"{side.get('verified_observation', '')}")
+    if sides:
+        sides = ("\n\nTHIS CONCERN DEPENDS ON MORE THAN ONE PLACE IN THE PAPER. Each "
+                 "location below was verified against the parsed paper by the harness, "
+                 "exactly as the citation above was. The concern holds only if the "
+                 "RELATIONSHIP between them holds; judge that relationship." + sides)
     return f"""{SECURITY}
 
 You are independently grading ONE candidate finding against this paper. You have not
@@ -252,7 +279,7 @@ Their cited evidence:
   ref: {evidence_ref}
   evidence_class (HARNESS-VERIFIED — the machine already checked this citation is real,
     you do not need to re-check that the quote is in the paper): {evidence_class}
-  verified_observation (HARNESS-WRITTEN fact about that citation): {verified_observation}
+  verified_observation (HARNESS-WRITTEN fact about that citation): {verified_observation}{sides}
 
 === TABLES (each cell addressed T<table>:r<row>:c<col>) ===
 {tables_text or "(no tables extracted)"}

@@ -153,9 +153,16 @@ def plan(doc: PaperDoc, budget_chars: int) -> ReadingPlan:
     over length.
     """
     anchor = anchors(doc)
-    room = max(400, budget_chars - min(anchor.chars,
-                                       int(budget_chars * ANCHOR_BUDGET_FRACTION)))
-    parts = pdf.plan_reading(list(doc.sections), room)
+    # A paper that fits WHOLE is read whole, and pays nothing for the anchor packet. The
+    # packet exists to restore a comparison that splitting takes away, so on a paper
+    # nothing was taken away from it is pure cost — and charging it anyway would split a
+    # paper that did not need splitting, which is the opposite of what this module is for.
+    parts = pdf.plan_reading(list(doc.sections), max(400, budget_chars))
+    whole = len(parts) <= 1
+    if not whole:
+        room = max(400, budget_chars - min(anchor.chars,
+                                           int(budget_chars * ANCHOR_BUDGET_FRACTION)))
+        parts = pdf.plan_reading(list(doc.sections), room)
 
     live = [s for s in doc.sections if (s.text or "")]
     total = sum(len(s.text) for s in live)
@@ -173,8 +180,11 @@ def plan(doc: PaperDoc, budget_chars: int) -> ReadingPlan:
         parts=parts, anchor=anchor,
         coverage=ReadingCoverage(
             extracted_prose_chars=total,
+            # Reported as zero on a paper read whole, because the packet is not sent:
+            # `anchor.chars` is what it WOULD cost, and a cost nobody paid must not appear
+            # in an accounting of what this design cost.
+            anchor_chars=0 if n <= 1 else anchor.chars,
             part_local_chars=covered,
-            anchor_chars=anchor.chars,
             anchor_repeat_chars=anchor.chars * max(0, n - 1),
             parts=n,
             synthesis_required=n > 1,
@@ -221,13 +231,26 @@ class SynthesisBrief(NamedTuple):
                 where += f" · p{c['page']}"
             if c.get("ref"):
                 where += f" · {c['ref']}"
-            rows.append(f"- [{where}] {c.get('description', '').strip()}\n"
+            rows.append(f"- [{where}] {(c.get('statement') or '').strip()}\n"
                         f"  quoted: \"{(c.get('quote') or '').strip()}\"")
         asks = "\n".join(f"  - {t}" for t in SYNTHESIS_TARGETS)
         return (f"{self.anchor.render()}\n\n"
                 f"## Your own observations across {self.parts_read} parts of this paper\n"
                 + ("\n".join(rows) if rows else "- (none)")
                 + f"\n\n## What to look for now\n{asks}\n")
+
+
+def _field(obj, name, default=None):
+    """Read one field off a `Finding` or off the plain dict a persisted part artifact is.
+
+    Both shapes are real. The tests build `Finding` objects because that is what the rest
+    of the pipeline passes around; `stages.audit.synthesis_inputs` builds dicts, because a
+    part artifact on disk is JSON and re-inflating it into a model would mean carrying
+    every harness-written field that has not been computed yet.
+    """
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
 
 
 def synthesis_brief(paper_id: str, lens: str, anchor: AnchorPacket,
@@ -242,19 +265,19 @@ def synthesis_brief(paper_id: str, lens: str, anchor: AnchorPacket,
     out = []
     for part in sorted(per_part_findings):
         for f in per_part_findings[part] or []:
-            quote = (getattr(f, "evidence_quote", "") or "").strip()
+            quote = (_field(f, "evidence_quote", "") or "").strip()
             if not quote:
                 continue
             out.append({
                 "part": part,
-                "section_idx": getattr(f, "section_idx", None),
-                "page": getattr(f, "page", None),
-                "ref": getattr(f, "evidence_ref", "") or "",
+                "section_idx": _field(f, "section_idx"),
+                "page": _field(f, "page"),
+                "ref": _field(f, "evidence_ref", "") or "",
                 "quote": quote,
                 # `statement` is the finding's own prose; `title` is its short form and
                 # is the fallback, because a finding with neither says nothing at all.
-                "statement": (getattr(f, "statement", "") or getattr(f, "title", "") or ""),
-                "finding_id": getattr(f, "finding_id", "") or "",
+                "statement": (_field(f, "statement", "") or _field(f, "title", "") or ""),
+                "finding_id": _field(f, "finding_id", "") or "",
             })
     return SynthesisBrief(paper_id=paper_id, lens=lens, anchor=anchor,
                           candidates=out, parts_read=len(per_part_findings))
@@ -305,6 +328,8 @@ if __name__ == "__main__":       # self-check: python -m harness.reading
                         sections=[Section(section_idx=0, title="Abstract", text="a")]), 70_000)
     assert one.coverage.parts == 1 and one.coverage.synthesis_required is False
     assert one.coverage.anchor_repeat_chars == 0
+    assert one.coverage.anchor_chars == 0, "a paper read whole is not sent the packet"
+    assert one.coverage.part_local_fraction == 1.0
 
     empty = plan(PaperDoc(paper_id="e"), 70_000)
     assert empty.coverage.part_local_fraction is None, "no prose is not full coverage"
