@@ -150,7 +150,7 @@ evaluation, and never claim equivalence on a change that has neither.
 | | |
 |---|---|
 | evaluated revision | `evaluated-v2`, commit `1c5bbdcf` |
-| release revision | the commit containing this report |
+| release revision | tag `release-2026-09-16` |
 
 The journal manuscript cites the evaluated revision for every empirical claim, because
 that is the code that produced the artifacts. The release revision is the one a reader
