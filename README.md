@@ -284,3 +284,22 @@ docs/                  the architecture map
 papers/                source PDFs
 projects/<pid>/        per-paper state: paper, audit, runs, reports, controller.json
 ```
+
+## The manuscript
+
+| file | what it is |
+|---|---|
+| `manuscript/journal.tex` / `.pdf` | **The journal treatment.** 35 pages, 20 sections, 5 appendices, 12 tables. Every table is generated from the frozen run by `manuscript/tables/make_journal_tables.py`; no measurement in it is typed by hand. |
+| `manuscript/manuscript.tex` / `.pdf` | The six-page condensed version of the same result. |
+| `manuscript/fig2_decision.tex` / `.pdf` | Figure 2, the decision structure, as standalone vector art. |
+| `manuscript/check_journal_claims.py` | Fails the build when a number in the prose disagrees with the run, when a comparative claim this evaluation cannot support appears, or when an em dash does. |
+| `manuscript/check_journal_style.py` | Fails the build on em dashes, on `provenance` used more than twice, on twelve rhetorical patterns that read as machine-written, on a missing section, and on a measurement written as a hand-made table. |
+| `manuscript/running_is_not_verifying.tex` | **Stale.** A longer draft against an earlier run, kept for comparison. Its header says so. |
+
+Both current sources build with zero overfull boxes, zero undefined references and zero
+undefined citations, and every bibliography entry is cited exactly once in the text.
+
+The claims in the manuscript are mapped to code, tests and artifacts in
+`docs/CODEBASE_CLAIM_MAP.md`; reviewer feedback is closed in
+`docs/REVIEWER_FEEDBACK_CLOSURE.md`. The revision that produced the evaluation is tagged
+`evaluated-v2`; the revision to check out is tagged `release-2026-09-16`.
