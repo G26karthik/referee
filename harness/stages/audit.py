@@ -283,7 +283,7 @@ def accept_lens(cfg: Config, pid: str, lens: str, raw: str, *,
               **delegation.provenance_record(mode=mode, reviewer=reviewer,
                                              tool_policy=tool_policy),
               "content_sha256": content_sha256, "findings": len(report.findings),
-              "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+              "ts": state.now()}
     state.write_json(out.with_suffix(".driver.json"), record)
     return record
 

@@ -352,7 +352,7 @@ def _seal(cfg: Config, pid: str, target_id: str, script: str,
     record.update({
         "paper_id": pid, "target_id": target_id, "established": conf.established,
         "content_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "ts": state.now(),
     })
     state.write_json(sidecar, record)
     return record

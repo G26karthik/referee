@@ -175,8 +175,12 @@ def test_the_pipeline_discovers_prioritises_and_plans_without_an_operator(cfg: C
     assert ts.objects == sorted(ts.objects, key=lambda o: (-o.priority, o.target_id))
     assert ts.objects[0].priority_reason.startswith("centrality=")
 
-    # at least one question was resolved with nothing running
-    assert ts.extraction_coverage["targets_resolved_without_execution"] >= 0
+    # The count exists and is a count. `>= 0` was the assertion here and it is true of
+    # every integer, so it did not test the comment above it. What this fixture actually
+    # establishes is that the term is reported at all, separately from the launch count.
+    resolved_without_execution = ts.extraction_coverage["targets_resolved_without_execution"]
+    assert isinstance(resolved_without_execution, int)
+    assert resolved_without_execution <= len(ts.objects)
     assert ts.extraction_coverage["repository_advertised"] is True
 
     # at least one target legitimately asked for an execution

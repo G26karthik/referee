@@ -161,7 +161,7 @@ def _seal(cfg: Config, pid: str, verdict: SubstantiveVerdict, record: dict) -> d
     record.update({
         "paper_id": pid, "verdict": verdict.verdict,
         "content_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "ts": state.now(),
     })
     state.write_json(out.with_suffix(".driver.json"), record)
     return record

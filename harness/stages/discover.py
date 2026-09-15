@@ -25,6 +25,8 @@ failed table extraction can be told apart from a paper with nothing to check.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from .. import (claims, discovery, exhaustion, planner, priority,
                 questions as questions_mod, reimplement, state)
 from ..artifacts import (DiscoveredObject, PaperDoc, PlanDecision, TargetOutcome,
@@ -67,8 +69,17 @@ _DISPOSITION_FOR_ACTION = {
 }
 
 
+def targets_path_in(root: Path):
+    """Where the target set lives inside a project directory. The ONE spelling.
+
+    `probe` holds a project root and `discover` holds a (cfg, pid); before this
+    they spelled the same three-component path five times between them.
+    """
+    return root / "discovery" / "targets.json"
+
+
 def targets_path(cfg: Config, pid: str):
-    return state.project_dir(cfg, pid) / "discovery" / "targets.json"
+    return targets_path_in(state.project_dir(cfg, pid))
 
 
 def load(cfg: Config, pid: str) -> TargetSet | None:

@@ -21,7 +21,12 @@ SUBDIRS = [
 ]
 
 
-def _now() -> str:
+def now() -> str:
+    """The one UTC timestamp in this harness.
+
+    Nine sites formatted this string independently, two of them as identically
+    bodied private functions in different modules. One format, one source of time.
+    """
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
@@ -54,8 +59,8 @@ def create_project(cfg: Config, repo_url: str, direction: str, pid: str | None =
         "direction": direction,
         "phase": "created",
         "status": "active",
-        "created_at": _now(),
-        "updated_at": _now(),
+        "created_at": now(),
+        "updated_at": now(),
         "cost_usd": 0.0,
     }
     save_meta(cfg, pid, meta)
@@ -68,7 +73,7 @@ def load_meta(cfg: Config, pid: str) -> dict[str, Any]:
 
 
 def save_meta(cfg: Config, pid: str, meta: dict[str, Any]) -> None:
-    meta["updated_at"] = _now()
+    meta["updated_at"] = now()
     (project_dir(cfg, pid) / "project.json").write_text(
         json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
     )
@@ -100,7 +105,7 @@ def append_log(
 ) -> None:
     """Append one artifact record to research_log.jsonl (the Director reads headers)."""
     rec = {
-        "ts": _now(),
+        "ts": now(),
         "type": artifact_type,
         "phase": phase,
         "headers": headers or {},
@@ -111,13 +116,6 @@ def append_log(
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     if cost_usd:
         add_cost(cfg, pid, cost_usd)
-
-
-def read_log(cfg: Config, pid: str) -> list[dict[str, Any]]:
-    p = project_dir(cfg, pid) / "research_log.jsonl"
-    if not p.exists():
-        return []
-    return [json.loads(line) for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
 def write_json(path: Path, obj: Any) -> str:

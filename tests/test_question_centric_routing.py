@@ -373,3 +373,68 @@ def test_the_object_and_its_question_never_disagree_about_what_is_being_asked():
     for obj in objs:
         if obj.question_id in by_id:
             assert obj.question_kind == by_id[obj.question_id].kind, obj.target_id
+
+
+# --------------------------------------------------------------------------- #
+# INVARIANT 23, second clause: a SUPPORTING target does not earn an execution
+# while a CENTRAL one is being pursued.
+#
+# The first clause ("a route that settles with nothing running is taken first") was
+# already pinned. This clause was not: the demotion existed, the counter existed, and
+# nothing asserted either, so a change that spent an execution on a peripheral target
+# while a central one waited would have passed the suite.
+# --------------------------------------------------------------------------- #
+def _obj(target_id: str, centrality: str) -> DiscoveredObject:
+    return DiscoveredObject(target_id=target_id, centrality=centrality,
+                            harness_addressable=True, materiality_basis="NONE")
+
+
+def _executable_plan(target_id: str) -> PlanDecision:
+    return PlanDecision(target_id=target_id, action="AUTHOR_CODE_REPRODUCTION",
+                        route="AUTHOR_CODE_EXECUTION", reason="fixture",
+                        requires_execution=True)
+
+
+def test_a_supporting_target_is_demoted_while_a_central_one_is_pursued():
+    objects = [_obj("CEN", "CENTRAL"), _obj("SUP", "SUPPORTING"), _obj("PER", "PERIPHERAL")]
+    plans = [_executable_plan(o.target_id) for o in objects]
+
+    out = discover_stage._demote_when_a_central_target_is_being_pursued(objects, plans)
+
+    by_id = {p.target_id: p for p in out}
+    assert by_id["CEN"].requires_execution is True, "the central target still runs"
+    for tid in ("SUP", "PER"):
+        assert by_id[tid].requires_execution is False, tid
+        # A NAMED refusal, never silence: the gate is what the funnel and the review print.
+        assert by_id[tid].blocking_gate == "outranked_by_a_central_target", tid
+        assert by_id[tid].gates.get("outranked_by_a_central_target") is True, tid
+        # And it is not recorded as "no experiment was needed here" without saying why.
+        assert "CENTRAL target" in by_id[tid].reason, tid
+
+
+def test_supporting_targets_stand_when_no_central_target_is_being_pursued():
+    """The other half of the rule, and the reason it is a SET-level fact.
+
+    A paper whose central claims are all unaddressable must not silently become a paper
+    on which nothing at all is checked."""
+    objects = [_obj("SUP", "SUPPORTING"), _obj("PER", "PERIPHERAL")]
+    plans = [_executable_plan(o.target_id) for o in objects]
+
+    out = discover_stage._demote_when_a_central_target_is_being_pursued(objects, plans)
+
+    assert [p.requires_execution for p in out] == [True, True]
+    assert all(p.blocking_gate != "outranked_by_a_central_target" for p in out)
+
+
+def test_a_central_target_that_does_not_run_does_not_outrank_anything():
+    """The trigger is a central target being PURSUED, not one merely existing. A central
+    target the planner refused cannot suppress the supporting work that is left."""
+    objects = [_obj("CEN", "CENTRAL"), _obj("SUP", "SUPPORTING")]
+    plans = [PlanDecision(target_id="CEN", action="INFEASIBLE_SPECIFICATION",
+                          route="AUTHOR_CODE_EXECUTION", reason="fixture",
+                          requires_execution=False),
+             _executable_plan("SUP")]
+
+    out = discover_stage._demote_when_a_central_target_is_being_pursued(objects, plans)
+
+    assert {p.target_id: p.requires_execution for p in out} == {"CEN": False, "SUP": True}

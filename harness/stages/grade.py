@@ -167,7 +167,7 @@ def accept_grade(cfg: Config, pid: str, slug: str, raw: str, *,
               "tool_policy_provable": prov["tool_policy_provable"],
               "verdict": grade.verdict,
               "content_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
-              "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+              "ts": state.now()}
     state.write_json(out.with_suffix(".driver.json"), record)
     return record
 

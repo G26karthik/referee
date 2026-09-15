@@ -118,7 +118,8 @@ def build_spec(cfg: Config, pid: str, doc: PaperDoc, target=None) -> ProbeSpec:
     finding_target = candidates[0] if candidates else None
     target_finding_id = ""
     if target is not None and getattr(target, "question_id", ""):
-        tset_path = root / "discovery" / "targets.json"
+        from . import discover as discover_stage
+        tset_path = discover_stage.targets_path_in(root)
         if tset_path.exists():
             raw_ts = state.read_json(tset_path)
             qrow = next((q for q in raw_ts.get("questions", [])
@@ -770,7 +771,7 @@ def resync_cached_outcomes(cfg: Config, pid: str) -> dict:
             obj.status = by_outcome[obj.target_id]
     discover_stage.sync_questions(target_set)
     exhaustion.refresh(target_set, cfg)
-    state.write_json(root / "discovery" / "targets.json", target_set.model_dump())
+    state.write_json(discover_stage.targets_path_in(root), target_set.model_dump())
     return {"resynced": len(outcomes), "pursued": len(pairs), "deferred": len(deferred)}
 
 
@@ -1162,7 +1163,7 @@ def _review(cfg: Config, pid: str) -> dict:
             if out.disposition == "SUPERSEDED_BY_ESTABLISHED_FAILURE")
         discover_stage.sync_questions(target_set)
         exhaustion.refresh(target_set, cfg)
-        state.write_json(root / "discovery" / "targets.json", target_set.model_dump())
+        state.write_json(discover_stage.targets_path_in(root), target_set.model_dump())
         return {
             "paper_id": pid,
             "verdict": "not_started",
@@ -1369,7 +1370,7 @@ def _review(cfg: Config, pid: str) -> dict:
         # makes, which is why it is a fold and not an accumulation.
         discover_stage.sync_questions(target_set)
         exhaustion.refresh(target_set, cfg)
-        state.write_json(root / "discovery" / "targets.json", target_set.model_dump())
+        state.write_json(discover_stage.targets_path_in(root), target_set.model_dump())
 
     rec = result.reconciliation
     state.append_log(

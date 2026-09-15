@@ -274,8 +274,11 @@ def test_an_empty_surface_has_no_coverage_rather_than_full_coverage():
     """`None` is not zero and is not one. A paper extraction recovered nothing from has no
     denominator, and reporting 100% for it is the fabrication this guards."""
     empty = coverage_mod.surface(PaperDoc(paper_id="p"))
-    assert empty.surface_empty is True and empty.surface_size == 0 \
-        if hasattr(empty, "surface_size") else True
+    # `surface_size` is a field of CoverageReport, not of ReviewSurface, so the guard this
+    # line used to carry (`... if hasattr(empty, "surface_size") else True`) was `assert
+    # True` by operator precedence and never looked at `surface_empty` at all.
+    assert empty.surface_empty is True
+    assert empty.addresses == () or not empty.addresses
     report = coverage_mod.measure(empty, addressed=(), examined=())
     assert report.addressed_rate is None
     assert report.examined_rate is None

@@ -279,7 +279,7 @@ harness/
   guarantees.py        what a review promises, what it does not, and which held
   provenance.py        the provenance ceiling, in one object
   preflight.py         is this batch N distinct papers? Answered before anything is spent
-tests/                 1571 tests
+tests/                 1982 tests
 docs/                  the architecture map
 papers/                source PDFs
 projects/<pid>/        per-paper state: paper, audit, runs, reports, controller.json

@@ -30,6 +30,7 @@ from .. import outcome as outcome_mod
 from .. import provenance as provenance_mod
 from .. import taxonomy
 from .. import selfaudit, state
+from .. import artifacts as artifacts_mod
 from ..artifacts import (CodeAudit, CodeAuditFinding, EvalReport, ExperimentalChain, Finding,
                          LensReport, PaperDoc, ProbeResult, Reconciliation, RepoAcquisition)
 from ..config import Config
@@ -1705,9 +1706,19 @@ _DROPPABLE_ORDER = (
 )
 # Never dropped, whatever the length: what was established, what failed, how much was
 # looked at, and what the review does not promise.
+#
+# The assertion below is the whole point of naming them. Before it, "never dropped" held
+# only because `_DROPPABLE_ORDER` happened not to list these five, and an edit that added
+# one would have violated invariant 19 with nothing catching it: `_bounded` reads
+# `_DROPPABLE_ORDER` and has never read this tuple. It is checked at import so the failure
+# lands on whoever made the edit rather than on a review that quietly lost its outcome
+# block.
 _UNDROPPABLE = ("## Review outcome", "## Established failures", "## Scientific findings",
                 "## Scope of this review",
                 "## What this review guarantees, and what it does not")
+assert not (set(_UNDROPPABLE) & set(_DROPPABLE_ORDER)), (
+    "a load-bearing section was made droppable: "
+    f"{sorted(set(_UNDROPPABLE) & set(_DROPPABLE_ORDER))}")
 
 
 def _split_sections(text: str) -> list[tuple[str, str]]:
@@ -2167,6 +2178,10 @@ def run_report(cfg: Config, pid: str) -> dict:
                                       probe=probe)
     triage_level, triage_why = triage(findings, rec, outcomes=outcomes, objects=objects,
                                       probe=probe)
+    # `TRIAGE_LEVELS` was a declared vocabulary nothing checked against: `triage` returns
+    # string literals. A fourth colour, or a typo, would have reached a reader and a
+    # batch summary unremarked.
+    assert triage_level in artifacts_mod.TRIAGE_LEVELS, triage_level
     repro = reproduction_status(probe)
     ran_as = provenance_label(probe.provenance) if probe else "SYNTHESIZED_DIAGNOSTIC"
 

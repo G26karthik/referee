@@ -257,16 +257,8 @@ def inspect_dependencies(repo: Path) -> tuple[list[str], list[str], list[str]]:
                 deps += _parse_requirements(path.read_text(encoding="utf-8", errors="replace"))
         except OSError:
             continue
-    seen, ordered = set(), []
-    for d in deps:
-        if d not in seen:
-            seen.add(d)
-            ordered.append(d)
-    frameworks = []
-    for d in ordered:
-        fw = _FRAMEWORKS.get(d)
-        if fw and fw not in frameworks:
-            frameworks.append(fw)
+    ordered = list(dict.fromkeys(deps))
+    frameworks = list(dict.fromkeys(fw for d in ordered if (fw := _FRAMEWORKS.get(d))))
     return files, ordered, frameworks
 
 

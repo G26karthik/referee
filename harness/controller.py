@@ -590,7 +590,7 @@ def step(cfg: Config, case: CaseState, **opts) -> CaseState:
     case.history.append(PhaseEvent(
         phase=case.phase, outcome=out.outcome, reason=out.reason,
         detail=out.detail or {}, attempt=attempt,
-        ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
+        ts=state.now()))
     if out.reproduction_class:
         case.reproduction_class = out.reproduction_class
 

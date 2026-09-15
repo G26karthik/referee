@@ -54,10 +54,11 @@ from . import (container as container_mod, isolation as isolation_mod, repo as r
 from .artifacts import (CommitVerification, ExecAuthorization, ExecCapability, ProbeSpec,
                         RepoAcquisition)
 from .config import Config
+from . import state
 from .experiment_id import identities_established
 
 def _utc() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return state.now()
 
 
 def _text(buf) -> str:

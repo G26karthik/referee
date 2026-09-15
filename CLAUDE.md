@@ -31,7 +31,7 @@ when targets are planned and again once anything has run.
 |---|---|---|
 | what KIND of problem is this | `scientific_class` — 10 values | the paper's argument |
 | was the question settled, by what | `resolution_status` — 5 values | the review process |
-| what did the evidence route produce | `evidence_state` — 13 values | the world |
+| what did the evidence route produce | `evidence_state` — 14 values | the world |
 | which review path was this paper on | `artifact_state` — 6 values | the paper's artifact |
 
 A CONFOUND settled from the paper and a CONFOUND left open by a missing artifact are the
@@ -123,8 +123,8 @@ below it decides what may be concluded. Neither side may overrule the other.
 ## Workflow
 
 ```
-papers → controller → ingest → audit → collect → grade → discover → probe → report
-                                                     └ questions · targets · priority · plan
+papers → controller → ingest → audit → collect → grade → assess → discover → probe → report
+                                                              └ questions · targets · priority · plan
 ```
 
 | phase | module | input → output | decides | refuses by |
@@ -133,6 +133,7 @@ papers → controller → ingest → audit → collect → grade → discover �
 | audit | `stages/audit.py` + `audit_driver.py` | doc → `audit/<lens>.json` ×4 | the four lenses judge | `waiting`, resumable |
 | collect | `stages/audit.load_reports` | lens files → verified findings | quote ≟ paper | drops the finding, counts it |
 | grade | `stages/grade.py` + `grade_driver.py` | serious findings → `audit/grade/<slug>.json` | a second, blinded reviewer per candidate | `ok` with partial coverage — never blocks a report by default |
+| assess | `assessment.py` | findings + grades → `CaseState.assessment` | has a material failure already been established, and is the investigation still open | never blocks; `investigation_open` is an INPUT to `planner.classify` |
 | **discover** | `stages/discover.py` | doc + findings → `discovery/targets.json` | what is addressable, what it is worth, whether an experiment is justified | records a NAMED refusal per target |
 | verify | `stages/probe.py` | doc + repo → `ProbeSpec` per target | identity, capability, resources, commit, backend | leaves the spec unpromoted |
 | execute | `backends.py` + `local_exec.py` | spec → `ProbeResult` | `authorize()` alone | `verdict: blocked` |
@@ -208,7 +209,8 @@ requested paper in exactly one terminal state, conservation law asserted).
 ## Commands
 
 ```bash
-python run.py review --paper a.pdf b.pdf c.pdf --auto-audit --auto-grade  # the entrypoint
+SH_ALLOW_AUTO_AUDIT=1 SH_ALLOW_GRADING=1 python run.py review \
+    --paper a.pdf b.pdf c.pdf --auto-audit --auto-grade       # the entrypoint
 python run.py review --paper a.pdf                            # exit 2 → lenses pending
 python run.py status <paper-id>                               # controller state + history
 python run.py list                                            # reviewed papers
@@ -216,8 +218,14 @@ python run.py dossier                                         # consolidate fini
 python run.py evaluate                                        # system metrics over the corpus
 python run.py sandbox [--release]                             # leased remote machines
 python run.py preflight                                       # is this batch N distinct papers?
-python -m pytest tests -q                                     # 1571 tests
+python -m pytest tests -q                                     # 1982 tests
 ```
+
+**The two env vars above are not decoration.** `--auto-audit` and `--auto-grade` select a
+delegation mode; they do not OPEN its gate. `run.py cmd_review` calls `Config.load()` and
+never calls `Config.open_delegation_gates`, so with the flags alone `audit_driver.available`
+returns `(False, 'auto-audit gate is closed: SH_ALLOW_AUTO_AUDIT is not set')` and the run
+stops at `waiting`. `run.py --help` says so; this line now says so too.
 
 Always `PYTHONUTF8=1` on Windows (paper text is full of em dashes and math) and always
 the repo venv: `../.venv/Scripts/python.exe`.
@@ -231,14 +239,14 @@ Per paper, `projects/<pid>/` holds four things a reader should not confuse:
 | `discovery/targets.json` | anyone asking what else was considered, and why it was not pursued |
 | `reports/<pid>.md` / `.json` | the complete machine trace |
 
-Self-checks, one per module: `python -m harness.<claims|questions|taxonomy|discovery|
-priority|planner|ledger|evaluation|local_exec|repo|code_audit|probe_synth|dossier|
-audit_driver|grade_driver|verdict_driver|grading|failures|selfaudit|corpus|backends|
-resources|sandbox|controller|provenance|outcome|coverage|docintegrity|guarantees|
-preflight|reimplement>` and `python -m harness.stages.<report|grade|discover>`.
-`tests/test_self_checks.py` DISCOVERS them rather than listing them, so a module that
-loses its self-check fails the suite; `tools/loop.py` runs the whole loop in one command.
-`harness.sandbox`'s self-check leases nothing and needs no credentials.
+Self-checks: **every module that carries an `if __name__ == "__main__"` guard has one,
+and there are 50 of them.** Do not maintain a list here; the hand-written one drifted to
+34 while modules kept landing. `tests/test_self_checks.py` DISCOVERS them by walking
+`harness/**/*.py` and parsing for the guard with `ast`, so a module that loses its
+self-check fails the suite, and `python -m harness.<module>` runs any one of them
+(`python -m harness.stages.<report|grade|discover>` for the stages). `tools/loop.py` runs
+the whole loop in one command. `harness.sandbox`'s self-check leases nothing and needs no
+credentials.
 `python -m harness.pdf <file.pdf>` takes a PDF path.
 
 `docs/HARNESS_ARCHITECTURE.md` is the per-stage contract, the address grammar and the
@@ -261,9 +269,14 @@ Do not weaken these to make more papers executable or more findings reportable.
    `P<i>:<a>-<b>` gains nothing (`span_mismatch`).
 2. `verified_observation` and `evidence_class` are written by the harness, never read
    from a lens file. A lens cannot certify its own reasoning.
-3. **Provenance ceiling** — only `driver` or `repo_exec` provenance may reconcile a
-   printed cell, in *either* direction. A synthesized probe can neither convict nor
-   acquit.
+3. **Provenance ceiling** — only `driver`, `repo_exec` or `reimpl_exec` provenance may
+   reconcile a printed cell, in *either* direction. A synthesized probe can neither
+   convict nor acquit. `reimpl_exec` is admissible HERE and gated further downstream:
+   `local_exec.reconcile` and `backends.authorize` additionally require
+   `ReimplementationConformance.established`, so a reconstruction settles a verdict only
+   when every required ingredient binds to both a paper locator and a verified
+   implementation locator. Its reader-facing label is INDEPENDENT_REIMPLEMENTATION and
+   never AUTHOR_REPOSITORY.
 4. Only `authorize()` may permit repository execution, and it requires all of: gate
    open, a backend that `can_execute`, `repo_exec` provenance, a verified commit,
    experiment + metric + configuration identity, capability, and sufficient resources.
@@ -276,7 +289,10 @@ Do not weaken these to make more papers executable or more findings reportable.
 8. The paper decision is a materiality TABLE in `stages/report.py`, not a model judgement
    and not a count: `MATERIAL_SEVERITY = ()`. RED iff `claim_status` is
    VERIFIED_FAILURE — deterministic paper arithmetic or a failed reproduction from an
-   admissible provenance. A model-assigned FATAL is an attention signal with no rejection
+   admissible provenance, AND `materiality.material_target_failure` establishing that a
+   central claim depends on that target. Both are necessary: an admissible FAILED
+   REPRODUCTION on a target no central claim is established to depend on is GREEN with
+   the defect reported, which 'RED iff VERIFIED_FAILURE' alone does not convey. A model-assigned FATAL is an attention signal with no rejection
    authority. Nothing accumulates: no number of MAJORs or MINORs ever reaches RED, because a
    concern weakens a claim and does not reject one, and the old `RED_MAJOR_ONE_LENS=3` /
    `RED_MAJOR_TOTAL=10` thresholds made the decision a property of how many things a
@@ -424,6 +440,13 @@ Do not weaken these to make more papers executable or more findings reportable.
     invisible in aggregate. An eight-file request that is seven documents produces seven
     reviews and a claim about eight papers.
 
+    **The interface, stated precisely, because the invariant used to overstate it.**
+    `preflight` is a SEPARATE OPERATOR COMMAND (`run.py preflight`), not a gate inside
+    `run.py review`: `harness/controller.py` contains no reference to it and
+    `review_papers` never calls it. A batch submitted straight to `review` is not
+    refused. The eight-paper run was preflighted and its output is preserved, so the
+    claim about that corpus stands; the claim about the entrypoint did not.
+
 ## Operating autonomously
 
 `--auto-audit` delegates each lens to a reviewer — `SH_AUDIT_CMD`, or the `claude` CLI
@@ -473,6 +496,15 @@ Never edit `projects/<pid>/audit/prompts/*.md` — regenerated every run.
 | install | `SH_ALLOW_INSTALL` | off | building `runs/<pid>/env` from the repo's requirements |
 | sandbox | `SH_ALLOW_SANDBOX` | off | **leasing a remote Linux machine** and staging the audited commit into it (`harness/sandbox.py`) |
 | execute | `SH_ALLOW_REPO_EXEC` | off | running the repository's own entrypoint |
+| reimpl. driver | `SH_ALLOW_REIMPLEMENTATION_DRIVER` | off | delegating the governed reconstruction's authoring and its separate conformance verification |
+| reimpl. exec | `SH_ALLOW_REIMPLEMENTATION_EXEC` | off | running a reconstruction that conformance verification bound; checked inside `authorize()` |
+| alignment trial | `SH_ALLOW_ALIGNMENT_TRIAL` | off | probing a candidate command's `--help` surface. **Gates nothing today: `alignment/trial.py` has no production caller** (see Known limitations) |
+| diagnostic | `SH_DIAGNOSTIC_MODE` | off | running an inadmissible probe anyway and recording its result SEPARATELY, where it settles nothing |
+
+`SH_AUDIT_BUDGET_CHARS` lives outside `Config` (`stages/audit.SECTION_BUDGET_CHARS`) and
+decides how much of the paper a lens is shown. It is the ceiling on recall, and
+`coverage.budget_chars` re-reads the same variable so the number a review PRINTS is the
+number the prompt USED.
 
 `SH_MAX_TARGETS` (default 3) is a BUDGET, not a gate: which targets are worth pursuing is
 `planner`'s decision and the order is `priority`'s, so lowering it drops the least useful
@@ -522,6 +554,37 @@ implementation this restores ran one to *author* experiments, which measures the
 rather than the paper.
 
 ## Known limitations
+
+**Found by the 2026-09-16 release audit, each verified by reading the code rather than
+by grep:**
+
+- **`harness/alignment/trial.py` is orphaned.** `may_trial` and `run_trial` are called only
+  from the module's own self-check and from `tests/test_alignment.py`. Nothing in
+  `experiment_id`, `backends` or `stages/probe` invokes them, so `SH_ALLOW_ALIGNMENT_TRIAL`
+  currently gates nothing. The module is kept rather than deleted because it is a complete,
+  argued design with test coverage, and because the ambiguous-candidate path in
+  `experiment_id.resolve_experiment` is exactly where it belongs; it is listed here so that
+  nobody reports it as a capability this system has.
+- **`stages/report.unearned_support_language` is enforced at TEST time, not at run time.**
+  It is the "GREEN may not borrow the words of evidence it does not have" guard and the
+  renderer never calls it: `tests/test_guarantees.py` and `tests/test_reimplementation_path.py`
+  run it over rendered output as an independent check. That is a defensible design (a linter
+  over the renderer beats a filter inside it) and it is not what "the report refuses to say
+  it" would mean. Same for `stages/report.material_failures`, whose body is `return []`: it
+  makes invariant 8 statically checkable and is not on any path.
+- **`json_metric` is unused, not merely diagnostic-only.** CLAUDE.md called it
+  diagnostic-only; `local_exec` reads it for a `saw_json_metric` flag and nothing else
+  consumes the value. The stronger statement is the true one: positional last-JSON-wins
+  never reaches a reconciliation.
+- **`docs/HARNESS_ARCHITECTURE.md` §3 is stale in three ways** and is superseded by the
+  phase table above: it lists six phases rather than nine, says only `audit` is retryable
+  when `controller.RETRYABLE` is `("audit", "grade")`, and says `--force-probe` rewinds to
+  `probe` when `controller` rewinds to `discover` (with a comment explaining that rewinding
+  to `probe` was the bug).
+- **`harness/materiality.py`, `harness/disposition.py` and `harness/container.py` are not
+  described anywhere in the prose above beyond the invariants that reference them**, even
+  though `disposition` supplies the first line `run.py` prints and `container` is the
+  backend the v2 run actually selected. `docs/CODEBASE_CLAIM_MAP.md` covers them.
 
 **THE SEVEN SHIPPED REVIEWS IN `projects/` PREDATE EVERYTHING BELOW.** They were produced
 under older code and are the record of that run. Nothing in this section has been
@@ -768,6 +831,11 @@ They are recorded because several refusals in those outputs — a 24 GiB demand 
 was underneath.
 
 Torch is cu126 (cu121 publishes no wheels for Python 3.13). GPU: RTX 4060 Laptop, 8 GB,
-sm_89. ~15 GB RAM. No WSL, no Docker, no virtualization on this host — which is exactly
+sm_89. ~15 GB RAM. Docker 29.7.2 is now installed here, which is why `harness/container.py`
+exists and why `backends.select_for` chose `container` on every paper of the v2 run: the
+isolation requirement for running a paper's own repository is MET on this host, and every
+refusal in that run was therefore an identity or conformance refusal rather than an
+infrastructural one. When this was written there was no WSL, no Docker and no
+virtualization here — which was exactly
 why the `modal` backend exists: a Linux-only repository is `environment_incompatible`
 here and clears the same check unchanged when the platform the run will SEE is linux.

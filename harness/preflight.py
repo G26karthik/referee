@@ -47,6 +47,7 @@ PREFLIGHT_STATES = (
     "UNREADABLE",           # the bytes could not be hashed
 )
 BLOCKING_STATES = ("DUPLICATE_REQUEST", "UNREADABLE")
+assert set(BLOCKING_STATES) <= set(PREFLIGHT_STATES), BLOCKING_STATES
 
 
 def _recorded_sha(cfg: Config, pid: str) -> str | None:

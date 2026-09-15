@@ -143,17 +143,6 @@ def driver_error(message: str) -> AuditDriverError:
     return cls(message, kind=kind, retry=retry, reset_hint=hint)
 
 
-def _reset_hint(text: str) -> str:
-    """A compatibility shim for `failures.reset_hint`, kept because the name was public.
-
-    Its docstring used to say `grade_driver` imports it. It does not — it imports
-    `NonRetryable`, `RateLimited` and `_kill_tree` — so the stated reason for the shim's
-    existence was false, which is exactly how a dead alias survives a cleanup: nobody
-    deletes the thing the comment says something else depends on.
-    """
-    return failures.reset_hint(text)
-
-
 def _kill_tree(proc: subprocess.Popen) -> None:
     """Kill the WHOLE process tree a `shell=True` command started, not just the shell.
 
@@ -1043,7 +1032,7 @@ def run_lens(cfg: Config, pid: str, lens: str, prompt: Path, out: Path, *,
             # name and the value was removed before the artifact was sealed.
             "harness_keys_stripped": meta.get("harness_keys_stripped", 0),
             "unknown_keys_dropped": meta.get("unknown_keys_dropped", 0),
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "ts": state.now(),
         }
         state.write_json(out.with_suffix(".driver.json"), record)
         return record

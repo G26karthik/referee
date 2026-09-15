@@ -328,7 +328,7 @@ def run_candidate(cfg: Config, pid: str, slug: str, prompt: Path, out: Path, *,
             "desiderata_passed": meta.get("desiderata_passed"),
             "unknown_desiderata": meta.get("unknown_desiderata") or [],
             "unknown_keys_dropped": meta.get("unknown_keys_dropped", 0),
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "ts": state.now(),
         }
         state.write_json(out.with_suffix(".driver.json"), record)
         return record
