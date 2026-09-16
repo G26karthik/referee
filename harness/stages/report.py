@@ -30,6 +30,7 @@ from .. import outcome as outcome_mod
 from .. import provenance as provenance_mod
 from .. import taxonomy
 from .. import selfaudit, state
+from .. import artifact_evidence
 from .. import artifacts as artifacts_mod
 from ..artifacts import (CodeAudit, CodeAuditFinding, EvalReport, ExperimentalChain, Finding,
                          LensReport, PaperDoc, ProbeResult, Reconciliation, RepoAcquisition)
@@ -1116,30 +1117,48 @@ def _runtime_block(c: CodeAudit) -> list[str]:
 
 
 def _code_audit_block(c: CodeAudit) -> list[str]:
-    """Static findings, each with a file, a line and the source line itself."""
+    """Static findings, each with a file, a line and the source line itself.
+
+    **Filtered by rule AUTHORITY, not by severity.** `artifact_evidence.RULE_AUTHORITY`
+    sorts each detector into what it can carry, and only classes A and B reach a reviewer;
+    an unaudited rule defaults to invisible, because the audit licenses a rule rather than
+    its existence. Measured over the four repository papers the detectors produced six hits
+    and five are false — four from "eval" containing "val" on a line calling an evaluation
+    FUNCTION named `test`, one from `new_transform_r` containing both an arm token and an
+    augmentation token — so printing all of them would cost a referee five investigations
+    to recover one fact. The suppressed hits stay in `probe_results.json`, where the machine
+    trace is complete and nobody is being asked to act on them.
+    """
     if c.skipped:
         return [f"⚪ **Not run.** {c.skipped}"]
-    if not c.findings:
+    shown = [f for f in c.findings if artifact_evidence.reviewer_visible(f.rule_id)]
+    hidden = len(c.findings) - len(shown)
+    suppressed = ([f"", f"_{hidden} further hit(s) came from detectors this harness has "
+                   f"audited as unsafe for reviewer output — they match substrings of "
+                   f"identifiers and were measured false on the evaluated corpus. They "
+                   f"remain in the machine trace._"] if hidden else [])
+    if not shown:
         return [f"🟢 **No cheat patterns matched** across {c.files_scanned} Python file(s) "
                 f"({c.lines_scanned:,} lines). This is the absence of a signature, not a "
                 f"clean bill of health: the detectors cover baseline crippling, split "
-                f"leakage and metric redefinition, and nothing else."]
-    counts = Counter(f.category for f in c.findings)
-    out = [f"⚠️ **{len(c.findings)} pattern(s)** across {c.files_scanned} Python file(s) "
+                f"leakage and metric redefinition, and nothing else."] + suppressed
+    counts = Counter(f.category for f in shown)
+    out = [f"⚠️ **{len(shown)} pattern(s)** across {c.files_scanned} Python file(s) "
            f"({c.lines_scanned:,} lines): "
            + ", ".join(f"{n} {cat.replace('_', ' ')}" for cat, n in sorted(counts.items())) + ".",
            "", "Static hits are suspicions with line numbers, never verdicts — each is "
            "listed with the counter-explanation that would clear it.", ""]
-    for f in c.findings[:MAX_CODE_ROWS]:
+    for f in shown[:MAX_CODE_ROWS]:
         out.append(f"- **[{f.severity}] {f.title}** — `{f.file}:{f.line}` · `{f.rule_id}`")
         out.append(f"  {f.statement}")
         if f.code_quote:
             out.append(f"  > `{_cell(f.code_quote, _QUOTE_CHARS)}`")
         if f.counter_explanations:
             out.append(f"  Alternative explanation: {_cell(f.counter_explanations[0], 200)}")
-    if len(c.findings) > MAX_CODE_ROWS:
-        out.append(f"- _…and {len(c.findings) - MAX_CODE_ROWS} further pattern(s); "
+    if len(shown) > MAX_CODE_ROWS:
+        out.append(f"- _…and {len(shown) - MAX_CODE_ROWS} further pattern(s); "
                    f"full set in `runs/<paper_id>/probe_results.json`._")
+    out += suppressed
     if c.unparseable:
         out += ["", f"_{len(c.unparseable)} file(s) could not be parsed and were skipped._"]
     return out

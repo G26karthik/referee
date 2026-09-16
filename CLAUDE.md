@@ -137,6 +137,7 @@ papers → controller → ingest → audit → collect → grade → assess → 
 | grade | `stages/grade.py` + `grade_driver.py` | serious findings → `audit/grade/<slug>.json` | a second, blinded reviewer per candidate | `ok` with partial coverage — never blocks a report by default |
 | assess | `assessment.py` | findings + grades → `CaseState.assessment` | has a material failure already been established, and is the investigation still open | never blocks; `investigation_open` is an INPUT to `planner.classify` |
 | **discover** | `stages/discover.py` | doc + findings → `discovery/targets.json` | what is addressable, what it is worth, whether an experiment is justified | records a NAMED refusal per target |
+| ↳ artifact | `stages/artifact.py` + `artifact_evidence.py` | doc + pinned checkout → `ArtifactFact` × N | what the RELEASED CODE establishes | `COMPARISON_BLOCKED` when it settles nothing |
 | verify | `stages/probe.py` | doc + repo → `ProbeSpec` per target | identity, capability, resources, commit, backend | leaves the spec unpromoted |
 | execute | `backends.py` + `local_exec.py` | spec → `ProbeResult` | `authorize()` alone | `verdict: blocked` |
 | reconcile | `local_exec.reconcile` | metric vs the addressed quantity | arithmetic only | `INCONCLUSIVE` |
@@ -221,7 +222,7 @@ python run.py dossier                                         # consolidate fini
 python run.py evaluate                                        # system metrics over the corpus
 python run.py sandbox [--release]                             # leased remote machines
 python run.py preflight                                       # is this batch N distinct papers?
-python -m pytest tests -q                                     # 1982 tests
+python -m pytest tests -q                                     # 2141 tests
 ```
 
 **The two env vars above are not decoration.** `--auto-audit` and `--auto-grade` select a
@@ -243,7 +244,7 @@ Per paper, `projects/<pid>/` holds four things a reader should not confuse:
 | `reports/<pid>.md` / `.json` | the complete machine trace |
 
 Self-checks: **every module that carries an `if __name__ == "__main__"` guard has one,
-and there are 50 of them.** Do not maintain a list here; the hand-written one drifted to
+and there are 60 of them.** Do not maintain a list here; the hand-written one drifted to
 34 while modules kept landing. `tests/test_self_checks.py` DISCOVERS them by walking
 `harness/**/*.py` and parsing for the guard with `ast`, so a module that loses its
 self-check fails the suite, and `python -m harness.<module>` runs any one of them
@@ -472,6 +473,18 @@ Do not weaken these to make more papers executable or more findings reportable.
     reader citing the wrong cell. An accepted link establishes a DEPENDENCY and never a
     truth, and the observation says so in those words.
 
+    **And an accepted link is not authority for the relationship it names.** Verifying two
+    endpoints does not verify that the evidence supports the claim; a model proposed that.
+    `link_authority` splits the two — `ENDPOINTS_VERIFIED_SEMANTIC_LINK`, whose support
+    relationship is model-proposed and which may inform priority, navigation, coverage and
+    explanation but **never a paper-level decision**, and `STRUCTURALLY_BOUND_LINK`, whose
+    relationship the DOCUMENT establishes by an explicit cross-reference from the claim
+    sentence or by independently established metric, benchmark, comparison-arm and
+    statistic identity. Only the second could ever become a materiality input. They are
+    counted separately and never summed into one headline, because summing them would
+    launder a model's semantic judgement into a deterministic result — invariant 2's
+    failure mode one level up. Over the eight-paper corpus the second count is 0 of 63.
+
 32. **A hyphen a line break inserted is not a difference in the quotation.** A PDF
     breaking "generation" across lines leaves `gener-` and `ation`, which flattens to
     `gener-ation`; a reader quoting the sentence writes `generation`, and the evidence gate
@@ -487,7 +500,39 @@ Do not weaken these to make more papers executable or more findings reportable.
     the word "verbatim" and says the match was recovered, because claiming verbatim there
     would be the false attestation `source_units` itself exists to prevent.
 
-33. **A batch's paper count is checked before it is spent.** `harness/preflight.py`
+33. **Static artifact inspection establishes what the CODE does and never that a result
+    is wrong.** `harness/artifact_evidence.py` has three authority levels and the third —
+    "the reported scientific result is false" — is not a value of `ARTIFACT_AUTHORITY`,
+    which makes the rule inexpressible rather than merely documented. `ARTIFACT_FACT` is
+    about the checkout alone. `PAPER_ARTIFACT_MISMATCH` additionally requires a paper
+    statement that MINTS to an address, an artifact span that RELOCATES in an audited
+    tree, and a NON-EMPTY experiment identity — three named refusals, and the third is the
+    one that separates a mismatch from a coincidence. `ARTIFACT_RESOLVED` is excluded from
+    `establishes_failure`, so no artifact observation can bypass materiality, and a
+    question whose answer is a measurement (`requires_execution`) is refused outright
+    rather than allowed to appear settled by a reading of the source.
+
+    **And a route discharges only when it answered something.** "The repository cloned
+    successfully" is not artifact evidence: `discharge` requires an audited snapshot, at
+    least one statement the route was asked about, and at least one fact carrying
+    authority. Everything else is COMPARISON_BLOCKED.
+
+34. **A model statement about code is not artifact evidence, and an unaudited rule is not
+    reviewer-visible.** `artifact_evidence.relocate` is `claims.mint` for source: the
+    writer supplies a file and a quotation, the HARNESS finds it, and a citation that is
+    absent, non-unique or outside the checkout is DROPPED — not softened. What survives
+    carries the file's SHA-256 beside the pinned commit, so a reader can prove the line has
+    not moved. The authors'-code auditor (`SH_ALLOW_ARTIFACT_REVIEW`, off) gets `Read` and
+    `Grep` and nothing else; `authority`, `refusal`, `span`, `snapshot`, `paper_ref`,
+    `fact_id` and `probe` are stripped at its driver boundary.
+
+    The ten existing AST rules are classified by the authority each can carry
+    (`RULE_AUTHORITY`), and an unclassified rule defaults to invisible: **the audit
+    licenses a rule, not its existence.** Measured over the four repository papers the
+    rules produced six hits of which five are false, every one because they match
+    SUBSTRINGS of identifiers and an identifier is not a semantic category.
+
+35. **A batch's paper count is checked before it is spent.** `harness/preflight.py`
     answers, per requested file, which `paper_id` it will get, whether that id already
     holds a DIFFERENT document, and whether another requested file is the SAME document —
     all from the PDF's bytes. Two different papers that slugify identically are fine and
@@ -593,6 +638,7 @@ nothing, measured over the eight-paper corpus:
 | `discovery._centrality`'s `in_abstract`, corrected locator | 0 / 706 objects |
 | `materiality.basis_for_ref` | 1 / 1,729 addresses |
 | `claimgraph`'s deterministic headline dependency | 0 / 1,729 addresses |
+| `claimlink`'s STRUCTURALLY BOUND links, with a reader proposing | 0 / 63 accepted |
 | value-matching a headline number to a unique cell | 0 / 21 numbers |
 
 The reason is not extraction quality. **There are zero cross-references in any Abstract of
@@ -613,6 +659,28 @@ accepted ones into `SUPPORTED_BY` edges, and `dependency()` answers with a PATH 
 abstract states 91.4; that number is one arm of the accuracy-on-CIFAR-100 comparison; the
 baseline is the other arm" — which a boolean never could.
 
+**An accepted link is not one thing, and the difference is the whole of its authority.**
+The harness proves both ENDPOINTS: the headline quotation exists, it really is in the
+Abstract or the Conclusion, the evidence quotation and address exist and agree, and any
+available numeric relationship recomputes. It does NOT prove *this evidence
+scientifically supports this headline claim* — that relationship was proposed by a model.
+So every accepted link carries one of two authorities, and the two counts are reported
+separately and never summed:
+
+| authority | deterministic | may inform |
+|---|---|---|
+| `ENDPOINTS_VERIFIED_SEMANTIC_LINK` | both endpoints | priority, navigation, coverage, route planning, explanation — **never a paper stop** |
+| `STRUCTURALLY_BOUND_LINK` | endpoints **and the relationship** | the above, and materiality, subject to the materiality audit |
+
+`claimlink.structural_binding` admits two bases: `explicit_crossref`, where the claim
+sentence itself cites the object the evidence belongs to and that label identifies exactly
+one recovered object; and `quantitative_identity`, where metric (the column header),
+comparison arm (the row label), benchmark (the caption) and statistic (the values agree to
+the claim's own printed precision) are each established independently. **Three of four is
+not a binding.** Measured over the eight papers: **76 proposed, 63 endpoint-verified,
+0 structurally bound, 13 refused.** The zero is printed as a zero, and
+`docs/CLAIM_GRAPH_MEASUREMENT.md` §8.1 says which requirement failed and how often.
+
 **Three things this channel may not become.**
 
   * *A second contradiction lens.* A claim and a cell whose numbers disagree may be a real
@@ -632,6 +700,50 @@ baseline is the other arm" — which a boolean never could.
 `discovery._centrality` are untouched; `claimgraph.compare_with_existing` measures the
 delta so a rule is never replaced before the replacement has been measured on every paper.
 
+## What the released artifact can establish, and what it cannot
+
+**The harness read the authors' code from the first version and threw the scientific
+result away.** `code_audit.py` parsed every cloned checkout, applied ten rules and wrote
+its hits into the machine report, where nothing consumed them: `ARTIFACT_EVIDENCE` and
+`RESOLVED_FROM_ARTIFACT` sat in their vocabularies with NO disposition mapping to either,
+so the state machine could not reach them from any input, and `ARTIFACT_INSPECTION` was a
+declared route that produced an `INFEASIBLE_*` action and nothing else.
+
+**Three levels, and the third has no spelling.**
+
+| level | what it is about | what it needs |
+|---|---|---|
+| `ARTIFACT_FACT` | the CHECKOUT | an audited snapshot and a relocated span |
+| `PAPER_ARTIFACT_MISMATCH` | the paper AND the checkout | + an addressed paper statement AND a bound experiment identity |
+| *the reported result is false* | — | **there is no value for this** |
+
+`artifacts.ARTIFACT_AUTHORITY` has exactly three members and level 3 is not one of them.
+An AST warning may not become RED. A code or configuration inconsistency may create a
+verified concern, establish a reproducibility defect, trigger execution, trigger focused
+validation, and become material where a central claim provably depends on it — every one
+of those is a downstream decision, and none is reachable by writing a stronger string in
+this layer. `ARTIFACT_RESOLVED` is deliberately excluded from
+`TargetOutcome.establishes_failure`.
+
+**The experiment identity is the requirement that makes level 2 real.** "Some config
+somewhere says 32" contradicts nothing: a repository sets a batch size in a dozen places,
+and `bind_mismatch` refuses `experiment_identity_unbound` rather than guessing which one
+the paper meant. Its fourth outcome, `no_disagreement`, records all three binding and the
+values AGREEING, which is a result and not "nothing found".
+
+**Five of the six AST hits this corpus produced are false, and the rules are audited by
+authority rather than exposed because they exist** (`artifact_evidence.RULE_AUTHORITY`,
+four classes, unaudited defaults to D-invisible). `leak-model-selection-on-test` fired four
+times on `rescaled_eval_metrics = test(model, eval_dataloader, ...)` — "eval" contains
+"val" and `test` is the evaluation FUNCTION's name — and `cripple-augmentation-one-arm`
+once on a branch that resizes a LoRA rank, because `new_transform_r` contains both an arm
+token and an augmentation token. Reviewer-visible hits: **1 of 6**.
+
+Measured over the four repository papers: 4 targets routed to inspection, 4 reaching
+`ARTIFACT_RESOLVED`, **8 level-1 facts and 0 level-2 mismatches**, 0 executions suppressed.
+`docs/ARTIFACT_ROUTE_MEASUREMENT.md` prints all eight facts and the reason the second
+number is zero.
+
 ## Execution gates
 
 | gate | env var | default | permits |
@@ -642,6 +754,7 @@ delta so a rule is never replaced before the replacement has been measured on ev
 | grading | `SH_ALLOW_GRADING` | off | a second, blinded reviewer per FATAL/MAJOR finding — zero tools, no filesystem access at all (`grade_driver.py`) |
 | substantive verdict | `SH_ALLOW_SUBSTANTIVE_VERDICT` | off | one best-effort, never-retried, whole-paper opinion — printed, consumed by no threshold (`verdict_driver.py`) |
 | claim links | `SH_ALLOW_CLAIM_LINKS` | off | one best-effort reading per paper pairing each headline claim with the evidence it rests on; both halves verified here (`claimlink_driver.py`) |
+| authors' code | `SH_ALLOW_ARTIFACT_REVIEW` | off | one read-only pass over the PINNED checkout asking whether the code does what the paper says; `Read`+`Grep` only, every citation relocated (`artifact_review_driver.py`) |
 | install | `SH_ALLOW_INSTALL` | off | building `runs/<pid>/env` from the repo's requirements |
 | sandbox | `SH_ALLOW_SANDBOX` | off | **leasing a remote Linux machine** and staging the audited commit into it (`harness/sandbox.py`) |
 | execute | `SH_ALLOW_REPO_EXEC` | off | running the repository's own entrypoint |
@@ -883,6 +996,15 @@ were current.
   population a sentence names and refuses everything else, because a prose-stated accuracy
   has no column header, no basis and no baseline row to bind against. An accuracy claimed
   only in text is discovered and is not executable.
+- **The artifact route has established ZERO paper/artifact mismatches on real papers.**
+  It reaches `ARTIFACT_EVIDENCE` on all four repository papers and what it established
+  there is eight LEVEL-1 facts: which entrypoint each checkout advertises, and that `iclr`
+  publishes no dependency manifest at all. Level 2 needs an experiment identity, and the
+  deterministic probes produce none — the channel that could propose one is the gated
+  authors'-code auditor, which has not been run against the corpus. Seven of the ten AST
+  rules did not fire on any of the four, so their authority classification rests on their
+  structure rather than on a measurement; a rule firing for the first time on a fifth
+  paper should be re-audited before its output is believed.
 - **Novelty / prior-art checking is architectural only.** `VERIFICATION_ROUTES` carries
   `LITERATURE_SEARCH` and nothing implements it: no literature tooling is wired in, so no
   novelty conclusion is produced. The route exists so that adding one later has a place to

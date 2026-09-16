@@ -40,6 +40,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from . import artifact as artifact_stage
 from .. import (backends, claims, code_audit, comparison as comparison_mod,
                 exhaustion, experiment_id, materiality, planner, probe_synth,
                 provenance as provenance_mod, reimplement, reimplement_driver,
@@ -1372,6 +1373,29 @@ def _review(cfg: Config, pid: str) -> dict:
         exhaustion.refresh(target_set, cfg)
         state.write_json(discover_stage.targets_path_in(root), target_set.model_dump())
 
+    # --- the artifact route ------------------------------------------------------------
+    # AFTER acquisition, because it needs the checkout, and structurally separate from the
+    # execution loop above because its targets are not executable ones: `planner` reaches
+    # ARTIFACT_INSPECTION_ONLY only where no executable route applies, so nothing here
+    # competes with, defers, or suppresses a run. It spends no process and no budget.
+    artifact_outcomes, inspection = artifact_stage.run_route(
+        cfg, pid, doc, target_set, acq.path, url=acq.url or (doc.repo_url or ""))
+    if target_set is not None and artifact_outcomes:
+        for out in artifact_outcomes:
+            state.write_json(
+                root / "runs" / pid / "targets" / out.target_id / "outcome.json",
+                out.model_dump())
+        replaced = {o.target_id for o in artifact_outcomes}
+        target_set.outcomes = [o for o in target_set.outcomes
+                               if o.target_id not in replaced] + artifact_outcomes
+        by_artifact = {o.target_id: o.disposition for o in artifact_outcomes}
+        for obj in target_set.objects:
+            if obj.target_id in by_artifact:
+                obj.status = by_artifact[obj.target_id]
+        discover_stage.sync_questions(target_set)
+        exhaustion.refresh(target_set, cfg)
+        state.write_json(discover_stage.targets_path_in(root), target_set.model_dump())
+
     rec = result.reconciliation
     state.append_log(
         cfg, pid, artifact_type="probe_result", phase="probe",
@@ -1396,6 +1420,8 @@ def _review(cfg: Config, pid: str) -> dict:
             "provenance": result.provenance, "mechanism": result.mechanism or None,
             "code_findings": len(audit.findings),
             "code_audit_skipped": audit.skipped or None,
+            "artifact_targets": len(artifact_outcomes),
+            "artifact_facts": len(inspection.facts) if inspection else 0,
             "reconciliation": rec.status if rec else None,
             "seconds": result.seconds, "reason": result.reason,
             "script": result.script_path, "results": f"runs/{pid}/probe_results.json"}

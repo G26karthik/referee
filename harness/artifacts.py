@@ -1129,6 +1129,145 @@ class CodeAuditFinding(_Base):
         return taxonomy.classify(is_artifact_finding=True)
 
 
+# --------------------------------------------------------------------------- #
+# ②b STATIC ARTIFACT INSPECTION — what the released artifact itself can establish
+# --------------------------------------------------------------------------- #
+# THREE LEVELS, AND THE THIRD IS DELIBERATELY NOT A VALUE HERE.
+#
+#   level 1  ARTIFACT_FACT            a deterministic fact about the checkout
+#   level 2  PAPER_ARTIFACT_MISMATCH  the paper says X, the pinned artifact says Y, and
+#                                     the experiment identity connecting them is bound
+#   level 3  the reported scientific result is false
+#
+# Level 3 has no spelling on this type, and that is the encoding of the rule rather than
+# a note about it: static inspection alone essentially never establishes that a reported
+# result is wrong. A configuration inconsistency may create a verified concern, establish
+# a reproducibility defect, trigger execution, trigger focused validation, and become
+# material when a central claim provably depends on it — every one of those is a
+# downstream decision made by a downstream module, and none of them is reachable by
+# writing a stronger string here. An AST warning may not become RED.
+ARTIFACT_AUTHORITY = (
+    "ARTIFACT_FACT",             # level 1: about the checkout, and nothing else
+    "PAPER_ARTIFACT_MISMATCH",   # level 2: about the paper AND the checkout, identity bound
+    "NONE",                      # observed; establishes nothing
+)
+
+# WHY a proposed mismatch was not bound. Named per attempt, because "we found nothing"
+# and "we found it and could not say which experiment it belongs to" are opposite
+# results: the first is a clean artifact, the second is an open question.
+MISMATCH_REFUSALS = (
+    "paper_statement_unaddressed",   # no resolvable paper locator for the claimed statement
+    "artifact_fact_unlocated",       # the file/span/hash did not relocate in the pinned tree
+    "experiment_identity_unbound",   # the config exists; which experiment it configures is open
+    "no_disagreement",               # both sides located and identity bound; they agree
+)
+
+
+class SourceSpan(_Base):
+    """Where in the PINNED checkout something is, re-derivable by hand from the SHA.
+
+    A model statement about code is not artifact evidence. What makes a code citation
+    evidence is the same thing that makes a paper quotation evidence: the harness, not the
+    writer, locates it — `artifact_evidence.relocate` searches the file for the quoted
+    text and refuses unless it occurs exactly once, exactly as `claims.mint` refuses an
+    ambiguous paper quotation. The file hash is recorded so a later reader can prove the
+    file has not moved under the citation.
+    """
+
+    file: str = Field(default="", description="repository-relative path, forward slashes")
+    line: int = Field(default=0, description="1-indexed first line of the span")
+    end_line: int = Field(default=0, description="1-indexed last line, == line for one line")
+    char_span: tuple[int, int] | None = Field(
+        default=None, description="(start, end) byte offsets into the file's decoded text")
+    quote: str = Field(default="", description="the source text at that span, VERBATIM")
+    file_sha256: str = Field(default="", description="of the file's bytes in the pinned tree")
+    node_type: str = Field(default="", description="the AST node kind, when one was matched")
+
+
+class ArtifactSnapshot(_Base):
+    """The immutable checkout every artifact fact is tied to.
+
+    RECORDED BEFORE ANYTHING RUNS. A later execution that mutates the working tree
+    invalidates the EXECUTION's identity — `repo.verify_commit` already refuses a dirty
+    tree — and must not rewrite history: the static facts below were established against
+    THIS snapshot and stay tied to it. That is why `dirty` and `tree_sha` are stored here
+    rather than re-read at report time.
+    """
+
+    repo_url: str = ""
+    commit: str = Field(default="", description="the full SHA the facts below are about")
+    tree_sha: str = Field(default="", description="`git rev-parse HEAD^{tree}`, '' if unknown")
+    dirty: bool = Field(default=True, description="defaults to DIRTY: an unknown tree is not "
+                                                  "an audited tree")
+    captured_at: str = ""
+    note: str = Field(default="", description="why the snapshot is incomplete, when it is")
+
+    @property
+    def audited(self) -> bool:
+        """A snapshot artifact evidence may be tied to at all. Fail-closed in every field."""
+        return bool(self.commit) and bool(self.tree_sha) and not self.dirty
+
+
+class ArtifactFact(_Base):
+    """One thing established about the released artifact, and the strongest authority it has.
+
+    `authority` is WRITTEN BY THE HARNESS from what was actually located, never read from
+    a proposal or from a rule's own opinion of itself. A rule that fires is a rule that
+    fired; whether what it found is a fact about the checkout, a mismatch with the paper,
+    or nothing reportable is decided here.
+    """
+
+    fact_id: str = ""
+    probe: str = Field(default="", description="which deterministic probe or rule produced it")
+    statement: str = Field(default="", description="what was established, in the harness's words")
+    authority: str = Field(default="NONE", description="WRITTEN BY THE HARNESS: "
+                                                       + " | ".join(ARTIFACT_AUTHORITY))
+    snapshot: ArtifactSnapshot | None = None
+    span: SourceSpan | None = None
+    # --- level 2 only -----------------------------------------------------------------
+    paper_ref: str = Field(default="", description="the paper address the mismatch is against")
+    paper_quote: str = Field(default="", description="verbatim, re-verified by `claims`")
+    paper_value: str = ""
+    artifact_value: str = ""
+    experiment_id: str = Field(default="", description="what binds the two; '' means unbound")
+    refusal: str = Field(default="", description=" | ".join(MISMATCH_REFUSALS))
+    # --- always -----------------------------------------------------------------------
+    counter_explanations: list[str] = Field(default_factory=list)
+
+    @property
+    def about_the_paper(self) -> bool:
+        """Only a bound mismatch says anything about the paper. Everything else is the code."""
+        return self.authority == "PAPER_ARTIFACT_MISMATCH"
+
+
+class ArtifactInspection(_Base):
+    """One ARTIFACT_INSPECTION route attempt, and whether it discharged its contract.
+
+    "The repository cloned successfully" is not artifact evidence, and `discharged` is
+    what stops it from becoming so: a route discharges only when it had a question it
+    could answer from the artifact, it looked, and it reached an answer. A route that
+    obtained a checkout and established nothing is COMPLETED_INCONCLUSIVE, which is a
+    different word from ARTIFACT_EVIDENCE for the same reason CITATION_VERIFIED is a
+    different word from PAPER_ONLY_RESOLVED.
+    """
+
+    paper_id: str = ""
+    target_id: str = ""
+    snapshot: ArtifactSnapshot | None = None
+    facts: list[ArtifactFact] = Field(default_factory=list)
+    files_examined: list[str] = Field(default_factory=list)
+    statements_examined: list[str] = Field(
+        default_factory=list, description="the paper statements this route was asked about")
+    discharged: bool = Field(default=False, description="WRITTEN BY THE HARNESS: the route "
+                                                        "answered the question it was given")
+    reason: str = Field(default="", description="why it did or did not discharge")
+    proposed: int = Field(default=0, description="code-auditor proposals received")
+    relocated: int = Field(default=0, description="proposals whose citation the harness relocated")
+
+    def bound_mismatches(self) -> list[ArtifactFact]:
+        return [f for f in self.facts if f.about_the_paper]
+
+
 class CodeAudit(_Base):
     """The static pass. Runs with no execution, so it is safe on an untrusted clone."""
 
@@ -2708,6 +2847,21 @@ TARGET_DISPOSITIONS = (
     # a contradicted composition in an appendix footnote is established, reported and
     # ledger-recorded, and does not reject the paper.
     "PAPER_ARITHMETIC_CONTRADICTION",
+    # THE ONE DISPOSITION THAT REACHES `ARTIFACT_EVIDENCE`, and the reason that state
+    # was previously unreachable. `ARTIFACT_EVIDENCE` and `RESOLVED_FROM_ARTIFACT` sat in
+    # their vocabularies with no disposition mapping to them: the static code pass ran on
+    # every cloned paper, wrote its hits into the machine report, and reached no question,
+    # no target and no evidence state. The route existed in name only.
+    #
+    # It is written ONLY by `artifact_evidence.discharge`, which requires an AUDITED
+    # snapshot, at least one statement the route was asked about, and at least one fact
+    # carrying authority. "The repository cloned successfully" produces
+    # COMPARISON_BLOCKED, not this. And it is NOT in `establishes_failure`: an
+    # inconsistency between a paper and its released code is a real result and is not a
+    # demonstration that the reported number is wrong — which of the two configurations
+    # produced it is a question for execution, and invariant 8's materiality gate still
+    # decides whether anything follows for the paper.
+    "ARTIFACT_RESOLVED",          # static inspection of the pinned checkout settled it
     "SPECIFICATION_BLOCKED",      # the paper does not say enough to run it
     "ARTIFACT_BLOCKED",           # no code, or the code does not contain the experiment
     "ENVIRONMENT_BLOCKED",        # dependencies, platform, install
@@ -2762,6 +2916,14 @@ PLAN_ACTIONS = (
     "INDEPENDENT_RECONSTRUCTION",
     "FOCUSED_VALIDATION_EXPERIMENT",
     "MECHANISM_TEST_ONLY",
+    # READING THE PINNED ARTIFACT, and nothing running. Reachable only where no
+    # executable route applies, so it can never SUPPRESS an execution — the failure mode
+    # `PAPER_INTERNAL_CHECK` had when it sat in `planner._RESOLVING` and silently
+    # cancelled every escalation behind it. It outranks the citation re-check in that
+    # slot because it can actually settle an artifact-only question, where a citation
+    # re-check settles nothing by construction, and it is refused outright for a question
+    # whose answer is a MEASUREMENT (`artifact_evidence.requires_execution`).
+    "ARTIFACT_INSPECTION_ONLY",
     "INFEASIBLE_SPECIFICATION",
     "INFEASIBLE_ADDRESSING",
     # The two that used to be folded into the line above. See TARGET_DISPOSITIONS.
@@ -3390,6 +3552,50 @@ CLAIM_LINK_REFUSALS = (
 )
 
 
+# WHAT AN ACCEPTED LINK IS AUTHORITY FOR, which is not one thing.
+#
+# A verified link proves that both ENDPOINTS exist and are what the reader said they were:
+# the sentence is in the paper, exactly once, inside the Abstract or the Conclusion; the
+# address resolves and holds the quoted contents; any number both sides carry was
+# recomputed. It does NOT prove the third thing, which is the one a referee cares about:
+#
+#     that this evidence scientifically supports this headline claim.
+#
+# That relationship was proposed by a model, and unless the DOCUMENT ITSELF binds the two
+# — by citing the object from the claim sentence, or by an identity this harness can
+# establish without a model — nothing here checks it. Calling all of them "machine-checked
+# dependencies" would launder a model's semantic judgement into a deterministic result,
+# which is the exact failure `verified_observation` exists to prevent one level down.
+CLAIM_LINK_AUTHORITY = (
+    # Both endpoints deterministically verified; the SUPPORT RELATIONSHIP is model-proposed.
+    # Useful for investigation priority, graph navigation, coverage, route planning and
+    # human explanation. It has NO paper-stopping authority and may not acquire any.
+    "ENDPOINTS_VERIFIED_SEMANTIC_LINK",
+    # The relationship ITSELF is established from the document, by one of
+    # `CLAIM_LINK_BINDING_BASES`. This class MAY become a materiality input in future,
+    # subject to the materiality audit. It is deliberately hard to reach.
+    "STRUCTURALLY_BOUND_LINK",
+    # An endpoint requirement failed. `refusal` says which.
+    "REFUSED",
+)
+
+# HOW a link's relationship was bound to the document, when it was. Named rather than
+# boolean so a reader can re-derive the binding by hand, and so a future basis arrives as
+# a new name instead of silently widening an existing one.
+CLAIM_LINK_BINDING_BASES = (
+    # The claim sentence itself cites the evidence's object by its printed label, that
+    # label identifies exactly one recovered object, and that object is the one the
+    # evidence address names. The paper drew the arrow; this only followed it.
+    "explicit_crossref",
+    # Metric, benchmark, comparison arm and statistic are each independently established
+    # between the claim sentence and the cell, and the two numbers agree. Every one of the
+    # four is a separate check recorded in `binding_checks`; three of four is not a
+    # binding, because the missing one is exactly where a plausible-looking pairing goes
+    # wrong.
+    "quantitative_identity",
+)
+
+
 class ClaimLink(_Base):
     """One proposed correspondence between a headline claim and the evidence behind it.
 
@@ -3425,6 +3631,19 @@ class ClaimLink(_Base):
     verified_observation: str = Field(
         default="", description="WRITTEN BY THE HARNESS: what it actually confirmed, in "
                                 "its own words, re-derivable from doc.json by hand")
+    link_authority: str = Field(
+        default="REFUSED", description="WRITTEN BY THE HARNESS: "
+                                       + " | ".join(CLAIM_LINK_AUTHORITY))
+    binding_basis: str = Field(
+        default="", description="WRITTEN BY THE HARNESS: which of "
+                                + " | ".join(CLAIM_LINK_BINDING_BASES)
+                                + " bound the relationship, '' when none did")
+    binding_checks: dict[str, bool] = Field(
+        default_factory=dict,
+        description="WRITTEN BY THE HARNESS: each named requirement of the strongest "
+                    "binding attempted, and whether it held. Kept even when the binding "
+                    "failed, because 'which of the four was missing' is the actionable "
+                    "half of a zero.")
 
 
 class ClaimLinkSet(_Base):
@@ -3442,9 +3661,22 @@ class ClaimLinkSet(_Base):
     accepted: int = 0
     refusals: dict[str, int] = Field(default_factory=dict)
     notes: str = Field(default="", description="the reader's own account of what it did")
+    # THE TWO COUNTS ARE REPORTED SEPARATELY AND NEVER SUMMED INTO ONE HEADLINE. They
+    # answer different questions — "did both ends of this pairing survive deterministic
+    # validation" and "did the document itself bind them" — and the second is the only one
+    # that could ever inform a paper-level decision. A zero is printed as a zero.
+    endpoints_verified: int = Field(
+        default=0, description="accepted links whose SUPPORT RELATIONSHIP is model-proposed")
+    structurally_bound: int = Field(
+        default=0, description="accepted links whose relationship the DOCUMENT establishes")
 
     def accepted_links(self) -> list[ClaimLink]:
         return [x for x in self.links if x.accepted]
+
+    def bound_links(self) -> list[ClaimLink]:
+        """Only the links whose RELATIONSHIP the document binds. Never `accepted_links`."""
+        return [x for x in self.links
+                if x.accepted and x.link_authority == "STRUCTURALLY_BOUND_LINK"]
 
 
 PHASES = ("ingest", "audit", "collect", "grade", "assess", "discover", "probe", "report",

@@ -683,7 +683,19 @@ INVARIANT_DISPOSITION: dict[int, str] = {
         "of a run. What a review reports is the dropped-finding count, which this changed "
         "from 5 to 2 over the evaluated corpus, and the per-finding observation, which "
         "says in its own words when a match was recovered rather than verbatim",
-    33: "not reportable here: a batch's paper count is checked by harness/preflight.py "
+    33: "not reportable as a guarantee: that static inspection cannot establish a "
+        "scientific failure is enforced by ARTIFACT_AUTHORITY having no value for one and "
+        "by ARTIFACT_RESOLVED being excluded from establishes_failure, so a review cannot "
+        "fail to apply it. What a review reports instead is the inspection itself — the "
+        "pinned commit, the facts by authority, and the named refusal for every mismatch "
+        "that did not bind — which is a measurement and not a promise",
+    34: "not reportable as a guarantee: that a code citation was relocated is enforced by "
+        "artifact_evidence.relocate dropping what it cannot find, and the rule-authority "
+        "audit is a property of the rule set rather than of a run. What a review reports "
+        "is the count proposed against the count relocated, and which AST rules were "
+        "reviewer-visible. EVERY_EVIDENCE_POINTER_RE_VERIFIED covers the findings channel "
+        "and deliberately does not reach here: an artifact fact is not a finding",
+    35: "not reportable here: a batch's paper count is checked by harness/preflight.py "
         "BEFORE the pipeline runs, and this artifact is per paper and per run. A "
         "preflight refusal means no review exists to carry a guarantee",
 }

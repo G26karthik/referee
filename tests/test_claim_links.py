@@ -242,7 +242,12 @@ def test_a_verified_link_is_the_edge_the_paper_does_not_print():
 
     path = claimgraph.dependency(after, "T1:r0:c1")
     assert path is not None and path.edges[-1].kind == "SUPPORTED_BY"
-    assert "the harness verified both halves" in path.explain(after)
+    # AND THE PATH SAYS WHICH HOP IS A MODEL'S. An endpoint-verified link is not a
+    # machine-checked dependency, and a path that read the same either way would let the
+    # two look identical to whoever opens it.
+    explained = path.explain(after)
+    assert "the harness verified both endpoints" in explained
+    assert "the support relationship itself is model-proposed" in explained
 
 
 # --------------------------------------------------------------------------- #
@@ -421,3 +426,47 @@ def test_the_exact_search_still_runs_first():
     klass, observation = audit_stage.verify_evidence(
         "We reduce peak memory by 40%", "p1", units, {})
     assert klass == "prose_verified" and "occurs verbatim inside" in observation
+
+
+# --------------------------------------------------------------------------- #
+# The authority split, and the wall between a proposed link and a paper-level stop
+# --------------------------------------------------------------------------- #
+def test_the_decision_path_does_not_consult_the_claim_graph():
+    """E is a MEASURED PARALLEL SIGNAL. The old materiality path stays authoritative.
+
+    A model-proposed semantic support edge may not turn an otherwise non-material defect
+    into a paper stop, and the guarantee is that the modules which decide never import the
+    modules that propose. `claimgraph` optionally CONSUMES links; nothing consumes
+    `claimgraph`.
+    """
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[1] / "harness"
+    for deciding in ("materiality.py", "discovery.py", "priority.py", "planner.py",
+                     "grading.py", "assessment.py", "outcome.py", "stages/report.py"):
+        src = (root / deciding).read_text(encoding="utf-8")
+        for proposing in ("claimgraph", "claimlink"):
+            assert f"import {proposing}" not in src and f"from .{proposing}" not in src, (
+                f"{deciding} imports {proposing}: the decision path may not consult a "
+                f"channel whose first hop is a model proposal")
+
+
+def test_an_endpoint_verified_link_is_never_counted_as_structurally_bound():
+    """The two counts answer different questions and are never summed into one headline."""
+    from harness.artifacts import CLAIM_LINK_AUTHORITY, ClaimLinkSet
+    assert CLAIM_LINK_AUTHORITY == ("ENDPOINTS_VERIFIED_SEMANTIC_LINK",
+                                    "STRUCTURALLY_BOUND_LINK", "REFUSED")
+    doc = _doc()
+    verified = claimlink.verify_all(doc, [
+        _link(claim_quote="We reduce peak memory by 40%.", evidence_ref="T1:r0:c1",
+              evidence_quote="40.2")])
+    assert isinstance(verified, ClaimLinkSet)
+    assert verified.accepted == 1
+    assert verified.endpoints_verified == 1
+    assert verified.structurally_bound == 0
+    assert verified.bound_links() == [], "nothing here is a document-bound relationship"
+    # And the accepted link says so itself, in the words a reader receives.
+    said = verified.links[0].verified_observation
+    assert "A READER proposed" in said
+    assert "has not checked the support relationship" in said
+    assert "remains a model's judgement" in said
+    assert "carries no authority over the paper-level decision" in said

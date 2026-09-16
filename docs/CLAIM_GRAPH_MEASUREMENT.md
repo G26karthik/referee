@@ -6,6 +6,15 @@ exists, its self-check passes, and `materiality.basis_for_ref` and
 for before the decision rule is replaced, and the measurement changed what the right
 answer is.
 
+**The headline number, stated at the authority it actually has: 76 model-proposed
+claim/evidence links, 63 of which passed deterministic ENDPOINT validation, and 0 of which
+are STRUCTURALLY BOUND.** Verifying two endpoints does not verify that the evidence
+supports the claim — a model proposed that relationship, and unless the document binds it
+nothing here checks it. The two counts are never summed, and §8.1 prints the zero and the
+reason for it. The old materiality path stays authoritative; the graph is a measured
+parallel signal that may improve target priority, grouping, explanation, route selection
+and coverage, and may stop no paper.
+
 ## 1. What was built
 
 Two node kinds and a small edge vocabulary, derived from `PaperDoc` and nothing else. No
@@ -185,11 +194,69 @@ One reading per paper, `claude` CLI, `sonnet`, read-only over the papers directo
 | sanchez24a-icml | 17 | 12 | evidence_unresolved 5 |
 | **total** | **76** | **63** | **13** |
 
-Of the 63 accepted, **59 are `NO_NUMBER_IN_CLAIM` and 4 are `NO_NUMBER_AT_EVIDENCE`** —
+Stated precisely, because the first version of this section overstated it:
+**76 model-proposed claim/evidence links passed deterministic ENDPOINT validation on 63
+of them.** What the harness proved of those 63 is that the headline quotation exists, that
+it really is in the Abstract or the Conclusion, that the evidence quotation and address
+exist and agree with each other, and that any available numeric relationship recomputes.
+It did NOT prove that the evidence scientifically supports the headline claim. That
+relationship was proposed by a model.
+
+Of the 63 accepted, **61 are `NO_NUMBER_IN_CLAIM` and 2 are `NO_NUMBER_AT_EVIDENCE`** —
 not one is an arithmetic agreement. That is the same fact §5 measures from the other side:
 headline sentences in these papers print 21 numbers between them, and the claims that
-actually carry the argument are qualitative. A link with no arithmetic is still a
-dependency; it locates the evidence and asserts nothing about the number.
+actually carry the argument are qualitative. A link with no arithmetic still locates the
+evidence, and asserts nothing about the number.
+
+### 8.1 The authority split, and the second count
+
+An accepted link therefore carries one of two authorities, and they are never summed:
+
+| authority | what is deterministic | what it may inform |
+|---|---|---|
+| `ENDPOINTS_VERIFIED_SEMANTIC_LINK` | both endpoints | investigation priority, graph navigation, coverage, route planning, human explanation |
+| `STRUCTURALLY_BOUND_LINK` | both endpoints **and the relationship** | the above, and — subject to the materiality audit — materiality |
+
+`claimlink.structural_binding` admits two bases and both are re-derivable from `doc.json`
+by hand. `explicit_crossref`: the claim sentence itself cites the object the evidence
+address belongs to, that printed label identifies exactly one recovered object, and the
+paper therefore drew the arrow. `quantitative_identity`: all four of metric (the column
+header), comparison arm (the row label), benchmark (the caption) and statistic (both
+values agree to the claim's own printed precision) are established independently. Three of
+four is not a binding — the missing one is where a plausible pairing goes wrong.
+
+Measured over the eight papers:
+
+| | count |
+|---|---:|
+| proposed | 76 |
+| endpoint-verified (`ENDPOINTS_VERIFIED_SEMANTIC_LINK`) | 63 |
+| **structurally bound (`STRUCTURALLY_BOUND_LINK`)** | **0** |
+| refused | 13 |
+
+**Zero, printed as zero.** Which requirement failed, over the 63:
+
+| requirement | failed on |
+|---|---:|
+| `statistic_agrees` | 63 |
+| `metric_identified` | 63 |
+| `comparison_arm_identified` | 58 |
+| `benchmark_identified` | 40 |
+
+`statistic_agrees` fails on all 63 for the reason above: no accepted link is an arithmetic
+agreement, because these papers' headline claims are qualitative. `metric_identified`
+fails on all 63 because 38 of them point at a figure caption or an equation, which have no
+column header at all, and on the 25 that do name a table cell the column header's words do
+not occur in the claim sentence — an abstract writes "improves fidelity", and the column
+is headed "FRD". And `explicit_crossref` fires nowhere, which §5 already measured: there
+are zero cross-references in any Abstract of any of the eight papers and one in any
+Conclusion.
+
+So the honest summary of this channel is: **it recovers the pairing that no deterministic
+mechanism could, and the pairing it recovers is a model's semantic judgement over two
+endpoints the harness verified.** That is worth having for priority, navigation and
+explanation. It is not worth anything to a paper-level decision, and this document does not
+claim it is.
 
 ## 9. The delta the brief asked for
 
@@ -205,20 +272,28 @@ dependency; it locates the evidence and asserts nothing about the number.
 | sanchez24a-icml | 858 | 0 | 1 | 0 |
 | **total** | **1,729** | **0** | **31** | **1** |
 
-**31 addresses now carry a machine-checked dependency on the paper's own summary of
-itself, against 1 before.** Every one is a PATH rather than a boolean, and the paths are
-openable end to end. One of them, from `apt-icml`:
+**31 addresses are now reachable from the paper's own summary of itself along a
+verified-endpoint path, against 1 the structural rule calls material.** Every one is a
+PATH rather than a boolean, and the paths are openable end to end — and every one of the
+31 rests on at least one `SUPPORTED_BY` edge whose SUPPORT RELATIONSHIP a model proposed,
+because `structurally_bound` is 0. The edge says so in the words the path prints. One of
+them, from `apt-icml`:
 
 ```
 T1:r0:c5, depth 3
   a headline claim in the abstract or conclusion (P22:124-193);
-  a reader paired that claim with T1:r1:c5, and the harness verified both halves;
+  a reader proposed that claim rests on T1:r1:c5 and the harness verified both
+  endpoints (NO_NUMBER_IN_CLAIM); the support relationship itself is model-proposed
+  and is not checked;
   the paper reports column 5 on table 2 — RoBERTa and T5 pruning with APT compared to
   baselines under 60% sparsity — for two methods, so the two arms are one comparison
 ```
 
-That is the shape the previous machinery could not produce: the headline claim rests on
-one arm of a comparison, so the OTHER arm is material too, and a referee can see why.
+That is the shape the previous machinery could not produce: a referee can open every
+hop, see exactly which one is a model's judgement and which are the document's, and decide
+what to look at first. It is a NAVIGATION and PRIORITY result. Read as a materiality
+result it would be the overclaim this section exists to prevent — the second hop is a
+model's, and a rule that stops a paper may not have a model's hop in it.
 
 ### Where it still gets nothing, and why
 
@@ -229,6 +304,22 @@ harness cannot read a figure's plotted values, so a claim supported by a figure 
 made checkable this way. That is a real ceiling and it is the extraction layer's, not the
 channel's.
 
+## 9.1 A second defect the binding work exposed
+
+`explicit_crossref` was structurally unreachable, and finding out why fixed a real bug in
+the quantity parser. A claim sentence citing an object prints that object's NUMBER — "as
+Table 3 shows" — and `claims.parse_quantity` read it as the quantity 3. Paired with a cell
+holding 91.4 the link was then refused for `numeric_mismatch`: the one binding basis the
+document itself supplies was refused by its own citation.
+
+`claims._OBJECT_CITATION` now refuses a span whose sole number is the label of a table,
+figure, equation, section, appendix or algorithm, which is exactly the rule
+`_BRACKETED_CITATION` already applied to `[25]` on the other family of address a paper
+prints. A cross-reference is an ADDRESS, not a measurement. Narrow on purpose: "Table 3
+reports 91.4" still has two numbers and is still refused for ambiguity. Measured over the
+eight papers, it moved two accepted links from `NO_NUMBER_AT_EVIDENCE` to
+`NO_NUMBER_IN_CLAIM` — the claim halves were never reporting a quantity.
+
 ## 10. What is still NOT rewired, deliberately
 
 `materiality.basis_for_ref` and `discovery._centrality` are unchanged, and nothing in this
@@ -237,7 +328,12 @@ channel whose first hop is a model proposal is a larger decision than adding the
 and the argument for it now has numbers behind it rather than only an intention. The next
 step, when it is taken, is to run the graph's answer BESIDE the existing rule over a full
 review and compare what each would have stopped — not to swap one for the other on the
-strength of 31 against 1.
+strength of 31 against 1 — and 31 against 1 is not even the right comparison, because
+those 31 are endpoint-verified and not structurally bound. **The old materiality path
+stays authoritative and the claim graph is a measured parallel signal.** A model-proposed
+semantic support edge may not turn an otherwise non-material defect into a paper stop. What
+the graph may do now, today, is improve target priority, target grouping, human
+explanation, route selection and coverage reporting — none of which gates anything.
 
 ## 11. A defect found by running it, worth more than the channel
 
@@ -249,8 +345,17 @@ quoted the sentence the way a human reads it and wrote `generation`.
 **The same defect was costing the evidence gate findings.** Measured over the evaluated
 corpus, **4 of the 5 findings `verify_evidence` dropped were correctly-quoted sentences
 refused for a hyphen the typesetter inserted** — 80% of every drop in the corpus. Dropped
-findings across the eight papers went from 5 to 2 once it was fixed, and three real
-findings came back.
+findings across the eight papers went from 5 to 2 once it was fixed: **three previously
+dropped CANDIDATE findings were restored because their quotations could now be correctly
+resolved across typeset line-break hyphenation.**
+
+Restored to the pipeline, not to a conclusion. Quotation verification establishes that a
+concern cites the paper accurately and nothing else — it is the entry condition to the
+review, not a result of it. All three remain subject to every stage that follows: the
+evidence ceiling, the candidate cap, independent blinded grading, and the materiality
+table. Saying "three real findings came back" would collapse `CITATION_VERIFIED` into
+`PAPER_ONLY_RESOLVED`, which is the precise confusion invariant 20 and the
+`CITATION_VERIFIED` state exist to keep apart.
 
 `claims.soft_hyphen_projection` removes only hyphens the ORIGINAL text shows were followed
 by whitespace, so `diverse-weather` survives and `gener-ation` does not. Three rules keep

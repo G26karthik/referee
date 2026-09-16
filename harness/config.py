@@ -223,6 +223,26 @@ class Config:
     claimlink_timeout_s: int = field(
         default_factory=lambda: int(os.environ.get("SH_CLAIMLINK_TIMEOUT", "600")))
 
+    # --- the authors'-code auditor ---------------------------------------------------
+    # "Did the authors actually implement the code correctly?" — one read-only pass over
+    # the PINNED checkout, proposing code-level scientific concerns. OFF by default and
+    # for the same reason as every other model channel: with it closed the artifact route
+    # still runs, on deterministic probes alone, and a reviewer sees exactly what the
+    # harness could establish without a model.
+    #
+    # It has NO EXECUTION AUTHORITY and NO DECISION AUTHORITY, and neither is enforced by
+    # this flag — the confinement grants `Read` and `Grep` and nothing else, and every
+    # code citation it writes is relocated by `artifact_evidence.relocate` before it can
+    # survive. A model statement about code is not artifact evidence.
+    allow_artifact_review: bool = field(
+        default_factory=lambda: _flag("SH_ALLOW_ARTIFACT_REVIEW"))
+    artifact_review_cmd: str = field(
+        default_factory=lambda: os.environ.get("SH_ARTIFACT_REVIEW_CMD", ""))
+    artifact_review_model: str = field(
+        default_factory=lambda: (os.environ.get("SH_ARTIFACT_REVIEW_MODEL") or "").strip())
+    artifact_review_timeout_s: int = field(
+        default_factory=lambda: int(os.environ.get("SH_ARTIFACT_REVIEW_TIMEOUT", "900")))
+
     # --- the substantive verdict -----------------------------------------------------
     # A single, best-effort, never-retried, whole-paper opinion — see
     # `harness/prompts/verdict.py`. OFF by default: a third external process an operator

@@ -157,6 +157,12 @@ DELIBERATELY_UNCLASSIFIED: dict[str, str] = {
                            "materiality gate decide what follows, not this table.",
     "PAPER_ARITHMETIC_CONTRADICTION": "as FAILED_REPRODUCTION, by the paper-internal route.",
     "PAPER_ONLY_RESOLVED": "the target settled from the paper's own printed content.",
+    "ARTIFACT_RESOLVED": "the target settled by reading the PINNED released artifact. Not "
+                         "a blocker, and not a material failure either: an inconsistency "
+                         "between the paper and its code is a real result about the "
+                         "artifact, and which configuration produced the reported number "
+                         "is a question for execution. `establishes_failure` excludes it "
+                         "for exactly that reason.",
     "INCONCLUSIVE": "pursued and settled nothing. Handled by `unresolved_central`, which "
                     "additionally requires an ADMISSIBLE provenance — a synthesized probe's "
                     "INCONCLUSIVE says nothing about the paper's checkability and must not "

@@ -470,9 +470,17 @@ def build(doc: PaperDoc, links=None) -> ClaimGraph:
             kind=_claim_kind(link.claim_section_idx, abstract_idx, conclusion_idx),
             address=link.claim_ref, section_idx=link.claim_section_idx,
             page=page_of.get(link.claim_section_idx, 0), text=link.claim_quote))
-        edges.append(Edge("SUPPORTED_BY", link.claim_ref, target,
-                          f"a reader paired that claim with {target}, and the harness "
-                          f"verified both halves ({link.numeric_relation})"))
+        # THE EDGE CARRIES ITS OWN AUTHORITY, in the words a path will print. A
+        # `dependency()` answer that read the same either way would let a model-proposed
+        # support relationship and one the paper itself printed look identical to whoever
+        # reads the path, which is the distinction the authority split exists to keep.
+        why = (f"the paper itself binds that claim to {target} "
+               f"({link.binding_basis}), verified here"
+               if link.link_authority == "STRUCTURALLY_BOUND_LINK" else
+               f"a reader proposed that claim rests on {target} and the harness verified "
+               f"both endpoints ({link.numeric_relation}); the support relationship "
+               f"itself is model-proposed and is not checked")
+        edges.append(Edge("SUPPORTED_BY", link.claim_ref, target, why))
 
     # IN_TABLE — a cell belongs to its table, so citing the table reaches the cell.
     for result in list(results.values()):

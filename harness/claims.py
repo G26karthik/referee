@@ -160,6 +160,20 @@ _MAGNITUDE_LETTER = re.compile(r"\d\s*[kKmMbBgGtT](?![A-Za-z0-9])")
 _MAGNITUDE_WORD = re.compile(r"\d\s*(?:thousand|million|billion|trillion|bn|mn)\b", re.I)
 _BRACKETED_CITATION = re.compile(r"\[\s*\d+\s*\]")
 
+# A CROSS-REFERENCE LABEL IS AN ADDRESS, NOT A MEASUREMENT — the same rule
+# `_BRACKETED_CITATION` already applies to `[25]`, on the other family of address a paper
+# prints. "Throughput improves, as Table 3 shows." reports no quantity; read as 3.0 it
+# becomes a claim that the paper states three of something, and a claim-link proposal
+# pairing that sentence with a cell holding 91.4 was REFUSED for numeric mismatch —
+# meaning the one binding basis the document itself supplies, an explicit citation from
+# the claim to the object, was unreachable whenever the cited cell carried a number.
+# Kept narrow deliberately: it fires only when the span's SOLE number is the one this
+# label addresses, so "Table 3 reports 91.4" still has two numbers and is refused by
+# ambiguity as before.
+_OBJECT_CITATION = re.compile(
+    r"\b(?:table|tab|figure|fig|equation|eq|section|sec|appendix|app|algorithm|alg)"
+    r"\s*\.?\s*\d", re.I)
+
 
 def _magnitude_suffixed(rhs: str, number: str) -> bool:
     """Does the number on this right-hand side carry a magnitude the float does not?
@@ -252,7 +266,7 @@ def parse_quantity(text: str) -> ReportedQuantity | None:
     # A lone scholarly reference such as ``U-Net [25]`` is an address to another work,
     # not a reported experimental value. Treating it as 25 minted a reproduction target
     # whose expected result was literally the bibliography index.
-    if _BRACKETED_CITATION.search(raw):
+    if _BRACKETED_CITATION.search(raw) or _OBJECT_CITATION.search(raw):
         return None
     return ReportedQuantity(value=float(nums[0]), raw=nums[0])
 

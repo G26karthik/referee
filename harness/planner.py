@@ -376,6 +376,44 @@ def plan(obj: DiscoveredObject, *, artifact_available: bool = False,
         # establishes something. It beats NEITHER of the executable routes above, which is
         # the whole point of moving it out of `_RESOLVING`: it no longer suppresses an
         # escalation, it only fills a gap where there was nothing to escalate to.
+        # STATIC ARTIFACT INSPECTION, and only here. Three conditions, each load-bearing:
+        #
+        #   * this arm is reached only when NO executable route applies, so inspection can
+        #     never suppress an execution. That is the defect `PAPER_INTERNAL_CHECK` had
+        #     from inside `_RESOLVING`, where it cancelled 100% of the corpus's
+        #     escalations by being cheap rather than by settling anything;
+        #   * the authors must have published something — `artifact_available`. Reading a
+        #     repository that was never acquired is not a route;
+        #   * the question's answer must not be a MEASUREMENT. "Does this code produce
+        #     91.4?" is not answerable by reading it, and a route that claimed otherwise
+        #     would let a reading of the source acquit or convict a number.
+        #
+        # It is tried BEFORE the citation re-check because it can settle an artifact-only
+        # question and the citation re-check settles nothing by construction.
+        from .artifact_evidence import requires_execution
+        if ("ARTIFACT_INSPECTION" in obj.routes and artifact_available
+                and not requires_execution(obj.question_kind)):
+            _, _, gates, _ = classify(
+                centrality=obj.centrality, addressable=bool(obj.harness_addressable),
+                route="ARTIFACT_INSPECTION", artifact_available=artifact_available,
+                specification_complete=specification_complete,
+                environment_state=environment_state,
+                addressing_blocker=obj.addressing_blocker,
+                investigation_open=investigation_open)
+            gates["resolvable_without_execution"] = False
+            gates["answer_is_a_measurement"] = False
+            return PlanDecision(
+                target_id=obj.target_id, action="ARTIFACT_INSPECTION_ONLY",
+                route="ARTIFACT_INSPECTION",
+                reason="no executable route applies and the authors published code, so "
+                       "the pinned checkout is read for what it can establish about this "
+                       "question. Reading the artifact cannot establish that a reported "
+                       "result is wrong; it can establish what the released code does.",
+                gates=gates, requires_execution=False,
+                necessity="NO_EXPERIMENT_NEEDED", why_material=why_material,
+                paper_only_insufficient_because=paper_only_no,
+                competing_explanations=competing, attempt=attempt)
+
         cite = next((r for r in obj.routes if r in _CITATION_ONLY), "")
         if cite:
             _, _, gates, _ = classify(

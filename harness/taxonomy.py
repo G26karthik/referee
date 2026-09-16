@@ -142,6 +142,12 @@ _EVIDENCE_FOR_DISPOSITION = {
     # so it maps like PAPER_ONLY_RESOLVED above, not like CITATION_VERIFIED_ONLY: the
     # arithmetic recheck decides something, the quotation recheck does not.
     "PAPER_ARITHMETIC_CONTRADICTION": "PAPER_INTERNAL_EVIDENCE",
+    # The released artifact answered it. ARTIFACT_EVIDENCE is in EVIDENCE_ABOUT_THE_PAPER
+    # — a bound paper/artifact mismatch IS a statement about the paper — and it is
+    # deliberately not in `establishes_failure`: saying the code disagrees with the method
+    # section is not saying the reported number is false. `resolution_state` turns it into
+    # RESOLVED_FROM_ARTIFACT, which is the other half of the pair that had no way in.
+    "ARTIFACT_RESOLVED": "ARTIFACT_EVIDENCE",
     "SPECIFICATION_BLOCKED": "SPECIFICATION_LIMITATION",
     "ARTIFACT_BLOCKED": "ARTIFACT_LIMITATION",
     # NOT ARTIFACT_LIMITATION. "We could not build an address for this claim" is a limit

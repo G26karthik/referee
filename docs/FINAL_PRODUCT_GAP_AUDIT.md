@@ -322,6 +322,30 @@ across four separate lists, e.g. `harness/materiality.py:313-330` linear-scans f
   relation between claims, and representing it is §12 of the brief, the claim/evidence
   graph. Until that exists and has been measured against the current rule on all eight
   papers, the decision rule stays where it is.
+  **Built and measured, and the decision rule is unchanged.** `harness/claimgraph.py`
+  exists, and because no deterministic mechanism can recover the abstract-to-evidence
+  correspondence — zero cross-references in any Abstract of the eight, one in any
+  Conclusion — a reader proposes the pairing and `harness/claimlink.py` verifies it.
+  Over the eight papers: **76 model-proposed claim/evidence links, 63 of which passed
+  deterministic ENDPOINT validation, 13 refused.** Along those 63, 31 of 1,729 addresses
+  become reachable from the paper's own summary of itself, against 1 the structural rule
+  calls material.
+
+  **That is not 31 machine-checked dependencies, and the count that would be is zero.**
+  An endpoint-verified link proves both ends exist and are what the reader said; the
+  SUPPORT RELATIONSHIP between them is a model's judgement unless the document binds it.
+  Links whose relationship the document binds — `STRUCTURALLY_BOUND_LINK`, by an explicit
+  cross-reference from the claim sentence or by independently established metric,
+  benchmark, comparison-arm and statistic identity — number **0 of 63 on this corpus**,
+  and that zero is printed rather than improved. `docs/CLAIM_GRAPH_MEASUREMENT.md` §8.1
+  reports which of the four requirements failed and how often.
+
+  So the graph is a MEASURED PARALLEL SIGNAL. `materiality.basis_for_ref` and
+  `discovery._centrality` are untouched and remain authoritative; the graph may inform
+  target priority, grouping, explanation, route selection and coverage, none of which
+  gates anything. A model-proposed semantic support edge may not turn an otherwise
+  non-material defect into a paper stop, and before any materiality rewrite both systems
+  run side by side on the fresh final corpus and every disagreement is inspected.
 - `anchored_by_confirmed` / `anchored_by_any` — whether a lens cited this address. A
   citation count, not an importance measure. `harness/materiality.py:20-23` records that
   **105 of 112 CENTRAL objects are CENTRAL only because a lens attacked the address.**
@@ -478,10 +502,10 @@ machine. Status of that transcription is recorded in
 | # | gap | brief | severity |
 |---|---|---|---|
 | 1 | No reader ever sees a whole paper; 33-84% of prose, hard extraction caps behind that | §3 | **blocking the product story** |
-| 2 | `ARTIFACT_INSPECTION` cannot produce evidence; `ARTIFACT_EVIDENCE` unreachable | §6, §7 | **blocking** |
+| 2 | ~~`ARTIFACT_INSPECTION` cannot produce evidence~~ — `ARTIFACT_RESOLVED` added, route reachable, measured at 8 level-1 facts / **0 level-2 mismatches** on the four repository papers | §6, §7 | implemented, measured |
 | 3 | `FOCUSED_VALIDATION_EXPERIMENT` runs but can never conclude; no between-arms arithmetic exists | §6, §10 | **blocking** |
 | 4 | `ContainerBackend` has zero tests and has never run; Docker daemon down | §11, §25 | **blocking** |
-| 5 | No claim/evidence graph; centrality is a citation count; `in_abstract` fires on 0 of 878 | §4 | **blocking materiality quality** |
+| 5 | ~~No claim/evidence graph~~ — built, and measured at 63 endpoint-verified / **0 structurally bound** links; wired into no decision | §4 | measured, parallel |
 | 6 | `FIRST_PASS_CLEAR` semantics do not require route exhaustion | §15 | high |
 | 7 | Geometry discarded before `PaperDoc`; blocks prose-vs-cell and caption pairing | §5 | high |
 | 8 | `LITERATURE_SEARCH` declared with no code | §6 | scope decision needed |

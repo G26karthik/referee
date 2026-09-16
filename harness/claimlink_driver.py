@@ -155,7 +155,12 @@ def parse_links(text: str) -> tuple[list[ClaimLink], str, dict]:
 _PROPOSAL_KEYS = ("claim_quote", "evidence_ref", "evidence_quote", "rationale")
 HARNESS_OWNED_LINK_KEYS = ("accepted", "refusal", "numeric_relation", "claim_ref",
                            "claim_section_idx", "claim_value", "evidence_value",
-                           "verified_observation", "link_id")
+                           "verified_observation", "link_id",
+                           # A reader asserting its own link's AUTHORITY is the forgery
+                           # that matters most: `STRUCTURALLY_BOUND_LINK` is the only
+                           # class that could ever inform a decision, and it is the
+                           # harness's to award from the document.
+                           "link_authority", "binding_basis", "binding_checks")
 
 
 def _paths(cfg: Config, pid: str) -> tuple[Path, Path]:
