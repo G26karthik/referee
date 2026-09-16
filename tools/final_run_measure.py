@@ -88,9 +88,19 @@ def measure(run_dir: Path, pid: str) -> dict:
         # LITERATURE
         "literature": {
             "claims_searched": len((search or {}).get("claims_searched") or []),
+            # `ProviderCall.completed` is a derived PROPERTY and is not in the JSON; the
+            # serialised field is `outcome`. Reading the absent key gave False on a
+            # protocol that had in fact completed, which is the direction this number
+            # must never fail in — `protocol_completed` is what makes "exhausted" mean
+            # anything, and understating it is as misleading as overstating it.
             "protocol_completed": bool((search or {}).get("provider_calls")
-                                       and all(c.get("completed")
+                                       and all(c.get("outcome") == "COMPLETED"
                                                for c in (search or {}).get("provider_calls") or [])),
+            "provider_calls": len((search or {}).get("provider_calls") or []),
+            "raw_records": (search or {}).get("raw_results", 0),
+            "candidates_reviewed": (search or {}).get("candidates_reviewed", 0),
+            "proposals": (search or {}).get("proposed", 0),
+            "discharged": bool((search or {}).get("discharged")),
             "works": len((search or {}).get("works") or []),
             "concerns": sum(1 for f in ((search or {}).get("facts") or [])
                             if f.get("authority") in ("ENDPOINTS_VERIFIED_LITERATURE_CONCERN",

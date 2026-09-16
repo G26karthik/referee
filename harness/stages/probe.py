@@ -1286,10 +1286,22 @@ def _review(cfg: Config, pid: str) -> dict:
             resources=spec.resources, commit_state=spec.commit_state,
             backend=spec.backend)
     result.repo, result.code_audit = acq, audit
-    # `_run` already wrote the file; rewrite it now that acquisition and the static
-    # audit are attached, so `probe_results.json` is the whole of S3 rather than a
-    # torso the report has to reassemble.
-    state.write_json(root / "runs" / pid / "probe_results.json", result.model_dump())
+    # `probe_results.json` IS THE EXECUTION RECORD, and a paper with no executable target
+    # has no execution to record. `_run` already wrote the file when it ran; this rewrite
+    # attaches acquisition and the static audit so the file is the whole of S3 rather than
+    # a torso the report has to reassemble.
+    #
+    # THE GUARD IS NOT TIDINESS. This stage is now entered even when nothing is
+    # executable, so the three routes that do not execute — artifact inspection, the
+    # prior-art search, the focused-validation design — can reach a paper at all; before,
+    # the controller returned before calling it and they were skipped for most papers.
+    # Writing a ProbeResult on that path made `stages/report` print a "Measured
+    # reproduction" section for a probe that started nothing, which is the precise
+    # overclaim `tests/test_review` exists to catch. The reading routes seal their own
+    # records under `literature/`, `artifact/` and `validation/`; none of them is an
+    # execution and none belongs in this file.
+    if pairs:
+        state.write_json(root / "runs" / pid / "probe_results.json", result.model_dump())
 
     # --- the remaining targets ---------------------------------------------------------
     # One blocked target used to end the paper's reproduction. It no longer does: the

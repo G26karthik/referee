@@ -118,13 +118,30 @@ def _doc(cfg: Config) -> PaperDoc:
     return PaperDoc(**state.read_json(state.project_dir(cfg, PID) / "paper" / "doc.json"))
 
 
-def test_the_probe_is_skipped_when_no_finding_is_settleable(cfg: Config):
+def test_no_execution_is_started_when_no_finding_is_settleable(cfg: Config):
+    """Nothing is EXECUTED — and the stage is still entered, which is the correction.
+
+    This used to assert that `probe_results.json` did not exist, because the controller
+    returned before `probe_stage.run`. That return was hiding three routes: the static
+    artifact inspection, the bounded prior-art search and the focused-validation design
+    are all reached from that function and NONE of them executes anything, so they were
+    being skipped for exactly the papers where they were the only routes left. The stage
+    is entered now and nothing is started, which is the honest thing for
+    it to say — except that the record itself is an EXECUTION record, so on this path it
+    is not written at all. The reading routes seal their own under `literature/`,
+    `artifact/` and `validation/`.
+    """
     review(cfg, str(PAPER))
     write_lenses(cfg, verifiable=False)
     res = review(cfg, PID)
     probe_step = next(s for s in res["steps"] if s["stage"] == "S3 verify")
     assert "skipped" in probe_step
-    assert not (state.project_dir(cfg, PID) / "runs" / PID / "probe_results.json").exists()
+
+    written = state.project_dir(cfg, PID) / "runs" / PID / "probe_results.json"
+    assert not written.exists(), (
+        "`probe_results.json` is the EXECUTION record and there was no execution. Writing "
+        "one here made `stages/report` print a 'Measured reproduction' section for a probe "
+        "that started nothing, which is the overclaim the test below catches.")
 
 
 def test_skip_probe_beats_a_settleable_finding(cfg: Config):
@@ -136,12 +153,23 @@ def test_skip_probe_beats_a_settleable_finding(cfg: Config):
 
 
 def test_the_report_records_a_skipped_probe_as_absent_not_as_a_pass(cfg: Config):
+    """The guarantee, which is about what a READER is told and has not changed.
+
+    `res["probe"]` used to be None here and is now `not_started`, because the stage is
+    entered for the three routes that do not execute (see the test above). That is a
+    representation change and the guarantee is not: a probe that started nothing may not
+    produce a reproduction section, and must never read as a pass. Asserting the absence
+    of the field pinned how the fact was stored; asserting these pins the fact.
+    """
     review(cfg, str(PAPER))
     write_lenses(cfg, verifiable=False)
     res = review(cfg, PID)
-    assert res["probe"] is None
+    assert res["probe"] in (None, "not_started"), res["probe"]
     md = Path(res["report_md"]).read_text(encoding="utf-8")
     assert "Measured reproduction" not in md, "no probe means no reproduction section"
+    for claimed in ("reproduced", "FAILED_REPRODUCTION", "RESOLVED_VERIFIED"):
+        assert claimed not in md, (
+            f"a probe that started nothing may not print {claimed!r}")
 
 
 def test_the_cli_keeps_every_paper_it_was_given():

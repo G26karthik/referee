@@ -584,17 +584,47 @@ def _phase_probe(cfg: Config, case: CaseState, *, force_probe: bool = False,
     # printed content abstains here for a GOOD reason, and the outcome says so.
     ts = discover_stage.load(cfg, case.paper_id)
     executable = [p for p in ts.plans if p.requires_execution] if ts else []
-    if ts is not None and not executable and not force_probe:
+    no_execution_justified = ts is not None and not executable and not force_probe
+    if no_execution_justified:
+        # THE ABSTENTION IS ABOUT EXECUTION, AND THREE ROUTES DO NOT EXECUTE. This branch
+        # used to RETURN here, and `probe_stage.run` is the only caller of the static
+        # artifact inspection, the bounded prior-art search and the focused-validation
+        # design — so a paper whose every question was settled from its own printed
+        # content, or blocked before execution, got none of the three. That is most
+        # papers. `stages/literature.py`'s own docstring says a paper-level search runs
+        # even when no target was planned for it, because the novelty claims it searches
+        # are the paper's own and are not a finding's to raise; the controller was
+        # quietly making that false.
+        #
+        # None of the three costs an execution: they read a pinned checkout, they query
+        # public indexes, and they derive a design and stop. The stage is entered, and
+        # the abstention below is composed from what it reports rather than instead of it.
         resolved = ts.extraction_coverage.get("targets_resolved_without_execution", 0)
         blocked = ts.extraction_coverage.get("targets_blocked_before_execution", 0)
-        return PhaseOutcome(
-            "abstain",
-            f"no target justified an execution: {len(ts.objects)} object(s) discovered, "
-            f"{resolved} settled against the paper itself, {blocked} blocked before "
-            f"execution by specification, artifact or environment",
-            {"skipped": "no execution justified", "objects": len(ts.objects),
-             "resolved_without_execution": resolved, "blocked_before_execution": blocked},
-            "no_execution_justified")
+        detail = {"skipped": "no execution justified", "objects": len(ts.objects),
+                  "resolved_without_execution": resolved,
+                  "blocked_before_execution": blocked}
+        reason = (f"no target justified an execution: {len(ts.objects)} object(s) "
+                  f"discovered, {resolved} settled against the paper itself, {blocked} "
+                  f"blocked before execution by specification, artifact or environment")
+        try:
+            reading = probe_stage.run(cfg, case.paper_id)
+        except Exception as e:                   # noqa: BLE001 — as below, never an error
+            detail["reading_routes_error"] = f"{type(e).__name__}: {e}"
+            return PhaseOutcome("abstain", reason + (
+                f". The non-executing routes raised {type(e).__name__} and were recorded "
+                f"as inconclusive."), detail, "no_execution_justified")
+        # Carried so the abstention can SAY what still ran. An abstention that reports
+        # nothing is indistinguishable from a phase that was skipped.
+        for key in ("artifact_targets", "artifact_facts", "literature_targets",
+                    "literature_works", "literature_concerns", "validation_designed",
+                    "validation_specification_blocked", "validation_launched"):
+            if key in reading:
+                detail[key] = reading[key]
+        return PhaseOutcome("abstain", reason + (
+            ". The routes that do not execute still ran: static artifact inspection, the "
+            "bounded prior-art search and the focused-validation design."),
+            detail, "no_execution_justified")
     if ts is None:
         reports, _, _ = audit_stage.load_reports(cfg, case.paper_id, doc)
         verifiable = [f for r in reports for f in r.findings if f.verifiable_by_experiment]
@@ -885,9 +915,47 @@ def review_papers(cfg: Config, papers: list[str], *, dossier_out: Path | None = 
     assumed (`harness/corpus.py`). It is built from `papers` rather than from `cases`
     precisely so a paper that lost its case, or whose id collided with another's, stays
     visible instead of vanishing from a smaller count.
+
+    **AND THE BATCH IS COUNTED BEFORE IT IS SPENT.** `harness/preflight.py` answers, from
+    the PDFs' bytes, whether an N-file request is N distinct documents, and it used to be
+    an operator command this function did not call — so a batch containing the same paper
+    twice was accepted, `allocate_paper_id` correctly resumed that paper's project, and an
+    eight-file request that was seven documents produced seven reviews and a claim about
+    eight papers. That is invisible in aggregate and is exactly what `corpus.account`'s
+    conservation law cannot catch, because the duplicate never becomes a second case to
+    conserve.
+
+    Two different papers that slugify to the same id are FINE and proceed with their
+    distinct ids; only a genuine duplicate document blocks, and the refusal names the
+    files. Nothing is spent when it does: the check reads bytes and allocates no case.
     """
     from . import corpus as corpus_mod
     from . import dossier as dossier_mod
+    from . import preflight as preflight_mod
+
+    pre = preflight_mod.check(cfg, list(papers))
+    # ONLY A DUPLICATE DOCUMENT BLOCKS HERE, and the narrowing is the point. `preflight`'s
+    # other blocking state, UNREADABLE, is a per-paper failure that `corpus.account`
+    # already reports with its own `failure_kind` — invariant 13 exists so that "6
+    # requested, 5 completed, 1 failed" is sayable, and refusing the batch for it would
+    # throw away five good reviews over one bad file. `review_papers` also accepts CASE
+    # IDS as well as paths, and a bare id is unreadable by construction.
+    #
+    # A duplicate is the one state that cannot be reported per paper: it corrupts the
+    # COUNT rather than one entry, because the duplicate never becomes a second case to
+    # account for. `run.py preflight` still reports both, where an operator is asking
+    # rather than spending.
+    duplicates = [e for e in pre["entries"] if e["state"] == "DUPLICATE_REQUEST"]
+    if duplicates:
+        blocking = [f"{Path(e['path']).name}: {e['detail']}" for e in duplicates]
+        return {"requested": pre["requested"], "completed": 0, "failed": 0,
+                "results": [], "needs_audit": {}, "preflight": pre,
+                "error": ("this batch was refused before anything ran: "
+                          + "; ".join(blocking) +
+                          f". {pre['requested']} file(s) requested and "
+                          f"{pre['distinct_documents']} distinct document(s) found — a "
+                          f"review of the second number may not be reported as a review "
+                          f"of the first.")}
 
     cases = drive_all(cfg, papers, **opts)
     results = []
@@ -899,6 +967,10 @@ def review_papers(cfg: Config, papers: list[str], *, dossier_out: Path | None = 
     accounting = corpus_mod.account(papers, list(cases))
     out = {**summarize(cases), "results": results,
            "needs_audit": {c.paper_id: c.awaiting for c in cases if c.status == "waiting"},
+           # Carried whether or not it blocked. A batch that passed preflight should be
+           # able to SHOW that it did, and `distinct_documents` is the number any corpus
+           # claim about this batch is entitled to use.
+           "preflight": pre,
            "corpus": accounting.model_dump()}
     ordered = [c.paper_id for c in cases if c.paper_id]
     if ordered:

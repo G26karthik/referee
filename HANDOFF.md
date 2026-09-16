@@ -87,11 +87,12 @@ clean extract of the handoff zip into an empty directory with a fresh interprete
 Then, from `single-harness/`:
 
 ```bash
-# The whole suite — start here. In the development tree: 1571 passed. In an older handoff package: 1027 passed, 2 skipped.
-# (1029 pass in the development tree; the two that skip here read the cloned
-# third-party checkout, 26 MB, which is deliberately not shipped. They skip rather
-# than fail, which is what you want from a test whose fixture is someone else's repo.)
-# Verified from a clean extract of the zip and a fresh venv built from requirements.txt.
+# The whole suite — start here. Current tree: 2282 tests collected, 2263 of them under
+# `-m "not docker and not network"` (measured with --collect-only: docker needs a reachable
+# container runtime, network reaches third-party indexes — see pytest.ini). Earlier "1571
+# passed" / "1027 passed, 2 skipped" claims for this command are stale: the suite has grown
+# substantially since (three whole evidence routes' worth), and the `docker` marker did not
+# exist when they were written.
 PYTHONUTF8=1 ../.venv/Scripts/python.exe -m pytest tests -q
 
 # every module also self-checks in isolation; each is a fast readable spec
@@ -101,11 +102,13 @@ PYTHONUTF8=1 ../.venv/Scripts/python.exe -m harness.sandbox      # leases nothin
 
 The self-checks are worth your time before the tests. Each one is a compressed statement
 of what its module guarantees, and running `python -m harness.<name>` for the module you
-are about to touch is the cheapest way to learn its contract. Modules with one:
-`claims questions taxonomy discovery priority planner ledger evaluation local_exec repo
-code_audit probe_synth dossier audit_driver grade_driver verdict_driver grading failures
-selfaudit corpus backends resources sandbox controller`, plus
-`harness.stages.<report|grade|discover>`.
+are about to touch is the cheapest way to learn its contract. There are **70** of them.
+Do not go looking for a hand-maintained list here — an earlier version of this document
+tried to name them and drifted stale as modules kept landing; `tests/test_self_checks.py`
+DISCOVERS every module under `harness/**/*.py` carrying an `if __name__ == "__main__"`
+guard by parsing for it with `ast`, so a module that loses its self-check fails the suite.
+`python -m harness.stages.<report|grade|discover|artifact|literature|validation>` runs a
+stage's own self-check the same way.
 
 ### Reviewing a paper
 
@@ -203,6 +206,42 @@ the second is the specific overclaim the split exists to prevent. Likewise
 `probe_stage_seconds` is named for what it measures — acquisition, static audit, planning
 and gate evaluation — and is **not** the cost of running experiments.
 
+### Three routes that hang off discover/probe, and each has a rung it cannot reach
+
+Three further modules answer questions the four-lens audit cannot. Each is bounded by a
+named **empty-tuple device** rather than a threshold, so its top rung is not merely
+unreached — there is no value that could reach it, which a sweep over the whole vocabulary
+asserts rather than a docstring promises.
+
+**Static artifact inspection** (`harness/artifact_evidence.py`, `harness/stages/artifact.py`)
+asks what the RELEASED CODE establishes, for a question whose SCOPE a bounded probe answers
+— `FILE_PRESENCE`, `ENTRYPOINT_PRESENCE`, `DEPENDENCY_DECLARED`, `MANIFEST_PRESENCE`,
+`CONFIG_LITERAL`, `COMMAND_PRESENCE`. With a paper span that also relocates and an experiment
+identity a deterministic source establishes, it can report a `PAPER_ARTIFACT_MISMATCH`. It
+cannot settle `IMPLEMENTATION_CORRESPONDENCE` — "does this code implement the method" — which
+is excluded from what a bounded fact may discharge by construction, and it cannot say the
+paper's result is false: `artifacts.ARTIFACT_AUTHORITY` has exactly three members and that
+rung is not one of them.
+
+**Bounded prior-art search** (`harness/literature.py`, `harness/stages/literature.py`) asks
+whether EARLIER PUBLISHED WORK bears on a novelty claim the paper makes about itself — a
+model proposes queries against the paper's own novelty sentences, public indexes answer, and
+a verified pairing can raise a concern a referee must adjudicate. It can never report that a
+contribution is novel: `artifacts.NOVELTY_ESTABLISHING_AUTHORITIES` is the empty tuple, so
+"novel" has no value to assign, and a completed search that matched nothing is
+`SEARCH_COMPLETED_NO_MATCH_FOUND` — a fact about the search, not about the paper.
+
+**Focused validation** (`harness/validation.py`, `harness/between_arms.py`,
+`harness/stages/validation.py`) exists for the question a reconciliation cannot ask: not "did
+the printed number reproduce" but "which of two competing explanations does a new,
+one-variable-changed experiment discriminate between". It derives the smallest such contrast
+the paper AND its pinned checkout together support — all eight `VALIDATION_INGREDIENTS` must
+bind or the design is `SPECIFICATION_BLOCKED` naming the missing one — and runs both arms in
+the authors' own code against a settlement rule declared before either ran. It cannot
+establish that the credited mechanism causes the effect: `artifacts.CAUSAL_ATTRIBUTION_AUTHORITIES`
+is the empty tuple. And it is never reconciled against a printed cell, because the paper
+printed neither arm — `local_exec.reconcile` refuses a `BETWEEN_ARMS` spec outright.
+
 ---
 
 ## 3b. Four layers that describe the REVIEW, not the paper
@@ -299,9 +338,23 @@ are different acts.
 | auto-audit | `SH_ALLOW_AUTO_AUDIT` | off | shelling out to a reviewer for the four lenses |
 | grading | `SH_ALLOW_GRADING` | off | a second, blinded reviewer per FATAL/MAJOR finding — zero tools, no filesystem |
 | substantive verdict | `SH_ALLOW_SUBSTANTIVE_VERDICT` | off | one whole-paper opinion; printed, counted by nothing |
+| authors' code | `SH_ALLOW_ARTIFACT_REVIEW` | off | one read-only pass over the pinned checkout, `Read`+`Grep` only, every citation relocated |
+| prior-art search | `SH_ALLOW_LITERATURE_SEARCH` | off | querying public scholarly indexes (Crossref, arXiv) for work predating the paper |
+| literature review | `SH_ALLOW_LITERATURE_REVIEW` | off | one reading per novelty claim against what those indexes returned; zero tools, so it cannot search on its own |
+| validation design | `SH_ALLOW_VALIDATION_DESIGN` | off | one reading per focused-validation target, naming the changed variable and the settlement rule; zero tools, every value relocated against the paper. Buys the DESIGN only — execution still needs `SH_ALLOW_REPO_EXEC` and `authorize()` |
 | install | `SH_ALLOW_INSTALL` | off | building the repository's declared stack |
 | **sandbox** | `SH_ALLOW_SANDBOX` | off | **leasing a remote Linux machine** |
 | execute | `SH_ALLOW_REPO_EXEC` | off | running the repository's own entrypoint |
+
+**All four new gates run to a terminal state with the gate closed**, because each is a
+deterministic half sitting in front of an optional model reading: `stages.artifact` produces
+its level-1 facts with `SH_ALLOW_ARTIFACT_REVIEW=0`; `stages.literature` reaches
+`SEARCH_COMPLETED_NO_MATCH_FOUND` on every one of eight papers with
+`SH_ALLOW_LITERATURE_REVIEW=0`, purely from cache, in about a tenth of a second each; and
+`stages.validation` blocks at the same ingredient with `SH_ALLOW_VALIDATION_DESIGN=0` as with
+it open — verified by running both gate states over the same targets and comparing the
+records. That property is what makes each model channel MEASURABLE at all: closing the gate
+removes the one step a model could have taken, not the route.
 
 `SH_MAX_TARGETS` (default 3) is a **budget, not a gate**: which targets are worth pursuing
 is `planner`'s decision and the order is `priority`'s, so lowering it drops the least
@@ -428,6 +481,24 @@ you are most likely to trip over.
 20. **A necessity decision is not evidence.** `NO_EXPERIMENT_NEEDED` is a *successful*
     review outcome on the necessity axis and resolves nothing on the evidence axis:
     declining to run something does not settle a missing control.
+21. **A completed search that matched nothing establishes nothing.**
+    `SEARCH_COMPLETED_NO_MATCH_FOUND` is a fact about a bounded protocol, never about the
+    paper, and `artifacts.NOVELTY_ESTABLISHING_AUTHORITIES` is the empty tuple so no later
+    contributor can wire a match count to "novel".
+22. **A relocated source line proves the line exists, never that it sets the number
+    somebody says it sets.** `ENDPOINTS_VERIFIED_ARTIFACT_CONCERN` is two real locations and
+    a model's reading of the correspondence between them; only an experiment identity a
+    DETERMINISTIC source establishes, itself relocated in the pinned tree, may lift a
+    concern to `PAPER_ARTIFACT_MISMATCH`.
+23. **An experiment whose scientific choices this harness supplied is not the paper's
+    experiment.** All eight `artifacts.VALIDATION_INGREDIENTS` must bind from the paper or
+    the pinned artifact; a design that would need this harness to invent an optimizer,
+    split, threshold or schedule is `SPECIFICATION_BLOCKED`, not completed from convention.
+24. **A focused validation is never reconciled against a printed cell.** The paper printed
+    neither arm of a between-arms comparison, so `local_exec.reconcile` refuses a
+    `BETWEEN_ARMS` spec outright; what the comparison may say is bounded separately by
+    `between_arms.authority_for`, and "the credited mechanism causes the effect" has no
+    value in `artifacts.CAUSAL_ATTRIBUTION_AUTHORITIES`, the empty tuple.
 
 ---
 
@@ -461,15 +532,37 @@ Read this before you quote a capability to anyone.
 - **`scientific_class` falls back to the lens name** when a finding declared neither a
   `discrepancy_type` nor a `baseline_class`. In those cases the count is partly a count of
   what each lens chose to write.
+- **The artifact route has established 0 `PAPER_ARTIFACT_MISMATCH` on real papers.**
+  `harness/artifact_evidence.py` inspected all four repository papers: 4 inspections
+  completed, 8 narrow level-1 facts (`FILE_PRESENCE`/`DEPENDENCY_DECLARED`/…), 0 broad
+  implementation-correctness questions settled — that question is excluded from what a
+  bounded fact may discharge by construction. The gated authors'-code auditor
+  (`SH_ALLOW_ARTIFACT_REVIEW`) then ran on all four: 8 concerns proposed, 7 relocated on
+  both the code and the paper side, 1 experiment identity ESTABLISHED and 6 AMBIGUOUS, 7
+  `ENDPOINTS_VERIFIED_ARTIFACT_CONCERN` and **0 mismatches** — the one candidate with an
+  established identity had a paper value that could not be re-derived from its own quoted
+  table span (it reports five numbers, not one), and was refused rather than accepted. See
+  `docs/ARTIFACT_ROUTE_MEASUREMENT.md`.
 - **The prior-art route runs and establishes no novelty, by construction.**
   `harness/literature.py` searches public indexes for work predating the paper, against
   the paper's own novelty sentences. It can raise a concern a referee must adjudicate; it
   can never report that a contribution is new, because
   `artifacts.NOVELTY_ESTABLISHING_AUTHORITIES` is the empty tuple and a completed search
-  with no match is a fact about the search. Over the eight-paper corpus it produced 0
-  concerns and 0 bound relations — see `docs/LITERATURE_MEASUREMENT.md` for why each zero
-  is the right number, and for the three limits (undatable papers, a metered index, a
-  bounded protocol) that are ours rather than the papers'.
+  with no match is a fact about the search. Over the eight-paper corpus it produced **0
+  concerns that survived** — the only candidate that reached endpoint verification, an
+  arXiv posting matching `acl`'s own title, benchmark name and figures, turned out to be
+  that paper's own preprint and was refused rather than reported, because a paper is not
+  prior art for itself. See `docs/LITERATURE_MEASUREMENT.md` for why each zero is the right
+  number, and for the three limits (undatable papers, a metered index, a bounded protocol)
+  that are ours rather than the papers'.
+- **The focused-validation route has never executed on a real paper.** Re-running discovery
+  over the eight-paper corpus offline: 23 focused-validation questions raised, 7 reached the
+  route, 2 designs attempted, and both `SPECIFICATION_BLOCKED` at the first ingredient,
+  `arm_instantiation` — the two targets (one ATTRIBUTION, one CONTROL_PRESENCE) carry an
+  empty metric and an empty benchmark, so no `COMPARISON` node from the paper's own claim
+  graph (74 exist across the corpus) can bind to either. Opening
+  `SH_ALLOW_VALIDATION_DESIGN` changes nothing: the deterministic half refuses first and the
+  designer is never called. See `docs/FOCUSED_VALIDATION_MEASUREMENT.md`.
 - **PATH B is eligibility-only.** `harness/reimplement.py` decides whether a paper with no
   published code says enough to rebuild, and writes the brief when it does. No independent
   reimplementation has been written and sealed through `run.py accept`.

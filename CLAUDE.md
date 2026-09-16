@@ -567,12 +567,18 @@ Do not weaken these to make more papers executable or more findings reportable.
     invisible in aggregate. An eight-file request that is seven documents produces seven
     reviews and a claim about eight papers.
 
-    **The interface, stated precisely, because the invariant used to overstate it.**
-    `preflight` is a SEPARATE OPERATOR COMMAND (`run.py preflight`), not a gate inside
-    `run.py review`: `harness/controller.py` contains no reference to it and
-    `review_papers` never calls it. A batch submitted straight to `review` is not
-    refused. The eight-paper run was preflighted and its output is preserved, so the
-    claim about that corpus stands; the claim about the entrypoint did not.
+    **And it is now a gate as well as a command.** For two revisions this invariant had
+    to carry a correction reading "`preflight` is a SEPARATE OPERATOR COMMAND, not a gate
+    inside `run.py review` — `harness/controller.py` contains no reference to it and
+    `review_papers` never calls it", which was honest and left a one-line hole open: a
+    batch submitted straight to `review` was not refused, `allocate_paper_id` correctly
+    resumed the duplicate's project, and an eight-file request that was seven documents
+    produced seven reviews and a claim about eight papers. `corpus.account`'s conservation
+    law cannot catch that, because the duplicate never becomes a second case to conserve.
+    `review_papers` calls `preflight.check` FIRST now, returns the refusal with the files
+    named and starts nothing, and carries the preflight result on every batch it does run
+    so a corpus claim can be checked against `distinct_documents` rather than against the
+    length of the request. `run.py preflight` remains, for asking before spending.
 
 36. **Finding prior art may support a concern; failing to find it establishes nothing,
     and the vocabulary is what makes that so.** `harness/literature.py` runs a bounded
