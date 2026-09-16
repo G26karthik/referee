@@ -2,7 +2,7 @@
 
 Dated 2026-09-17 (second pass). Supersedes the earlier same-day revision of this document
 (which cited revision `3e48a89`). The authoritative run is `runs_final_2026-09-16/`. The
-authoritative code revision is `00252bc`. The authoritative manuscript is
+authoritative code revision is `fdc2cc6`. The authoritative manuscript is
 `manuscript/journal.pdf`. The authoritative release artifact is
 `dist/REFEREE_final_source.zip`.
 
@@ -166,7 +166,7 @@ plainly, as future work, not as a completed or partially-completed capability.
 
 ## 6. Test accounting, exact
 
-Full offline suite, taken against the final committed revision (`00252bc`), both before
+Full offline suite, taken against the final committed revision (`fdc2cc6`), both before
 and after the `exhaustion.py` fix:
 
 ```
@@ -190,7 +190,7 @@ component ablations) remain deliberately pinned to the archived
 
 ## 8. The release ZIP
 
-`dist/REFEREE_final_source.zip`, built at revision `00252bc`, 268 files, no secrets
+`dist/REFEREE_final_source.zip`, built at revision `fdc2cc6`, 268 files, no secrets
 detected. `tools/zip_acceptance_test.py` extracted it into a clean temporary directory and
 verified:
 
@@ -217,7 +217,7 @@ the two now-unmet process guarantees (a checker wiring gap, disclosed); venue-ma
 
 ## Outcome
 
-- **PRODUCT READY: yes.** Code revision `00252bc`, offline suite 2282 passed / 0 failed,
+- **PRODUCT READY: yes.** Code revision `fdc2cc6`, offline suite 2282 passed / 0 failed,
   every gate, every known limitation, and two newly-found-and-disclosed defects (the
   exhaustion accounting fix, the guarantee-checker wiring gap) documented in the same
   artifact as the results.
