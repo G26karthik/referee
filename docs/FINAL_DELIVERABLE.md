@@ -1,12 +1,13 @@
 # REFEREE v2 finalization record
 
-> **Superseded in part, 2026-09-16.** This is the record of the v2 run's own finalization
-> and its numbers stand. What has changed since: the evaluated code is now committed and
-> tagged `evaluated-v2` (it was an uncommitted working tree when this was written), the
-> six-page manuscript has been joined by a 36-page journal treatment at
-> `manuscript/journal.pdf`, and the test count reads 1,985 after a behaviour-preserving
-> release refactor. See `docs/FINAL_HANDOFF_AUDIT.md`,
-> `docs/PONYTAIL_REFACTOR_REPORT.md` and `docs/CODEBASE_CLAIM_MAP.md`.
+> **Superseded, 2026-09-17.** This is the record of the v2 run's own finalization and its
+> numbers stand as a description of THAT run, kept for comparison. It is no longer the
+> current final delivery record. **See `docs/FINAL_DELIVERY_REPORT.md` for the
+> authoritative, current final delivery report**, covering the fresh eight-paper run
+> (`runs_final_2026-09-16/`), the rewritten `manuscript/journal.pdf`, and the accepted
+> `dist/REFEREE_final_source.zip`. See also `docs/FINAL_HANDOFF_AUDIT.md`,
+> `docs/PONYTAIL_REFACTOR_REPORT.md` and `docs/CODEBASE_CLAIM_MAP.md` for still-relevant
+> earlier history.
 
 ## Outcome
 
