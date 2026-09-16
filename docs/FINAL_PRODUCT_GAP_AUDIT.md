@@ -502,7 +502,7 @@ machine. Status of that transcription is recorded in
 | # | gap | brief | severity |
 |---|---|---|---|
 | 1 | No reader ever sees a whole paper; 33-84% of prose, hard extraction caps behind that | §3 | **blocking the product story** |
-| 2 | ~~`ARTIFACT_INSPECTION` cannot produce evidence~~ — `ARTIFACT_RESOLVED` added, route reachable, measured at 8 level-1 facts / **0 level-2 mismatches** on the four repository papers | §6, §7 | implemented, measured |
+| 2 | ~~`ARTIFACT_INSPECTION` cannot produce evidence~~ — route reachable through five terminal states; measured at 8 level-1 facts, 7 endpoint-verified concerns, **0 level-2 mismatches, 0 broad questions settled** | §6, §7 | implemented, measured |
 | 3 | `FOCUSED_VALIDATION_EXPERIMENT` runs but can never conclude; no between-arms arithmetic exists | §6, §10 | **blocking** |
 | 4 | `ContainerBackend` has zero tests and has never run; Docker daemon down | §11, §25 | **blocking** |
 | 5 | ~~No claim/evidence graph~~ — built, and measured at 63 endpoint-verified / **0 structurally bound** links; wired into no decision | §4 | measured, parallel |

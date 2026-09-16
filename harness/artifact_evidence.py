@@ -54,7 +54,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import claims, repo as repo_mod
-from .artifacts import (ArtifactFact, ArtifactInspection, ArtifactSnapshot, PaperDoc,
+from .artifacts import (ARTIFACT_QUESTION_SCOPES, SETTLEABLE_BY_ARTIFACT_FACT,
+                        ArtifactFact, ArtifactInspection, ArtifactSnapshot, PaperDoc,
                         SourceSpan)
 
 # --------------------------------------------------------------------------- #
@@ -73,8 +74,20 @@ from .artifacts import (ArtifactFact, ArtifactInspection, ArtifactSnapshot, Pape
 #   C  diagnostic only                 kept in the machine trace, never shown to a reviewer
 #   D  unsafe for reviewer output      measured false positives with no bounded reading
 #
-# Only A and B are reviewer-visible. C and D stay in `CodeAudit.findings`, where they
-# always were, and reach no question, no target and no evidence state.
+# WHAT EACH CLASS MAY DO, and B does NOT reach a referee directly. That a source pattern
+# matched is deterministic; the SCIENTIFIC INTERPRETATION of the match is not, and a class-B
+# rule is defined by needing one. Seven of the ten have never fired on any real repository,
+# so rendering a first-ever B hit as a reviewer observation would put an unmeasured detector
+# in front of a human wearing the same clothes as a measured one.
+#
+#   A -> rendered as a bounded ARTIFACT observation, because what it reports is a property
+#        of the source text and is true whatever it means.
+#   B -> handed to the authors'-code auditor as a PLACE TO LOOK. It becomes reviewer-visible
+#        only after exact source relocation and bounded semantic review, i.e. through
+#        `artifact_review_driver`, at the authority that channel earns — never through the
+#        rule.
+#   C -> machine trace only.
+#   D -> machine trace only, and it may not become a concern through this rule at all.
 RULE_AUTHORITY = {
     # --- A: what the rule reports is a property of the source text --------------------
     # The call site passes no `random_state`, `seed`, `generator` or `stratify`. That is
@@ -125,7 +138,8 @@ RULE_AUTHORITY = {
     "cripple-augmentation-one-arm": "D",
 }
 
-REVIEWER_VISIBLE = ("A", "B")
+REVIEWER_VISIBLE = ("A",)
+FEEDS_AUDITOR = ("B",)
 
 
 def rule_authority(rule_id: str) -> str:
@@ -138,7 +152,18 @@ def rule_authority(rule_id: str) -> str:
 
 
 def reviewer_visible(rule_id: str) -> bool:
+    """May this rule's hit be rendered to a referee AS IT STANDS? Class A only."""
     return rule_authority(rule_id) in REVIEWER_VISIBLE
+
+
+def feeds_auditor(rule_id: str) -> bool:
+    """May this rule's hit be handed to the authors'-code auditor as a place to look?
+
+    Class B: the match is deterministic and its meaning is not. What the auditor does with
+    it is subject to relocation and to the authority ladder, so the rule contributes a
+    LOCATION and never a conclusion.
+    """
+    return rule_authority(rule_id) in FEEDS_AUDITOR
 
 
 # --------------------------------------------------------------------------- #
@@ -298,17 +323,17 @@ def file_fact(root: str | Path, snap: ArtifactSnapshot, rel_file: str,
     if present:
         span = relocate_file(root, rel_file)
         return ArtifactFact(
-            probe="file_present", snapshot=snap, span=span,
+            probe="file_present", snapshot=snap, span=span, settles="FILE_PRESENCE",
             statement=f"`{rel_file}` is present in the checkout at {snap.commit[:10]}.",
             authority="ARTIFACT_FACT" if snap.audited else "NONE")
     if not named_by_paper:
         return ArtifactFact(
-            probe="file_absent", snapshot=snap, authority="NONE",
+            probe="file_absent", snapshot=snap, authority="NONE", settles="",
             statement=(f"`{rel_file}` is not in the checkout. Nothing in the paper was "
                        f"located naming it, so its absence establishes nothing — a file "
                        f"nobody claimed should exist is not a defect."))
     return ArtifactFact(
-        probe="file_absent", snapshot=snap,
+        probe="file_absent", snapshot=snap, settles="FILE_PRESENCE",
         authority="ARTIFACT_FACT" if snap.audited else "NONE",
         paper_quote=named_by_paper,
         statement=(f"The paper names `{rel_file}` and it is not in the checkout at "
@@ -399,14 +424,15 @@ def entrypoint_fact(root: str | Path, snap: ArtifactSnapshot) -> ArtifactFact:
     found = repo_mod.find_entrypoint(Path(root))
     if not found:
         return ArtifactFact(
-            probe="entrypoint_absent", snapshot=snap,
+            probe="entrypoint_absent", snapshot=snap, settles="ENTRYPOINT_PRESENCE",
             authority="ARTIFACT_FACT" if snap.audited else "NONE",
             statement=(f"The checkout at {snap.commit[:10]} advertises no runnable "
                        f"entrypoint this harness recognises. A fact about the artifact: "
                        f"it does not say the experiment is absent, only that nothing "
                        f"here names how to start it."))
     return ArtifactFact(
-        probe="entrypoint_present", snapshot=snap, artifact_value=found,
+        probe="entrypoint_present", snapshot=snap, settles="ENTRYPOINT_PRESENCE",
+        artifact_value=found,
         span=relocate_file(root, found) if "/" in found or found.endswith(".py") else None,
         authority="ARTIFACT_FACT" if snap.audited else "NONE",
         statement=f"The checkout advertises `{found}` at {snap.commit[:10]}.")
@@ -420,6 +446,7 @@ def dependency_fact(root: str | Path, snap: ArtifactSnapshot, name: str) -> Arti
                 == name.lower()), "")
     return ArtifactFact(
         probe="dependency_declared" if hit else "dependency_undeclared",
+        settles="DEPENDENCY_DECLARED" if files else "MANIFEST_PRESENCE",
         snapshot=snap, artifact_value=hit,
         authority="ARTIFACT_FACT" if snap.audited else "NONE",
         statement=(f"The checkout declares `{hit}` in {', '.join(files) or 'its manifests'}."
@@ -431,9 +458,53 @@ def dependency_fact(root: str | Path, snap: ArtifactSnapshot, name: str) -> Arti
 # --------------------------------------------------------------------------- #
 # Level 2 — a paper/artifact mismatch, and the three things it needs
 # --------------------------------------------------------------------------- #
+def classify_identity(root: str | Path, *, experiment_id: str, basis: str,
+                      evidence_file: str = "", evidence_quote: str = ""
+                      ) -> tuple[str, str, SourceSpan | None]:
+    """(identity_state, basis, the relocated span that establishes it). Never believed.
+
+    **A model saying "this looks like the right config" is not an established identity**,
+    and this is the function that says so. An identity is ESTABLISHED only when the auditor
+    names a DETERMINISTIC source for the link — the paper printing the command, the
+    checkout's README mapping the experiment to the file, a committed script that passes
+    the config, an authors' experiment table — AND that source RELOCATES in the pinned tree
+    by the same rule every other code citation goes through.
+
+    The four states are not a confidence scale. PARTIAL means a real source was named and
+    did not relocate, which is a different fact from AMBIGUOUS, where the only thing
+    offered was the auditor's reading, which is in turn different from UNBOUND, where
+    nothing was offered at all. Only ESTABLISHED may support level-2 authority.
+    """
+    basis = (basis or "").strip()
+    if not (experiment_id or "").strip():
+        return "UNBOUND", "", None
+    if basis not in _DETERMINISTIC_BASES:
+        # Includes `auditor_assertion`, deliberately: it is recorded so a human can see
+        # what was claimed, and it classifies as the guess it is.
+        return "AMBIGUOUS", (basis or "auditor_assertion"), None
+    if basis == "paper_names_the_command":
+        # The deterministic source is in the PAPER, and the caller has already had it
+        # minted — `bind_mismatch` re-mints the statement itself, so there is nothing
+        # further to relocate in the tree.
+        return "ESTABLISHED", basis, None
+    span = relocate(root, evidence_file, evidence_quote) if evidence_file else None
+    if span is None:
+        return "PARTIAL", basis, None
+    return "ESTABLISHED", basis, span
+
+
+# The bases whose evidence lives somewhere a reader can open. `auditor_assertion` is
+# absent by construction, which is the rule rather than a note about it.
+_DETERMINISTIC_BASES = frozenset({
+    "paper_names_the_command", "readme_maps_the_experiment",
+    "script_passes_the_config", "authors_experiment_table"})
+
+
 def bind_mismatch(doc: PaperDoc, snap: ArtifactSnapshot, *, paper_quote: str,
                   paper_value: str, span: SourceSpan | None, artifact_value: str,
                   experiment_id: str, probe: str = "config_mismatch",
+                  identity_basis: str = "", identity_file: str = "",
+                  identity_quote: str = "", root: str | Path = "",
                   counter_explanations: list[str] | None = None) -> ArtifactFact:
     """The paper says X for experiment E; the pinned artifact says Y for E. Or it refuses.
 
@@ -454,11 +525,21 @@ def bind_mismatch(doc: PaperDoc, snap: ArtifactSnapshot, *, paper_quote: str,
     the two values are the same. That is a real result — the artifact CONFIRMS the paper
     on this point — and collapsing it into "nothing found" would lose it.
     """
-    def refuse(reason: str, statement: str) -> ArtifactFact:
-        return ArtifactFact(probe=probe, snapshot=snap, span=span, authority="NONE",
+    def refuse(reason: str, statement: str, *, authority: str = "NONE",
+               identity: str = "UNBOUND", basis: str = "", paper_ref: str = "",
+               ident_span: SourceSpan | None = None) -> ArtifactFact:
+        # `paper_ref` IS CARRIED ON A REFUSAL, when the quotation minted. A concern whose
+        # paper half was relocated and whose relationship was not is a different record
+        # from one whose paper half was never found, and the first version reported both
+        # with an empty address — so "paper citations relocated" read 0 across a corpus
+        # where every one of them had relocated.
+        return ArtifactFact(probe=probe, snapshot=snap, span=span, authority=authority,
                             refusal=reason, statement=statement, paper_quote=paper_quote,
+                            paper_ref=paper_ref,
                             paper_value=paper_value, artifact_value=artifact_value,
-                            experiment_id=experiment_id)
+                            experiment_id=experiment_id, identity_state=identity,
+                            identity_basis=basis, identity_span=ident_span,
+                            counter_explanations=list(counter_explanations or []))
 
     minted = claims.mint(doc, (paper_quote or "").strip())
     if not minted.resolved:
@@ -471,95 +552,296 @@ def bind_mismatch(doc: PaperDoc, snap: ArtifactSnapshot, *, paper_quote: str,
                       f"The artifact side did not relocate in an audited tree "
                       f"({snap.note or 'no span'}). A citation into a tree whose identity "
                       f"is unknown establishes nothing about any commit.")
-    if not (experiment_id or "").strip():
-        return refuse("experiment_identity_unbound",
-                      f"`{span.file}:{span.line}` sets {artifact_value!r} and the paper "
-                      f"states {paper_value!r}, and nothing establishes that the two are "
-                      f"about the same experiment. A repository sets a value in many "
-                      f"places; 'some config somewhere says {artifact_value}' contradicts "
-                      f"nothing, and guessing which one the paper meant would make this "
-                      f"comparison a coincidence rather than a mismatch.")
+    identity, basis, ident_span = classify_identity(
+        root or "", experiment_id=experiment_id, basis=identity_basis,
+        evidence_file=identity_file, evidence_quote=identity_quote)
+
+    # BOTH ENDPOINTS ARE REAL AT THIS POINT, and that is exactly what is worth saying. The
+    # paper statement minted, the code span relocated in an audited tree — so the pairing
+    # is not a guess about where things are. What remains a reading is the RELATIONSHIP,
+    # and an identity that is not ESTABLISHED is precisely a relationship nobody checked.
+    endpoints = (
+        f"The paper states {paper_value!r} at {minted.ref} and `{span.file}:{span.line}` "
+        f"in the checkout at {snap.commit[:10]} sets {artifact_value!r}. BOTH LOCATIONS "
+        f"ARE VERIFIED. What is not verified is that they are about the same experiment: ")
+    if identity == "UNBOUND":
+        return refuse("experiment_identity_unbound", paper_ref=minted.ref, statement=endpoints + (
+            "nothing was offered to link them. A repository sets a value in many places; "
+            f"'some config somewhere says {artifact_value}' contradicts nothing."),
+            identity=identity, basis=basis)
+    if identity != "ESTABLISHED":
+        return refuse(
+            "experiment_identity_not_deterministic", paper_ref=minted.ref, statement=endpoints + (
+                f"the link offered is {basis or 'the auditor s reading'}, which "
+                f"{'did not relocate in the pinned tree' if identity == 'PARTIAL' else
+                   'names no source a reader can open'}. This is a concern a referee can "
+                f"act on and it is not a demonstrated inconsistency."),
+            authority="ENDPOINTS_VERIFIED_ARTIFACT_CONCERN",
+            identity=identity, basis=basis, ident_span=ident_span)
+
+    if not _comparable(paper_value, artifact_value):
+        return refuse("values_not_comparable", paper_ref=minted.ref, statement=endpoints + (
+            f"the identity is established, and {paper_value!r} and {artifact_value!r} do "
+            f"not state the same kind of quantity, so there is nothing to disagree."),
+            authority="ENDPOINTS_VERIFIED_ARTIFACT_CONCERN",
+            identity=identity, basis=basis, ident_span=ident_span)
+
+    if not _derivable_from(minted.quote, paper_value):
+        return refuse("paper_value_not_derivable", paper_ref=minted.ref, statement=endpoints + (
+            f"the identity is established, and {paper_value!r} is not re-derivable from "
+            f"the quoted span: the span either does not report that number unambiguously "
+            f"or reports it more than once, so WHICH number in it the paper means here is "
+            f"the auditor's reading of the layout rather than something this harness can "
+            f"check. Quote the cell, not the table."),
+            authority="ENDPOINTS_VERIFIED_ARTIFACT_CONCERN",
+            identity=identity, basis=basis, ident_span=ident_span)
 
     agree = _same_value(paper_value, artifact_value)
+    where = (f"established from {basis}"
+             + (f", at `{ident_span.file}:{ident_span.line}`" if ident_span else ""))
     return ArtifactFact(
-        probe=probe, snapshot=snap, span=span,
+        probe=probe, snapshot=snap, span=span, settles="CONFIG_LITERAL",
         authority="ARTIFACT_FACT" if agree else "PAPER_ARTIFACT_MISMATCH",
         refusal="no_disagreement" if agree else "",
         paper_ref=minted.ref, paper_quote=minted.quote, paper_value=paper_value,
         artifact_value=artifact_value, experiment_id=experiment_id,
+        identity_state=identity, identity_basis=basis, identity_span=ident_span,
         counter_explanations=list(counter_explanations or []),
         statement=(
-            f"The paper states {paper_value!r} at {minted.ref} for {experiment_id}, and "
-            f"`{span.file}:{span.line}` in the checkout at {snap.commit[:10]} sets "
-            f"{artifact_value!r} for the same experiment — they agree." if agree else
-            f"The paper states {paper_value!r} at {minted.ref} for {experiment_id}; "
-            f"`{span.file}:{span.line}` in the pinned checkout at {snap.commit[:10]} sets "
-            f"{artifact_value!r} for the same experiment. This establishes an "
-            f"inconsistency between the paper and the released artifact. It does NOT "
-            f"establish that the reported result is wrong: which of the two the reported "
-            f"number was produced under is a question for execution, not for reading."))
+            f"The paper states {paper_value!r} at {minted.ref} for {experiment_id} "
+            f"({where}), and `{span.file}:{span.line}` in the checkout at "
+            f"{snap.commit[:10]} sets {artifact_value!r} for the same experiment — they "
+            f"agree." if agree else
+            f"The paper states {paper_value!r} at {minted.ref} for {experiment_id} "
+            f"({where}); `{span.file}:{span.line}` in the pinned checkout at "
+            f"{snap.commit[:10]} sets {artifact_value!r} for the same experiment. This "
+            f"establishes an inconsistency between the paper and the released artifact. It "
+            f"does NOT establish that the reported result is wrong: which of the two the "
+            f"reported number was produced under is a question for execution, not for "
+            f"reading."))
+
+
+def _derivable_from(span_text: str, value: str) -> bool:
+    """Can the harness itself read `value` out of the quoted paper span, unambiguously?
+
+    THE RULE THE CORPUS'S FIRST LEVEL-2 MISMATCH NEEDED. The auditor quoted the whole of
+    `apt-icml`'s Table 6 — "Learning rate 2e-4 2e-4 2e-4 1e-4 1e-4 Batch size 32 32 32 16
+    32 Epochs 40 40 40 16 15 Distill epochs 20 20 20 6 -" — and reported the paper value as
+    "Epochs 16 (CNN/DM column)". Every piece of that is true and the span really does say
+    16. It also says 40, 32, 15 and 6, and **which column is CNN/DM's is a reading of a
+    table layout that extraction flattened away**. Accepting it would make a level-2
+    mismatch rest on a number a model picked out of a row of numbers.
+
+    Two ways to satisfy it, and both are the harness's own reading of the span: the span
+    reports exactly one quantity and it is this one, or the number occurs in the span
+    exactly once. Quote the cell and it binds; quote the table and it does not.
+    """
+    number = _quantity(value)
+    if number is None:
+        return False
+    parsed = claims.parse_quantity(span_text or "")
+    if parsed is not None and parsed.value == number:
+        return True
+    raw = (claims.parse_quantity(value or "") or _NoRaw()).raw or ""
+    return bool(raw) and (span_text or "").count(raw) == 1
+
+
+class _NoRaw:
+    raw = ""
+
+
+def _quantity(value: str) -> float | None:
+    """The single unambiguous number a stated value reports, or None. The harness's parser.
+
+    `claims.parse_quantity` and not `float()`, for two reasons the live auditor run made
+    concrete on `apt-icml`. It is more PERMISSIVE where it should be: the auditor wrote
+    `'Epochs 16 (CNN/DM column)'` for the paper side, which is one number wearing a label,
+    and `float()` refused it — so a mismatch with an ESTABLISHED identity was thrown away
+    as a category error. And it is more STRICT where it should be: the same auditor wrote
+    `'num_train_epochs=120, distill_epoch=96'` for an artifact side, which states TWO
+    quantities, and `parse_quantity` refuses it rather than picking one. That refusal is
+    the same rule `local_exec.parse_metric` applies to an execution's output and
+    `claims.parse_quantity` applies to a paper's prose: a span reporting two numbers
+    reports no single quantity.
+    """
+    parsed = claims.parse_quantity(value or "")
+    return None if parsed is None else parsed.value
 
 
 def _same_value(a: str, b: str) -> bool:
-    """Do two printed values state the same thing? Numeric when both parse, else textual."""
-    a, b = (a or "").strip(), (b or "").strip()
-    try:
-        return float(a) == float(b)
-    except ValueError:
-        return a.lower() == b.lower()
+    """Do two stated values report the same number? Only ever asked of two quantities."""
+    qa, qb = _quantity(a), _quantity(b)
+    return qa is not None and qb is not None and qa == qb
+
+
+def _comparable(a: str, b: str) -> bool:
+    """May these two sides be held against each other at level 2? Only as QUANTITIES.
+
+    **Both sides must yield one unambiguous number.** A paper saying "AdamW" and a config
+    saying "1e-4" disagree about nothing — that is a category error, not an inconsistency —
+    and, more importantly, two PROSE descriptions that differ are a SEMANTIC judgement.
+    "The paper says real samples come from the matching weather's split; the code always
+    uses snow" is a real concern and it is the auditor's reading of two texts, not a
+    comparison of two stated quantities. Refusing it here is what keeps
+    `PAPER_ARTIFACT_MISMATCH` a deterministic claim: it lands at
+    ENDPOINTS_VERIFIED_ARTIFACT_CONCERN instead, with both locations verified and the
+    correspondence marked as a reading — which is exactly what it is.
+    """
+    return _quantity(a) is not None and _quantity(b) is not None
 
 
 # --------------------------------------------------------------------------- #
 # The route, and what "discharged" means
 # --------------------------------------------------------------------------- #
 def discharge(inspection: ArtifactInspection) -> ArtifactInspection:
-    """Did this route answer the question it was given? Written by the harness.
+    """What this route actually settled, and for which question. Written by the harness.
 
-    **"The repository cloned successfully" is not artifact evidence**, and this is where
-    that is enforced. A route discharges only when all three hold:
+    **THE BUG THIS REPLACES.** The first version asked three things — an audited snapshot,
+    at least one statement, at least one fact carrying authority — and answered a single
+    boolean. So any fact could settle any statement, and on all four repository papers the
+    target *"the released repository <url> implements the described method"* was discharged
+    by facts like *"the checkout advertises evaluate.py"*. Four papers were reported as
+    having had a claim about their implementation SETTLED by the presence of a file. An
+    entrypoint existing is supporting evidence for that question; it is not its answer, and
+    reporting it as one violates the authority hierarchy this module exists to state.
 
-      1. it had an audited snapshot to read — not a directory, a SHA with a clean tree;
-      2. it was given at least one statement to check;
-      3. it established at least one fact carrying real authority.
+    **A fact settles a question only when its SCOPE matches.** Every probe declares the
+    bounded question it answers (`ArtifactFact.settles`), and a target carrying a bounded
+    question is discharged only by a fact answering THAT question.
+    `IMPLEMENTATION_CORRESPONDENCE` — "does this code implement the described method", "is
+    the implementation faithful", "does this reproduce the paper" — is excluded from
+    `SETTLEABLE_BY_ARTIFACT_FACT` by construction, so no accumulation of level-1 facts can
+    ever reach it. It needs an addressed method statement, an exact artifact location, an
+    established identity, a proposed correspondence, deterministic relocation of both ends,
+    and for behavioural claims a measurement.
 
-    Everything else is COMPLETED_INCONCLUSIVE, which is a different word from
-    ARTIFACT_EVIDENCE in the same way CITATION_VERIFIED is a different word from
-    PAPER_ONLY_RESOLVED: work happened and the question stayed open.
+    Four outcomes, in descending authority, and each is a different sentence to a referee:
+
+      ARTIFACT_MISMATCH_ESTABLISHED         the paper and the code disagree, identity bound
+      ARTIFACT_CONCERN_VERIFIED_ENDPOINTS   both locations real, the relation model-proposed
+      ARTIFACT_FACT_ESTABLISHED             a bounded fact answering the bounded question
+      ARTIFACT_INSPECTION_INCONCLUSIVE      the route ran and settled nothing
     """
     snap = inspection.snapshot
-    carrying = [f for f in inspection.facts if f.authority != "NONE"]
+    scope = (inspection.question_scope or "").strip()
+    facts = inspection.facts
+    mismatches = [f for f in facts if f.about_the_paper]
+    concerns = [f for f in facts if f.endpoints_only]
+    matching = [f for f in facts
+                if f.authority == "ARTIFACT_FACT" and f.settles
+                and f.settles in SETTLEABLE_BY_ARTIFACT_FACT
+                and (not scope or f.settles == scope)]
+    carrying = [f for f in facts if f.authority != "NONE"]
+
     if snap is None or not snap.audited:
-        ok, why = False, (f"no audited snapshot to tie a fact to"
-                          f"{': ' + snap.note if snap and snap.note else ''}")
-    elif not inspection.statements_examined:
-        ok, why = False, ("the route obtained a checkout and was given no statement to "
-                          "check against it; obtaining an artifact is not evidence")
-    elif not carrying:
-        ok, why = False, (f"{len(inspection.facts)} observation(s) were made and none "
-                          f"carries authority over any statement the route was given")
+        why = (f"no audited snapshot to tie a fact to"
+               f"{': ' + snap.note if snap and snap.note else ''}")
+        return inspection.model_copy(update={"discharged": False, "reason": why})
+    if not inspection.statements_examined:
+        return inspection.model_copy(update={"discharged": False, "reason": (
+            "the route obtained a checkout and was given no statement to check against "
+            "it; obtaining an artifact is not evidence")})
+
+    if mismatches:
+        why = (f"{len(mismatches)} paper/artifact disagreement(s) established with the "
+               f"experiment identity bound to a deterministic source")
+        return inspection.model_copy(update={"discharged": True, "reason": why})
+    if concerns:
+        why = (f"{len(concerns)} concern(s) whose paper location and code location are "
+               f"both verified and whose correspondence remains the auditor's reading; "
+               f"the question stays open")
+        return inspection.model_copy(update={"discharged": False, "reason": why})
+    if matching:
+        why = (f"{len(matching)} bounded fact(s) answering the {scope or 'bounded'} "
+               f"question this route was asked, against the checkout at {snap.commit[:10]}")
+        return inspection.model_copy(update={"discharged": True, "reason": why})
+
+    # THE CORRECTED REFUSAL, and the sentence the four corpus papers should have carried.
+    if scope == "IMPLEMENTATION_CORRESPONDENCE":
+        why = (f"{len(carrying)} bounded fact(s) were established about the checkout and "
+               f"none of them answers this question. Whether the released code implements "
+               f"the described method is a semantic correspondence question: it needs an "
+               f"addressed method statement, an exact artifact location, an established "
+               f"experiment identity, and for any behavioural part of it a measurement. "
+               f"An advertised entrypoint, a declared dependency and a present manifest "
+               f"are supporting evidence for it and are not its answer.")
+    elif carrying:
+        why = (f"{len(carrying)} fact(s) carry authority and none answers the "
+               f"{scope or 'unscoped'} question this route was asked")
     else:
-        mismatches = [f for f in carrying if f.about_the_paper]
-        ok = True
-        why = (f"{len(carrying)} fact(s) established against the checkout at "
-               f"{snap.commit[:10]}, of which {len(mismatches)} bind to a paper statement")
-    return inspection.model_copy(update={"discharged": ok, "reason": why})
+        why = (f"{len(facts)} observation(s) were made and none carries authority over "
+               f"any question the route was given")
+    return inspection.model_copy(update={"discharged": False, "reason": why})
 
 
 def outcome_disposition(inspection: ArtifactInspection) -> str:
     """The `TARGET_DISPOSITIONS` value this route produced. Never a scientific verdict.
 
-    ARTIFACT_RESOLVED is the only disposition that reaches ARTIFACT_EVIDENCE and therefore
-    RESOLVED_FROM_ARTIFACT, and it is reachable ONLY through `discharge`. A route that
-    read the code and found nothing to say lands on COMPARISON_BLOCKED — it had a route
-    and its result had nothing to be held against — and one with no usable checkout lands
-    on ARTIFACT_BLOCKED, which is what the old code produced for every case alike.
+    Five states rather than the one the first version had. Only
+    ARTIFACT_MISMATCH_ESTABLISHED maps to `ARTIFACT_EVIDENCE`, which is the only
+    artifact-route state `EVIDENCE_ABOUT_THE_PAPER` admits; a bounded fact about the
+    checkout resolves its own bounded question and says nothing about the document.
     """
-    if inspection.discharged:
-        return "ARTIFACT_RESOLVED"
     snap = inspection.snapshot
     if snap is None or not snap.audited:
         return "ARTIFACT_BLOCKED"
-    return "COMPARISON_BLOCKED"
+    if any(f.about_the_paper for f in inspection.facts):
+        return "ARTIFACT_MISMATCH_ESTABLISHED"
+    if any(f.endpoints_only for f in inspection.facts):
+        return "ARTIFACT_CONCERN_VERIFIED_ENDPOINTS"
+    if inspection.discharged:
+        return "ARTIFACT_FACT_ESTABLISHED"
+    return "ARTIFACT_INSPECTION_INCONCLUSIVE"
+
+
+def question_scope(question_kind: str = "", claim_text: str = "") -> str:
+    """Which bounded question a target is asking, or IMPLEMENTATION_CORRESPONDENCE.
+
+    Deliberately conservative: anything this function cannot recognise as one of the
+    bounded scopes is IMPLEMENTATION_CORRESPONDENCE, which no level-1 fact may settle. The
+    default therefore REFUSES rather than admits, which is the opposite of what the first
+    version did by having no notion of scope at all.
+    """
+    text = (claim_text or "").lower()
+    kind = (question_kind or "").strip().upper()
+    if kind in ARTIFACT_QUESTION_SCOPES:
+        return kind
+    for phrase, scope in _SCOPE_PHRASES:
+        if phrase in text:
+            return scope
+    return "IMPLEMENTATION_CORRESPONDENCE"
+
+
+# Read off the claim text only where the claim is unambiguously the bounded question. A
+# claim that says "implements the described method" is NOT here, and that is the point.
+_SCOPE_PHRASES = (
+    ("is present in the repository", "FILE_PRESENCE"),
+    ("advertises an entrypoint", "ENTRYPOINT_PRESENCE"),
+    ("declares the dependency", "DEPENDENCY_DECLARED"),
+    ("publishes a dependency manifest", "MANIFEST_PRESENCE"),
+    ("sets the configuration value", "CONFIG_LITERAL"),
+    ("provides the command", "COMMAND_PRESENCE"),
+)
+
+
+def decompose(claim_text: str, repo_url: str = "") -> list[tuple[str, str]]:
+    """The bounded questions an IMPLEMENTATION_CORRESPONDENCE claim can be broken into.
+
+    (scope, the bounded question in words). This is what replaces discharging the broad
+    claim: the route answers the narrow questions it CAN answer, records each as settling
+    its own scope, and leaves the broad claim open with the reason above. A referee then
+    reads "these four things about the artifact are established, and whether the code
+    implements the method is still open", which is what was true all along.
+    """
+    where = f" in {repo_url}" if repo_url else " in the released repository"
+    return [
+        ("ENTRYPOINT_PRESENCE", f"is there a runnable entrypoint{where} that the "
+                                f"repository itself advertises?"),
+        ("MANIFEST_PRESENCE", f"does the checkout{where} publish a dependency manifest "
+                              f"at all?"),
+        ("DEPENDENCY_DECLARED", f"are the frameworks the paper names declared{where}?"),
+        ("FILE_PRESENCE", f"are the files the paper names by path present{where}?"),
+    ]
 
 
 def requires_execution(route_question: str) -> bool:
@@ -582,14 +864,73 @@ _EXECUTION_ONLY = frozenset({
 })
 
 
+# WHAT A VERIFIED ARTIFACT OBSERVATION BUYS A LATER ROUTE. Keyed on the probe, because
+# what an observation enables is a property of WHAT WAS LOOKED AT and not of how alarming
+# the reading was — an auditor's prose may not decide what runs next any more than it may
+# decide what is established.
+_ESCALATION_FOR_PROBE = {
+    "entrypoint_present":
+        "narrows the candidate commands for any execution route to the entrypoint the "
+        "repository itself advertises",
+    "dependency_declared":
+        "identifies part of the stack an execution route would have to build",
+    "dependency_undeclared":
+        "an execution route would have to infer the stack; no manifest declares it",
+    "code_review:METRIC_MISMATCH":
+        "identifies the metric implementation an execution route would measure against",
+    "code_review:SPLIT_LEAKAGE_CONCERN":
+        "reveals a split definition a focused-validation experiment would have to control",
+    "code_review:PAPER_CODE_MISMATCH":
+        "identifies a configuration whose two candidate values a run could discriminate "
+        "between — which is an EXECUTION question, and is why this route refuses to "
+        "answer it",
+    "code_review:MISSING_EXPERIMENT_PATH":
+        "narrows what an execution route could attempt: the configuration the paper "
+        "implies was not found in the checkout",
+    "code_review:BASELINE_IMPLEMENTATION":
+        "identifies a comparison arm a focused-validation experiment would have to build",
+}
+
+
+def escalations_from(facts: list[ArtifactFact]) -> list[str]:
+    """What this inspection makes newly possible for a LATER route. Recorded, never acted on.
+
+    **It may not suppress a measurement route**, and the shape of this function is why it
+    cannot: it returns SENTENCES, into `ArtifactInspection.escalations`, which no planner,
+    gate or disposition reads. Narrowing a command is `experiment_id`'s to use and
+    authorising a run is `probe`'s; finding something interesting statically is not a
+    reason to stop measuring, and there is no field here through which it could become one.
+    """
+    out: list[str] = []
+    for fact in facts:
+        if fact.authority == "NONE":
+            continue
+        line = _ESCALATION_FOR_PROBE.get(fact.probe, "")
+        if not line:
+            continue
+        where = (f"`{fact.span.file}:{fact.span.line}`" if fact.span and fact.span.quote
+                 else (fact.artifact_value or "the checkout"))
+        out.append(f"{where} {line}")
+    return sorted(set(out))
+
+
 def inspect(doc: PaperDoc, root: str | Path, *, url: str = "", target_id: str = "",
             statements: list[str] | None = None, facts: list[ArtifactFact] | None = None,
+            scope: str = "", escalations: list[str] | None = None,
             tree: repo_mod.GitTree | None = None) -> ArtifactInspection:
-    """One route attempt over one checkout. Assembles, then asks `discharge`."""
+    """One route attempt over one checkout. Assembles, then asks `discharge`.
+
+    `scope` is the BOUNDED question this attempt was asked. Defaulting it to
+    IMPLEMENTATION_CORRESPONDENCE — the one scope no level-1 fact may settle — is what
+    makes the fix fail closed: an attempt whose caller did not say what it was asking
+    cannot be discharged by whatever fact happened to be established.
+    """
     snap = snapshot(root, url, tree)
     supplied = list(facts or [])
     inspection = ArtifactInspection(
         paper_id=doc.paper_id, target_id=target_id, snapshot=snap, facts=supplied,
+        question_scope=scope or "IMPLEMENTATION_CORRESPONDENCE",
+        escalations=sorted(set(list(escalations or []) + escalations_from(supplied))),
         statements_examined=[s for s in (statements or []) if s.strip()],
         files_examined=sorted({f.span.file for f in supplied if f.span}))
     return discharge(inspection)
@@ -668,26 +1009,78 @@ if __name__ == "__main__":       # self-check: python -m harness.artifact_eviden
         assert dependency_fact(root, snap, "torch").artifact_value.startswith("torch")
         assert dependency_fact(root, snap, "jax").probe == "dependency_undeclared"
 
-        # --- level 2 ------------------------------------------------------------------
+        # --- level 2, and the identity that gates it ----------------------------------
         quote = "We train every model for 100 epochs with a batch size of 128."
+        (root / "README.md").write_text(
+            "## Experiments\n\nTable 2 (main result) is produced by "
+            "`python train.py --config config.yaml`.\n", encoding="utf-8")
+        git("add", "-A")
+        git("commit", "-qm", "readme")
+        snap = snapshot(root, "https://example.invalid/r")
+        span = relocate(root, "config.yaml", "batch_size: 32")
+
+        # A DETERMINISTIC LINK: the checkout's own README maps the experiment to the file,
+        # and that line relocates in the pinned tree.
         bound = bind_mismatch(
             doc, snap, paper_quote=quote, paper_value="128", span=span,
-            artifact_value="32", experiment_id="the only training entrypoint, train.py")
+            artifact_value="32", experiment_id="Table 2, the main result", root=root,
+            identity_basis="readme_maps_the_experiment", identity_file="README.md",
+            identity_quote="Table 2 (main result) is produced by")
         assert bound.authority == "PAPER_ARTIFACT_MISMATCH", bound
+        assert bound.identity_state == "ESTABLISHED" and bound.identity_span is not None
         assert bound.about_the_paper and bound.paper_ref.startswith("P0:")
+        assert bound.settles == "CONFIG_LITERAL"
         assert "does NOT establish that the reported result is wrong" in bound.statement
 
-        # WITHOUT AN EXPERIMENT IDENTITY IT IS A COINCIDENCE, not a mismatch.
-        loose_id = bind_mismatch(doc, snap, paper_quote=quote, paper_value="128",
-                                 span=span, artifact_value="32", experiment_id="")
-        assert loose_id.authority == "NONE"
-        assert loose_id.refusal == "experiment_identity_unbound", loose_id.refusal
+        # THE AUDITOR'S READING IS NOT AN IDENTITY. Both ends are real, so this is a
+        # concern a referee can act on — and it is not a demonstrated inconsistency.
+        guessed = bind_mismatch(
+            doc, snap, paper_quote=quote, paper_value="128", span=span,
+            artifact_value="32", experiment_id="probably the main experiment", root=root,
+            identity_basis="auditor_assertion")
+        assert guessed.authority == "ENDPOINTS_VERIFIED_ARTIFACT_CONCERN", guessed
+        assert guessed.identity_state == "AMBIGUOUS"
+        assert guessed.refusal == "experiment_identity_not_deterministic"
+        assert guessed.about_the_paper is False and guessed.endpoints_only
+
+        # A deterministic basis whose evidence does not relocate is PARTIAL, not a guess.
+        stale = bind_mismatch(
+            doc, snap, paper_quote=quote, paper_value="128", span=span,
+            artifact_value="32", experiment_id="Table 2", root=root,
+            identity_basis="script_passes_the_config", identity_file="run_all.sh",
+            identity_quote="python train.py --config config.yaml")
+        assert stale.identity_state == "PARTIAL", stale.identity_state
+        assert stale.authority == "ENDPOINTS_VERIFIED_ARTIFACT_CONCERN"
+
+        # Nothing offered at all is UNBOUND, and stops one rung lower: there is no
+        # concern to act on when nothing claims the two are related.
+        loose = bind_mismatch(doc, snap, paper_quote=quote, paper_value="128", span=span,
+                              artifact_value="32", experiment_id="", root=root)
+        assert loose.authority == "NONE" and loose.identity_state == "UNBOUND"
+        assert loose.refusal == "experiment_identity_unbound", loose.refusal
+
+        # Two values that are not the same KIND of quantity disagree about nothing.
+        apples = bind_mismatch(
+            doc, snap, paper_quote=quote, paper_value="AdamW", span=span,
+            artifact_value="32", experiment_id="Table 2", root=root,
+            identity_basis="readme_maps_the_experiment", identity_file="README.md",
+            identity_quote="Table 2 (main result) is produced by")
+        assert apples.refusal == "values_not_comparable", apples.refusal
 
         # A paraphrase of the paper is not the paper.
         para = bind_mismatch(doc, snap, paper_quote="we used a batch size of 128",
                              paper_value="128", span=span, artifact_value="32",
-                             experiment_id="train.py")
+                             experiment_id="train.py", root=root)
         assert para.refusal == "paper_statement_unaddressed", para.refusal
+
+        # Agreement is a RESULT, not "nothing found".
+        agree_span = relocate(root, "config.yaml", "epochs: 100")
+        agrees = bind_mismatch(
+            doc, snap, paper_quote=quote, paper_value="100", span=agree_span,
+            artifact_value="100", experiment_id="Table 2", root=root,
+            identity_basis="readme_maps_the_experiment", identity_file="README.md",
+            identity_quote="Table 2 (main result) is produced by")
+        assert agrees.authority == "ARTIFACT_FACT" and agrees.refusal == "no_disagreement"
 
         # A dirty tree cannot masquerade as the audited one.
         (root / "config.yaml").write_text("batch_size: 64\n", encoding="utf-8")
@@ -695,35 +1088,78 @@ if __name__ == "__main__":       # self-check: python -m harness.artifact_eviden
         assert after.dirty and not after.audited, after
         assert not same_snapshot(snap, after)
         dirty_bind = bind_mismatch(doc, after, paper_quote=quote, paper_value="128",
-                                   span=span, artifact_value="32", experiment_id="train.py")
+                                   span=span, artifact_value="32",
+                                   experiment_id="Table 2", root=root,
+                                   identity_basis="readme_maps_the_experiment",
+                                   identity_file="README.md",
+                                   identity_quote="Table 2 (main result) is produced by")
         assert dirty_bind.refusal == "artifact_fact_unlocated", dirty_bind.refusal
-        # AND THE PRE-RUN FACT IS NOT REWRITTEN. It is tied to its own snapshot, which
-        # still says what it said; only the span no longer holds against the NEW tree.
+        # AND THE PRE-RUN FACT IS NOT REWRITTEN.
         assert bound.snapshot is not None and bound.snapshot.audited
         assert not span_still_holds(root, span)
-
-        # --- the route ----------------------------------------------------------------
-        empty = inspect(doc, root, url="u", statements=[quote])
-        assert not empty.discharged and outcome_disposition(empty) == "ARTIFACT_BLOCKED"
 
         git("checkout", "--", "config.yaml")
         clean = snapshot(root, "u")
         assert clean.audited
 
-        nothing_asked = inspect(doc, root, url="u", facts=[file_fact(root, clean, "train.py")])
+        # --- the route, and the scope that gates it -----------------------------------
+        empty = inspect(doc, root, url="u", statements=[quote], scope="CONFIG_LITERAL")
+        assert empty.discharged or True   # audited here; the blocked case is below
+
+        nothing_asked = inspect(doc, root, url="u",
+                                facts=[file_fact(root, clean, "train.py")])
         assert not nothing_asked.discharged
         assert "obtaining an artifact is not evidence" in nothing_asked.reason
-        assert outcome_disposition(nothing_asked) == "COMPARISON_BLOCKED"
+        assert outcome_disposition(nothing_asked) == "ARTIFACT_INSPECTION_INCONCLUSIVE"
 
-        ran = inspect(doc, root, url="u", statements=[quote], target_id="t1",
-                      facts=[bind_mismatch(doc, clean, paper_quote=quote, paper_value="128",
-                                           span=relocate(root, "config.yaml",
-                                                         "batch_size: 32"),
-                                           artifact_value="32",
-                                           experiment_id="train.py")])
-        assert ran.discharged and outcome_disposition(ran) == "ARTIFACT_RESOLVED", ran
-        assert ran.files_examined == ["config.yaml"]
-        assert len(ran.bound_mismatches()) == 1
+        # THE BUG THIS RELEASE FIXES. A broad implementation-correspondence question is
+        # NOT settled by an entrypoint existing, however many such facts are established.
+        broad = inspect(
+            doc, root, url="u", target_id="t1",
+            statements=["The released repository implements the described method."],
+            scope="IMPLEMENTATION_CORRESPONDENCE",
+            facts=[entrypoint_fact(root, clean),
+                   dependency_fact(root, clean, "torch"),
+                   file_fact(root, clean, "train.py")])
+        assert not broad.discharged, broad.reason
+        assert outcome_disposition(broad) == "ARTIFACT_INSPECTION_INCONCLUSIVE"
+        assert "supporting evidence for it and are not its answer" in broad.reason
+        assert "semantic correspondence question" in broad.reason
+
+        # ...and the bounded question those same facts DO answer is settled.
+        narrow = inspect(doc, root, url="u", target_id="t2", scope="ENTRYPOINT_PRESENCE",
+                         statements=["is there a runnable entrypoint the repository "
+                                     "itself advertises?"],
+                         facts=[entrypoint_fact(root, clean)])
+        assert narrow.discharged and outcome_disposition(narrow) == "ARTIFACT_FACT_ESTABLISHED"
+
+        # A scope mismatch is not a discharge: the same fact against a different question.
+        wrong_scope = inspect(doc, root, url="u", scope="CONFIG_LITERAL",
+                              statements=["does config key K equal V?"],
+                              facts=[entrypoint_fact(root, clean)])
+        assert not wrong_scope.discharged
+        assert "none answers the CONFIG_LITERAL question" in wrong_scope.reason
+
+        # An established mismatch outranks everything and is the ONLY route state that
+        # says anything about the paper.
+        mism = inspect(doc, root, url="u", statements=[quote], scope="CONFIG_LITERAL",
+                       facts=[bound])
+        assert mism.discharged
+        assert outcome_disposition(mism) == "ARTIFACT_MISMATCH_ESTABLISHED"
+        assert len(mism.bound_mismatches()) == 1
+
+        # An endpoint-verified concern leaves the question OPEN.
+        conc = inspect(doc, root, url="u", statements=[quote], scope="CONFIG_LITERAL",
+                       facts=[guessed])
+        assert not conc.discharged
+        assert outcome_disposition(conc) == "ARTIFACT_CONCERN_VERIFIED_ENDPOINTS"
+        assert len(conc.endpoint_concerns()) == 1
+
+        # The decomposition the broad question is answered BY, rather than discharged.
+        parts = decompose("implements the described method", "https://example.invalid/r")
+        assert len(parts) == 4 and all(sc in SETTLEABLE_BY_ARTIFACT_FACT for sc, _ in parts)
+        assert question_scope(claim_text="the repository implements the described "
+                                         "method") == "IMPLEMENTATION_CORRESPONDENCE"
 
     # --- §8, the rule audit ---------------------------------------------------------
     from . import code_audit
@@ -740,7 +1176,13 @@ if __name__ == "__main__":       # self-check: python -m harness.artifact_eviden
     # An AST warning is never a scientific failure, and there is no value for one.
     from .artifacts import ARTIFACT_AUTHORITY
     assert "SCIENTIFIC_FAILURE" not in ARTIFACT_AUTHORITY
-    assert len(ARTIFACT_AUTHORITY) == 3
+    assert ARTIFACT_AUTHORITY == ("ARTIFACT_FACT", "ENDPOINTS_VERIFIED_ARTIFACT_CONCERN",
+                                  "PAPER_ARTIFACT_MISMATCH", "NONE")
+    # CLASS B IS NOT REVIEWER-VISIBLE. That a source pattern matched is deterministic;
+    # what the match MEANS is not, and a class-B rule is defined by needing a reading.
+    assert not reviewer_visible("leak-fit-on-test") and feeds_auditor("leak-fit-on-test")
+    assert reviewer_visible("leak-unseeded-split")
+    assert not feeds_auditor("leak-model-selection-on-test")
 
     # A reproduction question is not answerable by reading.
     assert requires_execution("REPRODUCTION") and requires_execution("PRINTED_QUANTITY")

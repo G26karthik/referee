@@ -157,12 +157,23 @@ DELIBERATELY_UNCLASSIFIED: dict[str, str] = {
                            "materiality gate decide what follows, not this table.",
     "PAPER_ARITHMETIC_CONTRADICTION": "as FAILED_REPRODUCTION, by the paper-internal route.",
     "PAPER_ONLY_RESOLVED": "the target settled from the paper's own printed content.",
-    "ARTIFACT_RESOLVED": "the target settled by reading the PINNED released artifact. Not "
-                         "a blocker, and not a material failure either: an inconsistency "
-                         "between the paper and its code is a real result about the "
-                         "artifact, and which configuration produced the reported number "
-                         "is a question for execution. `establishes_failure` excludes it "
-                         "for exactly that reason.",
+    "ARTIFACT_FACT_ESTABLISHED":
+        "a bounded question about the checkout was answered by reading the pinned tree. "
+        "Settled, not blocked, and about the ARTIFACT rather than the paper.",
+    "ARTIFACT_MISMATCH_ESTABLISHED":
+        "the paper and the pinned artifact disagree, with the experiment identity "
+        "ESTABLISHED from a deterministic source. Not a blocker, and not a material "
+        "failure either: which configuration produced the reported number is a question "
+        "for execution, and `establishes_failure` excludes this for exactly that reason.",
+    "ARTIFACT_CONCERN_VERIFIED_ENDPOINTS":
+        "the paper location and the code location were both verified and the "
+        "correspondence between them is the auditor's reading. The question stays open "
+        "and is counted as open; calling it a blocker would say no route was available "
+        "when one was taken.",
+    "ARTIFACT_INSPECTION_INCONCLUSIVE":
+        "the artifact route completed and settled no question. Handled as a METHOD limit "
+        "would be only if it were a blocker, and it is not one: reading the code is a "
+        "route that ran, and what it could not answer is reported in the scope section.",
     "INCONCLUSIVE": "pursued and settled nothing. Handled by `unresolved_central`, which "
                     "additionally requires an ADMISSIBLE provenance — a synthesized probe's "
                     "INCONCLUSIVE says nothing about the paper's checkability and must not "

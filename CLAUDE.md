@@ -137,7 +137,7 @@ papers → controller → ingest → audit → collect → grade → assess → 
 | grade | `stages/grade.py` + `grade_driver.py` | serious findings → `audit/grade/<slug>.json` | a second, blinded reviewer per candidate | `ok` with partial coverage — never blocks a report by default |
 | assess | `assessment.py` | findings + grades → `CaseState.assessment` | has a material failure already been established, and is the investigation still open | never blocks; `investigation_open` is an INPUT to `planner.classify` |
 | **discover** | `stages/discover.py` | doc + findings → `discovery/targets.json` | what is addressable, what it is worth, whether an experiment is justified | records a NAMED refusal per target |
-| ↳ artifact | `stages/artifact.py` + `artifact_evidence.py` | doc + pinned checkout → `ArtifactFact` × N | what the RELEASED CODE establishes | `COMPARISON_BLOCKED` when it settles nothing |
+| ↳ artifact | `stages/artifact.py` + `artifact_evidence.py` | doc + pinned checkout → `ArtifactFact` × N | what the RELEASED CODE establishes, for a question whose SCOPE it answers | `ARTIFACT_INSPECTION_INCONCLUSIVE` when it settles nothing |
 | verify | `stages/probe.py` | doc + repo → `ProbeSpec` per target | identity, capability, resources, commit, backend | leaves the spec unpromoted |
 | execute | `backends.py` + `local_exec.py` | spec → `ProbeResult` | `authorize()` alone | `verdict: blocked` |
 | reconcile | `local_exec.reconcile` | metric vs the addressed quantity | arithmetic only | `INCONCLUSIVE` |
@@ -222,7 +222,7 @@ python run.py dossier                                         # consolidate fini
 python run.py evaluate                                        # system metrics over the corpus
 python run.py sandbox [--release]                             # leased remote machines
 python run.py preflight                                       # is this batch N distinct papers?
-python -m pytest tests -q                                     # 2141 tests
+python -m pytest tests -q                                     # 2154 tests
 ```
 
 **The two env vars above are not decoration.** `--auto-audit` and `--auto-grade` select a
@@ -501,21 +501,35 @@ Do not weaken these to make more papers executable or more findings reportable.
     would be the false attestation `source_units` itself exists to prevent.
 
 33. **Static artifact inspection establishes what the CODE does and never that a result
-    is wrong.** `harness/artifact_evidence.py` has three authority levels and the third —
-    "the reported scientific result is false" — is not a value of `ARTIFACT_AUTHORITY`,
-    which makes the rule inexpressible rather than merely documented. `ARTIFACT_FACT` is
-    about the checkout alone. `PAPER_ARTIFACT_MISMATCH` additionally requires a paper
-    statement that MINTS to an address, an artifact span that RELOCATES in an audited
-    tree, and a NON-EMPTY experiment identity — three named refusals, and the third is the
-    one that separates a mismatch from a coincidence. `ARTIFACT_RESOLVED` is excluded from
-    `establishes_failure`, so no artifact observation can bypass materiality, and a
-    question whose answer is a measurement (`requires_execution`) is refused outright
-    rather than allowed to appear settled by a reading of the source.
+    is wrong, and a bounded fact settles only a matching bounded question.**
+    `harness/artifact_evidence.py` has four authority rungs and the top one — "the
+    reported scientific result is false" — is not a value of `ARTIFACT_AUTHORITY`, which
+    makes the rule inexpressible rather than merely documented.
 
-    **And a route discharges only when it answered something.** "The repository cloned
-    successfully" is not artifact evidence: `discharge` requires an audited snapshot, at
-    least one statement the route was asked about, and at least one fact carrying
-    authority. Everything else is COMPARISON_BLOCKED.
+    **The scope rule is the correction that matters.** Every probe declares which bounded
+    question it answers, and `IMPLEMENTATION_CORRESPONDENCE` is excluded from
+    `SETTLEABLE_BY_ARTIFACT_FACT` by construction. The first version had no notion of
+    scope: `discharge` asked only whether SOME fact carried authority, so on all four
+    repository papers the target *"the released repository implements the described
+    method"* was settled by facts like *"the checkout advertises evaluate.py"* — four
+    papers reported as having had a claim about their implementation settled by the
+    presence of a file. An entrypoint existing is SUPPORTING EVIDENCE for that question and
+    is not its answer. A broad question is now decomposed into the narrow ones the route
+    can answer, each recorded against its own scope, and left open with the reason.
+
+    **And the experiment identity is classified, not believed.** `PAPER_ARTIFACT_MISMATCH`
+    requires a paper statement that MINTS, an artifact span that RELOCATES in an audited
+    tree, and an identity ESTABLISHED from a deterministic source that itself relocates.
+    A model saying "this looks like the right config" is AMBIGUOUS and stops at
+    `ENDPOINTS_VERIFIED_ARTIFACT_CONCERN` — both ends real, the correspondence unchecked,
+    which is a referee's question and not a demonstrated inconsistency.
+
+    Five terminal states, and only `ARTIFACT_MISMATCH_ESTABLISHED` reaches
+    `ARTIFACT_EVIDENCE`, the one `EVIDENCE_ABOUT_THE_PAPER` admits. None is in
+    `establishes_failure`, so no artifact observation can bypass materiality; a question
+    whose answer is a measurement (`requires_execution`) is refused outright; and "the
+    repository cloned successfully" discharges nothing, because `discharge` requires a
+    statement the route was asked about and a fact whose scope answers it.
 
 34. **A model statement about code is not artifact evidence, and an unaudited rule is not
     reviewer-visible.** `artifact_evidence.relocate` is `claims.mint` for source: the
@@ -531,6 +545,13 @@ Do not weaken these to make more papers executable or more findings reportable.
     licenses a rule, not its existence.** Measured over the four repository papers the
     rules produced six hits of which five are false, every one because they match
     SUBSTRINGS of identifiers and an identifier is not a semantic category.
+
+    **Only class A reaches a referee.** Class B FEEDS THE AUDITOR: the match is
+    deterministic and its meaning is not, so a B hit is a place to look and becomes
+    reviewer-visible only after exact source relocation and bounded semantic review, at
+    the authority that channel earns. Seven of the ten have never fired on a real
+    repository, so rendering a first-ever B hit as a reviewer observation would put an
+    unmeasured detector in front of a human wearing a measured one's clothes.
 
 35. **A batch's paper count is checked before it is spent.** `harness/preflight.py`
     answers, per requested file, which `paper_id` it will get, whether that id already
@@ -709,13 +730,20 @@ its hits into the machine report, where nothing consumed them: `ARTIFACT_EVIDENC
 so the state machine could not reach them from any input, and `ARTIFACT_INSPECTION` was a
 declared route that produced an `INFEASIBLE_*` action and nothing else.
 
-**Three levels, and the third has no spelling.**
+**Four rungs, and the top one has no spelling.**
 
 | level | what it is about | what it needs |
 |---|---|---|
-| `ARTIFACT_FACT` | the CHECKOUT | an audited snapshot and a relocated span |
-| `PAPER_ARTIFACT_MISMATCH` | the paper AND the checkout | + an addressed paper statement AND a bound experiment identity |
+| `ARTIFACT_FACT` | the CHECKOUT | an audited snapshot, a relocated span, and a question whose SCOPE it answers |
+| `ENDPOINTS_VERIFIED_ARTIFACT_CONCERN` | two real locations | + an addressed paper statement; the CORRESPONDENCE is the auditor's reading |
+| `PAPER_ARTIFACT_MISMATCH` | the paper AND the checkout | + an experiment identity ESTABLISHED from a deterministic source |
 | *the reported result is false* | — | **there is no value for this** |
+
+**A relocated code quotation proves that this code exists at this location in this audited
+snapshot. It does not prove that the code contradicts the paper** — that is the same
+correction the claim-link channel needed, on a second channel, and
+`ENDPOINTS_VERIFIED_ARTIFACT_CONCERN` is where a pairing lands when the relationship
+between its two verified ends is still a model's reading.
 
 `artifacts.ARTIFACT_AUTHORITY` has exactly three members and level 3 is not one of them.
 An AST warning may not become RED. A code or configuration inconsistency may create a
@@ -725,11 +753,36 @@ of those is a downstream decision, and none is reachable by writing a stronger s
 this layer. `ARTIFACT_RESOLVED` is deliberately excluded from
 `TargetOutcome.establishes_failure`.
 
-**The experiment identity is the requirement that makes level 2 real.** "Some config
-somewhere says 32" contradicts nothing: a repository sets a batch size in a dozen places,
-and `bind_mismatch` refuses `experiment_identity_unbound` rather than guessing which one
-the paper meant. Its fourth outcome, `no_disagreement`, records all three binding and the
-values AGREEING, which is a result and not "nothing found".
+**The experiment identity is the requirement that makes level 2 real, and it is
+CLASSIFIED rather than believed.** "Some config somewhere says 32" contradicts nothing: a
+repository sets a batch size in a dozen places. `classify_identity` returns ESTABLISHED
+only when the auditor names a DETERMINISTIC source for the link — the paper printing the
+command, the checkout's README mapping the experiment to the file, a committed script that
+passes the config, an authors' experiment table — AND that source RELOCATES in the pinned
+tree. PARTIAL is a real source that did not relocate; AMBIGUOUS is the auditor's reading;
+UNBOUND is nothing offered. **Only ESTABLISHED may support level 2.** `no_disagreement`
+records all three binding and the values AGREEING, which is a result and not "nothing
+found", and `values_not_comparable` records a category error rather than manufacturing an
+inconsistency out of one.
+
+**A BOUNDED FACT SETTLES ONLY A MATCHING BOUNDED QUESTION.** Every probe declares the
+scope it answers (`FILE_PRESENCE`, `ENTRYPOINT_PRESENCE`, `DEPENDENCY_DECLARED`,
+`MANIFEST_PRESENCE`, `CONFIG_LITERAL`, `COMMAND_PRESENCE`), and
+`IMPLEMENTATION_CORRESPONDENCE` — "does the released code implement the described method",
+"is the implementation faithful", "does this reproduce the paper" — is excluded from
+`SETTLEABLE_BY_ARTIFACT_FACT` by construction. The first version of this route had no
+notion of scope, so on all four repository papers the target *"the released repository
+<url> implements the described method"* was DISCHARGED by facts like "the checkout
+advertises evaluate.py", and four papers were reported as having had a claim about their
+implementation settled by the presence of a file. A broad question is now DECOMPOSED — the
+route answers the narrow questions it can and names them — and left open.
+
+**Five terminal states, and only one of them is about the paper:**
+`ARTIFACT_MISMATCH_ESTABLISHED` (→ `ARTIFACT_EVIDENCE`, the only one
+`EVIDENCE_ABOUT_THE_PAPER` admits), `ARTIFACT_FACT_ESTABLISHED`
+(→ `ARTIFACT_PROPERTY_ESTABLISHED`, a settled question about the CODE),
+`ARTIFACT_CONCERN_VERIFIED_ENDPOINTS` (→ UNRESOLVED, as `CITATION_VERIFIED` is),
+`ARTIFACT_INSPECTION_INCONCLUSIVE`, and `ARTIFACT_BLOCKED`.
 
 **Five of the six AST hits this corpus produced are false, and the rules are audited by
 authority rather than exposed because they exist** (`artifact_evidence.RULE_AUTHORITY`,
@@ -737,12 +790,23 @@ four classes, unaudited defaults to D-invisible). `leak-model-selection-on-test`
 times on `rescaled_eval_metrics = test(model, eval_dataloader, ...)` — "eval" contains
 "val" and `test` is the evaluation FUNCTION's name — and `cripple-augmentation-one-arm`
 once on a branch that resizes a LoRA rank, because `new_transform_r` contains both an arm
-token and an augmentation token. Reviewer-visible hits: **1 of 6**.
+token and an augmentation token.
 
-Measured over the four repository papers: 4 targets routed to inspection, 4 reaching
-`ARTIFACT_RESOLVED`, **8 level-1 facts and 0 level-2 mismatches**, 0 executions suppressed.
-`docs/ARTIFACT_ROUTE_MEASUREMENT.md` prints all eight facts and the reason the second
-number is zero.
+**Only class A is reviewer-visible; class B FEEDS THE AUDITOR.** That a source pattern
+matched is deterministic and what the match MEANS is not, and a class-B rule is defined by
+needing a reading — so a B hit is a place to look, and it reaches a referee only after
+exact source relocation and bounded semantic review through `artifact_review_driver`, at
+the authority that channel earns. Seven of the ten have never fired on any real
+repository, so rendering a first-ever B hit as a reviewer observation would put an
+unmeasured detector in front of a human wearing a measured one's clothes.
+Reviewer-visible hits on this corpus: **1 of 6**.
+
+Measured over the four repository papers: 4 inspections completed, **8 level-1 facts,
+0 broad implementation-correctness questions settled**, 0 executions suppressed. With the
+authors'-code auditor run on all four: 8 concerns proposed, 7 code and 7 paper citations
+relocated, 1 identity ESTABLISHED / 6 AMBIGUOUS, **7 endpoint-verified concerns and 0
+level-2 mismatches**. `docs/ARTIFACT_ROUTE_MEASUREMENT.md` prints every fact, every
+concern, and why each refusal is the right one.
 
 ## Execution gates
 
@@ -996,15 +1060,20 @@ were current.
   population a sentence names and refuses everything else, because a prose-stated accuracy
   has no column header, no basis and no baseline row to bind against. An accuracy claimed
   only in text is discovered and is not executable.
-- **The artifact route has established ZERO paper/artifact mismatches on real papers.**
-  It reaches `ARTIFACT_EVIDENCE` on all four repository papers and what it established
-  there is eight LEVEL-1 facts: which entrypoint each checkout advertises, and that `iclr`
-  publishes no dependency manifest at all. Level 2 needs an experiment identity, and the
-  deterministic probes produce none — the channel that could propose one is the gated
-  authors'-code auditor, which has not been run against the corpus. Seven of the ten AST
-  rules did not fire on any of the four, so their authority classification rests on their
-  structure rather than on a measurement; a rule firing for the first time on a fifth
-  paper should be re-audited before its output is believed.
+- **The artifact route has established ZERO paper/artifact mismatches on real papers, and
+  it settles ZERO broad implementation-correctness questions.** Measured over the four
+  repository papers: 4 inspections completed, 8 narrow level-1 facts established, 0 broad
+  questions settled. The authors'-code auditor HAS now been run on all four — 8 concerns
+  proposed, 7 code citations and 7 paper citations relocated, 1 experiment identity
+  ESTABLISHED and 6 AMBIGUOUS, **7 endpoint-verified concerns and 0 level-2 mismatches**.
+  Six of the seven are refused because which config belongs to which experiment is the
+  auditor's reading; the seventh had an ESTABLISHED identity and a paper value the harness
+  could not re-read from the quoted span. Both refusals are correct and neither should be
+  relaxed to make the route produce an interesting number. Seven of the ten AST rules did
+  not fire on any of the four, so their class-B classification rests on their structure
+  rather than a measurement; a rule firing for the first time on a fifth paper should be
+  re-audited before its output is believed.
+  `docs/ARTIFACT_ROUTE_MEASUREMENT.md` has the whole record, including every concern.
 - **Novelty / prior-art checking is architectural only.** `VERIFICATION_ROUTES` carries
   `LITERATURE_SEARCH` and nothing implements it: no literature tooling is wired in, so no
   novelty conclusion is produced. The route exists so that adding one later has a place to

@@ -84,13 +84,29 @@ sentence verbatim as well. It is searched for the same way.
 A paraphrase of the method section is not a citation of it, and a concern whose paper
 half is a paraphrase cannot establish a mismatch — it becomes, at most, an observation about the code.
 
-=== SAY WHICH EXPERIMENT ===
+=== SAY WHICH EXPERIMENT, AND SHOW WHERE THAT IS WRITTEN DOWN ===
 A repository sets a batch size in a dozen places. "Some config says 32" contradicts
-nothing. If your concern is a mismatch, say WHICH experiment or table of the paper the
-file you cite configures, and how you know — the entrypoint that reads it, the launcher
-that names it, the directory it sits in. If you cannot say, give the concern anyway and
-say you cannot: an unbound mismatch is still a question worth a referee's time, and it
-will be recorded as unbound rather than as a contradiction.
+nothing. If your concern is a mismatch, name WHICH experiment or table of the paper the
+file you cite configures — and then name the place that SAYS SO, because your reading of
+which config goes with which experiment is not itself evidence.
+
+`identity_basis` must be one of:
+
+    paper_names_the_command     the paper itself prints the command or the path
+    readme_maps_the_experiment  the checkout's README maps the experiment to the file
+    script_passes_the_config    a committed script names both the experiment and the file
+    authors_experiment_table    the repository documents its experiments in a table
+    auditor_assertion           none of the above; this is your reading
+
+For the middle three, give `identity_file` and `identity_quote`: the harness opens that
+file at the pinned commit and searches for the quote exactly as it does for your code
+citation. If it does not relocate, the identity is recorded as PARTIAL.
+
+**`auditor_assertion` is a legitimate answer and you should use it when it is true.** A
+concern whose identity is your reading is still worth a referee's time — it is recorded as
+a concern with both locations verified, not as a demonstrated inconsistency. What is not
+acceptable is claiming one of the other four when you have not opened the file that says
+so. Nothing is gained by it: the harness checks.
 
 === WHAT YOU ARE NOT SHOWN, AND WHY ===
 You are not shown any finding from any other reader, any severity, any grade, or any
@@ -120,6 +136,12 @@ Print ONLY this JSON to standard output. Do not write any file, and do not run a
     "paper_value": "what the paper states, e.g. 128, or \\"\\"",
     "artifact_value": "what the code sets, e.g. 32, or \\"\\"",
     "experiment_id": "which experiment/table this file configures and how you know, or \\"\\"",
+    "identity_basis": "paper_names_the_command | readme_maps_the_experiment | "
+                      "script_passes_the_config | authors_experiment_table | "
+                      "auditor_assertion",
+    "identity_file": "the file that states the experiment-to-config link, or \\"\\"",
+    "identity_quote": "VERBATIM line from that file stating the link, or \\"\\"",
+    "config_key": "the configuration key artifact_value is the value of, or \\"\\"",
     "counter_explanations": ["the innocent reading, which you must supply"]}
  ],
  "notes": "what you could not check, and why"}"""
@@ -163,12 +185,18 @@ def _self_check() -> None:
                  repo_path="/tmp/repo")
     assert "DOES THIS CODE DO WHAT THE PAPER SAYS IT DOES?" in body
     assert '"concerns"' in body and "train.py" in body
-    # The four rules that bound this reader, each stated to it.
+    # The five rules that bound this reader, each stated to it.
     for rule in ("You may NOT conclude that a reported result is false",
                  "THE CONCERN IS DROPPED",
                  "A paraphrase of the method section is not a citation of it",
-                 "Omit a concern rather than guess"):
+                 "Omit a concern rather than guess",
+                 "is a legitimate answer and you should use it when it is true"):
         assert rule in body, rule
+    # Every identity basis is offered by name, so the auditor cannot invent a sixth.
+    for basis in ("paper_names_the_command", "readme_maps_the_experiment",
+                  "script_passes_the_config", "authors_experiment_table",
+                  "auditor_assertion"):
+        assert basis in body, basis
     # It is shown no finding, no severity, no grade and no verdict, and the SIGNATURE is
     # what makes that so — there is no parameter that could carry one.
     import inspect

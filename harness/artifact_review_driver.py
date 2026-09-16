@@ -36,7 +36,9 @@ import time
 from pathlib import Path
 
 from . import artifact_evidence, delegation, state
-from .artifacts import ArtifactFact, ArtifactInspection, ArtifactSnapshot, PaperDoc
+from .artifacts import (ARTIFACT_IDENTITY_BASES, ARTIFACT_IDENTITY_STATES,
+                        ArtifactFact,
+                        ArtifactInspection, ArtifactSnapshot, PaperDoc)
 from .audit_driver import (Confinement, _kill_tree, denied_tools, envelope_provenance,
                            operator_confinement, unwrap_envelope, write_pinned_settings)
 from .config import Config
@@ -48,9 +50,18 @@ WRITERS = ("artifact_review_driver",) + tuple(delegation.WRITTEN_BY.values())
 # concern ESTABLISHES is the harness's, and a value arriving under one of these names is
 # counted as an attempted forgery rather than merged in — invariant 2, on a third channel.
 _PROPOSAL_KEYS = ("kind", "title", "statement", "file", "code_quote", "paper_quote",
-                  "paper_value", "artifact_value", "experiment_id", "counter_explanations")
+                  "paper_value", "artifact_value", "experiment_id", "identity_basis",
+                  "identity_file", "identity_quote", "config_key", "counter_explanations")
 HARNESS_OWNED_FACT_KEYS = ("authority", "refusal", "span", "snapshot", "paper_ref",
-                           "fact_id", "probe")
+                           "fact_id", "probe", "settles",
+                           # THE TWO THAT DECIDE WHETHER A CONCERN BECOMES A MISMATCH.
+                           # The auditor supplies a basis and its evidence; whether that
+                           # basis is DETERMINISTIC and whether its evidence relocates is
+                           # `artifact_evidence.classify_identity`'s to say, and an
+                           # auditor writing `identity_state: ESTABLISHED` would be
+                           # signing the harness's name to the only judgement that
+                           # separates level 2 from level 1.5.
+                           "identity_state", "identity_span")
 
 
 class ArtifactReviewDriverError(RuntimeError):
@@ -163,11 +174,56 @@ def parse_concerns(text: str) -> tuple[list[dict], str, dict]:
             "paper_value": str(row.get("paper_value") or "").strip()[:80],
             "artifact_value": str(row.get("artifact_value") or "").strip()[:80],
             "experiment_id": str(row.get("experiment_id") or "").strip()[:300],
+            "identity_basis": _basis(row.get("identity_basis")),
+            "identity_file": str(row.get("identity_file") or "").strip(),
+            "identity_quote": str(row.get("identity_quote") or "").strip(),
+            "config_key": str(row.get("config_key") or "").strip()[:120],
             "counter_explanations": [str(x).strip()[:300] for x in
                                      (row.get("counter_explanations") or [])
                                      if str(x).strip()][:4],
         })
     return out, str(data.get("notes") or "").strip()[:2000], meta
+
+
+def _basis(value) -> str:
+    """The auditor's claimed identity basis, or `auditor_assertion`. Never a sixth value.
+
+    An unrecognised basis falls back to the weakest one rather than being dropped: the
+    auditor said SOMETHING about why it paired these, and recording that as a reading is
+    more honest than recording nothing. It reaches AMBIGUOUS either way.
+    """
+    got = str(value or "").strip().lower()
+    return got if got in ARTIFACT_IDENTITY_BASES else "auditor_assertion"
+
+
+def _reread_config(root: str | Path, rel_file: str, key: str,
+                   claimed: str) -> tuple[str, str]:
+    """(the value the FILE states for `key`, how it was read). Never the auditor's copy.
+
+    §8 of the brief, and the reason `config_values` and `argparse_default` existed with no
+    caller: once the auditor names a key, the harness can stop trusting the value it was
+    handed and read the file itself. Two readers, tried in order, because a default in an
+    `argparse` call is not a `key: value` line and a YAML entry is not an `add_argument`.
+
+    AMBIGUITY REFUSES rather than picks. A key set in three places has three answers and
+    choosing one would be the positional coincidence `parse_metric` exists to refuse; the
+    auditor's own value is then kept and the disagreement is visible in `how`.
+    """
+    if not (rel_file and key):
+        return claimed, "as the auditor reported it; no key was named to re-read"
+    for reader, how in ((artifact_evidence.config_values, "re-read from the file as a "
+                                                          "key/value line"),
+                        (artifact_evidence.argparse_default, "re-read from the file as an "
+                                                             "argparse default")):
+        hits = reader(root, rel_file, key)
+        if len(hits) == 1:
+            return hits[0][0], how
+        if len(hits) > 1:
+            return claimed, (f"NOT re-read: `{key}` is set in {len(hits)} places in "
+                             f"`{rel_file}`, so which one the paper means is not decidable "
+                             f"from the file; the auditor's value is kept and the ambiguity "
+                             f"is recorded")
+    return claimed, f"NOT re-read: `{key}` was not found in `{rel_file}`"
 
 
 def locate_all(doc: PaperDoc, root: str | Path, snap: ArtifactSnapshot,
@@ -188,7 +244,9 @@ def locate_all(doc: PaperDoc, root: str | Path, snap: ArtifactSnapshot,
     """
     facts: list[ArtifactFact] = []
     meta = {"proposed": len(proposals), "relocated": 0, "dropped_unlocatable": 0,
-            "bound_mismatches": 0}
+            "paper_citations_relocated": 0, "bound_mismatches": 0,
+            "endpoint_concerns": 0, "reread_from_file": 0,
+            "identity": {k: 0 for k in ARTIFACT_IDENTITY_STATES}}
     for i, row in enumerate(proposals):
         span = artifact_evidence.relocate(root, row["file"], row["code_quote"])
         if span is None:
@@ -197,13 +255,29 @@ def locate_all(doc: PaperDoc, root: str | Path, snap: ArtifactSnapshot,
         meta["relocated"] += 1
         fid = f"AF{i + 1:02d}"
         if row["paper_quote"] and row["paper_value"] and row["artifact_value"]:
+            # THE VALUE IS RE-READ FROM THE FILE where the auditor named a key. What the
+            # auditor says the code sets is a claim about the code; what the file says is
+            # the fact, and the two are only the same when the harness has checked.
+            value, how = _reread_config(root, row["file"], row.get("config_key", ""),
+                                        row["artifact_value"])
+            if value != row["artifact_value"] or "re-read from" in how:
+                meta["reread_from_file"] += 1
             fact = artifact_evidence.bind_mismatch(
                 doc, snap, paper_quote=row["paper_quote"], paper_value=row["paper_value"],
-                span=span, artifact_value=row["artifact_value"],
+                span=span, artifact_value=value, root=root,
                 experiment_id=row["experiment_id"], probe=f"code_review:{row['kind']}",
-                counter_explanations=row["counter_explanations"])
+                identity_basis=row.get("identity_basis", ""),
+                identity_file=row.get("identity_file", ""),
+                identity_quote=row.get("identity_quote", ""),
+                counter_explanations=row["counter_explanations"] + [how])
+            meta["identity"][fact.identity_state] = \
+                meta["identity"].get(fact.identity_state, 0) + 1
+            if fact.paper_ref:
+                meta["paper_citations_relocated"] += 1
             if fact.authority == "PAPER_ARTIFACT_MISMATCH":
                 meta["bound_mismatches"] += 1
+            elif fact.authority == "ENDPOINTS_VERIFIED_ARTIFACT_CONCERN":
+                meta["endpoint_concerns"] += 1
             facts.append(fact.model_copy(update={"fact_id": fid}))
             continue
         # A CODE-ONLY OBSERVATION. The quotation is located in the pinned tree, which is
@@ -292,12 +366,34 @@ def load(cfg: Config, pid: str, *, commit: str = "") -> ArtifactInspection | Non
         return None
 
 
+def _record_failure(cfg: Config, pid: str, why: str, **extra) -> None:
+    """Why the auditor produced nothing. A silent None is not an acceptable record.
+
+    Every early return below writes this. A pass that fails and leaves no trace is
+    indistinguishable from a pass that ran and found nothing, and those are opposite facts
+    about a repository — the same reason `ClaimLinkSet` keeps its refusals and
+    `load_reports` counts its drops rather than discarding them.
+    """
+    try:
+        _out, sidecar = _paths(cfg, pid)
+        state.write_json(sidecar, {"written_by": "artifact_review_driver",
+                                   "paper_id": pid, "ran": False, "failure": why,
+                                   "ts": state.now(), **extra})
+    except OSError:
+        pass
+
+
 def run(cfg: Config, pid: str, doc: PaperDoc, root: str | Path, prompt_text: str, *,
         url: str = "", statements: list[str] | None = None,
         facts: list[ArtifactFact] | None = None) -> ArtifactInspection | None:
-    """One best-effort call. Returns None on ANY failure, and never raises."""
-    ok, _why = available(cfg)
+    """One best-effort call. Returns None on ANY failure, and never raises.
+
+    Every failure path records WHY in the sidecar before returning, so "the auditor found
+    nothing" and "the auditor never answered" are distinguishable afterwards.
+    """
+    ok, why = available(cfg)
     if not ok:
+        _record_failure(cfg, pid, why)
         return None
     prompt_sha = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
     started = time.time()
@@ -312,8 +408,9 @@ def run(cfg: Config, pid: str, doc: PaperDoc, root: str | Path, prompt_text: str
                 sp, sha = write_pinned_settings(policy_dir, conf.disallowed_tools)
                 settings_path = str(sp)
                 conf = dataclasses.replace(conf, settings_sha256=sha)
-        except OSError:
+        except OSError as e:
             shutil.rmtree(policy_dir, ignore_errors=True)
+            _record_failure(cfg, pid, f"the pinned tool policy could not be written: {e}")
             return None
         cmd = (resolve_cmd(cfg, settings=settings_path, repo_dir=str(root))
                .replace("{prompt}", str(prompt)).replace("{out}", str(out)))
@@ -328,20 +425,37 @@ def run(cfg: Config, pid: str, doc: PaperDoc, root: str | Path, prompt_text: str
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                         text=True, encoding="utf-8", errors="replace",
                                         **group_kwargs)
-            except OSError:
+            except OSError as e:
+                _record_failure(cfg, pid, f"the reader could not be started: {e}",
+                                command=cmd)
                 return None
+            stdout, stderr = "", ""
             try:
-                proc.communicate(timeout=cfg.artifact_review_timeout_s)
+                stdout, stderr = proc.communicate(timeout=cfg.artifact_review_timeout_s)
             except subprocess.TimeoutExpired:
                 _kill_tree(proc)
                 proc.communicate()
+                _record_failure(
+                    cfg, pid,
+                    f"the reader did not answer within "
+                    f"{cfg.artifact_review_timeout_s}s and was killed",
+                    command=cmd, seconds=round(time.time() - started, 1))
                 return None
             if not out.exists():
+                _record_failure(
+                    cfg, pid, "the reader exited without writing the output file",
+                    command=cmd, returncode=proc.returncode,
+                    stderr=(stderr or "")[-1200:], stdout=(stdout or "")[-1200:],
+                    seconds=round(time.time() - started, 1))
                 return None
             try:
                 raw = out.read_text(encoding="utf-8")
                 proposals, notes, meta = parse_concerns(raw)
-            except (OSError, ArtifactReviewDriverError):
+            except (OSError, ArtifactReviewDriverError) as e:
+                _record_failure(cfg, pid, f"the reader's output was unusable: {e}",
+                                command=cmd, returncode=proc.returncode,
+                                raw_head=(raw if isinstance(raw, str) else "")[:1500],
+                                seconds=round(time.time() - started, 1))
                 return None
             snap = artifact_evidence.snapshot(root, url)
             located, lmeta = locate_all(doc, root, snap, proposals)
@@ -414,7 +528,7 @@ if __name__ == "__main__":       # self-check: python -m harness.artifact_review
     with tempfile.TemporaryDirectory() as td:
         root = Path(td) / "repo"
         root.mkdir()
-        (root / "config.yaml").write_text("batch_size: 32\n", encoding="utf-8")
+        (root / "config.yaml").write_text("batch_size: 32\nepochs: 100\n", encoding="utf-8")
 
         def git(*args):
             subprocess.run(["git", *args], cwd=root, check=True,
@@ -435,14 +549,30 @@ if __name__ == "__main__":       # self-check: python -m harness.artifact_review
         doc = PaperDoc(paper_id="p", title="T", n_pages=1, sections=[
             Section(section_idx=0, title="Method", page_start=1,
                     text="We train with a batch size of 128 on every benchmark.")])
+        (root / "README.md").write_text(
+            "Table 2 of the paper is produced by `python train.py --config config.yaml`.\n",
+            encoding="utf-8")
+        git("add", "-A")
+        git("commit", "-qm", "readme")
+
         payload = json.dumps({"concerns": [
-            # bound: paper half mints, identity given, values disagree
+            # BOUND: the paper half mints, the README states the experiment-to-config
+            # link and relocates, and the two values disagree.
             {"kind": "PAPER_CODE_MISMATCH", "title": "batch size", "statement": "s",
              "file": "config.yaml", "code_quote": "batch_size: 32",
              "paper_quote": "We train with a batch size of 128 on every benchmark.",
-             "paper_value": "128", "artifact_value": "32",
-             "experiment_id": "the only config the entrypoint reads",
+             "paper_value": "128", "artifact_value": "32", "config_key": "batch_size",
+             "experiment_id": "Table 2",
+             "identity_basis": "readme_maps_the_experiment",
+             "identity_file": "README.md",
+             "identity_quote": "Table 2 of the paper is produced by",
              "counter_explanations": ["a launcher may override it"]},
+            # A READING IS NOT AN IDENTITY: both ends verified, the relation model-proposed.
+            {"kind": "PAPER_CODE_MISMATCH", "title": "batch size again", "statement": "s",
+             "file": "config.yaml", "code_quote": "epochs: 100",
+             "paper_quote": "We train with a batch size of 128 on every benchmark.",
+             "paper_value": "128", "artifact_value": "100",
+             "experiment_id": "probably the ablation", "identity_basis": "auditor_assertion"},
             # unlocatable: DROPPED WHOLE
             {"kind": "HARD_CODED_RESULT", "title": "x", "statement": "s",
              "file": "config.yaml", "code_quote": "accuracy = 0.914  # hard-coded"},
@@ -453,25 +583,44 @@ if __name__ == "__main__":       # self-check: python -m harness.artifact_review
         got = accept(cfg, "p", doc, root, payload,
                      statements=["We train with a batch size of 128 on every benchmark."],
                      reader="self-check")
-        assert got.proposed == 3 and got.relocated == 2, (got.proposed, got.relocated)
-        assert len(got.facts) == 2, "the unlocatable concern is dropped whole"
+        assert got.proposed == 4 and got.relocated == 3, (got.proposed, got.relocated)
+        assert len(got.facts) == 3, "the unlocatable concern is dropped whole"
+
         bound = got.bound_mismatches()
         assert len(bound) == 1 and bound[0].paper_ref.startswith("P0:"), bound
-        assert got.discharged and artifact_evidence.outcome_disposition(got) \
-            == "ARTIFACT_RESOLVED"
+        assert bound[0].identity_state == "ESTABLISHED"
+        assert bound[0].identity_basis == "readme_maps_the_experiment"
+        assert bound[0].identity_span is not None
+        # The value was RE-READ from the file rather than taken from the auditor.
+        assert any("re-read from the file" in c for c in bound[0].counter_explanations)
+
+        concerns = got.endpoint_concerns()
+        assert len(concerns) == 1 and concerns[0].identity_state == "AMBIGUOUS", concerns
+        assert concerns[0].refusal == "experiment_identity_not_deterministic"
+        assert concerns[0].about_the_paper is False
+
+        # AN ESTABLISHED MISMATCH DISCHARGES; a concern alone would not.
+        assert got.discharged and "identity bound to a deterministic source" in got.reason
+        assert artifact_evidence.outcome_disposition(got) == "ARTIFACT_MISMATCH_ESTABLISHED"
+        concern_only = artifact_evidence.inspect(
+            doc, root, statements=["We train with a batch size of 128 on every benchmark."],
+            scope="CONFIG_LITERAL", facts=[concerns[0]])
+        assert not concern_only.discharged, "a model-proposed relation settles nothing"
+        assert artifact_evidence.outcome_disposition(concern_only)             == "ARTIFACT_CONCERN_VERIFIED_ENDPOINTS"
+
         # The code-only fact is about the ARTIFACT and says its reading is unverified.
-        code_only = [f for f in got.facts if not f.about_the_paper]
-        assert len(code_only) == 1 and code_only[0].authority == "ARTIFACT_FACT"
-        assert "UNVERIFIED" in code_only[0].statement
+        code_only = [f for f in got.facts
+                     if f.authority == "ARTIFACT_FACT" and not f.paper_ref]
+        assert len(code_only) == 1 and "UNVERIFIED" in code_only[0].statement
 
         back = load(cfg, "p", commit=artifact_evidence.snapshot(root).commit)
-        assert back is not None and back.relocated == 2
+        assert back is not None and back.relocated == 3
         assert load(cfg, "p", commit="0" * 40) is None, \
             "an inspection is about ONE tree and may not be served for another"
 
         # A file edited after sealing is not the file that was sealed.
         out, _sidecar = _paths(cfg, "p")
-        out.write_text(out.read_text(encoding="utf-8").replace('"relocated": 2',
+        out.write_text(out.read_text(encoding="utf-8").replace('"relocated": 3',
                                                                '"relocated": 9'),
                        encoding="utf-8")
         assert load(cfg, "p") is None

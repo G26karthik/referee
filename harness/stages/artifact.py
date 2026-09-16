@@ -120,6 +120,16 @@ def run_route(cfg: Config, pid: str, doc: PaperDoc, target_set: TargetSet | None
     One snapshot for the whole pass, because every fact must be tied to ONE tree: two
     targets reading the same checkout at two moments could otherwise disagree about what
     the artifact says, and neither would be wrong.
+
+    **A broad question is DECOMPOSED, not discharged.** The corpus's four artifact targets
+    all ask the same thing — *"the released repository <url> implements the described
+    method"* — and no bounded artifact fact answers it. The first version discharged it
+    anyway, with facts like "the checkout advertises evaluate.py", and reported four papers
+    as having had a claim about their implementation settled by the presence of a file. Now
+    the route answers the bounded questions it CAN answer, records each against its own
+    scope, and leaves the broad claim open with the reason. A referee reads "these things
+    about the artifact are established, and whether the code implements the method is still
+    open", which is what was true all along.
     """
     pairs = planned(target_set)
     if not pairs or not Path(root).is_dir():
@@ -129,6 +139,7 @@ def run_route(cfg: Config, pid: str, doc: PaperDoc, target_set: TargetSet | None
     outcomes: list[TargetOutcome] = []
     all_facts: list[ArtifactFact] = list(extra_facts or [])
     statements: list[str] = []
+    escalations: list[str] = []
     for obj, plan in pairs:
         # A MEASUREMENT IS NOT READABLE. Refused per target rather than filtered at plan
         # time as well, so a plan that reached here by another path still cannot use this
@@ -143,25 +154,47 @@ def run_route(cfg: Config, pid: str, doc: PaperDoc, target_set: TargetSet | None
                         f"inspection is refused for it rather than allowed to appear to "
                         f"settle it.")))
             continue
+
         statement = (obj.claim_text or "").strip()
+        scope = artifact_evidence.question_scope(obj.question_kind, statement)
         facts = facts_for(doc, root, snap, obj)
-        one = artifact_evidence.inspect(
-            doc, root, url=url, target_id=obj.target_id,
-            statements=[statement] if statement else [],
-            facts=list(extra_facts or []) + facts)
         all_facts += facts
         if statement:
             statements.append(statement)
-        outcomes.append(TargetOutcome(
-            target_id=obj.target_id,
-            disposition=artifact_evidence.outcome_disposition(one),
-            action=plan.action, route=plan.route, launched=0, provenance="artifact",
-            reason=(f"the pinned checkout was read for this question: {one.reason}. "
-                    f"Reading the artifact establishes what the released code does and "
-                    f"never that a reported result is wrong.")))
 
-    whole = artifact_evidence.inspect(doc, root, url=url, statements=statements,
-                                      facts=all_facts)
+        one = artifact_evidence.inspect(
+            doc, root, url=url, target_id=obj.target_id, scope=scope,
+            statements=[statement] if statement else [],
+            facts=list(extra_facts or []) + facts)
+        disposition = artifact_evidence.outcome_disposition(one)
+
+        # WHAT THIS BUYS A LATER ROUTE, which is the honest value of an inspection that
+        # settled no broad question. Derived from the PROBE rather than from any reading,
+        # recorded into a list of sentences, and acted on by nothing here.
+        escalations += artifact_evidence.escalations_from(facts)
+
+        if scope == "IMPLEMENTATION_CORRESPONDENCE":
+            settled = [f for f in facts if f.authority == "ARTIFACT_FACT" and f.settles]
+            parts = artifact_evidence.decompose(statement, url)
+            reason = (
+                f"{one.reason} The bounded questions this route did answer against "
+                f"{snap.commit[:10]}: "
+                + "; ".join(f"{sc} — {q}" for sc, q in parts)
+                + f". {len(settled)} of them produced a fact.")
+        else:
+            reason = (f"the pinned checkout was read for this {scope} question: "
+                      f"{one.reason}. Reading the artifact establishes what the released "
+                      f"code does and never that a reported result is wrong.")
+
+        outcomes.append(TargetOutcome(
+            target_id=obj.target_id, disposition=disposition,
+            action=plan.action, route=plan.route, launched=0, provenance="artifact",
+            reason=reason))
+
+    whole = artifact_evidence.inspect(
+        doc, root, url=url, statements=statements, facts=all_facts,
+        scope="IMPLEMENTATION_CORRESPONDENCE",
+        escalations=sorted(set(escalations)))
     try:
         state.write_json(
             state.project_dir(cfg, pid) / "artifact" / f"{pid}.route.json",
@@ -177,6 +210,7 @@ if __name__ == "__main__":       # self-check: python -m harness.stages.artifact
     import sys
     import tempfile
 
+    from .. import taxonomy
     from ..artifacts import ClaimRef, Section
 
     doc = PaperDoc(paper_id="p", title="T", n_pages=1, repo_url="https://example.invalid/r",
@@ -229,17 +263,42 @@ if __name__ == "__main__":       # self-check: python -m harness.stages.artifact
         state.create_project(cfg, "", "T", pid="p")
         outcomes, whole = run_route(cfg, "p", doc, ts, root, url="https://example.invalid/r")
         assert len(outcomes) == 2, outcomes
-        settled, refused = outcomes[0], outcomes[1]
-        # An artifact-only question REACHES the state that had no way in.
-        assert settled.disposition == "ARTIFACT_RESOLVED", settled
-        assert settled.evidence_state == "ARTIFACT_EVIDENCE"
-        assert settled.resolution_state == "RESOLVED_FROM_ARTIFACT"
-        # And it is NOT a material failure, whatever it found.
-        assert settled.establishes_failure is False
+        broad, refused = outcomes[0], outcomes[1]
+
+        # THE BUG THIS RELEASE FIXES, asserted at the route. "The repository implements
+        # the described method" is a semantic correspondence question and four bounded
+        # facts about the checkout do not answer it.
+        assert broad.disposition == "ARTIFACT_INSPECTION_INCONCLUSIVE", broad
+        assert broad.evidence_state != "ARTIFACT_EVIDENCE"
+        assert broad.resolution_state == "UNRESOLVED"
+        assert "supporting evidence for it and are not its answer" in broad.reason
+        # ...and the bounded questions it DID answer are named, so the inspection is not
+        # reported as having produced nothing.
+        for scope in ("ENTRYPOINT_PRESENCE", "MANIFEST_PRESENCE", "DEPENDENCY_DECLARED",
+                      "FILE_PRESENCE"):
+            assert scope in broad.reason, scope
+
         # A REPRODUCTION-shaped question cannot be answered by reading.
         assert refused.disposition == "COMPARISON_BLOCKED", refused
         assert "whose answer is a measured result" in refused.reason
-        assert whole is not None and whole.discharged
+
+        # A BOUNDED target IS settled, and the state it reaches is the artifact one —
+        # about the checkout, never about the paper.
+        narrow_ts = TargetSet(
+            paper_id="p",
+            objects=[obj("t4", "ENTRYPOINT_PRESENCE",
+                         claim="is there a runnable entrypoint the repository advertises?")],
+            plans=[plan("t4")])
+        narrow_out, _ = run_route(cfg, "p", doc, narrow_ts, root, url="u")
+        assert narrow_out[0].disposition == "ARTIFACT_FACT_ESTABLISHED", narrow_out[0]
+        assert narrow_out[0].evidence_state == "ARTIFACT_PROPERTY_ESTABLISHED"
+        assert narrow_out[0].resolution_state == "RESOLVED_FROM_ARTIFACT"
+        assert narrow_out[0].evidence_state not in taxonomy.EVIDENCE_ABOUT_THE_PAPER
+        assert narrow_out[0].establishes_failure is False
+
+        # What the inspection buys a LATER route is recorded and acted on by nothing here.
+        assert whole is not None and whole.escalations, whole.escalations
+        assert any("narrows the candidate commands" in e for e in whole.escalations)
         assert (state.project_dir(cfg, "p") / "artifact" / "p.route.json").exists()
 
         # A checkout that is not there is not a route.

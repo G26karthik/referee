@@ -1148,9 +1148,69 @@ class CodeAuditFinding(_Base):
 # writing a stronger string here. An AST warning may not become RED.
 ARTIFACT_AUTHORITY = (
     "ARTIFACT_FACT",             # level 1: about the checkout, and nothing else
+    # LEVEL 1.5, and the correction that made the first version of this ladder wrong.
+    # A relocated code quotation proves that this code exists at this location in this
+    # audited snapshot. It does NOT prove that the code contradicts the paper. Where both
+    # endpoints are deterministic and the CORRESPONDENCE between them is the auditor's
+    # reading, this is what the pairing is worth — the same distinction
+    # `ENDPOINTS_VERIFIED_SEMANTIC_LINK` draws on the claim-link channel, for the same
+    # reason: verifying two ends does not verify the relationship between them.
+    "ENDPOINTS_VERIFIED_ARTIFACT_CONCERN",
     "PAPER_ARTIFACT_MISMATCH",   # level 2: about the paper AND the checkout, identity bound
     "NONE",                      # observed; establishes nothing
 )
+
+# HOW an experiment identity was established, and how well. Only ESTABLISHED may support
+# level-2 mismatch authority: a repository sets a batch size in a dozen places, and a
+# model saying "this looks like the right config" is a guess wearing a citation's clothes.
+# NAMED `ARTIFACT_` RATHER THAN `IDENTITY_STATES`, which already exists below for a
+# different thing — `ProbeSpec`'s experiment-identity resolution (established / ambiguous /
+# no_candidate / unmapped / unsupported). Two vocabularies under one name is not a style
+# problem: the first version of this constant shadowed that one, and the auditor run's
+# identity histogram came back keyed on the WRONG five values, counting nothing.
+ARTIFACT_IDENTITY_STATES = (
+    "ESTABLISHED",   # a deterministic source in the paper or the artifact links the two
+    "PARTIAL",       # one side links; the other is the auditor's reading
+    "AMBIGUOUS",     # several candidates fit and nothing in either document chooses
+    "UNBOUND",       # nothing was offered
+)
+
+# The deterministic sources that may establish an identity. Each is a thing a reader can
+# open. `auditor_assertion` is deliberately in the list and deliberately NOT sufficient:
+# it is recorded so a human can see what was claimed, and it classifies as AMBIGUOUS.
+ARTIFACT_IDENTITY_BASES = (
+    "paper_names_the_command",    # the paper prints the command or path itself
+    "readme_maps_the_experiment",  # the checkout's own README maps experiment -> file
+    "script_passes_the_config",   # a committed script names both the experiment and the file
+    "authors_experiment_table",   # the repository documents its experiments in a table
+    "auditor_assertion",          # the auditor's reading, and nothing deterministic
+)
+
+# WHAT a level-1 fact is allowed to settle. A probe answers a bounded question and may
+# discharge only a target asking that bounded question — the defect this closes is that
+# "the checkout advertises evaluate.py" was accepted as settling "the released repository
+# implements the described method", which is a semantic correspondence question no
+# entrypoint existing can answer.
+ARTIFACT_QUESTION_SCOPES = (
+    "FILE_PRESENCE",        # does the advertised file exist in the pinned tree?
+    "ENTRYPOINT_PRESENCE",  # does the repository contain a runnable entrypoint it advertises?
+    "DEPENDENCY_DECLARED",  # is dependency X declared, and at what version?
+    "MANIFEST_PRESENCE",    # is a dependency manifest present at all?
+    "CONFIG_LITERAL",       # does config key K literally equal V at this pinned file/span?
+    "COMMAND_PRESENCE",     # does command C exist?
+    # NOT a scope any probe may claim. Named so that a question of this shape can be
+    # RECOGNISED and refused rather than falling through to whichever fact happened to be
+    # established: "does the repository implement the described method", "is the
+    # implementation faithful", "does this code reproduce the paper" are semantic
+    # correspondence questions, and a bounded artifact fact is supporting evidence for one,
+    # never its answer.
+    "IMPLEMENTATION_CORRESPONDENCE",
+)
+
+# The scopes a deterministic probe may discharge. IMPLEMENTATION_CORRESPONDENCE is
+# excluded by construction, which is the fix rather than a note about it.
+SETTLEABLE_BY_ARTIFACT_FACT = tuple(
+    s for s in ARTIFACT_QUESTION_SCOPES if s != "IMPLEMENTATION_CORRESPONDENCE")
 
 # WHY a proposed mismatch was not bound. Named per attempt, because "we found nothing"
 # and "we found it and could not say which experiment it belongs to" are opposite
@@ -1159,6 +1219,18 @@ MISMATCH_REFUSALS = (
     "paper_statement_unaddressed",   # no resolvable paper locator for the claimed statement
     "artifact_fact_unlocated",       # the file/span/hash did not relocate in the pinned tree
     "experiment_identity_unbound",   # the config exists; which experiment it configures is open
+    # THE IDENTITY WAS OFFERED AND IS NOT DETERMINISTIC. Kept apart from `unbound`
+    # because they are opposite facts about the auditor: one gave nothing, the other gave
+    # a reading. Both stop at ENDPOINTS_VERIFIED_ARTIFACT_CONCERN.
+    "experiment_identity_not_deterministic",
+    "values_not_comparable",         # the two sides do not state the same kind of quantity
+    # THE PAPER'S NUMBER WAS THE AUDITOR'S PICK. Found by hand-checking the corpus's first
+    # level-2 mismatch: the auditor quoted a whole hyperparameter table and reported the
+    # paper value as "Epochs 16 (CNN/DM column)". The span is real and the number is in it
+    # — and so are 40, 32, 15 and 6, and WHICH of them is the CNN/DM column's is the
+    # auditor's reading of a table layout this harness cannot re-derive. A level-2
+    # mismatch may not rest on a number a model chose out of a row of numbers.
+    "paper_value_not_derivable",
     "no_disagreement",               # both sides located and identity bound; they agree
 )
 
@@ -1219,6 +1291,11 @@ class ArtifactFact(_Base):
 
     fact_id: str = ""
     probe: str = Field(default="", description="which deterministic probe or rule produced it")
+    settles: str = Field(default="", description="WRITTEN BY THE HARNESS: which of "
+                                                 + " | ".join(ARTIFACT_QUESTION_SCOPES)
+                                                 + " this fact answers. '' answers none, and "
+                                                   "a fact that answers none discharges "
+                                                   "nothing whatever its authority")
     statement: str = Field(default="", description="what was established, in the harness's words")
     authority: str = Field(default="NONE", description="WRITTEN BY THE HARNESS: "
                                                        + " | ".join(ARTIFACT_AUTHORITY))
@@ -1230,14 +1307,32 @@ class ArtifactFact(_Base):
     paper_value: str = ""
     artifact_value: str = ""
     experiment_id: str = Field(default="", description="what binds the two; '' means unbound")
+    identity_state: str = Field(
+        default="UNBOUND", description="WRITTEN BY THE HARNESS: "
+                                       + " | ".join(ARTIFACT_IDENTITY_STATES))
+    identity_basis: str = Field(
+        default="", description="WRITTEN BY THE HARNESS: which of "
+                                + " | ".join(ARTIFACT_IDENTITY_BASES))
+    identity_span: SourceSpan | None = Field(
+        default=None, description="WRITTEN BY THE HARNESS: the relocated artifact location "
+                                  "that establishes the identity, when one does")
     refusal: str = Field(default="", description=" | ".join(MISMATCH_REFUSALS))
     # --- always -----------------------------------------------------------------------
     counter_explanations: list[str] = Field(default_factory=list)
 
     @property
     def about_the_paper(self) -> bool:
-        """Only a bound mismatch says anything about the paper. Everything else is the code."""
+        """Only a bound mismatch says anything about the paper. Everything else is the code.
+
+        ENDPOINTS_VERIFIED_ARTIFACT_CONCERN is deliberately NOT about the paper: both of
+        its locations are real and the correspondence between them is the auditor's
+        reading, which is a question for a referee and not a finding about the document.
+        """
         return self.authority == "PAPER_ARTIFACT_MISMATCH"
+
+    @property
+    def endpoints_only(self) -> bool:
+        return self.authority == "ENDPOINTS_VERIFIED_ARTIFACT_CONCERN"
 
 
 class ArtifactInspection(_Base):
@@ -1258,14 +1353,26 @@ class ArtifactInspection(_Base):
     files_examined: list[str] = Field(default_factory=list)
     statements_examined: list[str] = Field(
         default_factory=list, description="the paper statements this route was asked about")
+    question_scope: str = Field(
+        default="", description="the bounded scope of the question this route was asked, "
+                                "or IMPLEMENTATION_CORRESPONDENCE for one it may not settle")
     discharged: bool = Field(default=False, description="WRITTEN BY THE HARNESS: the route "
                                                         "answered the question it was given")
     reason: str = Field(default="", description="why it did or did not discharge")
+    escalations: list[str] = Field(
+        default_factory=list,
+        description="what this inspection makes newly possible for a LATER route — a "
+                    "narrowed command, an identified configuration, a metric "
+                    "implementation, a split definition. Recorded, never acted on here.")
     proposed: int = Field(default=0, description="code-auditor proposals received")
     relocated: int = Field(default=0, description="proposals whose citation the harness relocated")
 
     def bound_mismatches(self) -> list[ArtifactFact]:
         return [f for f in self.facts if f.about_the_paper]
+
+    def endpoint_concerns(self) -> list[ArtifactFact]:
+        """Both locations verified, the correspondence still the auditor's reading."""
+        return [f for f in self.facts if f.endpoints_only]
 
 
 class CodeAudit(_Base):
@@ -2861,7 +2968,16 @@ TARGET_DISPOSITIONS = (
     # demonstration that the reported number is wrong — which of the two configurations
     # produced it is a question for execution, and invariant 8's materiality gate still
     # decides whether anything follows for the paper.
-    "ARTIFACT_RESOLVED",          # static inspection of the pinned checkout settled it
+    # FIVE TERMINAL STATES FOR ONE ROUTE, because the first version had one and it was
+    # too broad. `ARTIFACT_RESOLVED` accepted any fact carrying authority as settling any
+    # statement the route was given, so "the checkout advertises evaluate.py" discharged
+    # "the released repository implements the described method" on all four repository
+    # papers. An entrypoint existing is SUPPORTING EVIDENCE for that question and is not
+    # its answer.
+    "ARTIFACT_FACT_ESTABLISHED",           # a bounded fact about the checkout, matching the question
+    "ARTIFACT_CONCERN_VERIFIED_ENDPOINTS",  # both locations verified; the relation is model-proposed
+    "ARTIFACT_MISMATCH_ESTABLISHED",        # paper and code disagree, with identity ESTABLISHED
+    "ARTIFACT_INSPECTION_INCONCLUSIVE",     # the route completed and settled no question
     "SPECIFICATION_BLOCKED",      # the paper does not say enough to run it
     "ARTIFACT_BLOCKED",           # no code, or the code does not contain the experiment
     "ENVIRONMENT_BLOCKED",        # dependencies, platform, install

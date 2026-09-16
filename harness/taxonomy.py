@@ -81,7 +81,20 @@ EVIDENCE_STATES = (
     "REPRODUCTION_SUCCESS",     # admissible execution re-derived the printed quantity
     "REPRODUCTION_FAILURE",     # admissible execution did not, having reached the experiment
     "PAPER_INTERNAL_EVIDENCE",  # settled against the paper's own printed content
-    "ARTIFACT_EVIDENCE",        # settled by reading the released code
+    "ARTIFACT_EVIDENCE",        # settled by reading the released code — about the PAPER
+    # A BOUNDED FACT ABOUT THE CHECKOUT, and its own state because ARTIFACT_EVIDENCE is
+    # in EVIDENCE_ABOUT_THE_PAPER and this is not. "The checkout advertises evaluate.py"
+    # settles a question about the artifact and says nothing whatever about the document;
+    # the first version of this route mapped it to ARTIFACT_EVIDENCE and so reported four
+    # papers as having had a claim about their implementation settled by the presence of
+    # a file. The RESOLUTION is real — the narrow question is closed — which is why it
+    # still resolves to RESOLVED_FROM_ARTIFACT.
+    "ARTIFACT_PROPERTY_ESTABLISHED",
+    # BOTH LOCATIONS VERIFIED, THE RELATIONSHIP NOT. The artifact-route analogue of
+    # CITATION_VERIFIED, and its own state for the same reason: the alternatives both lie.
+    # ARTIFACT_EVIDENCE would say the paper had been checked; NOT_INVESTIGATED would say
+    # nobody looked.
+    "ARTIFACT_ENDPOINTS_VERIFIED",
     "ARTIFACT_LIMITATION",      # no usable artifact for this question
     "EXTRACTION_LIMITATION",    # this harness could not build an address for the claim
     "REPORTING_LIMITATION",     # the paper prints no unambiguous quantity to compare against
@@ -142,12 +155,23 @@ _EVIDENCE_FOR_DISPOSITION = {
     # so it maps like PAPER_ONLY_RESOLVED above, not like CITATION_VERIFIED_ONLY: the
     # arithmetic recheck decides something, the quotation recheck does not.
     "PAPER_ARITHMETIC_CONTRADICTION": "PAPER_INTERNAL_EVIDENCE",
-    # The released artifact answered it. ARTIFACT_EVIDENCE is in EVIDENCE_ABOUT_THE_PAPER
-    # — a bound paper/artifact mismatch IS a statement about the paper — and it is
-    # deliberately not in `establishes_failure`: saying the code disagrees with the method
-    # section is not saying the reported number is false. `resolution_state` turns it into
-    # RESOLVED_FROM_ARTIFACT, which is the other half of the pair that had no way in.
-    "ARTIFACT_RESOLVED": "ARTIFACT_EVIDENCE",
+    # FIVE TERMINAL STATES, and only ONE of them is about the paper.
+    #
+    # A bound paper/artifact mismatch IS a statement about the document, so it maps to
+    # ARTIFACT_EVIDENCE, which `EVIDENCE_ABOUT_THE_PAPER` admits — and it is still
+    # deliberately absent from `establishes_failure`, because saying the code disagrees
+    # with the method section is not saying the reported number is false.
+    "ARTIFACT_MISMATCH_ESTABLISHED": "ARTIFACT_EVIDENCE",
+    # A bounded fact about the checkout settles its own bounded question and nothing about
+    # the paper. Its own state so that a review cannot report "settled from the artifact"
+    # about a paper when what was settled was that a file exists.
+    "ARTIFACT_FACT_ESTABLISHED": "ARTIFACT_PROPERTY_ESTABLISHED",
+    # Both ends located, the correspondence between them the auditor's reading. Resolves
+    # to UNRESOLVED, exactly as CITATION_VERIFIED does, and for the same reason.
+    "ARTIFACT_CONCERN_VERIFIED_ENDPOINTS": "ARTIFACT_ENDPOINTS_VERIFIED",
+    # The route ran and settled nothing. A limit of what reading can establish, reported
+    # as such rather than as a missing artifact.
+    "ARTIFACT_INSPECTION_INCONCLUSIVE": "COMPARISON_LIMITATION",
     "SPECIFICATION_BLOCKED": "SPECIFICATION_LIMITATION",
     "ARTIFACT_BLOCKED": "ARTIFACT_LIMITATION",
     # NOT ARTIFACT_LIMITATION. "We could not build an address for this claim" is a limit
@@ -250,7 +274,11 @@ def resolution_state(evidence: str = "") -> str:
         return "RESOLVED_BY_EXECUTION"
     if e == "PAPER_INTERNAL_EVIDENCE":
         return "RESOLVED_FROM_PAPER"
-    if e == "ARTIFACT_EVIDENCE":
+    if e in ("ARTIFACT_EVIDENCE", "ARTIFACT_PROPERTY_ESTABLISHED"):
+        # BOTH are resolutions — the narrow artifact question really is closed — and they
+        # differ on the OTHER axis: only ARTIFACT_EVIDENCE is in EVIDENCE_ABOUT_THE_PAPER.
+        # A review that reads only `resolution_status` sees a settled question either way,
+        # which is correct; one that asks what was settled ABOUT THE PAPER gets the truth.
         return "RESOLVED_FROM_ARTIFACT"
     if e == "NOT_INVESTIGATED":
         return "NOT_INVESTIGATED"

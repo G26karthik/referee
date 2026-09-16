@@ -2537,11 +2537,23 @@ if __name__ == "__main__":  # self-check: python -m harness.stages.report
     assert "not a clean bill of health" in "\n".join(clean), \
         "an empty static audit must not read as an endorsement"
     assert "Not run." in "\n".join(_code_audit_block(CodeAudit(skipped="nothing acquired")))
-    hit = _code_audit_block(CodeAudit(repo_path="r", files_scanned=1, lines_scanned=10, findings=[
-        CodeAuditFinding(finding_id="code-01", rule_id="leak-fit-on-test",
-                         category="data_leakage", severity="MAJOR", title="t", statement="s",
-                         file="a.py", line=7, code_quote="scaler.fit(X_test)")]))
-    assert "`a.py:7`" in "\n".join(hit) and "scaler.fit(X_test)" in "\n".join(hit)
+    # A CLASS-A HIT IS RENDERED; a class-B one is not. The rule is the authority audit
+    # in `artifact_evidence.RULE_AUTHORITY`, not the severity: `leak-fit-on-test`
+    # carries MAJOR and is class B, because what a `.fit` on a test-shaped name MEANS
+    # needs a reading, and it reaches a referee through the authors'-code auditor
+    # instead of through the rule.
+    hit = "\n".join(_code_audit_block(CodeAudit(
+        repo_path="r", files_scanned=1, lines_scanned=10, findings=[
+            CodeAuditFinding(finding_id="code-01", rule_id="leak-unseeded-split",
+                             category="data_leakage", severity="MINOR", title="t",
+                             statement="s", file="a.py", line=7,
+                             code_quote="train, test = random_split(ds, [9, 1])"),
+            CodeAuditFinding(finding_id="code-02", rule_id="leak-fit-on-test",
+                             category="data_leakage", severity="MAJOR", title="t",
+                             statement="s", file="b.py", line=3,
+                             code_quote="scaler.fit(X_test)")])))
+    assert "`a.py:7`" in hit and "random_split(ds, [9, 1])" in hit
+    assert "b.py" not in hit and "audited as unsafe for reviewer output" in hit
 
     body = "\n".join(_reconciliation_block(_rec("FAILED_REPRODUCTION", reproduced_value=64.1,
                                                 delta_error=4.82, seeds_run=[0, 1, 2])))

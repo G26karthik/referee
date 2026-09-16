@@ -2,137 +2,126 @@
 
 `harness/artifact_evidence.py`, `harness/stages/artifact.py`,
 `harness/artifact_review_driver.py`, `harness/prompts/artifact_review.py`.
-Measured 2026-09-16, deterministically: no model call, no execution, no gate opened.
+Measured 2026-09-16. The deterministic half spends no model call; §7 onward is one gated,
+isolated authors'-code reading per repository.
 
-## 1. What was broken
+**The headline, at the authority it actually has:**
 
-`ARTIFACT_EVIDENCE` and `RESOLVED_FROM_ARTIFACT` were in their vocabularies and **no
-`TARGET_DISPOSITIONS` value mapped to either**. The state machine could not reach them from
-any input. Meanwhile `harness/code_audit.py` had been running on every cloned paper since
-the first version — parsing the checkout, applying ten rules, writing `CodeAudit.findings`
-into the machine report under `## Static code audit` — and nothing consumed them. The
-harness read the authors' code and threw the scientific result away.
+```
+4 artifact inspections completed
+8 narrow artifact facts established
+0 broad implementation-correctness questions settled
+8 authors'-code concerns proposed, 7 code citations and 7 paper citations relocated
+1 experiment identity ESTABLISHED, 6 AMBIGUOUS
+7 endpoint-verified artifact concerns
+0 PAPER_ARTIFACT_MISMATCH
+```
 
-`planner` made this concrete: `ARTIFACT_INSPECTION` appeared as a `fallback` route that
-produced an `INFEASIBLE_*` action and nothing else. The route was declared, ordered in
-`VERIFICATION_ROUTES`, counted in `exhaustion`, and unreachable.
+## 1. What was broken, twice
 
-## 2. Three levels, and the third has no spelling
+**First: the route could not produce evidence at all.** `ARTIFACT_EVIDENCE` and
+`RESOLVED_FROM_ARTIFACT` were in their vocabularies and no `TARGET_DISPOSITIONS` value
+mapped to either. Meanwhile `harness/code_audit.py` had been parsing every cloned paper
+since the first version and writing its hits into the machine report, where nothing
+consumed them. The harness read the authors' code and threw the scientific result away.
 
-    level 1  ARTIFACT_FACT            the checkout contains this, at this span, at this SHA
-    level 2  PAPER_ARTIFACT_MISMATCH  the paper states X for experiment E; the pinned
-                                      artifact sets Y for experiment E
-    level 3  the reported scientific result is false
+**Second, and this one shipped in the fix: the route settled questions it had not
+answered.** `discharge` asked three things — an audited snapshot, at least one statement,
+at least one fact carrying authority — and returned a boolean. Any fact could therefore
+settle any statement. On all four repository papers the routed target is
 
-`artifacts.ARTIFACT_AUTHORITY` has exactly three members and level 3 is not one of them.
-That is the encoding of the rule rather than a note about it: **an AST warning may not
-become RED.** A code or configuration inconsistency may create a verified concern, establish
-a reproducibility defect, trigger execution, trigger focused validation, and become material
-where a central claim provably depends on it — every one of those is a downstream decision
-by a downstream module, and none is reachable by writing a stronger string in this layer.
+> *"the released repository &lt;url&gt; implements the described method"*
 
-Level 2 needs all three of a precisely addressed paper statement, a precisely located
-artifact fact, and an established experiment identity. Each failure has its own name —
-`paper_statement_unaddressed`, `artifact_fact_unlocated`, `experiment_identity_unbound` —
-and the third is the one that matters: **"some config somewhere says 32" contradicts
-nothing**, and `bind_mismatch` refuses rather than guessing which of a dozen config files
-the paper meant. A fourth outcome, `no_disagreement`, records the case where all three bind
-and the two values AGREE, which is a real result and not "nothing found".
+and it was discharged by facts like *"the checkout advertises evaluate.py"*. **Four papers
+were reported as having had a claim about their implementation settled by the presence of
+a file.** An entrypoint existing is supporting evidence for that question; it is not its
+answer, and reporting it as one violates the authority hierarchy this route exists to
+state.
 
-## 3. Every fact is tied to an immutable snapshot, and the snapshot fails closed
+## 2. Four rungs, and the top one has no spelling
 
-`ArtifactSnapshot.audited` requires a commit, a tree hash and a clean working tree, and the
-type defaults to `dirty=True` — an unknown tree is not an audited tree. `repo.dirty_files`
-RAISES when `git status` could not run, and that raise is caught and recorded as dirty,
-because "we could not look" and "we looked and it was clean" must never produce the same
-artifact.
-
-The TREE sha is compared, not only the commit: an amended commit with identical content is
-the same code, and two commits sharing a message and differing in content are not.
-
-**The mutable-checkout question stays open, and this is what was done in the meantime.**
-The pre-run snapshot is recorded before anything executes. If a later execution mutates the
-tree, the post-run identity check retracts the EXECUTION's evidence exactly as it already
-did, and the pre-run static facts stay tied to the pre-run snapshot and are not rewritten —
-they are different evidence about different moments. Separating an immutable audited source
-from writable run outputs is the eventual answer and is deliberately not designed yet: what
-real repositories require has not been observed.
-
-## 4. Relocation — the `claims.mint` of this module
-
-**A model statement about code is not artifact evidence.** `artifact_evidence.relocate`
-takes a file and a quotation and the HARNESS finds it: the file must be in the checkout, the
-quoted text must be in the file, and it must occur exactly once. What survives carries the
-file's own SHA-256 alongside the pinned commit.
-
-Three rules, mirroring `claims.mint`: a path that escapes the checkout is not a citation
-into it (checked after resolution, so `../` and a symlink fail the same test); the EXACT
-search runs first; and the whitespace-collapsed fallback maps its offsets back through the
-original, so the span is a span of the FILE and not of a normalisation of it.
-
-## 5. The ten AST rules, audited by authority
-
-**Not all ten are exposed, and "it exists" is not a reason to expose one.** Each is sorted
-into one of four classes, and the classification is a MEASUREMENT over the four repository
-papers rather than a reading of the rule's docstring.
-
-| class | meaning | rules |
+| level | what it is about | what it needs |
 |---|---|---|
-| **A** deterministic artifact fact | true of the checkout by construction, whatever it means | `leak-unseeded-split` |
-| **B** candidate concern | it located something real; what that means needs interpretation | `cripple-per-arm-budget`, `cripple-config-table`, `leak-fit-before-split`, `leak-fit-on-test`, `metric-shadows-standard`, `metric-best-of-n`, `metric-filters-ground-truth` |
-| **C** diagnostic only | kept in the machine trace, never shown to a reviewer | — |
-| **D** unsafe for reviewer output | measured false positives with no bounded reading | `leak-model-selection-on-test`, `cripple-augmentation-one-arm` |
+| `ARTIFACT_FACT` | the CHECKOUT | an audited snapshot, a relocated span, and a question whose SCOPE it answers |
+| `ENDPOINTS_VERIFIED_ARTIFACT_CONCERN` | two real locations | + a paper statement that MINTS; the CORRESPONDENCE is the auditor's reading |
+| `PAPER_ARTIFACT_MISMATCH` | the paper AND the checkout | + an identity ESTABLISHED from a deterministic source, + two comparable quantities, + a paper value the harness can re-read from the span |
+| *the reported result is false* | — | **there is no value for this** |
 
-Only A and B are reviewer-visible, and an unaudited rule defaults to D: the audit licenses
-a rule, not its existence.
+`artifacts.ARTIFACT_AUTHORITY` has four members and the last is not one of them. That is
+the encoding of the rule rather than a note about it: **an AST warning may not become RED.**
+A code or configuration inconsistency may create a verified concern, establish a
+reproducibility defect, trigger execution, trigger focused validation, and become material
+where a central claim provably depends on it — every one of those is a downstream decision
+by a downstream module.
 
-**The corpus produced six hits and five of them are false**, every one for the same reason —
-the rules match SUBSTRINGS of identifiers, and an identifier is not a semantic category.
+**A relocated code quotation proves that this code exists at this location in this audited
+snapshot. It does not prove that the code contradicts the paper.** That is the same
+correction the claim-link channel needed, on a second channel.
 
-* `leak-model-selection-on-test` fired four times on `apt-icml/run_pruning.py`. Its first
-  regex alternative is ``val(idation)?[\w\[\]'". ]*=\s*[\w\.]*test``. The source lines read
-  `rescaled_eval_metrics = test(model, eval_dataloader, ...)` — **"eval" contains "val"**,
-  and `test` is the name of the evaluation FUNCTION. The rule reported that the test split
-  drives model selection in a file where it does not, four times, on lines that call an
-  evaluator on `eval_dataloader`. Nothing on the line is a split, a checkpoint or a
-  selection, so there is no narrower reading that rescues the hit.
-* `cripple-augmentation-one-arm` fired once, on
-  `if new_transform_r > model.layer_transformation.r and ...` — `new_` is the arm token and
-  `transform` is the augmentation token, in a branch that resizes a LoRA rank. The rule's
-  own statement ("data augmentation is applied on the proposed arm only") is false of the
-  branch it points at.
-* `leak-unseeded-split` fired once, on
-  `torch.utils.data.random_split(total_dataset, [n, m])` in `utils/utils.py:600`, and the
-  FACT is correct: that call site passes no `generator`, `seed`, `random_state` or
-  `stratify`. Whether the split is reproducible depends on a global seed set elsewhere,
-  which is why it is class A — a fact about the call — and not a finding.
+## 3. Scope — a bounded fact settles only a matching bounded question
 
-**Reviewer-visible AST hits across the four repository papers: 1 of 6.**
+Every probe declares which bounded question it answers:
 
-## 6. The measurement (§13)
+    FILE_PRESENCE  ENTRYPOINT_PRESENCE  DEPENDENCY_DECLARED
+    MANIFEST_PRESENCE  CONFIG_LITERAL  COMMAND_PRESENCE
 
-Four papers, four checkouts already on disk, every one clean and pinned.
+and `IMPLEMENTATION_CORRESPONDENCE` — "does the released code implement the described
+method", "is the implementation faithful", "does this reproduce the paper" — is excluded
+from `SETTLEABLE_BY_ARTIFACT_FACT` by construction, so no accumulation of level-1 facts can
+reach it. `question_scope` defaults to it for anything it cannot recognise, so the rule
+fails closed.
 
-| paper | repository | commit | tree | dirty | objects | routed to inspection | outcome |
-|---|---|---|---|---|---:|---:|---|
-| `acl` | mbzuai-nlp/finchain | `146eaa8225` | `05cb5cde3f` | no | 43 | 1 | ARTIFACT_RESOLVED |
-| `apt-icml` | ROIM1998/APT | `56eaf8bc86` | `869fe7f5c5` | no | 185 | 1 | ARTIFACT_RESOLVED |
-| `cvpr` | wuyang98/weathergen | `1462374ef6` | `87820905fc` | no | 68 | 1 | ARTIFACT_RESOLVED |
-| `iclr` | HanxunH/LDReg | `48956d25dc` | `8f0486e8aa` | no | 67 | 1 | ARTIFACT_RESOLVED |
-| **total** | | | | | **363** | **4** | **4 settled** |
+A broad question is now **decomposed rather than discharged**: the route answers the narrow
+questions it can, records each against its own scope, names them in the outcome, and leaves
+the broad claim open. A referee reads *"these four things about the artifact are
+established, and whether the code implements the method is still open"*, which is what was
+true all along.
 
-### Deterministic artifact facts established
+## 4. Five terminal states, and only one is about the paper
 
-| | count |
-|---|---:|
-| level 1 `ARTIFACT_FACT` | 8 |
-| **level 2 `PAPER_ARTIFACT_MISMATCH`** | **0** |
-| statements examined | 4 |
-| code-auditor concerns proposed | 0 (gate closed) |
-| concerns surviving code-location verification | 0 |
+| disposition | evidence state | resolution | about the paper |
+|---|---|---|---|
+| `ARTIFACT_MISMATCH_ESTABLISHED` | `ARTIFACT_EVIDENCE` | RESOLVED_FROM_ARTIFACT | **yes** |
+| `ARTIFACT_FACT_ESTABLISHED` | `ARTIFACT_PROPERTY_ESTABLISHED` | RESOLVED_FROM_ARTIFACT | no — about the CODE |
+| `ARTIFACT_CONCERN_VERIFIED_ENDPOINTS` | `ARTIFACT_ENDPOINTS_VERIFIED` | UNRESOLVED | no |
+| `ARTIFACT_INSPECTION_INCONCLUSIVE` | `COMPARISON_LIMITATION` | UNRESOLVED | no |
+| `ARTIFACT_BLOCKED` | `ARTIFACT_LIMITATION` | UNRESOLVED | no |
 
-The eight, in full, because a route that reports a count and not its content is a route
-nobody can check:
+None is in `TargetOutcome.establishes_failure`: no artifact observation can bypass
+materiality. A question whose answer is a MEASUREMENT (`requires_execution`) is refused
+outright rather than allowed to appear settled by a reading of the source.
+
+## 5. Experiment identity, classified rather than believed
+
+`classify_identity` returns ESTABLISHED only when the auditor names a DETERMINISTIC source
+for the experiment-to-file link **and that source relocates in the pinned tree**:
+
+| basis | evidence |
+|---|---|
+| `paper_names_the_command` | the paper prints the command or path itself |
+| `readme_maps_the_experiment` | the checkout's README maps the experiment to the file |
+| `script_passes_the_config` | a committed script names both |
+| `authors_experiment_table` | the repository documents its experiments |
+| `auditor_assertion` | the auditor's reading — **AMBIGUOUS, never ESTABLISHED** |
+
+PARTIAL is a deterministic basis whose evidence did not relocate; UNBOUND is nothing
+offered at all. **Only ESTABLISHED may support level 2.** A model saying "this looks like
+the right config" is a guess with a citation on it.
+
+## 6. The deterministic route, on the four repositories (§13)
+
+Every checkout clean and pinned; no model call.
+
+| paper | repository | commit | tree | objects | routed | facts | outcome |
+|---|---|---|---|---:|---:|---:|---|
+| `acl` | mbzuai-nlp/finchain | `146eaa8225` | `05cb5cde3f` | 43 | 1 | 1 | ARTIFACT_INSPECTION_INCONCLUSIVE |
+| `apt-icml` | ROIM1998/APT | `56eaf8bc86` | `869fe7f5c5` | 185 | 1 | 2 | ARTIFACT_INSPECTION_INCONCLUSIVE |
+| `cvpr` | wuyang98/weathergen | `1462374ef6` | `87820905fc` | 68 | 1 | 1 | ARTIFACT_INSPECTION_INCONCLUSIVE |
+| `iclr` | HanxunH/LDReg | `48956d25dc` | `8f0486e8aa` | 67 | 1 | 4 | ARTIFACT_INSPECTION_INCONCLUSIVE |
+| **total** | | | | **363** | **4** | **8** | **0 broad questions settled** |
+
+**This is the corrected result, and it is four fewer settled questions than the first
+version reported.** The eight facts, in full:
 
 ```
 acl       entrypoint_present     advertises data/templates/investment_analysis/npv.py
@@ -146,124 +135,194 @@ iclr      dependency_undeclared  no manifest declares `transformers` (no manifes
 ```
 
 The three `iclr` lines are one fact stated three ways: that checkout publishes **no
-dependency manifest at all**. That is a genuine reproducibility observation about the
-artifact and it is level 1 — a fact about the code, not a statement about the paper, and
-certainly not a claim that the paper's numbers are wrong.
+dependency manifest at all**. A genuine reproducibility observation about the artifact, at
+level 1 — about the code, not about the paper.
 
-### Zero paper↔artifact mismatches, and why
+Every inspection also records what it buys a later route: on each paper, the advertised
+entrypoint narrows the candidate commands for any execution route. Recorded and acted on by
+nothing here; narrowing a command is `experiment_id`'s to use and execution is `probe`'s to
+authorise. **Static inspection suppressed no execution on any of the four**:
+`ARTIFACT_INSPECTION_ONLY` is reachable only where no executable route applies.
 
-`bind_mismatch` requires an experiment identity, and the deterministic probes produce none:
-`entrypoint_present` and `dependency_declared` answer questions about the artifact that no
-paper statement is addressed against. **The channel that could propose one is the gated
-authors'-code auditor, and it was not run for this measurement** — the gate
-(`SH_ALLOW_ARTIFACT_REVIEW`) is off by default and this measurement spends no model calls.
-So the honest statement is: the route now reaches `ARTIFACT_EVIDENCE` on all four papers and
-has established zero level-2 mismatches, of which zero were proposed.
+## 7. The authors'-code auditor, run on all four (§5)
 
-**No scientific defect is reported because the route produces more output.** Eight true
-statements about four checkouts is what was established, and it is reported as eight true
-statements about four checkouts.
+One fresh isolated context per repository, `claude` CLI, `sonnet`, gated by
+`SH_ALLOW_ARTIFACT_REVIEW`. Enforced policy identical on all four: `tools=Read,Grep`,
+11 tools denied, one added directory (the checkout), restricted, strict MCP, pinned
+settings file. No Bash, no Write, no network. No finding, severity, grade, verdict, target
+outcome or paper decision reaches it — the `build` signature has no parameter that could
+carry one. Prompt, response hash, session id, turn count, wall time and the full tool
+policy are persisted per paper under `projects/<pid>/artifact/`.
 
-### How the planner routed everything else
+| paper | turns | seconds | proposed | code relocated | paper relocated | identity | concerns | mismatches |
+|---|---:|---:|---:|---:|---:|---|---:|---:|
+| `acl` | 8 | 74 | 1 | 0 | 0 | — | 0 | 0 |
+| `apt-icml` | 42 | 218 | 2 | 2 | 2 | 1 ESTABLISHED, 1 AMBIGUOUS | 2 | 0 |
+| `cvpr` | 14 | 113 | 2 | 2 | 2 | 2 AMBIGUOUS | 2 | 0 |
+| `iclr` | 10 | 117 | 3 | 3 | 3 | 3 AMBIGUOUS | 3 | 0 |
+| **total** | | | **8** | **7** | **7** | **1 / 6** | **7** | **0** |
 
-| paper | PAPER_ONLY_RESOLUTION | AUTHOR_CODE_REPRODUCTION | INFEASIBLE_ROUTE | ARTIFACT_INSPECTION_ONLY |
-|---|---:|---:|---:|---:|
-| `acl` | 4 | 25 | 13 | 1 |
-| `apt-icml` | 8 | 147 | 29 | 1 |
-| `cvpr` | 8 | 42 | 17 | 1 |
-| `iclr` | 6 | 43 | 17 | 1 |
+`acl`'s single proposal was dropped whole: its code citation did not relocate in the pinned
+tree. That is the gate working — not softened, not reported.
 
-One target per paper, and it is the right one: the IMPLEMENTATION_CLAIM object —
-*"the released repository <url> implements the described method"* — which is the only object
-`discovery` gives `routes == ["ARTIFACT_INSPECTION"]`. Everything with an executable route
-keeps it. **Static inspection suppressed no execution on any of the four**, which is the
-property the route ordering exists to guarantee and the specific failure
-`PAPER_INTERNAL_CHECK` had when it sat in `planner._RESOLVING` and cancelled 100% of the
-shipped corpus's escalations by being cheap rather than by settling anything.
+### What the concerns actually say
 
-One honest caveat on that ordering: every object in these four stored target sets carries
-`question_kind = ""`, so `artifact_evidence.requires_execution` — which refuses REPRODUCTION,
-PRINTED_QUANTITY, COMPOSITION and ATTRIBUTION questions outright — gated nothing on this
-corpus. It is exercised by `tests/test_artifact_route.py` and will gate a fresh run, where
-`discovery` populates the field.
+Substantive, openable, and every one a REFEREE'S QUESTION rather than a demonstrated
+inconsistency:
 
-## 7. Route order (§10)
+* **`cvpr`, `evaluate_weather.py:342`** — the paper says real samples are drawn from the
+  matching weather's test split; the auditor reads the code as always drawing from `snow`
+  regardless of the weather being evaluated. AMBIGUOUS identity.
+* **`cvpr`, `evaluate_weather.py:340`** — the paper says 200 real-world samples; the auditor
+  reads `12 * batch_size` (96 at the file's default).
+* **`iclr`, `losses/ntxent_lid_reg.py:174`** — the paper presents LL1 and LL2 as two
+  distinct regularisation formulations; the auditor reads `reg_type='l1'` and `'l2'` as
+  algebraically identical at that line.
+* **`iclr`, two config paths** — configurations the paper's Table 1 and its
+  transfer-learning section imply are not present in the checkout.
+* **`apt-icml`, `scripts/adaptpruning/roberta_base_cola_momentum.sh:59`** — the paper's
+  Table 6 GLUE-small column against `num_train_epochs=120, distill_epoch=96`.
 
-    paper-internal
-      -> static artifact inspection
-        -> authors' code identity/alignment
-          -> authors' code execution
-            -> reconstruction / focused validation
+**None of these is reported as a paper defect, and that is correct.** Their identity is the
+auditor's reading of which config belongs to which experiment, and two prose descriptions
+that differ is a semantic judgement, not a comparison of stated quantities.
 
-`ARTIFACT_INSPECTION_ONLY` is reachable only from the arm where NO executable route
-applies, which is what makes the first claim of that ordering safe. Within that arm it is
-tried BEFORE the citation re-check, because it can settle an artifact-only question and the
-citation re-check settles nothing by construction.
+### The one that came closest, and why it was refused
 
-## 8. What discharges, and what does not
+`apt-icml`, `scripts/adaptpruning/t5_base_lm_adapt_cnndm_momentum.sh:49`. Everything bound:
 
-`artifact_evidence.discharge` requires all three of: an AUDITED snapshot; at least one
-statement the route was asked about; and at least one fact carrying authority. Anything else
-is `COMPARISON_BLOCKED` — a route applied and its result had nothing to be held against —
-or `ARTIFACT_BLOCKED` where there was no usable checkout.
+* the paper span `P25:834-964` is Table 6's hyperparameter block, minted;
+* the checkout's own `README.md:62` says *"For finetuning T5-base models with APT, please
+  run: `bash scripts/adaptpruning/t5_base_lm_adapt_cnndm_momentum.sh`"* — identity
+  **ESTABLISHED**, relocated;
+* the script line reads `num_train_epochs=12`, **re-read from the file** rather than taken
+  from the auditor;
+* the auditor reported the paper value as `"Epochs 16 (CNN/DM column)"`.
 
-**"The repository cloned successfully" is not artifact evidence**, and that is enforced
-rather than stated: an inspection with facts and no statement discharges nothing.
+It was accepted as a `PAPER_ARTIFACT_MISMATCH`, and hand-checking it found the last defect
+this document reports. The span really does say 16 — and it also says 40, 32, 15 and 6:
 
-`ARTIFACT_RESOLVED` is excluded from `TargetOutcome.establishes_failure`, so no artifact
-observation can bypass materiality. Saying the code disagrees with the method section is not
-saying the reported number is false; which configuration produced the reported number is a
-question for execution.
+```
+Learning rate 2e-4 2e-4 2e-4 1e-4 1e-4 Batch size 32 32 32 16 32
+Epochs 40 40 40 16 15 Distill epochs 20 20 20 6 -
+```
 
-## 9. The authors'-code auditor (§7)
+**Which column is CNN/DM's is a reading of a table layout that extraction flattened away.**
+`_derivable_from` now requires the paper value to be re-derivable from the quoted span by
+the harness itself — the span reports exactly one quantity and it is this one, or the number
+occurs in the span exactly once. Quote the cell and it binds; quote the table and it does
+not. The concern is kept at `ENDPOINTS_VERIFIED_ARTIFACT_CONCERN` with the refusal
+`paper_value_not_derivable` and the sentence *"Quote the cell, not the table."*
 
-`harness/prompts/artifact_review.py` + `harness/artifact_review_driver.py`, gated by
-`SH_ALLOW_ARTIFACT_REVIEW`, default off.
+That refusal took the corpus from 1 established mismatch to 0. It is the right number.
 
-Access: the paper's METHOD text, the file tree, the pinned SHA, and `Read` + `Grep` over the
-checkout. No `Bash`, no `Write`, no network — the confinement is the enforcement, not the
-prompt, and an auditor that could run the code would be an execution path with none of
-`authorize()`'s preconditions in front of it.
+### Two smaller defects the live run exposed
 
-It may propose eight closed kinds (paper/code mismatch, missing experiment path, metric
-mismatch, split leakage, baseline implementation, dead claimed mechanism, hard-coded result,
-other). It is not shown any finding, severity, grade or verdict, and the `build` signature
-is what makes that so. `accepted`, `refusal`, `span`, `snapshot`, `paper_ref`, `fact_id` and
-`probe` are stripped at the driver boundary: a reader cannot award itself the only authority
-that could ever matter.
+* **A shadowed vocabulary.** `IDENTITY_STATES` was defined twice in `artifacts.py` — once
+  for `ProbeSpec`'s experiment-identity resolution, once (later, mine) for the artifact
+  route's four states. The second won at import, so the auditor run's identity histogram
+  came back keyed on five values the route never writes, and every bucket read zero. Renamed
+  to `ARTIFACT_IDENTITY_STATES`; `tests/test_artifact_route.py` now fails the suite on any
+  duplicated module-level vocabulary. **A miscount that looks like a measurement is worse
+  than a crash.**
+* **A silent failure.** Two of the four auditor calls first returned nothing and left no
+  record at all, so "the auditor found nothing" and "the auditor never answered" were
+  indistinguishable. Every early return in `run()` now writes a failure sidecar naming the
+  reason, the command, the return code and the captured stderr.
 
-Every citation is relocated; what does not relocate is dropped whole and counted. A
-relocated citation is an ARTIFACT_FACT whose statement carries the reader's reading marked
-UNVERIFIED — the harness established the location, not the reading.
+### What the inspection buys a later route (§12)
+
+Derived from the PROBE, never from the reading — what an observation ENABLES is a property
+of what was looked at, and an auditor's prose may not decide what runs next any more than
+it may decide what is established. Recorded into `ArtifactInspection.escalations`, a list
+of sentences no planner, gate or disposition reads:
+
+```
+apt-icml  scripts/adaptpruning/roberta_base_cola_momentum.sh:59
+          scripts/adaptpruning/t5_base_lm_adapt_cnndm_momentum.sh:49
+            identify a configuration whose two candidate values a RUN could discriminate
+            between — which is an execution question, and is why this route refuses it
+cvpr      evaluate_weather.py:340
+            identifies the metric implementation an execution route would measure against
+iclr      configs/simclr/in1k/vit_base_bs2048_e200/pretrain.yaml:16
+          detectron2/configs/coco_R_50_C4_2x_simclr_e100.yaml:11
+            narrow what an execution route could attempt: the configuration the paper
+            implies was not found in the checkout
+```
+
+**Finding something interesting statically is not a reason to stop measuring**, and there
+is no field here through which it could become one.
+
+## 8. The ten AST rules, re-audited (§14)
+
+**Only class A may appear in the referee report. Class B feeds the auditor.** That a source
+pattern matched is deterministic; the scientific interpretation of the match is not, and a
+class-B rule is defined by needing one.
+
+| rule | class | fired on these four | measured precision | in the report? | feeds the auditor? |
+|---|---|---|---|---|---|
+| `leak-unseeded-split` | A | **yes**, 1× (`apt-icml utils/utils.py:600`) | 1/1 as a FACT about the call site | **yes** | no |
+| `cripple-per-arm-budget` | B | no | unmeasured | no | yes |
+| `cripple-config-table` | B | no | unmeasured | no | yes |
+| `leak-fit-before-split` | B | no | unmeasured | no | yes |
+| `leak-fit-on-test` | B | no | unmeasured | no | yes |
+| `metric-best-of-n` | B | no | unmeasured | no | yes |
+| `metric-filters-ground-truth` | B | no | unmeasured | no | yes |
+| `metric-shadows-standard` | B | no | unmeasured | no | yes |
+| `leak-model-selection-on-test` | **D** | **yes**, 4× (`apt-icml run_pruning.py`) | **0/4** | no | no |
+| `cripple-augmentation-one-arm` | **D** | **yes**, 1× (`apt-icml param_control.py:819`) | **0/1** | no | no |
+
+Seven of the ten have never fired on a real repository, so their classification rests on
+their structure rather than on a measurement — which is precisely why a first-ever class-B
+hit must not reach a referee wearing a measured detector's clothes.
+
+The two class-D rules and why no narrower reading rescues them:
+
+* `leak-model-selection-on-test`'s first regex alternative is
+  ``val(idation)?[\w\[\]'". ]*=\s*[\w\.]*test``. The source lines read
+  `rescaled_eval_metrics = test(model, eval_dataloader, ...)` — **"eval" contains "val"**,
+  and `test` is the name of the evaluation FUNCTION. Nothing on those lines is a split, a
+  checkpoint or a selection.
+* `cripple-augmentation-one-arm` fired on
+  `if new_transform_r > model.layer_transformation.r and ...` — `new_` is the arm token and
+  `transform` is the augmentation token, in a branch that resizes a LoRA rank.
+
+**Reviewer-visible AST hits across the four repositories: 1 of 6.** The renderer enforces
+this (`stages/report._code_audit_block`), prints how many it suppressed, and keeps all of
+them in the machine trace.
+
+## 9. The authors'-code auditor, as built (§7)
+
+Access: the paper's METHOD and EXPERIMENT text, the file tree, the pinned SHA, `Read` and
+`Grep` over the checkout. It is deliberately NOT shown the abstract's headline claims: a
+reader given the result reads the code looking for the reason it might be wrong.
+
+Eight closed concern kinds. `authority`, `refusal`, `span`, `snapshot`, `paper_ref`,
+`fact_id`, `probe`, `settles`, `identity_state` and `identity_span` are stripped at the
+driver boundary — **a reader cannot award itself the only judgement that separates a
+mismatch from a concern.**
+
+Where the auditor names a config key, the harness **re-reads the value from the file**
+(`config_values` / `argparse_default`, which until now had no production caller). A key set
+in more than one place REFUSES rather than picking; the auditor's value is kept and the
+ambiguity is recorded. On this corpus that path fired once.
 
 ## 10. Tests
 
-`tests/test_artifact_route.py`, 20 tests, every one against a REAL git checkout: a fact
-about a pinned tree that was never pinned would be the exact defect this route exists to
-avoid. Plus four module self-checks (`artifact_evidence`, `artifact_review_driver`,
-`prompts.artifact_review`, `stages.artifact`).
-
-The rule audit is enforced at the RENDERER and not only recorded: `stages/report.
-_code_audit_block` prints only class-A and class-B hits and says how many it suppressed,
-so a referee is never asked to investigate the four `eval`-contains-`val` false positives.
-The machine trace keeps all of them — suppression is a rendering decision.
+`tests/test_artifact_route.py` — 32 tests, every one against a real git checkout — plus four
+module self-checks (`artifact_evidence`, `artifact_review_driver`, `prompts.artifact_review`,
+`stages.artifact`).
 
 ## 11. What this route still cannot do
 
-* **It has established zero level-2 mismatches on real papers.** The deterministic probes
-  cannot bind an experiment identity, and the channel that could propose one is a gated
-  model channel that has not been run against the corpus.
-* **`_paths_named` searches a fixed list of conventional filenames** rather than parsing
-  paths out of prose, because an extracted "path" that is really a hyphenated word would
-  make this route report a missing file nobody claimed.
-* **`config_values` and `argparse_default` have no production caller.** Both are real,
-  tested probes — "what does this file set for this key" and "what default does this flag
-  carry" — and they are the natural input to a level-2 mismatch. Nothing on the route calls
-  them yet, because binding one to a paper statement needs the experiment identity that the
-  route cannot produce on its own. They are listed here for the same reason
-  `alignment/trial.py` is listed in CLAUDE.md's limitations: so nobody reports them as a
-  capability this system exercises.
-* **Class-B rules are reviewer-visible and unmeasured.** Seven of the ten rules did not fire
-  on any of the four repositories, so their classification rests on their structure rather
-  than on a measurement. A rule that fires for the first time on a fifth paper should be
-  re-audited before its output is believed.
+* **Zero level-2 mismatches on real papers, and the reason is not extraction.** Six of the
+  seven concerns have an AMBIGUOUS identity, and the seventh had an ESTABLISHED identity and
+  a paper value the harness could not re-read from the span. Both refusals are correct.
+* **`decompose` answers four bounded questions and the broad one stays open**, which is the
+  honest state of "does this code implement the method": nothing in a static reading
+  answers it.
+* **`question_kind` is empty on every object in these four stored target sets**, so
+  `requires_execution` gated nothing on this corpus. It is exercised by tests and will gate
+  a fresh run, where `discovery` populates the field.
+* **Class-B rules are unmeasured**, and a rule firing for the first time on a fifth paper
+  should be re-audited before its output is believed.
