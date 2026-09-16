@@ -2,7 +2,7 @@
 
 Dated 2026-09-17. Supersedes `docs/FINAL_DELIVERABLE.md` (the v2 finalization record,
 kept as an archived comparison, not carried forward). The authoritative run is
-`runs_final_2026-09-16/`. The authoritative code revision is `6e59ffc`. The authoritative
+`runs_final_2026-09-16/`. The authoritative code revision is `3e48a89`. The authoritative
 manuscript is `manuscript/journal.pdf`. The authoritative release artifact is
 `dist/REFEREE_final_source.zip`.
 
@@ -35,7 +35,7 @@ now confirmed on real papers in the fresh run (§9), not only by a spy test.
 
 ## 4. Test accounting, exact
 
-Full offline suite, taken twice against the final committed revision (`6e59ffc`):
+Full offline suite, taken twice against the final committed revision (`3e48a89`):
 
 ```
 2282 passed, 7 deselected (network), 0 failed
@@ -52,7 +52,7 @@ readings across 8 papers (`RUN_MANIFEST.json`; `homogeneous: false`, never poole
 one claimed method — the run stopped on a provider session limit mid-corpus and was
 completed through isolated session subagents instead, sealed through the same
 `parse_lens_json` validation and provenance-sidecar path every channel uses). Code
-revision `6e59ffc`. Model: `claude-opus-5` / `claude-sonnet-5` depending on channel.
+revision `3e48a89`. Model: `claude-opus-5` / `claude-sonnet-5` depending on channel.
 Environment: container backend (Docker), the same host recorded in CLAUDE.md's Facts
 section. No manual scientific intervention occurred inside any paper's run.
 
@@ -121,12 +121,12 @@ this run), and the `artifact_review_driver` orphaned-gate finding folded in.
 
 ## 12. The release ZIP
 
-`dist/REFEREE_final_source.zip`, built at revision `6e59ffc`, 267 files, no secrets
+`dist/REFEREE_final_source.zip`, built at revision `3e48a89`, 268 files, no secrets
 detected. Manifest + SHA-256 written alongside it. `tools/zip_acceptance_test.py` (new)
 extracted it into a clean temporary directory and verified:
 
 ```
-integrity: 267 entries checked, 0 mismatch(es)
+integrity: 268 entries checked, 0 mismatch(es)
 self-checks: 70/84 modules carry a self-check (matches CLAUDE.md's stated count)
 test suite (from the extracted copy): 2226 passed, 56 skipped (gracefully, missing
   real-corpus PDF fixtures only), 7 deselected (network), 0 failed
@@ -155,7 +155,7 @@ execution); a settled focused-validation comparison is likewise fixture-proven o
 
 ## Outcome
 
-- **PRODUCT READY: yes.** Code revision `6e59ffc`, offline suite 2282 passed / 0 failed,
+- **PRODUCT READY: yes.** Code revision `3e48a89`, offline suite 2282 passed / 0 failed,
   every gate and every known limitation documented, including two now-disclosed orphaned
   gates (`harness/alignment/trial.py`, `harness/artifact_review_driver.py`).
 - **PAPER READY: yes.** Both automated checkers pass, the PDF compiles clean, and every
