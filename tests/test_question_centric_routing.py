@@ -158,14 +158,19 @@ def test_a_specification_question_is_read_and_never_run():
     assert not planner.plan(obj, artifact_available=True).requires_execution
 
 
-def test_prior_art_reaches_the_route_that_is_architectural_only():
-    """`VERIFICATION_ROUTES` carries LITERATURE_SEARCH and nothing implements it. The
-    question reaching it rather than 'no route applies' is the honest statement: a route
-    exists in the design and this system has not built it."""
+def test_prior_art_reaches_the_bounded_literature_route():
+    """LITERATURE_SEARCH is the only route this question has, and now it has an executor.
+
+    It remains non-executing: a prior-art question is not settled by running anything, and
+    the plan it produces must never carry `requires_execution` — which is also what keeps
+    it out of the arm where it could displace an experiment."""
     assert _routes("PRIOR_ART", repo=True, value=True) == ["LITERATURE_SEARCH"]
     obj = DiscoveredObject(target_id="T1", centrality="CENTRAL", harness_addressable=True,
                            question_kind="PRIOR_ART", routes=["LITERATURE_SEARCH"])
-    assert not planner.plan(obj, artifact_available=True).requires_execution
+    decision = planner.plan(obj, artifact_available=True)
+    assert not decision.requires_execution
+    assert decision.action == "LITERATURE_SEARCH_ONLY"
+    assert "finding none establishes nothing" in decision.reason
 
 
 # --------------------------------------------------------------------------- #

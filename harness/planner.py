@@ -414,6 +414,38 @@ def plan(obj: DiscoveredObject, *, artifact_available: bool = False,
                 paper_only_insufficient_because=paper_only_no,
                 competing_explanations=competing, attempt=attempt)
 
+        # A BOUNDED PRIOR-ART SEARCH, and only here. The same three conditions, one of
+        # them differently: this arm is reached only when no executable route applies, so
+        # a search can never be why an experiment did not happen; the route must be the
+        # one the question's own kind selected; and there is no artifact requirement,
+        # because the literature is not the authors' to publish.
+        #
+        # What it can settle is a prior-art question. What it can NEVER settle — by
+        # construction rather than by policy — is that a contribution is new: a search
+        # that completes and matches nothing produces SEARCH_COMPLETED_NO_MATCH_FOUND,
+        # which resolves nothing, and no authority in that route's vocabulary means novel.
+        if "LITERATURE_SEARCH" in obj.routes:
+            _, _, gates, _ = classify(
+                centrality=obj.centrality, addressable=bool(obj.harness_addressable),
+                route="LITERATURE_SEARCH", artifact_available=artifact_available,
+                specification_complete=specification_complete,
+                environment_state=environment_state,
+                addressing_blocker=obj.addressing_blocker,
+                investigation_open=investigation_open)
+            gates["resolvable_without_execution"] = False
+            return PlanDecision(
+                target_id=obj.target_id, action="LITERATURE_SEARCH_ONLY",
+                route="LITERATURE_SEARCH",
+                reason="no executable route applies and this is a question about earlier "
+                       "published work, so a bounded prior-art search is carried out. "
+                       "Finding earlier work may raise a concern for a referee; finding "
+                       "none establishes nothing, because the literature a bounded search "
+                       "does not reach is not enumerable.",
+                gates=gates, requires_execution=False,
+                necessity="NO_EXPERIMENT_NEEDED", why_material=why_material,
+                paper_only_insufficient_because=paper_only_no,
+                competing_explanations=competing, attempt=attempt)
+
         cite = next((r for r in obj.routes if r in _CITATION_ONLY), "")
         if cite:
             _, _, gates, _ = classify(

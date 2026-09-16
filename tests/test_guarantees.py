@@ -240,9 +240,14 @@ def test_a_perfect_review_still_publishes_every_scientific_non_guarantee():
 
 
 def test_novelty_is_never_reported_as_checked():
-    """`VERIFICATION_ROUTES` carries LITERATURE_SEARCH and nothing implements it. There
-    must be no input — no gate, no backend, no coverage number — that lets this system
-    report a novelty or prior-art conclusion."""
+    """THE ROUTE NOW EXISTS AND THIS MUST STILL HOLD, which is the whole point of it.
+
+    `stages/literature.py` carries out a bounded prior-art search and can raise a concern
+    a referee must adjudicate. There must still be no input — no gate, no backend, no
+    provider, no coverage number — that lets this system report that a contribution IS
+    new: a search that completed and matched nothing established a fact about the search.
+    The sweep is over every boolean this module accepts, so turning the literature gates
+    on cannot make this guarantee hold."""
     n = len(ALL_BOOL_PARAMS)
     for mask in range(1 << n):
         kwargs = {p: bool(mask >> i & 1) for i, p in enumerate(ALL_BOOL_PARAMS)}
@@ -526,7 +531,7 @@ def test_the_section_states_the_four_things_a_referee_would_otherwise_assume():
     appear in the rendered section of every review, not only in the ledger."""
     for rep, ts in ((_clean_report(), _target_set()), _red_report()):
         text = "\n".join(guarantees.render(guarantees.derive(rep, ts)))
-        for clause in ("accuracy unmeasured", "novelty and prior art not checked",
+        for clause in ("accuracy unmeasured", "novelty not established",
                        "nothing here says the paper is correct",
                        "not a substitute for a referee"):
             assert clause in text, clause
@@ -698,6 +703,12 @@ INVARIANT_DISPOSITION: dict[int, str] = {
     35: "not reportable here: a batch's paper count is checked by harness/preflight.py "
         "BEFORE the pipeline runs, and this artifact is per paper and per run. A "
         "preflight refusal means no review exists to carry a guarantee",
+    36: "not reportable here, and the NON-guarantee is where it lands instead: "
+        "NOVELTY_ASSESSED is in SCIENTIFIC_NON_GUARANTEES and holds on no input, which is "
+        "the asymmetry stated where a referee reads it. A per-review PROCESS guarantee "
+        "would have to be 'a bounded search ran', and that is a fact about the search "
+        "recorded in LiteratureSearch.protocol — not a property this harness enforces "
+        "about every review, since both literature gates are off by default",
 }
 
 

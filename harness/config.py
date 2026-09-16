@@ -243,6 +243,49 @@ class Config:
     artifact_review_timeout_s: int = field(
         default_factory=lambda: int(os.environ.get("SH_ARTIFACT_REVIEW_TIMEOUT", "900")))
 
+    # --- the prior-art route ----------------------------------------------------------
+    # Two separate gates, because they buy two different things and fail in two different
+    # ways. `allow_literature_search` permits QUERYING public scholarly indexes — network
+    # egress to OpenAlex, Crossref, arXiv and Semantic Scholar — and
+    # `allow_literature_review` permits a model to read what came back. Off by default,
+    # both: with the first closed nothing is searched and the route reports LITERATURE_
+    # BLOCKED, which is a fact about this host; with only the second closed the route
+    # searches on deterministic queries and adjudicates nothing semantically.
+    #
+    # NEITHER GATE CAN PRODUCE A NOVELTY CONCLUSION, and that is not enforced by these
+    # flags — `artifacts.NOVELTY_ESTABLISHING_AUTHORITIES` is the empty tuple, so a
+    # completed search with no match establishes nothing whatever either gate is set to.
+    allow_literature_search: bool = field(
+        default_factory=lambda: _flag("SH_ALLOW_LITERATURE_SEARCH"))
+    allow_literature_review: bool = field(
+        default_factory=lambda: _flag("SH_ALLOW_LITERATURE_REVIEW"))
+    literature_cmd: str = field(default_factory=lambda: os.environ.get("SH_LITERATURE_CMD", ""))
+    literature_model: str = field(
+        default_factory=lambda: (os.environ.get("SH_LITERATURE_MODEL") or "").strip())
+    literature_timeout_s: int = field(
+        default_factory=lambda: int(os.environ.get("SH_LITERATURE_TIMEOUT", "600")))
+    # The indexes to ask, in order. An operator may narrow this; narrowing it narrows the
+    # PUBLISHED protocol too, because `LiteratureSearch.protocol` records what was
+    # required and `protocol_completed` is false when a required index did not answer.
+    literature_providers: str = field(
+        default_factory=lambda: os.environ.get("SH_LITERATURE_PROVIDERS",
+                                               "openalex,crossref,arxiv"))
+    # How deep each query goes. A BOUND, published in the record: "no match in the top 20"
+    # means exactly that and says nothing about rank 21.
+    literature_top_k: int = field(
+        default_factory=lambda: int(os.environ.get("SH_LITERATURE_TOP_K", "20")))
+    literature_max_claims: int = field(
+        default_factory=lambda: int(os.environ.get("SH_LITERATURE_MAX_CLAIMS", "6")))
+    # How many retrieved candidates a reader is shown per claim. A reader given 160
+    # abstracts for one sentence has not read 160 abstracts.
+    literature_max_candidates: int = field(
+        default_factory=lambda: int(os.environ.get("SH_LITERATURE_MAX_CANDIDATES", "12")))
+    # Identifies this harness to the indexes, which ask politely to be told who is asking.
+    # Not a credential: none of the three default providers requires one, which is why
+    # they are the default and Semantic Scholar is not.
+    literature_mailto: str = field(
+        default_factory=lambda: os.environ.get("SH_LITERATURE_MAILTO", ""))
+
     # --- the substantive verdict -----------------------------------------------------
     # A single, best-effort, never-retried, whole-paper opinion — see
     # `harness/prompts/verdict.py`. OFF by default: a third external process an operator

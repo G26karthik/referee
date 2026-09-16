@@ -69,6 +69,11 @@ SCIENTIFIC_CLASSES = (
 RESOLUTION_STATES = (
     "RESOLVED_FROM_PAPER",      # the paper's own printed content settled it
     "RESOLVED_FROM_ARTIFACT",   # static inspection of the released code settled it
+    # A BOUNDED PRIOR-ART QUESTION SETTLED FROM THE PUBLISHED LITERATURE. Reachable only
+    # from `PRIOR_ART_EVIDENCE`, which needs a bound relation and not a silence: a search
+    # that completed and matched nothing resolves NOTHING, and lands on UNRESOLVED like
+    # every other state that looked without settling.
+    "RESOLVED_FROM_LITERATURE",
     "RESOLVED_BY_EXECUTION",    # something ran, admissibly, and settled it
     "UNRESOLVED",               # still open
     "NOT_INVESTIGATED",         # no route was pursued; see the evidence state for why
@@ -95,6 +100,26 @@ EVIDENCE_STATES = (
     # ARTIFACT_EVIDENCE would say the paper had been checked; NOT_INVESTIGATED would say
     # nobody looked.
     "ARTIFACT_ENDPOINTS_VERIFIED",
+    # A PRIOR-ART RELATION THE BOUNDED EVIDENCE ITSELF BINDS. About the paper, because a
+    # target claiming to be first at X and an earlier work stating that same narrow X is a
+    # statement about this document. Deliberately absent from `establishes_failure` all
+    # the same: novelty is a scholarly judgement, and a strong prior-art match is a
+    # serious question for a referee rather than a verdict this system may reach.
+    "PRIOR_ART_EVIDENCE",
+    # BOTH WORKS REAL, THE OVERLAP A READING. The third channel to need this state, after
+    # CITATION_VERIFIED and ARTIFACT_ENDPOINTS_VERIFIED, and it resolves to UNRESOLVED for
+    # the same reason they do.
+    "LITERATURE_ENDPOINTS_VERIFIED",
+    # THE ASYMMETRY, ON THE EVIDENCE AXIS. A bounded search that completed and matched
+    # nothing is a fact about the SEARCH — the declared protocol ran to its declared
+    # bounds — and it is not in `EVIDENCE_ABOUT_THE_PAPER`, so no amount of it can resolve
+    # anything about the document. There is no evidence state meaning "novel", and this is
+    # the one a completed empty search gets instead: the encoding of
+    # "failing to find prior art does not establish novelty".
+    "BOUNDED_SEARCH_NO_MATCH",
+    # No index answered, or none could be reached from here. A fact about this host's
+    # configuration in exactly the way ENVIRONMENT_LIMITATION is.
+    "LITERATURE_LIMITATION",
     "ARTIFACT_LIMITATION",      # no usable artifact for this question
     "EXTRACTION_LIMITATION",    # this harness could not build an address for the claim
     "REPORTING_LIMITATION",     # the paper prints no unambiguous quantity to compare against
@@ -172,6 +197,19 @@ _EVIDENCE_FOR_DISPOSITION = {
     # The route ran and settled nothing. A limit of what reading can establish, reported
     # as such rather than as a missing artifact.
     "ARTIFACT_INSPECTION_INCONCLUSIVE": "COMPARISON_LIMITATION",
+    # THE FIVE LITERATURE OUTCOMES, and the one that matters is the third.
+    "PRIOR_ART_RELATION_STRUCTURALLY_BOUND": "PRIOR_ART_EVIDENCE",
+    "LITERATURE_MATCH_VERIFIED_ENDPOINTS": "LITERATURE_ENDPOINTS_VERIFIED",
+    # A COMPLETED SEARCH THAT MATCHED NOTHING RESOLVES NOTHING. Mapping this to anything
+    # in `EVIDENCE_ABOUT_THE_PAPER` would make a search budget into a novelty finding,
+    # which is the single rule this route is built around; mapping it to NOT_INVESTIGATED
+    # would say nobody looked, which is the CITATION_VERIFIED defect in a new costume.
+    "SEARCH_COMPLETED_NO_MATCH_FOUND": "BOUNDED_SEARCH_NO_MATCH",
+    # Candidates were found and the evidence did not reach them — no retrievable abstract,
+    # a quotation that did not resolve, a date no index knew. A limit of the retrieval,
+    # reported as one.
+    "SEARCH_INCONCLUSIVE": "LITERATURE_LIMITATION",
+    "LITERATURE_BLOCKED": "LITERATURE_LIMITATION",
     "SPECIFICATION_BLOCKED": "SPECIFICATION_LIMITATION",
     "ARTIFACT_BLOCKED": "ARTIFACT_LIMITATION",
     # NOT ARTIFACT_LIMITATION. "We could not build an address for this claim" is a limit
@@ -207,8 +245,14 @@ _EVIDENCE_FOR_DISPOSITION = {
 
 # Only these two evidence states are statements ABOUT THE PAPER. Everything else in
 # `EVIDENCE_STATES` describes an artifact, a host, or a gate — invariants 4 to 7.
+# PRIOR_ART_EVIDENCE is the fifth and the newest. A target claiming to be first at X
+# and an earlier work stating that same narrow X is a statement about THIS document, so it
+# belongs here — and it still reaches no stop, because `TargetOutcome.establishes_failure`
+# names two dispositions and this is neither. Membership here decides what a review may
+# say it examined, never what it may conclude.
 EVIDENCE_ABOUT_THE_PAPER = ("REPRODUCTION_SUCCESS", "REPRODUCTION_FAILURE",
-                            "PAPER_INTERNAL_EVIDENCE", "ARTIFACT_EVIDENCE")
+                            "PAPER_INTERNAL_EVIDENCE", "ARTIFACT_EVIDENCE",
+                            "PRIOR_ART_EVIDENCE")
 
 
 def classify(*, lens: str = "", discrepancy_type: str = "", baseline_class: str = "",
@@ -274,6 +318,8 @@ def resolution_state(evidence: str = "") -> str:
         return "RESOLVED_BY_EXECUTION"
     if e == "PAPER_INTERNAL_EVIDENCE":
         return "RESOLVED_FROM_PAPER"
+    if e == "PRIOR_ART_EVIDENCE":
+        return "RESOLVED_FROM_LITERATURE"
     if e in ("ARTIFACT_EVIDENCE", "ARTIFACT_PROPERTY_ESTABLISHED"):
         # BOTH are resolutions — the narrow artifact question really is closed — and they
         # differ on the OTHER axis: only ARTIFACT_EVIDENCE is in EVIDENCE_ABOUT_THE_PAPER.

@@ -242,7 +242,7 @@ Verified end to end on synthetic git fixtures, not yet on a published paper:
 | the prose path on a published paper | **achieved up to identity.** With gates open, FinChain's prose composition is discovered, addressed, arithmetically re-verified, prioritised, and pursued against a commit-verified checkout. `experiment_id` then refuses — *"none of the 3 advertised command(s) emits a count"* — which is true of that repository and is the guarantee working: producing the benchmark means looping all 58 generators and no advertised command does. The harness will not write that loop |
 | RED from an autonomous execution on a published paper | not achieved. Proven end to end on git fixtures (`tests/test_autonomous_review_e2e.py`), in both directions |
 | prose identity for anything but a COUNT | not implemented, deliberately: a prose-stated accuracy has no column header, no basis and no baseline row to bind against |
-| novelty / prior-art checking | architectural only. `LITERATURE_SEARCH` is in the route vocabulary and nothing implements it. No novelty conclusion is produced |
+| novelty / prior-art checking | **implemented as a bounded prior-art search** (`harness/literature.py`), and it establishes no novelty by construction: the route can raise a concern for a referee and has no value anywhere meaning "novel". Measured on all eight papers: 0 concerns, 0 bound relations |
 | reviewer accuracy, precision, recall | not measurable: the corpus carries no adjudicated ground truth. `harness/evaluation.LIMITATIONS` says so inside the artifact |
 | scalability | not established. Seven papers is an initial systems study |
 | independent reimplementation sealed end to end | still eligibility-only (`harness/reimplement.py`) |

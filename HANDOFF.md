@@ -461,9 +461,15 @@ Read this before you quote a capability to anyone.
 - **`scientific_class` falls back to the lens name** when a finding declared neither a
   `discrepancy_type` nor a `baseline_class`. In those cases the count is partly a count of
   what each lens chose to write.
-- **Novelty / prior-art checking is architectural only.** `VERIFICATION_ROUTES` carries
-  `LITERATURE_SEARCH` and nothing implements it. The route exists so that adding one later
-  has a place to attach with its own provenance — not as a capability the system has.
+- **The prior-art route runs and establishes no novelty, by construction.**
+  `harness/literature.py` searches public indexes for work predating the paper, against
+  the paper's own novelty sentences. It can raise a concern a referee must adjudicate; it
+  can never report that a contribution is new, because
+  `artifacts.NOVELTY_ESTABLISHING_AUTHORITIES` is the empty tuple and a completed search
+  with no match is a fact about the search. Over the eight-paper corpus it produced 0
+  concerns and 0 bound relations — see `docs/LITERATURE_MEASUREMENT.md` for why each zero
+  is the right number, and for the three limits (undatable papers, a metered index, a
+  bounded protocol) that are ours rather than the papers'.
 - **PATH B is eligibility-only.** `harness/reimplement.py` decides whether a paper with no
   published code says enough to rebuild, and writes the brief when it does. No independent
   reimplementation has been written and sealed through `run.py accept`.

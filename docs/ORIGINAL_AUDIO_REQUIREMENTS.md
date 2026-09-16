@@ -195,18 +195,23 @@ Grade: **AUDIO.** This is a four-stage order, stated explicitly:
 | # | requested stage | status |
 |---|---|---|
 | 1 | obvious internal contradictions, abstract vs conclusion, table vs conclusion | **RESOLVED** — the `contradiction` lens plus the deterministic integrity layer |
-| 2 | novelty search: did someone already do this | **OPEN — no code exists.** `LITERATURE_SEARCH` is a declared route with no implementation |
+| 2 | novelty search: did someone already do this | **IMPLEMENTED as a bounded prior-art investigation**, which is the honest form of the request: it may raise a concern about earlier work and can never report that a contribution is new |
 | 3 | reproduction, and what the difference is | **PARTIAL** — implemented end to end, never completed on a real paper |
 | 4 | did they implement the code correctly | **OPEN as a route.** Real static analysis exists and runs on every clone, but its output cannot become evidence |
 
-**Two of the four stages the original audio asked for are not capabilities today.** Stage 2
-has no code at all. Stage 4 has code whose findings are structurally walled off from the
-evidence pipeline: `ARTIFACT_INSPECTION` is not an executable route and the evidence state
-`ARTIFACT_EVIDENCE` is unreachable. See `docs/FINAL_PRODUCT_GAP_AUDIT.md` §2.1.
+**All four stages are now capabilities, and two of them are deliberately weaker than the
+words the audio used.** Stage 4 became the artifact route: `ARTIFACT_INSPECTION` is
+executable, `ARTIFACT_EVIDENCE` is reachable, and what it establishes is what the RELEASED
+CODE does — never that a reported result is wrong. Stage 2 became a bounded prior-art
+investigation: it searches public indexes for earlier work bearing on the paper's own
+novelty claims, and it establishes no novelty, because the literature a bounded search
+does not reach is not enumerable.
 
-This is the single most important thing the audio adds that later written feedback did not:
-**novelty checking and authors'-code correctness were requested at the start and are the
-two stages still missing.**
+**That gap between the request and the capability is the honest part, not a shortfall.**
+"Novelty search: did someone already do this" is answerable in one direction only. Finding
+an earlier work is a concern a referee must adjudicate; finding none is a statement about
+a search. The route is built so the stronger claim is inexpressible rather than merely
+discouraged — see CLAUDE.md invariant 36 and `docs/LITERATURE_MEASUREMENT.md`.
 
 ---
 

@@ -138,6 +138,7 @@ papers → controller → ingest → audit → collect → grade → assess → 
 | assess | `assessment.py` | findings + grades → `CaseState.assessment` | has a material failure already been established, and is the investigation still open | never blocks; `investigation_open` is an INPUT to `planner.classify` |
 | **discover** | `stages/discover.py` | doc + findings → `discovery/targets.json` | what is addressable, what it is worth, whether an experiment is justified | records a NAMED refusal per target |
 | ↳ artifact | `stages/artifact.py` + `artifact_evidence.py` | doc + pinned checkout → `ArtifactFact` × N | what the RELEASED CODE establishes, for a question whose SCOPE it answers | `ARTIFACT_INSPECTION_INCONCLUSIVE` when it settles nothing |
+| ↳ literature | `stages/literature.py` + `literature.py` | doc + public indexes → `PriorArtFact` × N | what EARLIER PUBLISHED WORK bears on a novelty claim the paper makes about itself | `SEARCH_COMPLETED_NO_MATCH_FOUND`, which settles nothing |
 | verify | `stages/probe.py` | doc + repo → `ProbeSpec` per target | identity, capability, resources, commit, backend | leaves the spec unpromoted |
 | execute | `backends.py` + `local_exec.py` | spec → `ProbeResult` | `authorize()` alone | `verdict: blocked` |
 | reconcile | `local_exec.reconcile` | metric vs the addressed quantity | arithmetic only | `INCONCLUSIVE` |
@@ -166,6 +167,7 @@ reviewer actually asks get separated:
 | where does the paper say this? | `claims.py` | the parsed doc — a lens supplies a quote, the harness mints the address |
 | what would settle this concern? | `questions.py` | a finding's own closed-vocabulary self-classification |
 | what KIND of problem is this? | `taxonomy.py` | the same closed vocabulary; never a number, a name or a paper |
+| has somebody already done this? | `literature.py` + `literature_providers.py` | the paper's own novelty sentences, and bibliographic records a public index returned |
 | what is checkable, and how central? | `discovery.py` | structure: abstract, cited addresses, parsed quantities |
 | is it worth it, and is it justified? | `priority.py`, `planner.py` | vocabulary strings and booleans only |
 
@@ -222,7 +224,8 @@ python run.py dossier                                         # consolidate fini
 python run.py evaluate                                        # system metrics over the corpus
 python run.py sandbox [--release]                             # leased remote machines
 python run.py preflight                                       # is this batch N distinct papers?
-python -m pytest tests -q                                     # 2154 tests
+python -m pytest tests -q                                     # 2220 tests
+python -m pytest tests -q -m "not network"                    # 2213, no third party
 ```
 
 **The two env vars above are not decoration.** `--auto-audit` and `--auto-grade` select a
@@ -244,7 +247,7 @@ Per paper, `projects/<pid>/` holds four things a reader should not confuse:
 | `reports/<pid>.md` / `.json` | the complete machine trace |
 
 Self-checks: **every module that carries an `if __name__ == "__main__"` guard has one,
-and there are 60 of them.** Do not maintain a list here; the hand-written one drifted to
+and there are 65 of them.** Do not maintain a list here; the hand-written one drifted to
 34 while modules kept landing. `tests/test_self_checks.py` DISCOVERS them by walking
 `harness/**/*.py` and parsing for the guard with `ast`, so a module that loses its
 self-check fails the suite, and `python -m harness.<module>` runs any one of them
@@ -569,6 +572,36 @@ Do not weaken these to make more papers executable or more findings reportable.
     refused. The eight-paper run was preflighted and its output is preserved, so the
     claim about that corpus stands; the claim about the entrypoint did not.
 
+36. **Finding prior art may support a concern; failing to find it establishes nothing,
+    and the vocabulary is what makes that so.** `harness/literature.py` runs a bounded
+    prior-art search — the paper's own novelty sentences, minted by `claims.mint`, against
+    public indexes with stable identifiers — and there is NO authority, NO disposition and
+    NO evidence state anywhere in it that means "novel".
+    `artifacts.NOVELTY_ESTABLISHING_AUTHORITIES` is the EMPTY TUPLE, so the membership
+    test that asks the question can never succeed and there is no threshold a later
+    contributor could relax. A completed search that matched nothing is
+    `SEARCH_COMPLETED_NO_MATCH_FOUND` → `BOUNDED_SEARCH_NO_MATCH`, which is not in
+    `EVIDENCE_ABOUT_THE_PAPER`, resolves to UNRESOLVED, and does not discharge the route.
+
+    **Three deterministic halves and one model half.** The claims are quotations this
+    document contains; the candidate set is CANONICALISED (DOI, then arXiv id, then index
+    id, then title AND first author AND year — so one paper appearing as a preprint and a
+    proceedings record counts once, and two papers sharing a title do not merge); and the
+    chronology is decided from dates, never from a reading. A candidate dated after the
+    target's cutoff is refused whatever the overlap looks like, and two dates are never
+    ordered more precisely than their sources allow — a proceedings YEAR does not put one
+    same-year paper before another. Every date any source offered is recorded beside the
+    one chosen, so "we picked the date that suited the concern" would be visible.
+
+    What a model may do is propose queries and propose a RELATION. Both ends are then
+    verified — the claim re-mints to the same address and actually claims something; the
+    candidate carries an identifier; the quoted passage is present in the text THIS HARNESS
+    retrieved — and the pairing lands at `ENDPOINTS_VERIFIED_LITERATURE_CONCERN`, whose
+    overlap is the reviewer's reading. `STRUCTURALLY_BOUND_PRIOR_ART` additionally needs a
+    deterministic basis AND a priority claim, and may be zero over a corpus. **Level 4, "the
+    paper is not novel", has no spelling**, and no literature disposition is in
+    `establishes_failure`.
+
 ## Operating autonomously
 
 `--auto-audit` delegates each lens to a reviewer — `SH_AUDIT_CMD`, or the `claude` CLI
@@ -808,6 +841,69 @@ relocated, 1 identity ESTABLISHED / 6 AMBIGUOUS, **7 endpoint-verified concerns 
 level-2 mismatches**. `docs/ARTIFACT_ROUTE_MEASUREMENT.md` prints every fact, every
 concern, and why each refusal is the right one.
 
+## What a bounded prior-art search can establish, and what it cannot
+
+**The original brief asked for novelty search, and the honest version of that capability
+is asymmetric.** Finding an earlier work that appears to make the same contribution is a
+concern a referee must look at. Finding nothing is not the opposite result — it is a
+statement about a SEARCH, and the global literature is not enumerable, so no bounded
+protocol can ever turn its own silence into evidence that a contribution is new.
+
+**So there is nothing in this route that means "novel".** Not an authority, not a
+disposition, not an evidence state. `artifacts.NOVELTY_ESTABLISHING_AUTHORITIES` is the
+empty tuple and `PriorArtFact.establishes_novelty` is a membership test in it, which makes
+the rule inexpressible rather than merely documented — the same device
+`ARTIFACT_AUTHORITY` uses to keep "the reported result is false" off the artifact route.
+
+| level | what it is about | what it needs |
+|---|---|---|
+| `BIBLIOGRAPHIC_FACT` | the WORK | an index record carrying a DOI, an arXiv id or an index id |
+| `ENDPOINTS_VERIFIED_LITERATURE_CONCERN` | two real works | + an addressed novelty claim, a passage located in the text THIS harness retrieved, and a verified chronology; the OVERLAP is the reviewer's reading |
+| `STRUCTURALLY_BOUND_PRIOR_ART` | the paper AND an earlier work | + a deterministic binding basis AND a priority claim to bind |
+| *the paper is not novel* | — | **there is no value for this** |
+
+**Chronology is the half that must be deterministic**, and it is the half a reading can
+never move. The target's earliest public date comes from its own arXiv stamp where it
+prints one, then Crossref, then OpenAlex, then — year-only — a publication statement on
+page one; every offer is recorded beside the one chosen. A candidate later than that
+cutoff is `POSTDATES_CUTOFF` and prior art for nothing; two dates known only to the year
+are `CONTEMPORANEOUS_UNRESOLVED` rather than quietly ordered; an undated candidate is not
+"probably earlier". A paper this harness cannot date makes no chronological claim at all.
+
+**One paper is not four papers.** The same work arrives as an arXiv preprint, a Crossref
+record and an OpenAlex work, and `canonical_id` folds them strongest-identifier-first,
+keeping every alias and the EARLIEST date — prior art is about when a work became public,
+not when a publisher printed it. The title fallback is conjunctive (title AND first author
+AND year) because similar titles are common and identity is not.
+
+**And a cited predecessor is a different concern from an omitted one.** §8 of the design,
+and the distinction is an accusation: a work the paper already cites may still challenge a
+novelty claim, and that is "the stated distinction may be insufficient", not "the authors
+omitted prior art". A reference list extraction did not recover is
+`BIBLIOGRAPHY_UNAVAILABLE` and never `APPARENTLY_UNCITED`.
+
+**What "route exhausted" means here, precisely.** The DECLARED PROTOCOL completed: these
+query families, against these indexes, to this depth, with this many candidates read per
+claim, every retained candidate adjudicated to a typed state. All of those bounds are in
+`SearchProtocol` and printed in the record. It does not mean the literature was searched,
+and a provider this host could not authenticate to does not complete anything — an
+unconfigured index is a CONFIGURATION outcome, which is why `protocol_completed` is false
+whenever one did not answer.
+
+Measured over the eight papers, both gates open: **23 claims searched, 306 queries across
+two indexes, 5,692 records folded to 3,798 distinct works, 1,703 of them pre-cutoff, 143
+read by a reviewer, 6 proposals — and 0 endpoint-verified concerns, 0 structurally bound
+relations.** Six papers `SEARCH_COMPLETED_NO_MATCH_FOUND`, two `SEARCH_INCONCLUSIVE`, none
+blocked. With the review gate CLOSED the same protocol runs and all eight still reach
+`SEARCH_COMPLETED_NO_MATCH_FOUND` — which is what makes the model half assessable at all.
+
+**The one concern that reached level 2 was the paper's own preprint**, found by hand and
+refused rather than reported: `acl`'s arXiv posting, with every endpoint genuinely verified
+and the reviewer's own note saying it looked like the authors' own. A paper is not prior
+art for itself, and printing it would have been an accusation about their scholarship.
+`docs/LITERATURE_MEASUREMENT.md` prints the per-paper table, the protocol, every refusal,
+the run-to-run variance in the reviewer's own readings, and why each zero is right.
+
 ## Execution gates
 
 | gate | env var | default | permits |
@@ -819,6 +915,8 @@ concern, and why each refusal is the right one.
 | substantive verdict | `SH_ALLOW_SUBSTANTIVE_VERDICT` | off | one best-effort, never-retried, whole-paper opinion — printed, consumed by no threshold (`verdict_driver.py`) |
 | claim links | `SH_ALLOW_CLAIM_LINKS` | off | one best-effort reading per paper pairing each headline claim with the evidence it rests on; both halves verified here (`claimlink_driver.py`) |
 | authors' code | `SH_ALLOW_ARTIFACT_REVIEW` | off | one read-only pass over the PINNED checkout asking whether the code does what the paper says; `Read`+`Grep` only, every citation relocated (`artifact_review_driver.py`) |
+| prior-art search | `SH_ALLOW_LITERATURE_SEARCH` | off | querying public scholarly indexes (OpenAlex, Crossref, arXiv) for work that predates the paper |
+| literature review | `SH_ALLOW_LITERATURE_REVIEW` | off | one reading per novelty claim, comparing it against what those indexes returned; ZERO tools, so it cannot search on its own (`literature_driver.py`) |
 | install | `SH_ALLOW_INSTALL` | off | building `runs/<pid>/env` from the repo's requirements |
 | sandbox | `SH_ALLOW_SANDBOX` | off | **leasing a remote Linux machine** and staging the audited commit into it (`harness/sandbox.py`) |
 | execute | `SH_ALLOW_REPO_EXEC` | off | running the repository's own entrypoint |
@@ -1074,10 +1172,39 @@ were current.
   rather than a measurement; a rule firing for the first time on a fifth paper should be
   re-audited before its output is believed.
   `docs/ARTIFACT_ROUTE_MEASUREMENT.md` has the whole record, including every concern.
-- **Novelty / prior-art checking is architectural only.** `VERIFICATION_ROUTES` carries
-  `LITERATURE_SEARCH` and nothing implements it: no literature tooling is wired in, so no
-  novelty conclusion is produced. The route exists so that adding one later has a place to
-  attach with its own provenance — not as a capability the system has.
+- **The prior-art route runs and produces NO novelty conclusion, which is the design and
+  not a shortfall.** Measured over the eight-paper corpus with both gates open: 23 claims
+  searched, 306 queries across two indexes, 5,692 records folded to 3,798 distinct works,
+  1,703 of them pre-cutoff, 143 read by a reviewer, 6 proposals — and **0 endpoint-verified
+  concerns, 0 structurally bound relations**. Six papers SEARCH_COMPLETED_NO_MATCH_FOUND,
+  two SEARCH_INCONCLUSIVE, none blocked. That means the declared protocol completed and
+  nothing qualified; it does not mean any contribution is new. Four limits bound the route,
+  and all four are OURS rather than the papers'.
+
+  **A paper is not prior art for itself**, and the corpus's first endpoint-verified concern
+  was `acl`'s own arXiv preprint — every endpoint genuinely verified, the reviewer's own
+  note saying it looked like the authors' preprint, and reporting it would have been an
+  accusation about their scholarship. `literature.same_work` refuses a candidate carrying
+  an identifier the paper prints on its own first page or the paper's own title, and
+  `candidate_may_be_the_target_itself` refuses the case this harness cannot decide.
+
+  **The cutoff cannot always be established.** Two of the eight cannot be dated at all, and
+  for them no chronological claim is made in either direction. The cause is extraction:
+  `doc.title` comes back as an author line or as publication boilerplate, and
+  `literature.target_title` refuses to search an index with one — a wrong title does not
+  fail, it succeeds with somebody else's paper and then dates this one.
+
+  **OpenAlex now meters its API** and returned "Insufficient budget ... Resets at midnight
+  UTC" once this host's free daily allowance was spent. A 429 is two different facts and
+  the body says which; that one is recorded as UNAUTHENTICATED, not as a completed query,
+  so the measurement's declared protocol is crossref + arxiv.
+
+  **And the reviewer is not reproducible.** Across two runs the same verified candidate —
+  K-prune, arXiv:2308.03449, genuinely earlier work on structured pruning of pretrained
+  encoder LMs — came back POSSIBLE_OMITTED_BASELINE once and
+  RELATED_BUT_MATERIALLY_DIFFERENT the next. Both ends verified identically both times;
+  what varied was the reading, which is exactly why a relation is recorded as a reading.
+  `docs/LITERATURE_MEASUREMENT.md` has the per-paper table, every refusal and the variance.
 - **No adjudicated ground truth exists for this corpus.** `harness/evaluation.py`
   therefore reports no precision, recall, or agreement-with-humans number, and says so in
   the artifact itself. Reviewer accuracy is unmeasured, not measured-and-good.

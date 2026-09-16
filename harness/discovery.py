@@ -146,9 +146,12 @@ ROUTES_FOR_QUESTION = {
     # ratio. Reading the released code can say what was actually computed; running it
     # cannot say what it should have been.
     "SPECIFICATION": ("ARTIFACT_INSPECTION",),
-    # Architectural only, as `VERIFICATION_ROUTES` already says: nothing implements
-    # literature search, so this reaches a route that produces no evidence and the
-    # question is reported open. The route exists so a future one has somewhere to attach.
+    # A BOUNDED PRIOR-ART SEARCH, and the only route this question has. It is
+    # deliberately the only one: no execution answers "has somebody already done this",
+    # and no reading of the released code does either. What the route can return is a
+    # concern about an earlier work a referee must adjudicate — and never that the
+    # contribution is new, which is why a completed empty search leaves this question
+    # open rather than closing it.
     "PRIOR_ART": ("LITERATURE_SEARCH",),
     # EXACTLY WHAT `has_value` USED TO GIVE EVERY TARGET. A finding that classified itself
     # as nothing gets the old behaviour, so the default of this vocabulary is never a new

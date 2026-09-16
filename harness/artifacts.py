@@ -2978,6 +2978,16 @@ TARGET_DISPOSITIONS = (
     "ARTIFACT_CONCERN_VERIFIED_ENDPOINTS",  # both locations verified; the relation is model-proposed
     "ARTIFACT_MISMATCH_ESTABLISHED",        # paper and code disagree, with identity ESTABLISHED
     "ARTIFACT_INSPECTION_INCONCLUSIVE",     # the route completed and settled no question
+    # FIVE TERMINAL STATES FOR THE LITERATURE ROUTE, and the asymmetry is in which ones
+    # exist. There is no NOVEL and no NOVELTY_VERIFIED here, because a bounded search that
+    # matched nothing has established a fact about the SEARCH: the declared protocol
+    # completed. The literature is not enumerable, and a disposition meaning "novel" would
+    # turn `top_k = 20` into a claim about rank 21.
+    "LITERATURE_MATCH_VERIFIED_ENDPOINTS",   # a real earlier work, a real passage, the overlap read
+    "PRIOR_ART_RELATION_STRUCTURALLY_BOUND",  # the relation itself bound; rare, and may be zero
+    "SEARCH_COMPLETED_NO_MATCH_FOUND",       # the protocol completed and no candidate qualified
+    "SEARCH_INCONCLUSIVE",                   # candidates found; the evidence did not reach them
+    "LITERATURE_BLOCKED",                    # provider, credential or cutoff unavailable
     "SPECIFICATION_BLOCKED",      # the paper does not say enough to run it
     "ARTIFACT_BLOCKED",           # no code, or the code does not contain the experiment
     "ENVIRONMENT_BLOCKED",        # dependencies, platform, install
@@ -3040,6 +3050,12 @@ PLAN_ACTIONS = (
     # re-check settles nothing by construction, and it is refused outright for a question
     # whose answer is a MEASUREMENT (`artifact_evidence.requires_execution`).
     "ARTIFACT_INSPECTION_ONLY",
+    # SEARCHING THE PUBLISHED LITERATURE, and nothing running. Reachable only where no
+    # executable route applies, for the same reason `ARTIFACT_INSPECTION_ONLY` is: a
+    # bounded prior-art search is cheap and must never be the reason an experiment did not
+    # happen. What it can settle is a prior-art QUESTION, and what it can never settle —
+    # by construction, not by policy — is whether a contribution is new.
+    "LITERATURE_SEARCH_ONLY",
     "INFEASIBLE_SPECIFICATION",
     "INFEASIBLE_ADDRESSING",
     # The two that used to be folded into the line above. See TARGET_DISPOSITIONS.
@@ -3793,6 +3809,402 @@ class ClaimLinkSet(_Base):
         """Only the links whose RELATIONSHIP the document binds. Never `accepted_links`."""
         return [x for x in self.links
                 if x.accepted and x.link_authority == "STRUCTURALLY_BOUND_LINK"]
+
+
+# --------------------------------------------------------------------------------------
+# PRIOR ART, AND THE ONE RULE THAT SHAPES THE WHOLE VOCABULARY
+#
+#     finding prior art may support a novelty concern;
+#     failing to find prior art does NOT establish novelty.
+#
+# That asymmetry is encoded here rather than stated in prose, and the encoding is that
+# **there is no value anywhere in this vocabulary that means "novel"**. There is no
+# authority for it, no disposition for it, and `NOVELTY_ESTABLISHING_AUTHORITIES` below is
+# the empty tuple BY CONSTRUCTION — a caller asking "does this establish novelty?" gets
+# False from a membership test that can never succeed, rather than from a rule someone
+# could later relax. A completed search with no candidate is a fact about THE SEARCH, and
+# the only honest thing it can say is that the declared protocol completed.
+#
+# The global literature is not enumerable. Everything below is written so that a bounded
+# protocol can report what it did without any path by which "we looked at twenty results"
+# becomes "there is nothing at rank twenty-one".
+LITERATURE_AUTHORITY = (
+    # LEVEL 1: a work exists, with the identity the index reports. Says nothing whatever
+    # about the target paper — it is the bibliographic analogue of `ARTIFACT_FACT`.
+    "BIBLIOGRAPHIC_FACT",
+    # LEVEL 2: an addressed novelty/contribution claim in the target, a resolved passage
+    # in an EARLIER work, and a verified chronology — with the OVERLAP between them still
+    # a model's reading. A referee's question, not a novelty failure. The third channel to
+    # need this distinction, after `ENDPOINTS_VERIFIED_SEMANTIC_LINK` and
+    # `ENDPOINTS_VERIFIED_ARTIFACT_CONCERN`, and for the same reason each time: verifying
+    # two ends does not verify the relationship between them.
+    "ENDPOINTS_VERIFIED_LITERATURE_CONCERN",
+    # LEVEL 3: the RELATIONSHIP itself is established from bounded evidence — see
+    # `PRIOR_ART_BINDING_BASES`. Deliberately hard to reach, and may be zero over a whole
+    # corpus. It is not manufactured to make the route produce a number.
+    "STRUCTURALLY_BOUND_PRIOR_ART",
+    # LEVEL 4 — "the paper is not novel" — HAS NO SPELLING. Novelty is a scholarly
+    # judgement requiring semantic comparison and field context; a strong prior-art match
+    # is a serious human-facing concern and is not a verdict this system may reach.
+    "NONE",
+)
+
+# The authorities that may support a prior-art CONCERN, and the ones that establish
+# novelty. The second is empty and is a tuple rather than a constant `False` so that the
+# asymmetry is a fact about the vocabulary that a test can read.
+PRIOR_ART_CAPABLE_AUTHORITIES = ("ENDPOINTS_VERIFIED_LITERATURE_CONCERN",
+                                 "STRUCTURALLY_BOUND_PRIOR_ART")
+NOVELTY_ESTABLISHING_AUTHORITIES: tuple[str, ...] = ()
+
+# HOW a prior-art relationship was bound without a model, when it was. Each is a thing a
+# reader can open in both documents. `reviewer_reading` is deliberately in the list and
+# deliberately NOT sufficient, exactly as `auditor_assertion` is for experiment identity.
+PRIOR_ART_BINDING_BASES = (
+    "named_method_lineage",      # both works name the same method, and the dates are unambiguous
+    "explicit_first_claim_met",  # the target claims "first to X"; the earlier work states that X
+    "identical_identifier",      # the same DOI or arXiv id describes the claimed contribution
+    "reviewer_reading",          # the literature reviewer's judgement, and nothing deterministic
+)
+
+# WHAT the literature reviewer may propose about a (target claim, candidate work) pair.
+# A closed vocabulary for the same reason every other model-facing one is closed: an open
+# one lets the proposer name a category and escape whatever rule is keyed on it.
+LITERATURE_RELATIONS = (
+    "LIKELY_DIRECT_PREDECESSOR",
+    "RELATED_BUT_MATERIALLY_DIFFERENT",
+    "TERMINOLOGY_COLLISION_ONLY",
+    "POSSIBLE_OMITTED_BASELINE",
+    "POSSIBLE_PRIORITY_CONFLICT",
+    "INSUFFICIENT_EVIDENCE",
+)
+
+# The relations that can carry a concern at all. The other three are real answers — and
+# "related but materially different" is the answer a careful search most often produces,
+# which is why it is a value rather than a silence.
+CONCERNING_RELATIONS = ("LIKELY_DIRECT_PREDECESSOR", "POSSIBLE_OMITTED_BASELINE",
+                        "POSSIBLE_PRIORITY_CONFLICT")
+
+# WHERE a target paper's earliest public date came from, strongest first. Chronology is
+# the one half of this route that must be deterministic: a candidate dated after the
+# target cannot be prior art for it, whatever any reading says about the overlap.
+CUTOFF_SOURCES = (
+    "arxiv_submission_v1",   # the first arXiv submission, which is what "public" means here
+    "crossref_published",    # the publisher's own earliest printed date
+    "openalex_publication_date",
+    "proceedings_year",      # year only: a same-year candidate cannot be ordered against it
+    "operator_supplied",
+    "none",
+)
+
+# How well the cutoff is known. YEAR_ONLY is its own state and not a weak ESTABLISHED:
+# it is the state in which a same-year candidate must be refused rather than admitted.
+CUTOFF_STATES = ("ESTABLISHED", "YEAR_ONLY", "AMBIGUOUS", "UNKNOWN")
+
+# Where one candidate sits relative to the target's cutoff. Derived from dates and never
+# from a reading, and the source of each date is recorded so that "we chose the date most
+# useful to the concern" is checkable rather than promised.
+CHRONOLOGY_STATES = (
+    "PREDATES_CUTOFF",         # public before the target: eligible to be prior art
+    "POSTDATES_CUTOFF",        # later work. Possibly related; prior art for nothing here
+    "CONTEMPORANEOUS_UNRESOLVED",  # the two dates cannot be ordered at the precision known
+    "CANDIDATE_DATE_UNKNOWN",
+    "TARGET_CUTOFF_UNKNOWN",
+)
+
+# The only chronology that may support prior-art authority, named as a tuple so the rule
+# is a membership test rather than a comparison someone can widen.
+PRIOR_ART_ELIGIBLE_CHRONOLOGY = ("PREDATES_CUTOFF",)
+
+# Whether the TARGET already cites the candidate. Not a refusal either way: §8 of the
+# design — a cited predecessor may still challenge a novelty claim, but that is
+# "the stated distinction may be insufficient" and not "the authors omitted prior art".
+# Calling the first the second would accuse the authors of something they did not do.
+CANDIDATE_CITATION_STATES = ("CITED_BY_TARGET", "APPARENTLY_UNCITED",
+                             "BIBLIOGRAPHY_UNAVAILABLE")
+
+# WHY a proposed prior-art relation did not bind. Named per attempt for the same reason
+# `MISMATCH_REFUSALS` is: "we found nothing" and "we found it and could not date it" are
+# opposite results about a search.
+LITERATURE_REFUSALS = (
+    "target_claim_unaddressed",        # the quoted claim does not resolve in the paper
+    "target_claim_not_a_novelty_claim",  # it resolves, and it claims no novelty or contribution
+    # A PAPER IS NOT PRIOR ART FOR ITSELF. Found by the first live run: the ACL paper's own
+    # arXiv preprint came back as a LIKELY_DIRECT_PREDECESSOR — same title, same benchmark
+    # name, same 58 topics and 12 domains, posted before the proceedings — and the reviewer
+    # said so in its own note. Every endpoint verified and the finding would have been an
+    # accusation about the authors citing themselves.
+    "candidate_is_the_target_itself",
+    # AND THE CASE WHERE THE HARNESS CANNOT TELL. When extraction did not recover a title
+    # this harness will stand behind, a candidate whose title carries the very name the
+    # paper says it introduces is either that paper's own earlier version or a real
+    # priority conflict — and nothing available here separates them. Refused with the
+    # reason said out loud, because reporting it as prior art would be a false accusation
+    # and dropping it silently would hide something a referee should glance at.
+    "candidate_may_be_the_target_itself",
+    "candidate_identity_unestablished",  # no DOI, no arXiv id, no index id: not a citable work
+    "candidate_quote_unresolved",      # the quoted passage is not in the retrieved candidate text
+    "candidate_date_unknown",          # no provider dated it
+    "target_cutoff_unknown",           # the target's own earliest public date is not established
+    "candidate_not_earlier",           # dated, and not before the target's cutoff
+    "relation_not_concerning",         # the reviewer's own answer raises no prior-art question
+    "relation_not_deterministic",      # a concern, and the overlap is the reviewer's reading
+    "insufficient_candidate_evidence",  # metadata only where the claim needs the work's content
+)
+
+# What a provider call actually did. A provider this system could not reach is a
+# CONFIGURATION outcome and never a scientific one: "we have no Semantic Scholar key" is
+# not evidence about anybody's paper, and a protocol that counted it as a completed query
+# would discharge a route by being unconfigured.
+PROVIDER_OUTCOMES = (
+    "COMPLETED",            # the index answered, with results or with none
+    "NO_RESULTS",           # the index answered and matched nothing. A completed query
+    "RATE_LIMITED",
+    "UNAUTHENTICATED",      # the index requires a credential this host does not hold
+    "UNREACHABLE",
+    "MALFORMED_RESPONSE",
+    "NOT_ATTEMPTED",
+)
+
+# The outcomes that count toward the declared protocol being carried out.
+PROTOCOL_COMPLETING_OUTCOMES = ("COMPLETED", "NO_RESULTS")
+
+
+class WorkIdentity(_Base):
+    """One scholarly work, canonicalised across the indexes that report it.
+
+    ONE PAPER IS NOT FOUR PAPERS. The same work is an arXiv preprint, a Crossref record,
+    an OpenAlex work and a conference version, and counting those as four prior works
+    would make a search's candidate count a measure of how many indexes answered.
+    `literature.canonical_id` folds them, strongest identifier first, and `aliases` keeps
+    every id that folded so the merge is re-derivable by hand rather than asserted.
+
+    The fallback — normalised title plus first author plus year — is deliberately last and
+    deliberately conjunctive: two different works with similar titles must not merge.
+    """
+
+    canonical_id: str = Field(default="", description="WRITTEN BY THE HARNESS: doi: | arxiv: "
+                                                      "| openalex: | s2: | title:")
+    doi: str = ""
+    arxiv_id: str = ""
+    openalex_id: str = ""
+    s2_id: str = ""
+    title: str = ""
+    authors: list[str] = Field(default_factory=list)
+    venue: str = ""
+    year: int = 0
+    date: str = Field(default="", description="ISO-8601, the earliest public date known")
+    date_source: str = Field(default="none", description=" | ".join(CUTOFF_SOURCES))
+    url: str = ""
+    abstract: str = Field(default="", description="as retrieved; the text a quotation is "
+                                                  "checked against")
+    abstract_sha256: str = Field(default="", description="of the retrieved text, so a later "
+                                                         "reader can prove what was read")
+    aliases: list[str] = Field(
+        default_factory=list, description="every provider id that folded into this work")
+    providers: list[str] = Field(default_factory=list, description="which indexes reported it")
+
+
+class SearchCutoff(_Base):
+    """The target paper's earliest defensible public date, and how well it is known.
+
+    Only work public BEFORE this may support a prior-art concern. `state` is what stops
+    the rule being quietly widened: with YEAR_ONLY, a candidate from the same year is
+    CONTEMPORANEOUS_UNRESOLVED rather than earlier, because a proceedings year does not
+    order two papers within it.
+    """
+
+    date: str = Field(default="", description="ISO-8601; '' when unknown")
+    source: str = Field(default="none", description=" | ".join(CUTOFF_SOURCES))
+    state: str = Field(default="UNKNOWN", description=" | ".join(CUTOFF_STATES))
+    evidence: str = Field(default="", description="what established it, in the harness's words")
+    candidates: dict[str, str] = Field(
+        default_factory=dict,
+        description="every date any provider offered, by source. Recorded BEFORE one is "
+                    "chosen, so 'the date most useful to the concern' is visible if it "
+                    "ever happens")
+
+
+class ProviderCall(_Base):
+    """One query against one index, and what it did. The unit the protocol is counted in."""
+
+    provider: str = ""
+    query: str = Field(default="", description="the exact query string sent")
+    query_family: str = ""
+    claim_id: str = ""
+    requested_at: str = ""
+    outcome: str = Field(default="NOT_ATTEMPTED", description=" | ".join(PROVIDER_OUTCOMES))
+    http_status: int = 0
+    n_results: int = 0
+    cache_key: str = Field(default="", description="sha256 of provider+query+top_k; the "
+                                                   "cached raw response is stored under it")
+    from_cache: bool = False
+    error: str = ""
+    seconds: float = 0.0
+
+    @property
+    def completed(self) -> bool:
+        """Did this query actually get carried out? A credential we lack is not a result."""
+        return self.outcome in PROTOCOL_COMPLETING_OUTCOMES
+
+
+class SearchClaim(_Base):
+    """One bounded thing the route searched for, addressed in the target paper.
+
+    NOT "is this paper novel". A claim is a quoted sentence that resolves in the document,
+    minted by `claims.mint` exactly as every other quotation in this system is, plus the
+    concepts a query can be built from.
+    """
+
+    claim_id: str = ""
+    ref: str = Field(default="", description="WRITTEN BY THE HARNESS: the minted address")
+    quote: str = Field(default="", description="verbatim, re-verified against the parsed paper")
+    claim_kind: str = Field(default="", description="NOVELTY_MARKER | CONTRIBUTION | "
+                                                    "HEADLINE_CLAIM | METHOD_NAME")
+    marker: str = Field(default="", description="the novelty word the scan matched, when it did")
+    concepts: list[str] = Field(default_factory=list)
+    queries: list[str] = Field(default_factory=list, description="the exact queries issued")
+
+
+class SearchProtocol(_Base):
+    """The bounds of the search, PUBLISHED so that "exhausted" means something checkable.
+
+    "Route exhausted" for this route means THE DECLARED PROTOCOL COMPLETED. It does not
+    and cannot mean that the literature was searched: the universe is not enumerable, and
+    a system that let a budget stand in for the world would turn `top_k = 20` into a
+    statement about rank 21.
+    """
+
+    query_families: list[str] = Field(default_factory=list)
+    providers_required: list[str] = Field(default_factory=list)
+    top_k: int = 0
+    max_queries_per_claim: int = 0
+    max_claims: int = 0
+    # HOW MANY RETRIEVED CANDIDATES ARE ACTUALLY READ, per claim. A separate bound from
+    # `top_k` because they are separate facts: top_k is how deep each query went, and this
+    # is how many of what came back a reader was shown. Four queries at top_k 20 across
+    # two indexes returns up to 160 records for one sentence, and a reader shown all of
+    # them is a reader shown none of them carefully. Published, like every other bound
+    # here, because "no match" means nothing without it.
+    max_candidates_reviewed: int = 0
+    notes: str = ""
+
+
+class PriorArtFact(_Base):
+    """One adjudicated (target claim, candidate work) pair, and the authority it carries.
+
+    `authority` is WRITTEN BY THE HARNESS from what actually verified — the claim's
+    address, the candidate's identity, the candidate quotation against retrieved text, and
+    the chronology — never read from the reviewer that proposed the pair. The reviewer
+    supplies two quotations and a relation; everything that decides what the pair
+    ESTABLISHES is decided here.
+    """
+
+    fact_id: str = ""
+    claim_id: str = ""
+    target_ref: str = Field(default="", description="WRITTEN BY THE HARNESS: the minted address")
+    target_quote: str = ""
+    candidate: WorkIdentity | None = None
+    candidate_quote: str = Field(default="", description="verbatim from the retrieved text")
+    candidate_quote_located: bool = Field(
+        default=False, description="WRITTEN BY THE HARNESS: the quotation was found in the "
+                                   "text this harness itself retrieved")
+    relation: str = Field(default="INSUFFICIENT_EVIDENCE", description=" | ".join(
+        LITERATURE_RELATIONS) + " — the REVIEWER's proposal, and a proposal only")
+    statement: str = Field(default="", description="what this pair establishes, in the "
+                                                   "harness's words")
+    authority: str = Field(default="NONE", description="WRITTEN BY THE HARNESS: "
+                                                       + " | ".join(LITERATURE_AUTHORITY))
+    chronology: str = Field(default="TARGET_CUTOFF_UNKNOWN",
+                            description="WRITTEN BY THE HARNESS: " + " | ".join(CHRONOLOGY_STATES))
+    chronology_basis: str = Field(default="", description="which date, from which source, "
+                                                          "on each side")
+    citation_state: str = Field(default="BIBLIOGRAPHY_UNAVAILABLE",
+                                description="WRITTEN BY THE HARNESS: "
+                                            + " | ".join(CANDIDATE_CITATION_STATES))
+    binding_basis: str = Field(default="", description="WRITTEN BY THE HARNESS: which of "
+                                                       + " | ".join(PRIOR_ART_BINDING_BASES))
+    refusal: str = Field(default="", description=" | ".join(LITERATURE_REFUSALS))
+    reviewer_note: str = Field(default="", description="the reviewer's own prose, kept for a "
+                                                       "human and consumed by nothing")
+
+    @property
+    def supports_concern(self) -> bool:
+        """Does this pair raise a prior-art question a referee should look at?"""
+        return self.authority in PRIOR_ART_CAPABLE_AUTHORITIES
+
+    @property
+    def establishes_novelty(self) -> bool:
+        """Always False, and it is a membership test in an EMPTY tuple that makes it so.
+
+        The asymmetry this whole route is built around, written where a caller trips over
+        it: nothing this search produces — least of all its silence — establishes that a
+        contribution is new.
+        """
+        return self.authority in NOVELTY_ESTABLISHING_AUTHORITIES
+
+
+class LiteratureSearch(_Base):
+    """One LITERATURE_SEARCH route attempt over one paper, and what its protocol did.
+
+    `discharged` is what stops a completed search from resolving anything: a route
+    discharges only when it adjudicated a pair to an authority, and a search that found no
+    qualifying candidate reports SEARCH_COMPLETED_NO_MATCH_FOUND, whose evidence state is
+    a fact about the search and not about the paper.
+    """
+
+    paper_id: str = ""
+    target_id: str = ""
+    cutoff: SearchCutoff | None = None
+    protocol: SearchProtocol | None = None
+    claims_searched: list[SearchClaim] = Field(default_factory=list)
+    provider_calls: list[ProviderCall] = Field(default_factory=list)
+    works: list[WorkIdentity] = Field(
+        default_factory=list, description="the DEDUPLICATED candidate set")
+    raw_results: int = Field(default=0, description="records returned, before dedup")
+    facts: list[PriorArtFact] = Field(default_factory=list)
+    cited_by_target: int = 0
+    apparently_uncited: int = 0
+    discharged: bool = Field(default=False, description="WRITTEN BY THE HARNESS")
+    reason: str = ""
+    escalations: list[str] = Field(
+        default_factory=list,
+        description="what this search makes newly possible for a LATER route — a missing "
+                    "comparison worth measuring, a baseline worth building. Recorded, "
+                    "never acted on here.")
+    candidates_reviewed: int = Field(
+        default=0, description="distinct candidate works a reader was actually SHOWN. A "
+                               "different number from `proposed`, which counts what came "
+                               "back: a reader that read twelve abstracts and proposed "
+                               "nothing has done the work and found nothing, and a reader "
+                               "that was shown nothing has not")
+    proposed: int = Field(default=0, description="reviewer proposals received")
+    notes: str = Field(default="", description="the reviewer's own account of what it did")
+
+    @property
+    def providers_completed(self) -> list[str]:
+        return sorted({c.provider for c in self.provider_calls if c.completed})
+
+    @property
+    def providers_failed(self) -> list[str]:
+        done = set(self.providers_completed)
+        return sorted({c.provider for c in self.provider_calls if c.provider not in done})
+
+    def concerns(self) -> list[PriorArtFact]:
+        return [f for f in self.facts if f.supports_concern]
+
+    def bound_relations(self) -> list[PriorArtFact]:
+        return [f for f in self.facts if f.authority == "STRUCTURALLY_BOUND_PRIOR_ART"]
+
+    @property
+    def protocol_completed(self) -> bool:
+        """The DECLARED bounds were carried out. Never "the literature was searched".
+
+        Every planned query reached an index that answered. A provider this host could not
+        authenticate to leaves this False, because an unconfigured system has not
+        completed a protocol — it has failed to attempt one, and the two must not print
+        the same number.
+        """
+        return bool(self.provider_calls) and all(c.completed for c in self.provider_calls)
 
 
 PHASES = ("ingest", "audit", "collect", "grade", "assess", "discover", "probe", "report",

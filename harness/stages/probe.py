@@ -41,6 +41,7 @@ import re
 from pathlib import Path
 
 from . import artifact as artifact_stage
+from . import literature as literature_stage
 from .. import (backends, claims, code_audit, comparison as comparison_mod,
                 exhaustion, experiment_id, materiality, planner, probe_synth,
                 provenance as provenance_mod, reimplement, reimplement_driver,
@@ -1396,6 +1397,29 @@ def _review(cfg: Config, pid: str) -> dict:
         exhaustion.refresh(target_set, cfg)
         state.write_json(discover_stage.targets_path_in(root), target_set.model_dump())
 
+    # --- the prior-art route -----------------------------------------------------------
+    # NEEDS NO CHECKOUT, so it runs whether or not the authors published one, and it is
+    # here rather than in `discover` for the same reason the artifact route is: `discover`
+    # is pure with respect to the parsed paper and consults no external source at all.
+    # Like the artifact route it spends no process and no execution budget, and `planner`
+    # reaches LITERATURE_SEARCH_ONLY only where no executable route applies.
+    literature_outcomes, search = literature_stage.run_route(cfg, pid, doc, target_set)
+    if target_set is not None and literature_outcomes:
+        for out in literature_outcomes:
+            state.write_json(
+                root / "runs" / pid / "targets" / out.target_id / "outcome.json",
+                out.model_dump())
+        replaced = {o.target_id for o in literature_outcomes}
+        target_set.outcomes = [o for o in target_set.outcomes
+                               if o.target_id not in replaced] + literature_outcomes
+        by_literature = {o.target_id: o.disposition for o in literature_outcomes}
+        for obj in target_set.objects:
+            if obj.target_id in by_literature:
+                obj.status = by_literature[obj.target_id]
+        discover_stage.sync_questions(target_set)
+        exhaustion.refresh(target_set, cfg)
+        state.write_json(discover_stage.targets_path_in(root), target_set.model_dump())
+
     rec = result.reconciliation
     state.append_log(
         cfg, pid, artifact_type="probe_result", phase="probe",
@@ -1422,6 +1446,12 @@ def _review(cfg: Config, pid: str) -> dict:
             "code_audit_skipped": audit.skipped or None,
             "artifact_targets": len(artifact_outcomes),
             "artifact_facts": len(inspection.facts) if inspection else 0,
+            # THREE COUNTS, NEVER SUMMED. Works retrieved is what the search saw;
+            # concerns is what survived every endpoint check; and a concern is a question
+            # for a referee, not a novelty finding.
+            "literature_targets": len(literature_outcomes),
+            "literature_works": len(search.works) if search else 0,
+            "literature_concerns": len(search.concerns()) if search else 0,
             "reconciliation": rec.status if rec else None,
             "seconds": result.seconds, "reason": result.reason,
             "script": result.script_path, "results": f"runs/{pid}/probe_results.json"}

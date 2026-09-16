@@ -121,7 +121,7 @@ from any model output (invariant 8). The manuscript must say that precisely.
 | `AUTHOR_CODE_EXECUTION` | yes | full pipeline | yes | IMPLEMENTED |
 | `INDEPENDENT_RECONSTRUCTION` | yes | full pipeline | yes | IMPLEMENTED |
 | `FOCUSED_VALIDATION_EXPERIMENT` | yes, rarely offered | runs, forced `synthesized` | **never** | **CANNOT DISCHARGE** |
-| `LITERATURE_SEARCH` | yes, `PRIOR_ART` only | none | never | **DECLARED ONLY** |
+| `LITERATURE_SEARCH` | yes, `PRIOR_ART` only | `stages/literature.py`, five terminal states | only via a verified concern or a bound relation — **never by finding nothing** | IMPLEMENTED |
 | `NONE` | sentinel | n/a | n/a | IMPLEMENTED as sentinel |
 
 ### 2.1 Artifact inspection is a third thing, neither preparatory nor a route
@@ -508,7 +508,7 @@ machine. Status of that transcription is recorded in
 | 5 | ~~No claim/evidence graph~~ — built, and measured at 63 endpoint-verified / **0 structurally bound** links; wired into no decision | §4 | measured, parallel |
 | 6 | `FIRST_PASS_CLEAR` semantics do not require route exhaustion | §15 | high |
 | 7 | Geometry discarded before `PaperDoc`; blocks prose-vs-cell and caption pairing | §5 | high |
-| 8 | `LITERATURE_SEARCH` declared with no code | §6 | scope decision needed |
+| 8 | ~~`LITERATURE_SEARCH` declared with no code~~ — bounded prior-art route implemented and measured on all eight papers: **0 concerns, 0 structurally bound relations, and no novelty conclusion is reachable** | §6 | implemented, measured |
 | 9 | Manuscript says four model components; there are six on the always-on path | §1 | manuscript |
 | 10 | No statistical test behind the 2σ tolerance | §13 | manuscript wording |
 | 11 | `harness/alignment/trial.py` orphaned; `SH_ALLOW_ALIGNMENT_TRIAL` gates nothing | §26 | low |

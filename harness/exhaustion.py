@@ -33,8 +33,8 @@ that checked everything it could — and the reader is entitled to tell them apa
 **Three further rules, each closing a way to make the number flattering.**
 
 *A route is APPLICABLE only if it is implemented.* `ARTIFACT_INSPECTION` appears on 261
-corpus objects and has no `PLAN_ACTIONS` member, so it can never discharge; `LITERATURE_SEARCH`
-has no implementation at all. Counting them as applicable pins exhaustion below 1.0 forever
+corpus objects and has no `PLAN_ACTIONS` member, so it can never discharge.
+Counting such a route as applicable pins exhaustion below 1.0 forever
 for a reason that has nothing to do with any paper. They are excluded from the denominator
 and named in `UNIMPLEMENTED_ROUTES`, so the ceiling is visible rather than absorbed.
 
@@ -88,7 +88,13 @@ UNIMPLEMENTED_ROUTES = (
     # ``synthesized`` probe whose result the provenance ceiling cannot admit.  A route
     # which cannot possibly discharge is advertised, not implemented, for this metric.
     "FOCUSED_VALIDATION_EXPERIMENT",
-    "LITERATURE_SEARCH",
+    # LITERATURE_SEARCH used to be here and no longer is: it has a `PLAN_ACTIONS` member
+    # (`LITERATURE_SEARCH_ONLY`) and an executor (`stages/literature.py`), so it can
+    # discharge. What it discharges is bounded — a verified prior-art concern or a bound
+    # relation — and a search that completed with no match does NOT discharge, which is
+    # `literature.discharge`'s whole job. A route that could be discharged by finding
+    # nothing would be an exhaustion number that rises fastest on the papers nobody
+    # searched properly.
     "NONE",
 )
 
