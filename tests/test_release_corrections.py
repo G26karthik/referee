@@ -116,7 +116,14 @@ def test_a_unit_carries_the_sections_own_index_not_its_position():
         Section(section_idx=2, title="c", text=_B)])
     units = source_units(doc)
     assert len(units) == 2, "an empty section is not a unit"
-    assert [i for i, _ in units] == [0, 2], "the gap is real and must be preserved"
+    assert [i for i, *_rest in units] == [0, 2], "the gap is real and must be preserved"
+    # THREE elements now: the section's own index, its flattened text, and the same text
+    # with the hyphens a line break inserted removed. The third is a SEARCH projection and
+    # never an address coordinate — every `P<i>:<a>-<b>` in this repository indexes the
+    # second — and it exists because 4 of the 5 findings the evidence gate dropped over
+    # the evaluated corpus were correctly-quoted sentences refused for a hyphen the
+    # typesetter put in.
+    assert all(len(unit) == 3 for unit in units), units
 
     # And the address the harness states must be the one a reader can open.
     _, obs = verify_evidence(_B, "p4", units, {})

@@ -3346,6 +3346,107 @@ class PaperAssessment(_Base):
                     "only trustworthy when a reader can see which finding stopped it.")
 
 
+# --------------------------------------------------------------------------- #
+# ⑨ CLAIM LINKS — the one correspondence the paper does not print
+# --------------------------------------------------------------------------- #
+# Measured over the eight-paper corpus, NO deterministic rule connects a paper's headline
+# claims to its numbers, because papers do not write that connection down:
+#
+#     cross-references appearing in any Abstract ................... 0
+#     cross-references appearing in any Conclusion ................. 1
+#     reported numbers resolving into any Abstract ................. 0
+#     numbers printed by headline sentences ....................... 21
+#     of those, occurring in exactly one recovered table cell ...... 0
+#
+# An abstract says "reduces training memory by 40%". It does not say "see Table 3", and
+# 40% is not a cell. The correspondence is SEMANTIC, and every model-free mechanism that
+# tried to recover it fired on nothing: `in_abstract` on 0 of 706 objects under either
+# spelling of its locator, `materiality.basis_for_ref` on 1 of 1,729 addresses, and the
+# deterministic claim graph on 0 of 1,729.
+#
+# So the pairing is PROPOSED by a reader and VERIFIED by the harness, which is the
+# arrangement every other model-supplied fact in this system already has. The proposal is
+# a pair of addresses; the harness re-resolves both, requires the claim side to be in the
+# paper's own summary of itself, and where both sides carry numbers re-derives the
+# relationship between them. Invariant 2 is untouched: nothing below that the harness
+# writes may be read from the reader's file.
+CLAIM_LINK_RELATIONS = (
+    "EQUAL",                    # the claim prints the evidence's value
+    "ROUNDS_TO",                # the claim prints a rounding of it — "40%" for 40.2
+    "NO_NUMBER_IN_CLAIM",       # a qualitative claim; the link is a pointer, not arithmetic
+    "NO_NUMBER_AT_EVIDENCE",    # the evidence is a caption, an equation or prose
+    "MISMATCH",                 # both carry numbers and they disagree — REFUSED
+)
+
+# Why a proposed link was not accepted. Named per link rather than counted, because
+# "the reader proposed twelve and eight held" is only actionable with the four reasons.
+CLAIM_LINK_REFUSALS = (
+    "claim_unresolved",         # the claim quotation is not in the paper, or is ambiguous
+    "claim_not_headline",       # it resolved, and not inside the Abstract or Conclusion
+    "evidence_unresolved",      # the evidence address names nothing in the parsed paper
+    "numeric_mismatch",         # both sides carry a number and the numbers disagree
+    "duplicate",                # the same (claim, evidence) pair proposed twice
+    "self_reference",           # the evidence IS the claim span; a claim cannot cite itself
+)
+
+
+class ClaimLink(_Base):
+    """One proposed correspondence between a headline claim and the evidence behind it.
+
+    THE READER SUPPLIES TWO QUOTATIONS. Everything else on this type is written by the
+    harness, exactly as on `Finding`: the reader says "this sentence rests on that cell",
+    and the harness decides whether both halves exist, whether the claim is really in the
+    paper's summary of itself, and whether the two numbers agree.
+
+    `rationale` is the reader's prose and is never checked. It is kept because a link a
+    human disagrees with is more useful with the reasoning attached than without it, and
+    it reaches no threshold.
+    """
+
+    link_id: str = ""
+    # --- WRITTEN BY THE READER --------------------------------------------------------
+    claim_quote: str = Field(default="", description="verbatim sentence from the Abstract "
+                                                     "or Conclusion")
+    evidence_ref: str = Field(default="", description="T<t>:r<r>:c<c> | F<n> | E<n> | p<N>")
+    evidence_quote: str = Field(default="", description="verbatim text at that address")
+    rationale: str = Field(default="", description="UNVERIFIED: the reader's reason for "
+                                                   "pairing them")
+    # --- WRITTEN BY THE HARNESS -------------------------------------------------------
+    claim_ref: str = Field(default="", description="WRITTEN BY THE HARNESS: the address "
+                                                   "minted for `claim_quote`")
+    claim_section_idx: int = Field(default=-1, description="WRITTEN BY THE HARNESS")
+    accepted: bool = Field(default=False, description="WRITTEN BY THE HARNESS")
+    refusal: str = Field(default="", description="WRITTEN BY THE HARNESS: "
+                                                 + " | ".join(CLAIM_LINK_REFUSALS))
+    numeric_relation: str = Field(default="", description="WRITTEN BY THE HARNESS: "
+                                                          + " | ".join(CLAIM_LINK_RELATIONS))
+    claim_value: float | None = Field(default=None, description="WRITTEN BY THE HARNESS")
+    evidence_value: float | None = Field(default=None, description="WRITTEN BY THE HARNESS")
+    verified_observation: str = Field(
+        default="", description="WRITTEN BY THE HARNESS: what it actually confirmed, in "
+                                "its own words, re-derivable from doc.json by hand")
+
+
+class ClaimLinkSet(_Base):
+    """Every link proposed for one paper, accepted and refused alike.
+
+    The refused ones are kept. A reader that proposed twelve pairings of which four did
+    not resolve is a different reader from one that proposed eight, and a set that
+    silently dropped the failures would make the two indistinguishable — the same reason
+    `load_reports` counts dropped findings rather than discarding them.
+    """
+
+    paper_id: str = ""
+    links: list[ClaimLink] = Field(default_factory=list)
+    proposed: int = 0
+    accepted: int = 0
+    refusals: dict[str, int] = Field(default_factory=dict)
+    notes: str = Field(default="", description="the reader's own account of what it did")
+
+    def accepted_links(self) -> list[ClaimLink]:
+        return [x for x in self.links if x.accepted]
+
+
 PHASES = ("ingest", "audit", "collect", "grade", "assess", "discover", "probe", "report",
           "done")
 

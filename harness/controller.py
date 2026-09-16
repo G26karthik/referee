@@ -38,9 +38,10 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 
-from . import assessment, audit_driver, grade_driver, state
+from . import assessment, audit_driver, claimlink_driver, grade_driver, state
 from .artifacts import (PHASES, CaseState, PaperDoc, PhaseEvent, ProbeResult)
 from .config import Config
 from .stages import audit as audit_stage
@@ -226,6 +227,7 @@ def _phase_audit(cfg: Config, case: CaseState, *, auto_audit: bool = False, **_)
     meta = state.load_meta(cfg, case.paper_id)
     pdf_path = meta.get("paper_path") or ""
     pdf_dir = str(Path(pdf_path).resolve().parent) if pdf_path else ""
+    _claim_links(cfg, case, res.get("claimlink_prompt", ""), pdf_dir)
 
     # ROUNDS, because a long paper's readings have one real dependency: a lens's cross-part
     # synthesis reads that lens's own part outputs, so its prompt does not exist until they
@@ -311,6 +313,48 @@ def _phase_audit(cfg: Config, case: CaseState, *, auto_audit: bool = False, **_)
         "waiting",
         f"{len(case.awaiting)} lens(es) could not be produced in {attempts} attempt(s): {why}",
         detail)
+
+
+def _claim_links(cfg: Config, case: CaseState, prompt_path: str, pdf_dir: str) -> None:
+    """One best-effort claim-link reading per paper. Returns nothing and raises nothing.
+
+    HERE rather than in `discover`, which is where materiality is consumed, because this
+    reading has to be blind to every finding — and the audit phase is the only place in
+    the pipeline where that is structurally true rather than merely intended. `discover`
+    also states, and must keep stating, that it consults no model; it READS the sealed
+    link set later, which is the same relationship `run_report` has with a sealed
+    whole-paper opinion.
+
+    Never blocks and never retries. A closed gate, an unreachable reader, a timeout or a
+    malformed response all leave the paper with no links, which is exactly the state every
+    paper was in before this channel existed: `materiality` falls back to its own
+    structural rule and the decision is unchanged. That is what makes a new model channel
+    on the always-on path an addition rather than a dependency.
+    """
+    if not cfg.allow_claim_links or not prompt_path:
+        return
+    try:
+        text = Path(prompt_path).read_text(encoding="utf-8")
+    except OSError:
+        return
+    sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if claimlink_driver.load(cfg, case.paper_id, prompt_sha256=sha) is not None:
+        return                                   # already sealed against THIS prompt
+    doc_path = state.project_dir(cfg, case.paper_id) / "paper" / "doc.json"
+    if not doc_path.exists():
+        return
+    try:
+        doc = PaperDoc(**state.read_json(doc_path))
+        linkset = claimlink_driver.run(cfg, case.paper_id, doc, text, pdf_dir=pdf_dir)
+    except Exception:                            # noqa: BLE001 — see the docstring
+        return
+    if linkset is None:
+        return
+    state.append_log(
+        cfg, case.paper_id, artifact_type="claim_links", phase="audit",
+        headers={"proposed": linkset.proposed, "accepted": linkset.accepted,
+                 "refusals": linkset.refusals},
+        path=str(state.project_dir(cfg, case.paper_id) / "links"))
 
 
 def _phase_collect(cfg: Config, case: CaseState, **_) -> PhaseOutcome:

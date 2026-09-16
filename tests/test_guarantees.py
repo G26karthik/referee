@@ -672,7 +672,18 @@ INVARIANT_DISPOSITION: dict[int, str] = {
         "construction of the key, so a review cannot fail to apply it. What a review "
         "reports instead is LensReport.merged_duplicates — the count of concerns actually "
         "folded — which is a measurement and not a promise",
-    31: "not reportable here: a batch's paper count is checked by harness/preflight.py "
+    31: "not reportable as a guarantee: that a reader cannot certify its own claim link "
+        "is enforced by field stripping at the driver boundary and by overwriting at the "
+        "verifier, so a review cannot fail to apply it. What a review reports instead is "
+        "the link set itself — proposed, accepted, and the refusals by reason — which is a "
+        "measurement. EVERY_EVIDENCE_POINTER_RE_VERIFIED covers the findings channel and "
+        "deliberately does not reach here: a link is a dependency, not a finding",
+    32: "not reportable as a guarantee: whether a quotation was refused for a hyphen a "
+        "line break inserted is a property of one comparison inside verify_evidence, not "
+        "of a run. What a review reports is the dropped-finding count, which this changed "
+        "from 5 to 2 over the evaluated corpus, and the per-finding observation, which "
+        "says in its own words when a match was recovered rather than verbatim",
+    33: "not reportable here: a batch's paper count is checked by harness/preflight.py "
         "BEFORE the pipeline runs, and this artifact is per paper and per run. A "
         "preflight refusal means no review exists to carry a guarantee",
 }

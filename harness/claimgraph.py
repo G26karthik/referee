@@ -51,6 +51,20 @@ shortest path from a HEADLINE claim to that address, or None. A path is an EXPLA
 boolean could never give a referee, and the thing that makes the answer arguable rather
 than merely asserted.
 
+**The one edge the paper does not print.** Measured over the eight-paper corpus, the
+deterministic edges above establish a headline dependency for 0 of 1,729 addresses, and
+that is not a defect of this module: there are zero cross-references in any Abstract and
+one in any Conclusion, and none of the twenty-one numbers headline sentences print occurs
+in exactly one recovered cell. An abstract says "reduces memory by 40%", Table 3 says
+`40.2`, and nothing in the document says those are the same claim.
+
+So `SUPPORTED_BY` comes from `harness/claimlink.py`: a reader PROPOSES the pairing and the
+harness verifies both halves — the claim quotation must mint to an address inside the
+Abstract or Conclusion, the evidence address must resolve against the quotation given for
+it, and where both carry a number the arithmetic is re-derived. `build(doc)` with no links
+produces exactly the graph it produced before that channel existed, which is what makes
+the channel safe to have: it can only ADD a dependency, never remove or alter one.
+
 **This module changes no decision.** `materiality.basis_for_ref` and
 `discovery._centrality` are untouched, and `compare_with_existing` exists so the delta can
 be measured on every paper before anything is rewired. A decision rule replaced without
@@ -69,7 +83,7 @@ from .artifacts import PaperDoc
 CLAIM_KINDS = ("HEADLINE", "SUPPORTING")
 RESULT_KINDS = ("TABLE_CELL", "REPORTED_QUANTITY", "TABLE", "FIGURE", "EQUATION",
                 "COMPARISON")
-EDGE_KINDS = ("STATES", "CITES", "IN_TABLE", "MEASURED_BY", "MEASURES")
+EDGE_KINDS = ("STATES", "CITES", "IN_TABLE", "MEASURED_BY", "MEASURES", "SUPPORTED_BY")
 
 # How far a HEADLINE claim's dependency may reach. Four is what the longest real chain
 # needs: a headline cites Table 3 (1), the cell is in Table 3 (2), that cell belongs to a
@@ -347,8 +361,19 @@ def _object_for_citation(doc: PaperDoc, kind: str, number: str) -> str:
     return ""
 
 
-def build(doc: PaperDoc) -> ClaimGraph:
-    """The graph. A `PaperDoc` and nothing else.
+def build(doc: PaperDoc, links=None) -> ClaimGraph:
+    """The graph. A `PaperDoc`, and optionally the VERIFIED claim links for it.
+
+    `links` is a `ClaimLinkSet` or a list of `ClaimLink`, and only its ACCEPTED members
+    are read — a refused pairing is a record of what a reader proposed, not a dependency.
+    Passing none produces exactly the graph this function produced before the claim-link
+    channel existed, which is the property that makes an optional model channel safe: the
+    deterministic graph is the floor and links can only add to it.
+
+    Still a `PaperDoc` and nothing about the review. A `ClaimLinkSet` carries no finding,
+    no severity and no outcome — it is a set of address pairs the harness has already
+    checked against this same document — so the guarantee in the module docstring is
+    unchanged, and the self-check asserts it over the source.
 
     Claim nodes come from two deterministic sources and no others: the verbatim span each
     reported number was printed in, and the citing sentence each cross-reference was found
@@ -421,6 +446,34 @@ def build(doc: PaperDoc) -> ClaimGraph:
                     edges.append(Edge("CITES", node.claim_id, target,
                                       f"that sentence cites {kind} {number} ({target})"))
 
+    # SUPPORTED_BY — the edge the document does not print, proposed and verified.
+    #
+    # The claim node is minted from the LINK's own address rather than matched against a
+    # sentence span, because the two need not coincide: a reader may quote a clause, and
+    # the splitter may have cut at an abbreviation. Both are addresses into the same
+    # section and both resolve; insisting they be the same span would discard a verified
+    # dependency over a disagreement about where a sentence ends.
+    for link in _accepted_links(links):
+        target = link.evidence_ref if link.evidence_ref in results else \
+            by_address.get(link.evidence_ref)
+        if target is None:
+            # A verified evidence address the deterministic pass did not enumerate — a
+            # prose quantity, most often. It is a real unit of the paper and the harness
+            # has already resolved it, so it joins the graph rather than being dropped.
+            target = link.evidence_ref
+            results[target] = ResultNode(
+                result_id=target, kind="REPORTED_QUANTITY", address=target, label="",
+                value=link.evidence_value, metric="", benchmark="", method="")
+            by_address.setdefault(target, target)
+        claim_nodes.setdefault(link.claim_ref, ClaimNode(
+            claim_id=link.claim_ref,
+            kind=_claim_kind(link.claim_section_idx, abstract_idx, conclusion_idx),
+            address=link.claim_ref, section_idx=link.claim_section_idx,
+            page=page_of.get(link.claim_section_idx, 0), text=link.claim_quote))
+        edges.append(Edge("SUPPORTED_BY", link.claim_ref, target,
+                          f"a reader paired that claim with {target}, and the harness "
+                          f"verified both halves ({link.numeric_relation})"))
+
     # IN_TABLE — a cell belongs to its table, so citing the table reaches the cell.
     for result in list(results.values()):
         if result.kind != "TABLE_CELL":
@@ -471,6 +524,21 @@ def build(doc: PaperDoc) -> ClaimGraph:
 # --------------------------------------------------------------------------- #
 # Asking it questions
 # --------------------------------------------------------------------------- #
+def _accepted_links(links) -> list:
+    """The accepted members of a `ClaimLinkSet`, a plain list, or nothing.
+
+    Accepted only. A refused pairing is a record of what a reader proposed and of why the
+    harness would not take it; treating it as a dependency would be treating the proposal
+    as the verification, which is the whole distinction this channel rests on.
+    """
+    if links is None:
+        return []
+    rows = getattr(links, "links", links)
+    return [x for x in (rows or [])
+            if getattr(x, "accepted", False) and getattr(x, "claim_ref", "")
+            and getattr(x, "evidence_ref", "")]
+
+
 def _adjacency(graph: ClaimGraph) -> dict:
     out: dict[str, list] = {}
     for edge in graph.edges:
@@ -573,7 +641,8 @@ class Delta(NamedTuple):
         return self.agree / self.addresses if self.addresses else None
 
 
-def compare_with_existing(doc: PaperDoc, graph: ClaimGraph | None = None) -> Delta:
+def compare_with_existing(doc: PaperDoc, graph: ClaimGraph | None = None,
+                          links=None) -> Delta:
     """The graph's centrality against `materiality.basis_for_ref`, address by address.
 
     Compared against MATERIALITY rather than against `discovery._centrality`, deliberately.
@@ -583,7 +652,7 @@ def compare_with_existing(doc: PaperDoc, graph: ClaimGraph | None = None) -> Del
     structural answer to the same question this module asks, and it is the rule that
     actually gates a paper-level failure.
     """
-    graph = graph if graph is not None else build(doc)
+    graph = graph if graph is not None else build(doc, links)
     agree, graph_only, rule_only = 0, [], []
     graph_counts = {"CENTRAL": 0, "SUPPORTING": 0, "PERIPHERAL": 0}
     rule_counts = {"material": 0, "none": 0}
@@ -704,7 +773,28 @@ if __name__ == "__main__":       # self-check: python -m harness.claimgraph [pap
     for forbidden in ("Finding", "TargetSet", "DiscoveredObject", "TargetOutcome",
                       "LensReport", "Grade"):
         assert f"import {forbidden}" not in src and f", {forbidden}" not in src, forbidden
-    assert list(inspect.signature(build).parameters) == ["doc"]
+    # `links` is the ONLY thing this module accepts besides the document, and a
+    # `ClaimLinkSet` is a set of address pairs the harness has already checked against
+    # this same document — no finding, no severity, no outcome. The guarantee the
+    # docstring makes is that nothing about the REVIEW can reach the denominator, and it
+    # still holds.
+    assert list(inspect.signature(build).parameters) == ["doc", "links"]
+
+    # WITH NO LINKS the graph is exactly what it was before the channel existed.
+    assert build(doc).counts() == build(doc, None).counts()
+    assert build(doc, []).counts() == build(doc).counts()
+    assert all(e.kind != "SUPPORTED_BY" for e in build(doc).edges)
+
+    # A verified link adds the edge the document does not print, and a REFUSED one does
+    # not — the distinction the whole channel rests on.
+    from .artifacts import ClaimLink
+    accepted = ClaimLink(link_id="L1", claim_quote="x", claim_ref="P1:0-45",
+                         claim_section_idx=1, evidence_ref="T1:r1:c1",
+                         accepted=True, numeric_relation="EQUAL")
+    refused = accepted.model_copy(update={"accepted": False, "refusal": "numeric_mismatch"})
+    linked = build(doc, [accepted])
+    assert any(e.kind == "SUPPORTED_BY" for e in linked.edges)
+    assert build(doc, [refused]).counts() == build(doc).counts()
 
     # An address the graph does not hold answers None rather than guessing.
     assert dependency(g, "T9:r9:c9") is None

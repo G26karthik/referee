@@ -205,6 +205,24 @@ class Config:
     # this run could not cover everything, exactly as the audit lenses already work.
     require_grades: bool = field(default_factory=lambda: _flag("SH_REQUIRE_GRADES"))
 
+    # --- claim links ------------------------------------------------------------------
+    # The one correspondence a paper does not print: which number a headline claim rests
+    # on. OFF by default, and the default is load-bearing rather than cautious. With the
+    # gate closed no link is ever established, `claimgraph` has no SUPPORTED_BY edges, and
+    # `materiality` falls back to its own structural rule — which is exactly the state the
+    # harness was in before this channel existed. So turning it off reproduces the
+    # pre-claim-link decision bit for bit, the same property `allow_grading` has and for
+    # the same reason: a model channel that could only be assessed by running it is a
+    # channel nobody can turn off to see what it did.
+    allow_claim_links: bool = field(default_factory=lambda: _flag("SH_ALLOW_CLAIM_LINKS"))
+    claimlink_cmd: str = field(default_factory=lambda: os.environ.get("SH_CLAIMLINK_CMD", ""))
+    # Same reasoning as `grade_model` and `verdict_model`: empty means the role's declared
+    # default in `harness.prompts.claimlink.ROLE_SPEC`, never the CLI's ambient default.
+    claimlink_model: str = field(
+        default_factory=lambda: (os.environ.get("SH_CLAIMLINK_MODEL") or "").strip())
+    claimlink_timeout_s: int = field(
+        default_factory=lambda: int(os.environ.get("SH_CLAIMLINK_TIMEOUT", "600")))
+
     # --- the substantive verdict -----------------------------------------------------
     # A single, best-effort, never-retried, whole-paper opinion — see
     # `harness/prompts/verdict.py`. OFF by default: a third external process an operator

@@ -48,12 +48,14 @@ import hashlib
 import re
 import time
 
-from .. import audit_driver, delegation, grading, pdf, reading, state, taxonomy
+from .. import (audit_driver, delegation, grading, materiality, pdf, reading, state,
+                taxonomy)
 from ..artifacts import (BASELINE_CLASSES, CANDIDATE_CLASSES, CONFIDENCES, DISCREPANCY_TYPES,
                          EVIDENCE_ORIGINS, PRIOR_ART_BASES, SEVERITIES, Equation,
                          EvidencePointer, Figure, Finding, LensReport, PaperDoc)
 from ..config import Config
 from ..prompts import audit as P
+from ..prompts import claimlink as CLP
 
 LENSES = tuple(P.LENSES)
 # THE DEFAULT, not the live value. `SH_AUDIT_BUDGET_CHARS` is read by `budget_chars()`
@@ -139,7 +141,7 @@ def _oneline(s: str, n: int) -> str:
     return " ".join((s or "").split())[:n]
 
 
-def source_units(doc: PaperDoc) -> tuple[tuple[int, str], ...]:
+def source_units(doc: PaperDoc) -> tuple[tuple[int, str, str], ...]:
     """The paper as SEPARATE searchable units, one per section. Never one string.
 
     A quote is verified against each unit independently. Concatenating the sections into
@@ -156,11 +158,28 @@ def source_units(doc: PaperDoc) -> tuple[tuple[int, str], ...]:
     the parser produced and the unit a reader can open; whitespace normalisation still
     happens, inside a unit, where it cannot invent adjacency.
     """
-    return tuple((s.section_idx, _flat(s.text))
-                 for s in doc.sections if (s.text or "").strip())
+    from ..claims import flatten, soft_hyphen_projection
+    out = []
+    for section in doc.sections:
+        if not (section.text or "").strip():
+            continue
+        flat, offsets = flatten(section.text)
+        # A THIRD ELEMENT, and it is the same text with the TYPESETTER'S hyphens gone.
+        # A line break inside "generation" leaves "gener-" and "ation" in the PDF, which
+        # flattens to `gener-ation`; a reader quoting the sentence writes `generation` and
+        # the evidence gate refuses a correctly-quoted sentence. Measured over the
+        # evaluated corpus, 4 of the 5 findings that gate drops are exactly this — 80% of
+        # every drop in the corpus is punctuation the typesetter inserted.
+        #
+        # Note `_flat(section.text)` and `flatten(section.text)[0]` are the same string:
+        # one lowercases and strips whitespace in this module, the other in `claims`. The
+        # projection needs the offsets, which only `claims.flatten` returns.
+        projected, _index = soft_hyphen_projection(flat, offsets, section.text)
+        out.append((section.section_idx, flat, projected))
+    return tuple(out)
 
 
-def _units(corpus) -> tuple[tuple[int, str], ...]:
+def _units(corpus) -> tuple[tuple[int, str, str], ...]:
     """Accept the unit tuple, or a single pre-flattened string as one anonymous unit.
 
     Each unit carries the section's OWN `section_idx`, not its position in this tuple.
@@ -171,7 +190,13 @@ def _units(corpus) -> tuple[tuple[int, str], ...]:
     Replacing one false machine attestation with another is not a fix, so the index is
     carried with the text rather than inferred from the ordering.
     """
-    return ((-1, corpus),) if isinstance(corpus, str) else tuple(corpus)
+    if isinstance(corpus, str):
+        return ((-1, corpus, corpus),)
+    # Padded rather than required: `verify_evidence` is called directly from many tests
+    # with two-element units and with a bare string, and a unit that carries no separate
+    # de-hyphenated projection is its own projection — which is exactly right for text
+    # that was never line-broken.
+    return tuple(u if len(u) >= 3 else (u[0], u[1], u[1]) for u in corpus)
 
 
 def render_numbers(doc: PaperDoc) -> str:
@@ -481,12 +506,36 @@ def accept_lens(cfg: Config, pid: str, lens: str, raw: str, *,
     return record
 
 
+def claimlink_prompt(doc: PaperDoc) -> str:
+    """The claim-link reading's prompt, rendered here beside the lens prompts.
+
+    Rendered unconditionally, gate open or shut, exactly as `audit/prompts/<lens>.md` is:
+    a prompt on disk is what makes the manual channel possible on a host where no CLI is
+    reachable, and `claimlink_driver.accept` is the door it goes back in through.
+
+    Shown the Abstract and the Conclusion in full and the paper's addressable evidence,
+    and NOT the body prose — see `prompts.claimlink.build` for why that is a bound on the
+    task rather than a saving.
+    """
+    ctx = context(doc)
+    by_idx = {sec.section_idx: sec for sec in doc.sections}
+    abstract_idx = materiality.abstract_section_idx(doc)
+    conclusion_idx = materiality.conclusion_section_idx(doc)
+    return CLP.build(
+        title=doc.title,
+        abstract_text=(by_idx[abstract_idx].text if abstract_idx in by_idx else ""),
+        conclusion_text=(by_idx[conclusion_idx].text if conclusion_idx in by_idx else ""),
+        tables_text=ctx["tables_text"], figures_text=ctx["figures_text"],
+        equations_text=ctx["equations_text"], numbers_text=ctx["numbers_text"],
+        pdf_path=ctx["pdf_path"])
+
+
 def _locate(quote: str, corpus) -> int | None:
     """Which parsed section contains this quote, or None. Used only to LABEL a candidate."""
     q = _flat(quote)
     if not q:
         return None
-    return next((idx for idx, unit in _units(corpus) if q in unit), None)
+    return next((idx for idx, unit, _proj in _units(corpus) if q in unit), None)
 
 
 def synthesis_inputs(doc: PaperDoc, lens: str,
@@ -805,6 +854,13 @@ def run_audit(cfg: Config, pid: str, lenses: tuple[str, ...] = LENSES) -> dict:
         _write_manifest(unit, pid=pid, part=part, anchor=plan.anchor, prompt_text=body,
                         budget=budget_chars(), inputs=inputs)
 
+    # The claim-link prompt, beside the lens prompts and on the same terms: written every
+    # run, never edited by hand, and the only way a host with no reachable CLI can supply
+    # the one correspondence the paper does not print.
+    link_prompt = root / "links" / "prompt.md"
+    link_prompt.parent.mkdir(parents=True, exist_ok=True)
+    link_prompt.write_text(pdf.sanitise_controls(claimlink_prompt(doc)), encoding="utf-8")
+
     done = [u.unit_id for u in units if unit_is_accepted(u)[0]]
     todo = [u.unit_id for u in units if u.unit_id not in done and u.unit_id in written]
 
@@ -838,6 +894,7 @@ def run_audit(cfg: Config, pid: str, lenses: tuple[str, ...] = LENSES) -> dict:
                    "out": str(u.out_path)} for u in units],
         "awaiting": todo, "deferred": deferred, "complete": done,
         "lenses_complete": [ln for ln in lenses if lens_is_accepted(root, ln)[0]],
+        "claimlink_prompt": str(link_prompt),
         "composed": composed, "parts": cov.parts,
         "reader_visible_fraction": cov.part_local_fraction,
         "next": (f"Read each prompt in audit/prompts/, perform that reading, and return "
@@ -972,12 +1029,36 @@ def verify_evidence(quote: str, ref: str, corpus: str | Sequence[tuple[int, str]
     if len(q) < _QUOTE_MIN:
         return "unverified", ""
     # WITHIN ONE SECTION. A quote spanning two sections is not in the paper.
-    hit = next((idx for idx, unit in _units(corpus) if q in unit), None)
+    units = _units(corpus)
+    hit = next((idx for idx, unit, _proj in units if q in unit), None)
+    dehyphenated = False
+    if hit is None:
+        # THE TYPESETTER'S HYPHEN, and only after the exact search has failed. A quote
+        # that matches the paper character for character is never resolved through a
+        # normalisation; this recovers the one that differs only by a hyphen a line break
+        # inserted, which over the evaluated corpus is 4 of the 5 findings this gate drops.
+        # The observation below says so, because "occurs verbatim" would then be a false
+        # machine attestation — the exact defect `source_units` itself was written to stop.
+        from ..claims import _self_projection, soft_hyphen_projection
+        probe = soft_hyphen_projection(*_self_projection(q))[0]
+        if len(probe) >= _QUOTE_MIN:
+            hit = next((idx for idx, _unit, proj in units if probe in proj), None)
+            dehyphenated = hit is not None
     if hit is None:
         return "unverified", ""
     where = f"section_idx {hit}" if hit >= 0 else "the parsed section text"
+    # "VERBATIM" IS DROPPED WHEN IT WOULD BE FALSE, and only then. An exact match is
+    # verbatim and says so; a match recovered by removing a line break's hyphen is not,
+    # and claiming it were would be a false machine attestation of exactly the kind
+    # `source_units` itself exists to prevent.
+    how = ("occurs verbatim inside" if not dehyphenated else
+           "occurs inside")
+    note = ("" if not dehyphenated else
+            " — matched after removing the hyphens a line break inserted into the PDF, so "
+            "the quotation differs from the extracted characters only by that hyphenation "
+            "and is NOT a character-for-character match")
     return "prose_verified", (
-        f"The quoted text occurs verbatim inside a single parsed section ({where}); the lens "
+        f"The quoted text {how} a single parsed section ({where}){note}; the lens "
         f"cited {ref}, which is NOT checked — only the section containing the quote is. "
         f"Verified as a substring of one section, not across sections and not as a page.")
 

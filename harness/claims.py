@@ -95,6 +95,42 @@ def flatten(text: str) -> tuple[str, list[int]]:
     return "".join(flat_chars), offsets
 
 
+def soft_hyphen_projection(flat: str, offsets: list[int],
+                           original: str) -> tuple[str, list[int]]:
+    """(text with LINE-BREAK hyphens removed, index of each kept char in `flat`).
+
+    THE DEFECT THIS CLOSES, measured. A typesetter breaking "generation" across a line
+    leaves "gener-" and "ation" in the PDF, and `flatten` — which removes whitespace and
+    keeps punctuation — turns that into `gener-ation`. A reader quoting the sentence the
+    way any human reads it writes `generation`, and the harness refuses the quotation as
+    not present in the paper. Measured on one real abstract (`cvpr`), that refused 8 of
+    11 correctly-quoted sentences.
+
+    A SOFT HYPHEN IS DECIDABLE, and only from the original text. In the flattened text a
+    line-break hyphen and a real compound hyphen are the same character; in the original,
+    a line-break hyphen is the one immediately FOLLOWED BY WHITESPACE. So this projection
+    drops exactly those and keeps `diverse-weather` intact.
+
+    `flatten` itself is deliberately NOT changed. Every `P<i>:<a>-<b>` address in this
+    repository is a pair of offsets into its output, so changing it would silently move
+    every stored reference — the `extraction_version` problem, caused rather than avoided.
+    This is a second projection used for SEARCHING, and the offsets it returns are indices
+    back into `flat`, so an address minted through it is in the same coordinate system as
+    every address minted before it.
+    """
+    kept_chars: list[str] = []
+    kept_index: list[int] = []
+    for i, ch in enumerate(flat):
+        if ch == "-":
+            at = offsets[i]
+            nxt = original[at + 1] if at + 1 < len(original) else ""
+            if nxt and nxt.isspace():
+                continue                          # a hyphen the line break inserted
+        kept_chars.append(ch)
+        kept_index.append(i)
+    return "".join(kept_chars), kept_index
+
+
 def section_units(doc: PaperDoc) -> list[tuple[int, str, list[int], str, int]]:
     """(section_idx, flat, offsets, original_text, page) per non-empty section."""
     out = []
@@ -392,6 +428,18 @@ def resolve(doc: PaperDoc, ref: str, quote: str = "") -> ClaimRef:
     return _unresolved(ref, "", "malformed", f"{ref!r} is not an address in any known form")
 
 
+def _self_projection(flat_quote: str) -> tuple[str, list[int], str]:
+    """A quote as its own (flat, offsets, original), so the same projection applies to it.
+
+    The quote has already been flattened, so its "original" is itself and its offsets are
+    the identity — which means a hyphen inside it is never followed by whitespace and none
+    are dropped. That is correct: the READER wrote the quote as continuous text, so any
+    hyphen it contains is one the reader meant. The projection is applied to it anyway so
+    the two sides go through one function rather than two rules.
+    """
+    return flat_quote, list(range(len(flat_quote))), flat_quote
+
+
 def mint(doc: PaperDoc, quote: str) -> ClaimRef:
     """Find `quote` in the paper and mint the address for it. The harness's half.
 
@@ -422,7 +470,8 @@ def mint(doc: PaperDoc, quote: str) -> ClaimRef:
         return _unresolved("", "table_cell", "ambiguous",
                            f"the quote is the whole contents of {len(hits)} different cells")
 
-    for section_idx, flat, offsets, original, page in section_units(doc):
+    units = section_units(doc)
+    for section_idx, flat, offsets, original, page in units:
         start = flat.find(flat_quote)
         while start != -1:
             end = start + len(flat_quote)
@@ -436,6 +485,31 @@ def mint(doc: PaperDoc, quote: str) -> ClaimRef:
                 break
         if len(hits) > 1:
             break
+
+    if not hits:
+        # THE LINE-BREAK HYPHEN, and only then. Tried second rather than first so a quote
+        # that matches the paper exactly is never resolved through a normalisation, and so
+        # the cheap search stays the common path. The address that comes back is in `flat`
+        # coordinates like every other, because `soft_hyphen_projection` returns indices
+        # into `flat` rather than into its own output.
+        for section_idx, flat, offsets, original, page in units:
+            projected, index = soft_hyphen_projection(flat, offsets, original)
+            probe, _ = soft_hyphen_projection(*_self_projection(flat_quote))
+            if len(probe) < _QUOTE_MIN:
+                continue
+            start = projected.find(probe)
+            while start != -1:
+                a, b = index[start], index[start + len(probe) - 1] + 1
+                text = _verbatim(original, offsets, a, b)
+                hits.append(ClaimRef(ref=f"P{section_idx}:{a}-{b}", kind="prose_claim",
+                                     quote=text, section_idx=section_idx, span=(a, b),
+                                     page=page, resolution="resolved",
+                                     quantity=parse_quantity(text)))
+                start = projected.find(probe, start + 1)
+                if len(hits) > 1:
+                    break
+            if len(hits) > 1:
+                break
 
     if len(hits) == 1:
         return hits[0]

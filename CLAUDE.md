@@ -161,6 +161,7 @@ reviewer actually asks get separated:
 
 | question | module | what it may read |
 |---|---|---|
+| what does the paper's own summary rest on? | `claimlink.py` + `claimgraph.py` | the parsed doc, and address pairs a reader proposed which this harness has already verified |
 | where does the paper say this? | `claims.py` | the parsed doc — a lens supplies a quote, the harness mints the address |
 | what would settle this concern? | `questions.py` | a finding's own closed-vocabulary self-classification |
 | what KIND of problem is this? | `taxonomy.py` | the same closed vocabulary; never a number, a name or a paper |
@@ -459,7 +460,34 @@ Do not weaken these to make more papers executable or more findings reportable.
     synthesis is asked to fold. The key errs toward the second. Over the evaluated corpus
     it now merges 0 of 227 findings, which is correct: each lens there read once.
 
-31. **A batch's paper count is checked before it is spent.** `harness/preflight.py`
+31. **A proposed claim link is two quotations, and the harness writes everything else.**
+    `harness/claimlink.py` re-mints the claim quotation, requires it to resolve inside the
+    Abstract or the Conclusion, re-resolves the evidence address against the quotation
+    given for it, and re-derives the arithmetic. `accepted`, `refusal`,
+    `numeric_relation`, `claim_ref` and `verified_observation` are stripped at the driver
+    boundary and overwritten at the verifier, so a reader cannot certify its own pairing
+    any more than a lens can certify its own evidence (invariant 2, on a new channel). A
+    numeric disagreement is REFUSED rather than reported: this channel has no grader, no
+    evidence ceiling and no severity cap, and cannot tell a real inconsistency from a
+    reader citing the wrong cell. An accepted link establishes a DEPENDENCY and never a
+    truth, and the observation says so in those words.
+
+32. **A hyphen a line break inserted is not a difference in the quotation.** A PDF
+    breaking "generation" across lines leaves `gener-` and `ation`, which flattens to
+    `gener-ation`; a reader quoting the sentence writes `generation`, and the evidence gate
+    refused a correctly-quoted sentence. Measured over the evaluated corpus, **4 of the 5
+    findings that gate dropped were exactly this** — 80% of every drop was punctuation the
+    typesetter inserted — and 8 of 11 correctly-quoted abstract sentences were refused on
+    the one paper the claim-link reader was first run against. `claims.soft_hyphen_projection`
+    removes only hyphens that the ORIGINAL text shows were followed by whitespace, so
+    `diverse-weather` survives and `gener-ation` does not. Three rules keep it honest: the
+    exact search runs FIRST, so a character-for-character quotation is never resolved
+    through a normalisation; `claims.flatten` is unchanged, so every `P<i>:<a>-<b>` address
+    in the repository still means what it meant; and the machine-written observation drops
+    the word "verbatim" and says the match was recovered, because claiming verbatim there
+    would be the false attestation `source_units` itself exists to prevent.
+
+33. **A batch's paper count is checked before it is spent.** `harness/preflight.py`
     answers, per requested file, which `paper_id` it will get, whether that id already
     holds a DIFFERENT document, and whether another requested file is the SAME document —
     all from the PDF's bytes. Two different papers that slugify identically are fine and
@@ -553,6 +581,57 @@ are traversed in bounded parts without exposing one part's model findings to the
 a final lens-local synthesis combines only quotation-grounded observations from that lens
 to recover cross-section relationships.*
 
+## The one correspondence a paper does not print
+
+**A referee's first question about a number is "does the conclusion depend on this?", and
+until now nothing here could answer it.** Every model-free mechanism fired on almost
+nothing, measured over the eight-paper corpus:
+
+| mechanism | hits |
+|---|---|
+| `discovery._centrality`'s `in_abstract`, legacy locator | 0 / 706 objects |
+| `discovery._centrality`'s `in_abstract`, corrected locator | 0 / 706 objects |
+| `materiality.basis_for_ref` | 1 / 1,729 addresses |
+| `claimgraph`'s deterministic headline dependency | 0 / 1,729 addresses |
+| value-matching a headline number to a unique cell | 0 / 21 numbers |
+
+The reason is not extraction quality. **There are zero cross-references in any Abstract of
+any of the eight papers and one in any Conclusion.** An abstract states a result in prose —
+"reduces training memory by 40%" — and does not write "see Table 3"; the number it prints
+is a rounding, a rename, or a delta that appears in no cell. The correspondence is
+SEMANTIC and the document does not state it, so no amount of parsing recovers it and
+adding a fifth heuristic weight to `_centrality` would move a number without making it
+mean anything.
+
+**So a reader proposes the pairing and the harness verifies it** — the arrangement every
+other model-supplied fact in this system already has. `harness/claimlink.py` re-mints the
+claim quotation, requires it to land in the Abstract or the Conclusion, re-resolves the
+evidence address against the quotation given for it, and where both sides carry a number
+re-derives the relationship to the claim's own printed precision. A pairing whose halves do
+not both hold is refused, counted, and kept on disk. `harness/claimgraph.py` turns the
+accepted ones into `SUPPORTED_BY` edges, and `dependency()` answers with a PATH — "the
+abstract states 91.4; that number is one arm of the accuracy-on-CIFAR-100 comparison; the
+baseline is the other arm" — which a boolean never could.
+
+**Three things this channel may not become.**
+
+  * *A second contradiction lens.* A claim and a cell whose numbers disagree may be a real
+    inconsistency or a reader citing the wrong cell, and nothing here can tell them apart.
+    The link is REFUSED. Raising a contradiction belongs to a lens, under quotation
+    verification, an evidence ceiling and independent grading; minting one here would
+    reach a reader with none of those.
+  * *A source of truth.* An accepted link says the paper's summary DEPENDS on an address.
+    It says nothing about whether the claim is correct, and the machine-written
+    observation says so in those words.
+  * *A dependency.* With `SH_ALLOW_CLAIM_LINKS` closed no link is ever established, the
+    graph has no `SUPPORTED_BY` edges, `materiality` falls back to its own structural
+    rule, and the decision is bit-identical to what it was before this channel existed —
+    the same property `allow_grading` has and for the same reason.
+
+`claimgraph` is **wired into no decision.** `materiality.basis_for_ref` and
+`discovery._centrality` are untouched; `claimgraph.compare_with_existing` measures the
+delta so a rule is never replaced before the replacement has been measured on every paper.
+
 ## Execution gates
 
 | gate | env var | default | permits |
@@ -562,6 +641,7 @@ to recover cross-section relationships.*
 | auto-audit | `SH_ALLOW_AUTO_AUDIT` | off | shelling out to a reviewer for the lenses |
 | grading | `SH_ALLOW_GRADING` | off | a second, blinded reviewer per FATAL/MAJOR finding — zero tools, no filesystem access at all (`grade_driver.py`) |
 | substantive verdict | `SH_ALLOW_SUBSTANTIVE_VERDICT` | off | one best-effort, never-retried, whole-paper opinion — printed, consumed by no threshold (`verdict_driver.py`) |
+| claim links | `SH_ALLOW_CLAIM_LINKS` | off | one best-effort reading per paper pairing each headline claim with the evidence it rests on; both halves verified here (`claimlink_driver.py`) |
 | install | `SH_ALLOW_INSTALL` | off | building `runs/<pid>/env` from the repo's requirements |
 | sandbox | `SH_ALLOW_SANDBOX` | off | **leasing a remote Linux machine** and staging the audited commit into it (`harness/sandbox.py`) |
 | execute | `SH_ALLOW_REPO_EXEC` | off | running the repository's own entrypoint |
