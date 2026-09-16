@@ -42,13 +42,14 @@ from pathlib import Path
 
 from . import artifact as artifact_stage
 from . import literature as literature_stage
-from .. import (backends, claims, code_audit, comparison as comparison_mod,
+from . import validation as validation_stage
+from .. import (backends, claimgraph, claims, code_audit, comparison as comparison_mod,
                 exhaustion, experiment_id, materiality, planner, probe_synth,
                 provenance as provenance_mod, reimplement, reimplement_driver,
                 repo as repo_mod, resources as resources_mod, state)
-from ..artifacts import (CodeAudit, DiscoveredObject, Finding, PaperDoc, PlanDecision,
-                         ProbeResult, ProbeSpec, ReimplementationReadiness,
-                         RepoAcquisition, TargetOutcome)
+from ..artifacts import (CodeAudit, DiscoveredObject, Finding, FocusedValidation,
+                         PaperDoc, PlanDecision, ProbeResult, ProbeSpec,
+                         ReimplementationReadiness, RepoAcquisition, TargetOutcome)
 from ..config import Config
 from ..local_exec import run_probe as _run
 from . import audit as audit_stage
@@ -911,7 +912,25 @@ def _superseded_by_established_failure(obj, plan, stopper) -> TargetOutcome:
                 f"and was not attempted"))
 
 
-def establish_comparison(spec: ProbeSpec, route: str) -> ProbeSpec:
+def _graph_for(doc: PaperDoc, pairs: list) -> object | None:
+    """The claim graph, built ONCE and only when a focused validation needs it.
+
+    `claimgraph.build` parses the whole document; a paper with no target on this route
+    must not pay for it. Reused rather than rebuilt inside the design layer, so the
+    COMPARISON nodes a focused validation acts on are the same ones the claim-link channel
+    and `dependency()` read — a second inventory of the paper's own contrasts would be
+    free to disagree with the first.
+    """
+    if not any(plan.action == validation_stage.ACTION for _obj, plan in pairs):
+        return None
+    try:
+        return claimgraph.build(doc)
+    except Exception:                             # noqa: BLE001 — a graph is an optimisation
+        return None
+
+
+def establish_comparison(spec: ProbeSpec, route: str, *,
+                         settlement_declared: bool = False) -> ProbeSpec:
     """Record what this spec's result would be held against, from the ROUTE it took.
 
     Derived rather than assumed, which is the whole of the correction: every execution in
@@ -922,6 +941,13 @@ def establish_comparison(spec: ProbeSpec, route: str) -> ProbeSpec:
     and the paper printed neither, so reconciling either against a cell answers a question
     nobody asked.
 
+    `settlement_declared` is the second half of what a between-arms comparison needs and
+    is written by `stages.validation.prepare`, never by this function: two arms with no
+    rule declared for them BEFORE the run is a comparison with nothing to settle it
+    against, and a rule chosen once both numbers are in settles whatever its author
+    wanted. A caller that does not pass it gets the pre-focused-validation behaviour,
+    which is what keeps every other route and every fixture unchanged.
+
     Attached to the spec whether or not it is established, for the same reason capability
     and identity are: "we could not have compared it either" is more useful to a reader
     than leaving the question unanswered.
@@ -929,7 +955,8 @@ def establish_comparison(spec: ProbeSpec, route: str) -> ProbeSpec:
     spec.comparison = comparison_mod.derive(
         route,
         printed_value_available=bool((spec.claimed_cell_value or "").strip()),
-        arms_specified=len(spec.arms or []))
+        arms_specified=len(spec.arms or []),
+        settlement_declared=bool(settlement_declared))
     return spec
 
 
@@ -1186,10 +1213,25 @@ def _review(cfg: Config, pid: str) -> dict:
     # execution planning so the authors' own entrypoint still wins when it is available.
     spec = synthesize_probe(cfg, doc, spec, acq)
     spec = plan_execution(cfg, spec, acq, doc, audit, root=root)
+    # THE FOCUSED-VALIDATION DESIGN, for a target on that route and for no other. It runs
+    # HERE — after identity has bound against a real checkout and before the comparison is
+    # derived — because a design that binds is what names the two arms, and the arms are
+    # what `establish_comparison` counts. A design that does not bind leaves `spec.arms`
+    # alone and nothing starts.
+    fv_graph = _graph_for(doc, pairs) if pairs else None
+    validations: list[FocusedValidation] = []
+    fv = None
+    if pairs and pairs[0][1].action == validation_stage.ACTION:
+        spec, fv, fv_record = validation_stage.prepare(
+            cfg, doc, pairs[0][0], pairs[0][1], spec, fv_graph)
+        state.write_json(root / "runs" / pid / "validation.driver.json", fv_record)
     # WHAT ITS RESULT WOULD BE HELD AGAINST, from the route the planner chose. Attached
     # whether or not it is established; only the gate below reads it.
     if pairs:
-        spec = establish_comparison(spec, pairs[0][1].route)
+        spec = establish_comparison(
+            spec, pairs[0][1].route,
+            settlement_declared=bool(fv is not None and fv.design is not None
+                                     and fv.design.established))
 
     state.write_json(root / "runs" / pid / "spec.json", spec.model_dump())
 
@@ -1257,7 +1299,20 @@ def _review(cfg: Config, pid: str) -> dict:
     # explain both rather than whichever happened to be first.
     outcomes: list[TargetOutcome] = []
     if target_set is not None and pairs:
-        if reconstruction_result is not None and reconstruction_plan is not None:
+        if fv is not None and not (fv.design is not None and fv.design.established):
+            # THE DESIGN DID NOT BIND, so nothing was started and the reason is the
+            # paper's method section rather than any gate of ours. Reported as
+            # SPECIFICATION_BLOCKED naming the ingredient, not as COMPARISON_BLOCKED,
+            # which would report a limit of our arithmetic for a limit of their reporting.
+            outcomes.append(validation_stage.outcome_for(fv, pairs[0][1]))
+            validations.append(fv)
+        elif fv is not None and may_run and not direct_reconstruction:
+            fv = validation_stage.adjudicate(fv, spec, result)
+            outcomes.append(validation_stage.outcome_for(
+                fv, pairs[0][1], provenance=result.provenance,
+                execution_ref=result.execution_log))
+            validations.append(fv)
+        elif reconstruction_result is not None and reconstruction_plan is not None:
             outcomes.append(outcome_for(pairs[0][0].target_id, reconstruction_result,
                                         reconstruction_plan.action,
                                         reconstruction_plan.route))
@@ -1296,7 +1351,23 @@ def _review(cfg: Config, pid: str) -> dict:
                 other.written_by = "harness"
                 other = synthesize_probe(cfg, doc, other, acq)
                 other = plan_execution(cfg, other, acq, doc, audit, root=root)
-                other = establish_comparison(other, plan.route)
+                other_fv = None
+                if plan.action == validation_stage.ACTION:
+                    other, other_fv, other_record = validation_stage.prepare(
+                        cfg, doc, obj, plan, other, fv_graph)
+                    state.write_json(
+                        root / "runs" / pid / "targets" / obj.target_id /
+                        "validation.driver.json", other_record)
+                    if not (other_fv.design is not None
+                            and other_fv.design.established):
+                        outcomes.append(validation_stage.outcome_for(other_fv, plan))
+                        validations.append(other_fv)
+                        continue
+                other = establish_comparison(
+                    other, plan.route,
+                    settlement_declared=bool(other_fv is not None
+                                             and other_fv.design is not None
+                                             and other_fv.design.established))
                 tdir = root / "runs" / pid / "targets" / obj.target_id
                 state.write_json(tdir / "spec.json", other.model_dump())
                 # STEP 6 — the same re-plan, per remaining target. `plan` here is the
@@ -1334,7 +1405,15 @@ def _review(cfg: Config, pid: str) -> dict:
                     continue
                 tres = _run(cfg, root, other, out_dir=tdir)
                 state.write_json(tdir / "probe_results.json", tres.model_dump())
-                outcomes.append(outcome_for(obj.target_id, tres, plan.action, plan.route))
+                if other_fv is not None:
+                    other_fv = validation_stage.adjudicate(other_fv, other, tres)
+                    outcomes.append(validation_stage.outcome_for(
+                        other_fv, plan, provenance=tres.provenance,
+                        execution_ref=tres.execution_log))
+                    validations.append(other_fv)
+                else:
+                    outcomes.append(outcome_for(obj.target_id, tres, plan.action,
+                                                plan.route))
             except Exception as e:                # noqa: BLE001
                 # A fault pursuing one target is not evidence about the paper and must not
                 # cost the paper its other targets — the same rule `_phase_probe` applies
@@ -1449,7 +1528,13 @@ def _review(cfg: Config, pid: str) -> dict:
             # THREE COUNTS, NEVER SUMMED. Works retrieved is what the search saw;
             # concerns is what survived every endpoint check; and a concern is a question
             # for a referee, not a novelty finding.
-            "literature_targets": len(literature_outcomes),
+            # FOUR COUNTS, NEVER SUMMED, for the same reason the literature route's three
+        # are not: a design attempted, a design that bound, a contrast actually measured
+        # and a question actually settled are four different facts, and adding any two of
+        # them produces a number that means nothing.
+        **{f"validation_{k}": v for k, v in
+           validation_stage.summarise(validations).items()},
+        "literature_targets": len(literature_outcomes),
             "literature_works": len(search.works) if search else 0,
             "literature_concerns": len(search.concerns()) if search else 0,
             "reconciliation": rec.status if rec else None,

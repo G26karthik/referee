@@ -286,6 +286,28 @@ class Config:
     literature_mailto: str = field(
         default_factory=lambda: os.environ.get("SH_LITERATURE_MAILTO", ""))
 
+    # --- the focused-validation route -------------------------------------------------
+    # ONE gate, and it buys the DESIGN rather than the run. With it closed the route still
+    # runs: the arms, the metric, the benchmark, the split and the addressed question are
+    # all read off the document, and every design reports SPECIFICATION_BLOCKED naming the
+    # ingredients the paper does not bind — which is the honest answer for a paper that
+    # does not state enough, and is what a reader sees without any model in the loop.
+    #
+    # EXECUTION IS NOT GATED HERE. A focused validation runs the authors' own checkout, so
+    # it passes through `backends.authorize` and `SH_ALLOW_REPO_EXEC` exactly as a
+    # reproduction does. Nothing in this flag can start a process.
+    allow_validation_design: bool = field(
+        default_factory=lambda: _flag("SH_ALLOW_VALIDATION_DESIGN"))
+    validation_cmd: str = field(default_factory=lambda: os.environ.get("SH_VALIDATION_CMD", ""))
+    validation_model: str = field(
+        default_factory=lambda: (os.environ.get("SH_VALIDATION_MODEL") or "").strip())
+    validation_timeout_s: int = field(
+        default_factory=lambda: int(os.environ.get("SH_VALIDATION_TIMEOUT", "600")))
+    # How many focused validations one paper may design. A BUDGET, not a gate: which
+    # targets are worth it is `planner`'s decision and the order is `priority`'s.
+    validation_max_designs: int = field(
+        default_factory=lambda: int(os.environ.get("SH_VALIDATION_MAX_DESIGNS", "2")))
+
     # --- the substantive verdict -----------------------------------------------------
     # A single, best-effort, never-retried, whole-paper opinion — see
     # `harness/prompts/verdict.py`. OFF by default: a third external process an operator

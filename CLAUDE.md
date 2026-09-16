@@ -139,6 +139,7 @@ papers → controller → ingest → audit → collect → grade → assess → 
 | **discover** | `stages/discover.py` | doc + findings → `discovery/targets.json` | what is addressable, what it is worth, whether an experiment is justified | records a NAMED refusal per target |
 | ↳ artifact | `stages/artifact.py` + `artifact_evidence.py` | doc + pinned checkout → `ArtifactFact` × N | what the RELEASED CODE establishes, for a question whose SCOPE it answers | `ARTIFACT_INSPECTION_INCONCLUSIVE` when it settles nothing |
 | ↳ literature | `stages/literature.py` + `literature.py` | doc + public indexes → `PriorArtFact` × N | what EARLIER PUBLISHED WORK bears on a novelty claim the paper makes about itself | `SEARCH_COMPLETED_NO_MATCH_FOUND`, which settles nothing |
+| ↳ validation | `stages/validation.py` + `validation.py` + `between_arms.py` | doc + pinned checkout → one CONTROLLED CONTRAST | what the smallest ONE-VARIABLE experiment the paper supports would discriminate between | `SPECIFICATION_BLOCKED`, naming the ingredient the paper does not state |
 | verify | `stages/probe.py` | doc + repo → `ProbeSpec` per target | identity, capability, resources, commit, backend | leaves the spec unpromoted |
 | execute | `backends.py` + `local_exec.py` | spec → `ProbeResult` | `authorize()` alone | `verdict: blocked` |
 | reconcile | `local_exec.reconcile` | metric vs the addressed quantity | arithmetic only | `INCONCLUSIVE` |
@@ -168,6 +169,7 @@ reviewer actually asks get separated:
 | what would settle this concern? | `questions.py` | a finding's own closed-vocabulary self-classification |
 | what KIND of problem is this? | `taxonomy.py` | the same closed vocabulary; never a number, a name or a paper |
 | has somebody already done this? | `literature.py` + `literature_providers.py` | the paper's own novelty sentences, and bibliographic records a public index returned |
+| what is the smallest experiment that would discriminate? | `validation.py` + `between_arms.py` | the claim graph's own COMPARISON nodes, and configuration values quoted from the paper or the pinned checkout |
 | what is checkable, and how central? | `discovery.py` | structure: abstract, cited addresses, parsed quantities |
 | is it worth it, and is it justified? | `priority.py`, `planner.py` | vocabulary strings and booleans only |
 
@@ -247,7 +249,7 @@ Per paper, `projects/<pid>/` holds four things a reader should not confuse:
 | `reports/<pid>.md` / `.json` | the complete machine trace |
 
 Self-checks: **every module that carries an `if __name__ == "__main__"` guard has one,
-and there are 65 of them.** Do not maintain a list here; the hand-written one drifted to
+and there are 70 of them.** Do not maintain a list here; the hand-written one drifted to
 34 while modules kept landing. `tests/test_self_checks.py` DISCOVERS them by walking
 `harness/**/*.py` and parsing for the guard with `ast`, so a module that loses its
 self-check fails the suite, and `python -m harness.<module>` runs any one of them
@@ -602,6 +604,48 @@ Do not weaken these to make more papers executable or more findings reportable.
     paper is not novel", has no spelling**, and no literature disposition is in
     `establishes_failure`.
 
+37. **A controlled experiment this review designed may say what the experiment did,
+    and only a conformant one may say anything about the paper.**
+    `harness/validation.py` derives the smallest one-variable contrast the paper and its
+    pinned checkout support, and refuses to build one otherwise: all eight entries of
+    `artifacts.VALIDATION_INGREDIENTS` must bind, and `NEVER_ASSUMED` names the scientific
+    choices — optimizer, split, schedule, threshold, augmentation strength, seed policy and
+    seven more — this harness will not supply however conventional the value is. A design
+    needing one is `SPECIFICATION_BLOCKED` with the key printed. `ValidationDesign.state`
+    is DERIVED from `missing` and `assumed` rather than stored beside them, so a design
+    cannot be reported DESIGNED while something it needs is absent.
+
+    **The settlement condition is declared before anything runs**, and there is no
+    universal percentage anywhere in the route. `SettlementCondition` carries the rule, the
+    predicted direction and — where the rule needs one — a tolerance WITH A BASIS, and
+    `declared_before_execution` is written by the harness at design time.
+    `between_arms.compare` refuses a comparison without it, because a rule chosen once both
+    numbers are in settles whatever its author wanted it to.
+
+    **The arms are checked, not trusted.** Metric, basis, unit, benchmark, split and
+    statistical unit must agree between the two arms, and exactly the declared variables —
+    no more — may differ in their configurations; a key present on one arm and absent on
+    the other is a DIFFERENCE, because comparing only the keys both carry would call two
+    arms controlled precisely because the thing that differs was recorded on one side. Each
+    failure is its own entry in `BETWEEN_ARM_REFUSALS` and not one of them is a finding
+    about the paper.
+
+    **Four rungs, and the top one has no spelling.** `ARM_MEASUREMENT` is about one run;
+    `CONTROLLED_OBSERVATION` is two arms compared with conformance unestablished, resolves
+    to UNRESOLVED and is the expected commonest outcome; `CONFORMANT_CONTROLLED_RESULT`
+    needs BOTH a design whose every arm derives from the paper or the pinned artifact AND a
+    provenance `harness.provenance` already admits. Level 4 — "the credited mechanism is
+    what produces the effect" — is `CAUSAL_ATTRIBUTION_AUTHORITIES`, the EMPTY TUPLE, so
+    `ArmComparison.establishes_attribution` is a membership test that can never succeed.
+    One controlled comparison on one benchmark is evidence about that comparison.
+
+    **And `local_exec.reconcile` refuses this comparison outright.** A BETWEEN_ARMS spec
+    reaches the reconciler with an established, admissible comparison and is returned
+    NOT_ATTEMPTED: everything below that gate holds a measured quantity against one the
+    PAPER PRINTED, and the paper printed neither arm. The arithmetic runs in
+    `between_arms.compare`, which asserts over its own source that it reads no
+    `claimed_value`, `claimed_delta`, `claimed_cell_value` or `table_ref`.
+
 ## Operating autonomously
 
 `--auto-audit` delegates each lens to a reviewer — `SH_AUDIT_CMD`, or the `claude` CLI
@@ -904,6 +948,74 @@ art for itself, and printing it would have been an accusation about their schola
 `docs/LITERATURE_MEASUREMENT.md` prints the per-paper table, the protocol, every refusal,
 the run-to-run variance in the reviewer's own readings, and why each zero is right.
 
+## What a controlled experiment this review designed can establish
+
+**A referee's hardest questions are not about a number, and re-running the number cannot
+answer them.** Two variables changed between the arms and the paper credits one of them;
+the control the claim needs was never run; the arms saw different data budgets; the
+protocol that produced the number is not the protocol the claim is about. The printed
+value is consistent with every competing explanation at once, so reproducing it settles
+nothing. What settles it is a NEW experiment that varies exactly one thing.
+
+**This is the route `comparison.py` named and could not perform.** `COMPARISON_FOR_ROUTE`
+has said since Step 5 that a `FOCUSED_VALIDATION_EXPERIMENT` is compared `BETWEEN_ARMS`,
+and `RECONCILABLE` was one entry long: the route was declared, planned for, listed in
+`UNIMPLEMENTED_ROUTES`, and refused before anything started with the sentence *"a run would
+produce two numbers and no verdict"*. That sentence was true and is no longer.
+`harness/between_arms.py` is the missing arithmetic and `harness/validation.py` is the
+design layer in front of it.
+
+**"Derivable from the paper" is the whole of the discipline.** An experiment that answers
+the question by choosing an optimizer, a split, an augmentation strength, a threshold or a
+schedule the paper never stated measures OUR choice, and its result would be a fact about
+this review's reconstruction wearing the clothes of a fact about the paper.
+`artifacts.NEVER_ASSUMED` lists those choices as data, so filling one in is a diff a reader
+can see rather than a habit nobody wrote down, and eight ingredients must ALL bind:
+
+| ingredient | where it comes from |
+|---|---|
+| `addressed_question` | a `ReviewQuestion` whose address re-resolves against the parsed paper |
+| `competing_explanations` | the finding's own counter-explanations, carried, never invented |
+| `arm_instantiation` | the claim graph's own COMPARISON node — REUSED, never rebuilt |
+| `metric_identity` | the quantity, and the unit read off the CELL, never off the metric's name |
+| `dataset_identity` | the benchmark AND the split, from a sentence that names the benchmark |
+| `controlled_variables` | named, not assumed |
+| `changed_variable` | exactly one; two things moving discriminates between neither |
+| `settlement_condition` | declared BEFORE the run, with a tolerance that has a basis |
+
+**Three halves are deterministic and one is a proposal.** The question, the arms, the
+metric, the unit and the stated split are read off the document. What a document does not
+print — and no parser recovers, because it is not there — is which variable the arms differ
+in, which are held fixed, and what would settle it. A gated designer
+(`SH_ALLOW_VALIDATION_DESIGN`, off) may propose those, and every configuration value it
+offers must RELOCATE: `validation_driver.relocate_configuration` is `claims.mint` for a
+scientific choice, and a value whose quotation is not in this paper or in the pinned
+checkout is dropped and named.
+
+**What the run may then conclude is bounded twice over.** `between_arms.compare` computes
+the contrast — difference, relative difference (None rather than infinity when the control
+measured zero), direction against the declared dead band, and interval overlap only where
+both arms ran more than once — and `between_arms.authority_for` decides separately what the
+contrast is entitled to say. A perfectly computed comparison on a design that deviates, or
+on a provenance the reproduction ceiling refuses, carries `CONTROLLED_OBSERVATION` and
+resolves nothing. `VALIDATION_DEFECT_ESTABLISHED` is its own disposition and not
+`FAILED_REPRODUCTION`, because a reproduction re-runs an experiment the authors published
+and this one re-runs an experiment they did not — and a referee reading the review has to
+be able to see which happened.
+
+Measured over the eight papers, offline, with the design gate shut: **710 discovered
+objects, 23 focused-validation questions, 7 that reached the route, 2 planned, 2 designs
+attempted and 2 `SPECIFICATION_BLOCKED` — 0 executable, 0 launched, 0 settled.** Both
+blocked at `arm_instantiation`, and the reason is measured rather than guessed: both
+targets carry an EMPTY metric and an EMPTY benchmark, so no COMPARISON node can bind to
+them. The papers contain **74 such nodes** between them — their own contrasts are recovered
+perfectly well — and none binds to the targets that raise attribution and control-presence
+questions, because those come from PROSE findings naming no metric and no benchmark. That
+is the same correspondence the claim-graph section already reports as semantic and
+unstated. **Opening the design gate changes nothing**: the deterministic half refuses
+first, at `no_arms`, and the designer is never called.
+`docs/FOCUSED_VALIDATION_MEASUREMENT.md` prints the per-paper table and every refusal.
+
 ## Execution gates
 
 | gate | env var | default | permits |
@@ -917,6 +1029,7 @@ the run-to-run variance in the reviewer's own readings, and why each zero is rig
 | authors' code | `SH_ALLOW_ARTIFACT_REVIEW` | off | one read-only pass over the PINNED checkout asking whether the code does what the paper says; `Read`+`Grep` only, every citation relocated (`artifact_review_driver.py`) |
 | prior-art search | `SH_ALLOW_LITERATURE_SEARCH` | off | querying public scholarly indexes (OpenAlex, Crossref, arXiv) for work that predates the paper |
 | literature review | `SH_ALLOW_LITERATURE_REVIEW` | off | one reading per novelty claim, comparing it against what those indexes returned; ZERO tools, so it cannot search on its own (`literature_driver.py`) |
+| validation design | `SH_ALLOW_VALIDATION_DESIGN` | off | one reading per focused-validation target, naming the variable the arms differ in and the settlement rule; ZERO tools, every value relocated against the paper (`validation_driver.py`). It buys the DESIGN, never a run: execution still passes `SH_ALLOW_REPO_EXEC` and `backends.authorize` |
 | install | `SH_ALLOW_INSTALL` | off | building `runs/<pid>/env` from the repo's requirements |
 | sandbox | `SH_ALLOW_SANDBOX` | off | **leasing a remote Linux machine** and staging the audited commit into it (`harness/sandbox.py`) |
 | execute | `SH_ALLOW_REPO_EXEC` | off | running the repository's own entrypoint |
@@ -1205,6 +1318,31 @@ were current.
   RELATED_BUT_MATERIALLY_DIFFERENT the next. Both ends verified identically both times;
   what varied was the reading, which is exactly why a relation is recorded as a reading.
   `docs/LITERATURE_MEASUREMENT.md` has the per-paper table, every refusal and the variance.
+- **The focused-validation route has never executed on a real paper, and the reason is
+  ours rather than the papers'.** Measured over the eight-paper corpus with the design gate
+  shut: 23 focused-validation questions identified, 7 reached the route, 5 of those refused
+  by `planner` on `specification_complete`, 2 designs attempted and both
+  `SPECIFICATION_BLOCKED` — 0 executable, 0 launched, 0 reconciled, 0 settled. The
+  between-arms arithmetic, the authority ladder and the conformance rule are therefore
+  proven on FIXTURES, not on a published paper, exactly as RED-from-execution is.
+
+  **The first unbound ingredient is `arm_instantiation`**, and it is unbound because both
+  targets carry an empty `metric` and an empty `experiment`: a design reuses the claim
+  graph's COMPARISON node, keyed `comparison:<metric>|<benchmark>`, and with neither field
+  there is nothing to bind. The papers hold 74 comparison nodes between them, so the
+  contrasts ARE recovered; what is not recovered is which prose concern is about which
+  contrast, which is the semantic correspondence the claim-graph section already reports
+  the document does not print.
+
+  **16 of the 23 questions reached no route at all**, because a focused validation varies
+  one thing in the AUTHORS' OWN code and those papers published none. Building both arms
+  from nothing is a reconstruction, which is a different route with its own governance.
+
+  **And opening `SH_ALLOW_VALIDATION_DESIGN` changes none of it** — verified by running
+  both gate states over the same targets: the deterministic half blocks first with the
+  driver record reading `no_arms`, so the designer is never called. A route whose model
+  half cannot be reached is a route whose measurement is entirely deterministic, which is
+  the honest thing to say about this one today.
 - **No adjudicated ground truth exists for this corpus.** `harness/evaluation.py`
   therefore reports no precision, recall, or agreement-with-humans number, and says so in
   the artifact itself. Reviewer accuracy is unmeasured, not measured-and-good.

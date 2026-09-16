@@ -120,6 +120,24 @@ EVIDENCE_STATES = (
     # No index answered, or none could be reached from here. A fact about this host's
     # configuration in exactly the way ENVIRONMENT_LIMITATION is.
     "LITERATURE_LIMITATION",
+    # A CONTROLLED EXPERIMENT THIS REVIEW DESIGNED, RUN AND READ. About the paper, and
+    # separate from REPRODUCTION_* on purpose: a reproduction re-runs an experiment the
+    # authors published, and a focused validation runs one they did not. Folding the two
+    # would let an experiment nobody published convict a paper through a state whose name
+    # says "reproduction" — and a referee reading the review could not tell which had
+    # happened. Reached only from a CONFORMANT design on an admissible provenance.
+    "CONTROLLED_EXPERIMENT_EVIDENCE",
+    # THE SAME ARITHMETIC, SAYING NOTHING ABOUT THE PAPER. Two arms really ran and really
+    # were compared, and the experiment is not established to be the paper's — a scientific
+    # choice in it is this review's. The fourth channel to need an endpoints-verified
+    # state, after CITATION_VERIFIED, ARTIFACT_ENDPOINTS_VERIFIED and
+    # LITERATURE_ENDPOINTS_VERIFIED, and it resolves to UNRESOLVED exactly as they do.
+    # This is expected to be the commonest outcome of the route and it is not a shortfall.
+    "CONTROLLED_OBSERVATION",
+    # The design could not be built from what the paper states. Mapped to
+    # SPECIFICATION_LIMITATION below rather than given its own state, because it is the
+    # same fact `INFEASIBLE_SPECIFICATION` already reports: the paper's method section,
+    # not our method inventory.
     "ARTIFACT_LIMITATION",      # no usable artifact for this question
     "EXTRACTION_LIMITATION",    # this harness could not build an address for the claim
     "REPORTING_LIMITATION",     # the paper prints no unambiguous quantity to compare against
@@ -210,6 +228,16 @@ _EVIDENCE_FOR_DISPOSITION = {
     # reported as one.
     "SEARCH_INCONCLUSIVE": "LITERATURE_LIMITATION",
     "LITERATURE_BLOCKED": "LITERATURE_LIMITATION",
+    # THE FOUR FOCUSED-VALIDATION OUTCOMES. The first two are about the paper and the
+    # last two are not, and the difference is conformance rather than arithmetic: the
+    # same measured contrast lands on the third row when a scientific choice in the
+    # experiment was this review's. `VALIDATION_INCONCLUSIVE` is its own row rather than
+    # folded into INCONCLUSIVE, because "it ran and the declared rule fired neither way"
+    # is a result of a predeclared condition and "it ran and settled nothing" is not.
+    "VALIDATION_DEFECT_ESTABLISHED": "CONTROLLED_EXPERIMENT_EVIDENCE",
+    "VALIDATION_SUPPORTS_CLAIM": "CONTROLLED_EXPERIMENT_EVIDENCE",
+    "VALIDATION_OBSERVATION_ONLY": "CONTROLLED_OBSERVATION",
+    "VALIDATION_INCONCLUSIVE": "INCONCLUSIVE_EXECUTION",
     "SPECIFICATION_BLOCKED": "SPECIFICATION_LIMITATION",
     "ARTIFACT_BLOCKED": "ARTIFACT_LIMITATION",
     # NOT ARTIFACT_LIMITATION. "We could not build an address for this claim" is a limit
@@ -252,7 +280,7 @@ _EVIDENCE_FOR_DISPOSITION = {
 # say it examined, never what it may conclude.
 EVIDENCE_ABOUT_THE_PAPER = ("REPRODUCTION_SUCCESS", "REPRODUCTION_FAILURE",
                             "PAPER_INTERNAL_EVIDENCE", "ARTIFACT_EVIDENCE",
-                            "PRIOR_ART_EVIDENCE")
+                            "PRIOR_ART_EVIDENCE", "CONTROLLED_EXPERIMENT_EVIDENCE")
 
 
 def classify(*, lens: str = "", discrepancy_type: str = "", baseline_class: str = "",
@@ -304,6 +332,12 @@ def evidence_state(disposition: str = "", provenance: str = "") -> str:
     if state in ("REPRODUCTION_SUCCESS", "REPRODUCTION_FAILURE") \
             and not _admits(provenance or ""):
         return "INCONCLUSIVE_EXECUTION"
+    # THE SAME CEILING, ON THE FOCUSED-VALIDATION CHANNEL. `between_arms.authority_for`
+    # already refuses the top rung for an inadmissible provenance, so a disposition
+    # arriving here with one is a disagreement between two layers rather than a verdict —
+    # and it falls to the observation state, which says something true about what ran.
+    if state == "CONTROLLED_EXPERIMENT_EVIDENCE" and not _admits(provenance or ""):
+        return "CONTROLLED_OBSERVATION"
     return state
 
 
@@ -314,7 +348,12 @@ def resolution_state(evidence: str = "") -> str:
     of the evidence behind it is a resolution nobody checked.
     """
     e = (evidence or "").strip().upper()
-    if e in ("REPRODUCTION_SUCCESS", "REPRODUCTION_FAILURE"):
+    if e in ("REPRODUCTION_SUCCESS", "REPRODUCTION_FAILURE",
+             "CONTROLLED_EXPERIMENT_EVIDENCE"):
+        # A focused validation IS an execution — the one axis on which it is exactly like
+        # a reproduction — so it resolves here rather than earning a sixth RESOLUTION_STATES
+        # member. What it is NOT like a reproduction in is which evidence state it carries,
+        # and that distinction is one line above, where a reader can see it.
         return "RESOLVED_BY_EXECUTION"
     if e == "PAPER_INTERNAL_EVIDENCE":
         return "RESOLVED_FROM_PAPER"

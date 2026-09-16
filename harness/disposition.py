@@ -170,6 +170,27 @@ DELIBERATELY_UNCLASSIFIED: dict[str, str] = {
         "correspondence between them is the auditor's reading. The question stays open "
         "and is counted as open; calling it a blocker would say no route was available "
         "when one was taken.",
+    # --- THE FOUR FOCUSED-VALIDATION OUTCOMES. None is a blocker; three settled --------
+    "VALIDATION_DEFECT_ESTABLISHED":
+        "a controlled experiment derived from the paper, run on an admissible provenance "
+        "and answering the question it was designed for, produced the opposite of what "
+        "the claim predicts. SETTLED, not blocked. Whether it also STOPS the paper is "
+        "`harness.materiality`'s to decide from where the claim sits — established is not "
+        "material, exactly as PAPER_ARITHMETIC_CONTRADICTION is not.",
+    "VALIDATION_SUPPORTS_CLAIM":
+        "the same experiment, firing the other way. A settled question in the paper's "
+        "favour is a result and not a blocker, and it is not a certificate either: it "
+        "settles the bounded contrast that ran and nothing wider.",
+    "VALIDATION_OBSERVATION_ONLY":
+        "two arms ran and were compared, and the conformance that would let the "
+        "comparison say something about the PAPER was not established — a scientific "
+        "choice in the experiment was this review's. NOT a blocker, because a route ran "
+        "and produced a real measurement; NOT a resolution, because the measurement is "
+        "about our experiment. This is the expected commonest outcome of the route.",
+    "VALIDATION_INCONCLUSIVE":
+        "the controlled comparison ran and the rule declared for it before the run fired "
+        "in neither direction. As INCONCLUSIVE: pursued, and it settled nothing. Kept "
+        "apart from COMPARISON_BLOCKED because the arms WERE held against each other.",
     # --- THE FIVE LITERATURE OUTCOMES. None is a blocker, and the reasons differ. -------
     "PRIOR_ART_RELATION_STRUCTURALLY_BOUND":
         "an earlier work and this paper's own priority claim were bound from the two "

@@ -91,7 +91,7 @@ def loop(monkeypatch, tmp_path):
         monkeypatch.setattr(probe_stage, "synthesize_probe", lambda cfg, d, s, a: s)
         monkeypatch.setattr(probe_stage, "plan_execution",
                             lambda cfg, s, a, d, au, root=None: s)
-        monkeypatch.setattr(probe_stage, "establish_comparison", lambda s, r: s)
+        monkeypatch.setattr(probe_stage, "establish_comparison", lambda s, r, **kw: s)
         monkeypatch.setattr(probe_stage, "may_be_compared", lambda s: (True, ""))
         monkeypatch.setattr(probe_stage, "admissible_if_it_succeeds",
                             lambda cfg, s: (True, ""))
@@ -322,7 +322,7 @@ def test_material_target_beyond_numeric_budget_is_still_pursued(monkeypatch, tmp
     monkeypatch.setattr(probe_stage, "synthesize_probe", lambda cfg, d, s, a: s)
     monkeypatch.setattr(probe_stage, "plan_execution",
                         lambda cfg, s, a, d, au, root=None: s)
-    monkeypatch.setattr(probe_stage, "establish_comparison", lambda s, route: s)
+    monkeypatch.setattr(probe_stage, "establish_comparison", lambda s, route, **kw: s)
     monkeypatch.setattr(probe_stage, "may_be_compared", lambda s: (True, ""))
     monkeypatch.setattr(probe_stage, "admissible_if_it_succeeds", lambda cfg, s: (True, ""))
     monkeypatch.setattr(probe_stage, "replan_after_author_code_exhausted",

@@ -84,10 +84,15 @@ NON_DISCHARGING_BLOCKERS = ("AUTHORIZATION_BLOCKED", "BUDGET_DEFERRED",
 # limitation, and a reader who cannot see it cannot judge the rate.
 UNIMPLEMENTED_ROUTES = (
     "ARTIFACT_INSPECTION",
-    # The planner can name this action, but the only current executor authors a
-    # ``synthesized`` probe whose result the provenance ceiling cannot admit.  A route
-    # which cannot possibly discharge is advertised, not implemented, for this metric.
-    "FOCUSED_VALIDATION_EXPERIMENT",
+    # FOCUSED_VALIDATION_EXPERIMENT used to be here and no longer is. It was listed
+    # because the only executor authored a ``synthesized`` probe whose result the
+    # provenance ceiling cannot admit — a route that could not possibly discharge, so
+    # advertised rather than implemented. It has an executor now (`stages/validation.py`,
+    # over `validation.design` and `between_arms.compare`), and what it discharges is
+    # bounded in the same way the literature route's is: `validation.discharge` requires a
+    # comparison that reached CONFORMANT_CONTROLLED_RESULT and answers the question it was
+    # designed for, so a blocked design, a refused comparison and a controlled observation
+    # whose conformance was never established all leave it undischarged.
     # LITERATURE_SEARCH used to be here and no longer is: it has a `PLAN_ACTIONS` member
     # (`LITERATURE_SEARCH_ONLY`) and an executor (`stages/literature.py`), so it can
     # discharge. What it discharges is bounded — a verified prior-art concern or a bound

@@ -108,26 +108,38 @@ def test_a_derived_question_carries_its_kind():
 
 
 # --------------------------------------------------------------------------- #
-# Unimplemented focused validation is not advertised as an applicable route
+# Focused validation is now implemented and IS advertised as an applicable route
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("question_kind",
                          ["ATTRIBUTION", "CONTROL_PRESENCE", "PROTOCOL_CONFORMANCE"])
-def test_a_question_with_no_printed_quantity_does_not_advertise_focused_validation(question_kind):
+def test_a_question_with_no_printed_quantity_still_reaches_focused_validation(question_kind):
+    """`FOCUSED_VALIDATION_EXPERIMENT` left `exhaustion.UNIMPLEMENTED_ROUTES` once
+    `harness.between_arms` and `stages/validation.py` gave it a real executor, and its
+    comparison is BETWEEN_ARMS — one measured arm held against another, never a printed
+    cell (`comparison.needs_printed_value("FOCUSED_VALIDATION_EXPERIMENT")` is False). So
+    `_routes` no longer requires `has_value` to offer it: with a repository and no parsed
+    quantity, ATTRIBUTION, CONTROL_PRESENCE and PROTOCOL_CONFORMANCE now reach exactly
+    these two routes, in escalation order."""
     got = _routes(question_kind, repo=True, value=False)
-    assert got == ["ARTIFACT_INSPECTION"]
-    assert "FOCUSED_VALIDATION_EXPERIMENT" not in got
+    assert got == ["ARTIFACT_INSPECTION", "FOCUSED_VALIDATION_EXPERIMENT"]
 
 
 @pytest.mark.parametrize("question_kind",
                          ["ATTRIBUTION", "CONTROL_PRESENCE", "PROTOCOL_CONFORMANCE"])
-def test_planner_does_not_warrant_an_unimplemented_focused_experiment(question_kind):
+def test_planner_now_warrants_an_implemented_focused_experiment(question_kind):
+    """The old rule was that an implemented-but-unexecutable route could never be
+    warranted, so the planner fell back to ARTIFACT_INSPECTION. Now that
+    FOCUSED_VALIDATION_EXPERIMENT has an executor, a fully specified target with a
+    repository escalates PAST the static inspection to it, exactly as `_EXECUTABLE_ORDER`
+    says every other executable route does."""
     obj = DiscoveredObject(target_id="T1", centrality="CENTRAL", harness_addressable=True,
                            question_kind=question_kind,
                            routes=_routes(question_kind, repo=True, value=False))
     d = planner.plan(obj, artifact_available=True, specification_complete=True,
                      environment_state="ok")
-    assert not d.requires_execution
-    assert d.route == "ARTIFACT_INSPECTION"
+    assert d.requires_execution
+    assert d.route == "FOCUSED_VALIDATION_EXPERIMENT"
+    assert d.action == "FOCUSED_VALIDATION_EXPERIMENT"
 
 
 @pytest.mark.parametrize("question_kind",
@@ -189,22 +201,35 @@ def test_an_attribution_experiment_is_not_compared_against_a_printed_cell():
     assert comparison.kind_for_route("AUTHOR_CODE_EXECUTION") == "AGAINST_PRINTED_VALUE"
 
 
-def test_only_one_comparison_has_arithmetic_behind_it_and_it_says_so():
-    assert comparison.RECONCILABLE == ("AGAINST_PRINTED_VALUE",)
-    for k in set(COMPARISON_KINDS) - {"AGAINST_PRINTED_VALUE"}:
+def test_two_comparisons_have_arithmetic_behind_them_and_it_says_so():
+    """`harness.between_arms` gave BETWEEN_ARMS a real executor, so `RECONCILABLE` grew
+    from one entry to two — AGAINST_PRINTED_VALUE (`local_exec.reconcile`) and BETWEEN_ARMS
+    (`between_arms.compare`), in separate modules that share no code. AGAINST_EXISTENCE and
+    AGAINST_SPECIFICATION still have none and are routed to and refused rather than
+    quietly performed as though they were one of the two that do."""
+    assert comparison.RECONCILABLE == ("AGAINST_PRINTED_VALUE", "BETWEEN_ARMS")
+    for k in set(COMPARISON_KINDS) - {"AGAINST_PRINTED_VALUE", "BETWEEN_ARMS"}:
         assert not comparison.reconcilable(k), k
 
 
-@pytest.mark.parametrize("route,printed,arms,state", [
-    ("AUTHOR_CODE_EXECUTION", True, 1, "established"),
-    ("AUTHOR_CODE_EXECUTION", False, 1, "no_reference"),
-    ("FOCUSED_VALIDATION_EXPERIMENT", True, 1, "arms_unspecified"),
-    ("FOCUSED_VALIDATION_EXPERIMENT", True, 2, "unsupported"),
-    ("ARTIFACT_INSPECTION", True, 2, "unsupported"),
-    ("NONE", True, 2, "unmapped"),
+@pytest.mark.parametrize("route,printed,arms,declared,state", [
+    ("AUTHOR_CODE_EXECUTION", True, 1, False, "established"),
+    ("AUTHOR_CODE_EXECUTION", False, 1, False, "no_reference"),
+    ("FOCUSED_VALIDATION_EXPERIMENT", True, 1, False, "arms_unspecified"),
+    # Two arms and no declared settlement: the experiment could be BUILT but this run has
+    # nothing to settle it against yet — `no_reference`, not `unsupported`. `unsupported`
+    # is reserved for a comparison kind this system has no arithmetic for at all, and
+    # BETWEEN_ARMS is no longer one of those.
+    ("FOCUSED_VALIDATION_EXPERIMENT", True, 2, False, "no_reference"),
+    # The newly reachable state: two arms AND a settlement condition declared before the
+    # run is a comparison `harness.between_arms` can perform.
+    ("FOCUSED_VALIDATION_EXPERIMENT", True, 2, True, "established"),
+    ("ARTIFACT_INSPECTION", True, 2, False, "unsupported"),
+    ("NONE", True, 2, False, "unmapped"),
 ])
-def test_the_comparison_states_are_four_different_facts(route, printed, arms, state):
-    c = comparison.derive(route, printed_value_available=printed, arms_specified=arms)
+def test_the_comparison_states_are_four_different_facts(route, printed, arms, declared, state):
+    c = comparison.derive(route, printed_value_available=printed, arms_specified=arms,
+                          settlement_declared=declared)
     assert c.state == state
     assert c.state in COMPARISON_STATES
 
@@ -213,13 +238,16 @@ def test_the_comparison_states_are_four_different_facts(route, printed, arms, st
 # Widening what is ROUTED must not widen what is EXECUTED
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("arms,state", [(["reproduction"], "arms_unspecified"),
-                                        (["baseline", "treatment"], "unsupported")])
+                                        (["baseline", "treatment"], "no_reference")])
 def test_a_run_whose_result_could_not_be_compared_is_never_started(arms, state):
     """The same rule `admissible_if_it_succeeds` applies to provenance, one question
     earlier. A between-arms comparison means the process is not started, however
     impeccable the program that would have run — and the two ways it can fail are two
-    different facts: the second arm could not be BUILT, or it could and this review has no
-    arithmetic that reads the result."""
+    different facts: the second arm could not be BUILT (`arms_unspecified`), or it could
+    and no settlement condition was declared for it BEFORE the run (`no_reference`).
+    BETWEEN_ARMS has real arithmetic now (`harness.between_arms`), but a rule chosen once
+    both numbers are in settles whatever its author wanted, so `establish_comparison`
+    called with no `settlement_declared` still refuses to start either way."""
     spec = probe_stage.establish_comparison(
         ProbeSpec(paper_id="p", provenance="repo_exec", claimed_cell_value="61.4",
                   arms=arms),
@@ -230,6 +258,22 @@ def test_a_run_whose_result_could_not_be_compared_is_never_started(arms, state):
     assert "nothing to be held against" in why
     assert spec.comparison.reason and spec.comparison.reason in why, (
         "the refusal must carry WHY, not an empty clause")
+
+
+def test_a_focused_validation_with_a_declared_settlement_may_start():
+    """The other half of the split above, and coverage for the state
+    `test_a_run_whose_result_could_not_be_compared_is_never_started` cannot show because
+    its whole point is a refusal. Two arms AND a settlement condition declared before
+    either one ran is a comparison `harness.between_arms` can perform, so
+    `establish_comparison` reports it `established` and `may_be_compared` no longer
+    refuses it — the same `admissible_if_it_succeeds` rule, now able to say yes as well as
+    no."""
+    spec = probe_stage.establish_comparison(
+        ProbeSpec(paper_id="p", provenance="repo_exec", claimed_cell_value="61.4",
+                  arms=["baseline", "treatment"]),
+        "FOCUSED_VALIDATION_EXPERIMENT", settlement_declared=True)
+    assert spec.comparison is not None and spec.comparison.state == "established"
+    assert probe_stage.may_be_compared(spec) == (True, "")
 
 
 def test_no_comparison_is_reported_established_and_then_refused():

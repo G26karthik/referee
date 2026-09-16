@@ -439,7 +439,7 @@ def test_review_attempts_direct_reconstruction_for_primary_and_later_targets(
     monkeypatch.setattr(probe_stage, "synthesize_probe", lambda cfg, d, s, a: s)
     monkeypatch.setattr(probe_stage, "plan_execution",
                         lambda cfg, s, a, d, au, root=None: s)
-    monkeypatch.setattr(probe_stage, "establish_comparison", lambda s, route: s)
+    monkeypatch.setattr(probe_stage, "establish_comparison", lambda s, route, **kw: s)
     monkeypatch.setattr(probe_stage, "may_be_compared", lambda s: (True, ""))
     monkeypatch.setattr(probe_stage, "admissible_if_it_succeeds", lambda cfg, s: (True, ""))
 

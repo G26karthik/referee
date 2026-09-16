@@ -2988,6 +2988,21 @@ TARGET_DISPOSITIONS = (
     "SEARCH_COMPLETED_NO_MATCH_FOUND",       # the protocol completed and no candidate qualified
     "SEARCH_INCONCLUSIVE",                   # candidates found; the evidence did not reach them
     "LITERATURE_BLOCKED",                    # provider, credential or cutoff unavailable
+    # FOUR TERMINAL STATES FOR THE FOCUSED-VALIDATION ROUTE, and the split that matters
+    # is between the first two and the third. A focused validation is a NEW experiment
+    # this review designed; a reproduction re-runs one the paper published. Folding the
+    # two together would let an experiment nobody published convict a paper through a
+    # disposition whose name says "reproduction", so they are separate strings with
+    # separate evidence states and separate entries in `establishes_failure`.
+    #
+    # `VALIDATION_OBSERVATION_ONLY` is the honest default and is expected to be the
+    # commonest: two arms really ran and really were compared, and the conformance that
+    # would let the comparison say something about the PAPER was not established. It
+    # settles nothing and says so.
+    "VALIDATION_DEFECT_ESTABLISHED",   # conformant, identity-bound, and the prediction failed
+    "VALIDATION_SUPPORTS_CLAIM",       # conformant, identity-bound, and the prediction held
+    "VALIDATION_OBSERVATION_ONLY",     # the arms were compared; conformance was not bound
+    "VALIDATION_INCONCLUSIVE",         # it ran and the declared settlement rule fired neither way
     "SPECIFICATION_BLOCKED",      # the paper does not say enough to run it
     "ARTIFACT_BLOCKED",           # no code, or the code does not contain the experiment
     "ENVIRONMENT_BLOCKED",        # dependencies, platform, install
@@ -3427,8 +3442,18 @@ class TargetOutcome(_Base):
         property so the fold in `stages/report` cannot accidentally count a blocked
         target as a failed one.
 
-        TWO STRUCTURALLY SEPARATE ROUTES, deliberately never merged into one condition:
+        THREE STRUCTURALLY SEPARATE ROUTES, deliberately never merged into one condition:
 
+          VALIDATION_DEFECT_ESTABLISHED  a controlled experiment this review DESIGNED,
+                               subject to the SAME provenance ceiling as a reproduction
+                               and, before it, to three conditions the reproduction path
+                               does not have: the design conformant to the paper, the
+                               comparison identity bound arm-to-arm, and the rule that
+                               fired being one the addressed question admits
+                               (`ArmComparison.establishes_defect`). It is a separate
+                               disposition rather than a FAILED_REPRODUCTION because the
+                               experiment is not one the authors published, and a referee
+                               reading the review must be able to see which happened.
           FAILED_REPRODUCTION  admissible only through `provenance.admits` — the
                                reproduction-provenance ceiling, which exists to keep a
                                synthesized or template probe from convicting a paper.
@@ -3445,7 +3470,9 @@ class TargetOutcome(_Base):
                                printed operands, with no model judgement involved.
         """
         from .provenance import admits
-        return ((self.disposition == "FAILED_REPRODUCTION" and admits(self.provenance))
+        return ((self.disposition in ("FAILED_REPRODUCTION",
+                                      "VALIDATION_DEFECT_ESTABLISHED")
+                 and admits(self.provenance))
                 or self.disposition == "PAPER_ARITHMETIC_CONTRADICTION")
 
     # The three scientific axes, DERIVED — never stored, never read from a file, and so
@@ -4205,6 +4232,402 @@ class LiteratureSearch(_Base):
         the same number.
         """
         return bool(self.provider_calls) and all(c.completed for c in self.provider_calls)
+
+
+# --------------------------------------------------------------------------- #
+# Focused validation — WHAT A CONTROLLED EXPERIMENT THIS REVIEW DESIGNED CAN SAY
+# --------------------------------------------------------------------------- #
+# The route exists for the questions a referee asks that re-running a published number
+# cannot answer: two variables changed at once, a missing control, a data budget that
+# differs between arms, a protocol confound, a comparison that is not apples-to-apples.
+# The question it asks is always the same one:
+#
+#     what is the SMALLEST scientifically legitimate experiment, derivable from the
+#     paper and its artifact, that discriminates between the competing explanations?
+#
+# "Derivable" is the whole of the discipline. An experiment that answers the question by
+# choosing an optimizer, a split, an augmentation strength or a schedule the paper never
+# stated measures OUR choice, not theirs — so the missing ingredient is named and the
+# design is refused. `NEVER_ASSUMED` is that rule as data.
+
+# The eight things a focused-validation experiment needs before it may be built. Every
+# one of them is a REQUIREMENT and none has a default: a design missing any of them is
+# SPECIFICATION_BLOCKED and names which, rather than being completed from convention.
+VALIDATION_INGREDIENTS = (
+    "addressed_question",       # a review question with an address that re-resolves
+    "competing_explanations",   # at least two readings the run would discriminate between
+    "arm_instantiation",        # the paper/artifact says enough to BUILD both arms
+    "metric_identity",          # the quantity, its basis and its unit, on both arms
+    "dataset_identity",         # the benchmark AND the split, on both arms
+    "controlled_variables",     # what is held fixed, named rather than assumed
+    "changed_variable",         # exactly what differs, named
+    "settlement_condition",     # what observation would settle it, declared BEFORE the run
+)
+
+# The scientific choices this harness will not supply, whatever the convention is. Named
+# as data so that "we filled in the usual value" is a diff a reader can see rather than a
+# habit nobody wrote down. A design that would need one of these and does not have it
+# reports `SPECIFICATION_BLOCKED` with the ingredient named.
+NEVER_ASSUMED = (
+    "optimizer", "learning_rate", "schedule", "split", "augmentation_strength",
+    "preprocessing", "threshold", "batch_size", "epochs", "seed_policy",
+    "early_stopping", "weight_decay", "tokenizer", "normalisation",
+)
+
+VALIDATION_DESIGN_STATES = (
+    "DESIGNED",                # every ingredient bound; the experiment could be built
+    "SPECIFICATION_BLOCKED",   # at least one ingredient is missing from the paper/artifact
+    "NOT_APPLICABLE",          # this question is not one a controlled experiment answers
+)
+
+# FOUR RUNGS, AND THE TOP ONE HAS NO SPELLING — the same device `ARTIFACT_AUTHORITY` and
+# `LITERATURE_AUTHORITY` use. The unreachable rung here is CAUSAL ATTRIBUTION: "the
+# mechanism the paper credits is what produces the gain". One controlled comparison, on
+# one benchmark, at one scale, cannot establish that — it can establish that under THIS
+# controlled comparison the effect the claim predicts did or did not appear, which is a
+# bounded observation a referee can act on and is not a causal law.
+VALIDATION_AUTHORITY = (
+    "ARM_MEASUREMENT",               # level 1: about one run of one arm, and nothing else
+    "CONTROLLED_OBSERVATION",        # level 2: two arms compared; conformance NOT established
+    "CONFORMANT_CONTROLLED_RESULT",  # level 3: + conformance, bound identity, answers the question
+    "NONE",                          # observed; establishes nothing
+)
+
+# Only the third rung may reach a defect, and even then materiality decides independently
+# whether anything follows for the paper.
+DEFECT_CAPABLE_VALIDATION_AUTHORITIES = ("CONFORMANT_CONTROLLED_RESULT",)
+
+# THE EMPTY TUPLE THAT MAKES LEVEL 4 INEXPRESSIBLE. `ArmComparison.establishes_attribution`
+# is a membership test in this, so the question "did this experiment prove the mechanism"
+# has one answer for every input this system can produce, and there is no threshold a
+# later contributor could relax to change it.
+CAUSAL_ATTRIBUTION_AUTHORITIES: tuple[str, ...] = ()
+
+# WHETHER THE EXPERIMENT IS THE PAPER'S EXPERIMENT. Not a judgement and not a model field:
+# `validation.conformance` derives it from whether every arm was instantiated from a
+# source that relocates, no `NEVER_ASSUMED` choice was supplied by this harness, and the
+# provenance is one the reproduction ceiling already admits.
+VALIDATION_CONFORMANCE_STATES = (
+    "CONFORMANT",    # every arm derives from the paper or the pinned artifact
+    "DEVIATES",      # at least one scientific choice is this harness's, not the authors'
+    "UNASSESSED",    # conformance was never reached
+)
+
+# HOW THE QUESTION WOULD BE SETTLED, DECLARED BEFORE ANYTHING RUNS. There is deliberately
+# no universal percentage anywhere in this module: the rule belongs to the review question
+# and is carried on the design, so a result cannot be settled against a threshold chosen
+# after the numbers came back.
+SETTLEMENT_RULES = (
+    "DIRECTION_AGREES",              # the treatment moves the metric the way the claim says
+    "EFFECT_EXCEEDS_TOLERANCE",      # the gap between arms exceeds a tolerance the design declared
+    "EFFECT_WITHIN_EQUIVALENCE_MARGIN",  # non-inferiority / equivalence, against a declared margin
+    "ARMS_INDISTINGUISHABLE",        # the two arms' intervals overlap, or they do not
+)
+
+# Rules whose arithmetic needs a NUMBER the design must declare. Listed rather than
+# inferred, because a rule that silently defaults its tolerance to zero would settle every
+# comparison in whichever direction the noise happened to fall.
+RULES_REQUIRING_TOLERANCE = ("EFFECT_EXCEEDS_TOLERANCE", "EFFECT_WITHIN_EQUIVALENCE_MARGIN")
+
+# Rules whose arithmetic needs per-arm UNCERTAINTY. A comparison asked to decide overlap
+# between two arms that reported a single number each is refused, not answered.
+RULES_REQUIRING_UNCERTAINTY = ("ARMS_INDISTINGUISHABLE",)
+
+BETWEEN_ARM_STATES = (
+    "SETTLED_AS_PREDICTED",       # the declared rule fired in the direction the claim predicts
+    "SETTLED_AGAINST_PREDICTION",  # it fired the other way
+    "NOT_SETTLED",                # it fired neither way; the question stays open
+    "REFUSED",                    # the comparison was not performed at all — see `refusal`
+)
+
+# Every way a between-arms comparison can be refused. Closed, and every one of them is a
+# fact about the experiment or about this harness — not one is a finding about the paper.
+BETWEEN_ARM_REFUSALS = (
+    "",
+    "arm_missing",                    # fewer than two arms produced a measurement
+    "arm_produced_no_value",          # an arm ran and reported no value for the metric
+    "metric_identity_mismatch",       # the arms measured different quantities, bases or units
+    "dataset_identity_mismatch",      # the arms ran on different benchmarks or splits
+    "statistical_unit_mismatch",      # the arms aggregate over different units
+    "not_a_controlled_comparison",    # more than one thing differs between the arms
+    "settlement_condition_undeclared",  # no rule was declared before the run
+    "tolerance_undeclared",           # the declared rule needs a tolerance and none was given
+    "uncertainty_unavailable",        # the declared rule needs intervals and the arms have none
+    "relative_difference_undefined",  # the control arm measured zero
+    "design_not_established",         # the design was SPECIFICATION_BLOCKED
+)
+
+ARM_ROLES = ("control", "treatment")
+
+# Which direction a metric has to move for the claim to hold. Declared on the design, from
+# the claim's own wording, and never inferred from the numbers.
+PREDICTED_DIRECTIONS = ("INCREASE", "DECREASE", "NO_CHANGE", "UNSTATED")
+
+OBSERVED_DIRECTIONS = ("INCREASE", "DECREASE", "NO_CHANGE", "UNDETERMINED")
+
+
+class ValidationArm(_Base):
+    """One arm of a focused-validation experiment, and where every part of it came from.
+
+    `instantiation_basis` is the field that makes conformance checkable: an arm the paper
+    describes and an arm this harness assembled are two different things, and an
+    experiment whose arms cannot say which they are cannot be held against the paper.
+    """
+
+    role: str = Field(default="", description=" | ".join(ARM_ROLES))
+    label: str = Field(default="", description="the arm's own name, e.g. the method a row names")
+    address: str = Field(
+        default="",
+        description="where the paper reports this arm, when it does — a cell, a prose span. "
+                    "Empty is normal and is not a defect: the control arm of an attribution "
+                    "question is usually an arm the paper never ran.")
+    method: str = Field(default="", description="the method this arm instantiates")
+    configuration: dict[str, str] = Field(
+        default_factory=dict,
+        description="every scientific choice this arm fixes, by name. WRITTEN FROM THE "
+                    "PAPER OR THE PINNED ARTIFACT — a key whose value this harness chose "
+                    "is what `NEVER_ASSUMED` forbids and what `conformance` detects.")
+    varies: list[str] = Field(
+        default_factory=list, description="what this arm changes relative to the control")
+    source: str = Field(
+        default="", description="paper | artifact | harness — where this arm's configuration "
+                                "came from. 'harness' is never conformant.")
+    instantiation_basis: str = Field(
+        default="", description="the address or file:line each choice was read from")
+    command: list[str] = Field(
+        default_factory=list, description="the artifact's own command for this arm, when one exists")
+
+
+class SettlementCondition(_Base):
+    """What observation would settle the question, declared BEFORE anything runs.
+
+    There is no default rule and no default tolerance. A design that reaches execution
+    without one is refused by `between_arms.compare` with
+    `settlement_condition_undeclared`, which is the only way this system can honestly say
+    a controlled result settled anything: a rule chosen after the numbers arrived settles
+    whatever the author of the rule wanted.
+    """
+
+    rule: str = Field(default="", description=" | ".join(SETTLEMENT_RULES))
+    tolerance: float | None = Field(
+        default=None,
+        description="the margin the declared rule compares against, in the metric's own "
+                    "unit. Required for the rules in RULES_REQUIRING_TOLERANCE and "
+                    "deliberately never defaulted — a tolerance of zero settles every "
+                    "comparison in whichever direction the noise fell.")
+    tolerance_basis: str = Field(
+        default="",
+        description="where the tolerance came from — the paper's own stated effect size, "
+                    "its own reported variance, or the measured seed-noise band. A "
+                    "tolerance with no basis is a number this review invented.")
+    predicted_direction: str = Field(
+        default="UNSTATED", description=" | ".join(PREDICTED_DIRECTIONS))
+    statement: str = Field(
+        default="", description="the condition in one sentence, as a referee would read it")
+    declared_before_execution: bool = Field(
+        default=False,
+        description="WRITTEN BY THE HARNESS when the design is persisted, before any "
+                    "process starts. False makes the comparison refuse.")
+
+
+class ValidationDesign(_Base):
+    """The smallest legitimate experiment that would discriminate the explanations — or
+    the named reason one cannot be built.
+
+    Every ingredient in `VALIDATION_INGREDIENTS` is required and `missing` names the ones
+    that are not bound. `state` is derived from `missing` rather than stored beside it, so
+    a design cannot be reported DESIGNED while something it needs is absent.
+    """
+
+    design_id: str = ""
+    paper_id: str = ""
+    target_id: str = ""
+    question_id: str = ""
+    question_kind: str = Field(default="", description="the ReviewQuestion kind this answers")
+    question_ref: str = Field(
+        default="", description="the addressed claim the question is about, re-resolvable")
+    question_text: str = ""
+    competing_explanations: list[str] = Field(
+        default_factory=list,
+        description="the readings this run would discriminate between. CARRIED from the "
+                    "finding's own counter-explanations, never invented here.")
+    comparison_id: str = Field(
+        default="",
+        description="the claim-graph COMPARISON node this design reuses, e.g. "
+                    "'comparison:accuracy|cifar-100'. Empty when the paper set up no such "
+                    "comparison, which is itself an unbound ingredient.")
+    metric: str = ""
+    metric_basis: str = Field(default="", description="absolute | relative_to_baseline")
+    metric_unit: str = ""
+    metric_ref: str = Field(default="", description="where the paper defines the metric")
+    benchmark: str = ""
+    split: str = Field(
+        default="",
+        description="the evaluation split, from the paper. NEVER defaulted to 'test': "
+                    "which split a number was measured on is exactly the kind of choice "
+                    "`NEVER_ASSUMED` keeps this harness from supplying.")
+    statistical_unit: str = Field(
+        default="", description="what one measurement is over — an example, a seed, a fold")
+    arms: list[ValidationArm] = Field(default_factory=list)
+    changed_variables: list[str] = Field(default_factory=list)
+    controlled_variables: list[str] = Field(default_factory=list)
+    settlement: SettlementCondition | None = None
+    state: str = Field(default="SPECIFICATION_BLOCKED",
+                       description=" | ".join(VALIDATION_DESIGN_STATES))
+    missing: list[str] = Field(
+        default_factory=list, description="unbound entries of VALIDATION_INGREDIENTS")
+    assumed: list[str] = Field(
+        default_factory=list,
+        description="NEVER_ASSUMED choices this harness would have had to supply. A "
+                    "non-empty list makes the design SPECIFICATION_BLOCKED, whatever else "
+                    "is bound.")
+    conformance: str = Field(default="UNASSESSED",
+                             description=" | ".join(VALIDATION_CONFORMANCE_STATES))
+    conformance_basis: str = Field(default="", description="why, naming the arm and the source")
+    statement: str = Field(
+        default="", description="what this experiment would establish, in the harness's words")
+    reason: str = Field(default="", description="why it cannot be built, when it cannot")
+
+    @property
+    def established(self) -> bool:
+        return self.state == "DESIGNED"
+
+    @property
+    def control(self) -> ValidationArm | None:
+        return next((a for a in self.arms if a.role == "control"), None)
+
+    @property
+    def treatment(self) -> ValidationArm | None:
+        return next((a for a in self.arms if a.role == "treatment"), None)
+
+
+class ArmMeasurement(_Base):
+    """What ONE arm of a focused validation actually produced.
+
+    Persisted per arm rather than folded immediately into a delta, because the delta is
+    the only thing the old `ProbeResult.measured_delta` kept and a referee tracing a
+    between-arms verdict needs each side's identity, configuration, unit and repetition
+    count to check that the two were comparable at all.
+    """
+
+    design_id: str = ""
+    role: str = Field(default="", description=" | ".join(ARM_ROLES))
+    label: str = ""
+    experiment_id: str = Field(
+        default="", description="the artifact command or reconstruction that produced it")
+    configuration: dict[str, str] = Field(default_factory=dict)
+    metric: str = ""
+    metric_basis: str = ""
+    unit: str = ""
+    benchmark: str = ""
+    split: str = ""
+    statistical_unit: str = ""
+    value: float | None = Field(default=None, description="the arm's point estimate, or None")
+    uncertainty: float | None = Field(
+        default=None, description="one standard deviation over the repetitions, when there "
+                                  "were repetitions. None is not zero.")
+    n: int = Field(default=0, description="repetitions that produced a value")
+    seeds: list[int] = Field(default_factory=list)
+    provenance: str = Field(default="", description="mirrors ProbeSpec.provenance")
+    execution_ref: str = Field(default="", description="where the raw record lives")
+    reason: str = Field(default="", description="why this arm produced no value, when it did not")
+
+
+class ArmComparison(_Base):
+    """One arm held against another, against a rule declared before either of them ran.
+
+    `state` is arithmetic over the two measurements and the declared rule. `authority` is
+    what that arithmetic is ENTITLED to say, which is a different question and the one
+    this class exists to keep separate: a comparison can be perfectly computed and still
+    say nothing about the paper, because the arms were this harness's arms.
+    """
+
+    design_id: str = ""
+    control_label: str = ""
+    treatment_label: str = ""
+    metric: str = ""
+    unit: str = ""
+    control_value: float | None = None
+    treatment_value: float | None = None
+    difference: float | None = Field(
+        default=None, description="treatment - control, in the metric's own unit")
+    relative_difference: float | None = Field(
+        default=None,
+        description="difference / |control|, or None when the control measured zero. "
+                    "Reported as None rather than as infinity or as a large number: a "
+                    "relative change against zero is undefined, not enormous.")
+    direction: str = Field(default="UNDETERMINED", description=" | ".join(OBSERVED_DIRECTIONS))
+    intervals_overlap: bool | None = Field(
+        default=None,
+        description="do the arms' one-sigma intervals overlap? None when either arm "
+                    "reported no uncertainty — never False, which would read as a "
+                    "separation nobody measured.")
+    settlement_rule: str = Field(default="", description=" | ".join(SETTLEMENT_RULES))
+    tolerance: float | None = None
+    state: str = Field(default="REFUSED", description=" | ".join(BETWEEN_ARM_STATES))
+    refusal: str = Field(default="", description=" | ".join(BETWEEN_ARM_REFUSALS))
+    authority: str = Field(default="NONE", description=" | ".join(VALIDATION_AUTHORITY))
+    conformance: str = Field(default="UNASSESSED",
+                             description=" | ".join(VALIDATION_CONFORMANCE_STATES))
+    answers_question: bool = Field(
+        default=False,
+        description="WRITTEN BY THE HARNESS: does the rule that fired answer the question "
+                    "the design was built for? A settled comparison that answers a "
+                    "different question settles a different question.")
+    provenance: str = Field(default="", description="the ProbeSpec.provenance behind both arms")
+    statement: str = Field(default="", description="what this establishes, in the harness's words")
+    reason: str = ""
+
+    @property
+    def establishes_defect(self) -> bool:
+        """May this comparison contribute a paper-level defect?
+
+        Three conditions and all of them are structural: the top authority rung, the rule
+        having fired AGAINST the claim's own prediction, and the comparison answering the
+        question it was designed for. Materiality then decides independently whether
+        anything follows for the paper — this property is never the last word.
+        """
+        return (self.authority in DEFECT_CAPABLE_VALIDATION_AUTHORITIES
+                and self.state == "SETTLED_AGAINST_PREDICTION"
+                and self.answers_question)
+
+    @property
+    def supports_claim(self) -> bool:
+        return (self.authority in DEFECT_CAPABLE_VALIDATION_AUTHORITIES
+                and self.state == "SETTLED_AS_PREDICTED"
+                and self.answers_question)
+
+    @property
+    def establishes_attribution(self) -> bool:
+        """Did this experiment establish that the credited mechanism causes the effect?
+
+        A membership test in `CAUSAL_ATTRIBUTION_AUTHORITIES`, which is the empty tuple,
+        so the answer is False for every input this system can construct. One controlled
+        comparison on one benchmark is evidence about that comparison. Generalising it to
+        a mechanism is the reader's job and is not a thing this route may assert.
+        """
+        return self.authority in CAUSAL_ATTRIBUTION_AUTHORITIES
+
+
+class FocusedValidation(_Base):
+    """One FOCUSED_VALIDATION_EXPERIMENT route attempt over one target.
+
+    `discharged` requires a comparison that reached an authority. A design that was built
+    and blocked, and a run whose arms could not be compared, both leave it False — the
+    same property `LiteratureSearch.discharged` has, and for the same reason: a route that
+    discharged by failing to conclude is an exhaustion number that rises fastest where the
+    least was established.
+    """
+
+    paper_id: str = ""
+    target_id: str = ""
+    design: ValidationDesign | None = None
+    measurements: list[ArmMeasurement] = Field(default_factory=list)
+    comparison: ArmComparison | None = None
+    disposition: str = Field(default="NOT_ATTEMPTED", description=" | ".join(TARGET_DISPOSITIONS))
+    discharged: bool = Field(default=False, description="WRITTEN BY THE HARNESS")
+    launched: int = Field(default=0, description="processes actually started for this route")
+    reason: str = ""
 
 
 PHASES = ("ingest", "audit", "collect", "grade", "assess", "discover", "probe", "report",

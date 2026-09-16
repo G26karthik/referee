@@ -127,19 +127,25 @@ ROUTES_FOR_QUESTION = {
     "COMPOSITION": ("ARTIFACT_INSPECTION", "AUTHOR_CODE_EXECUTION",
                     "INDEPENDENT_RECONSTRUCTION"),
     # These three kinds need a run that VARIES something rather than one that merely
-    # re-derives a printed cell.  FOCUSED_VALIDATION_EXPERIMENT used to be listed here,
-    # but no executor implements its between-arms evidence contract.  Advertising that
-    # placeholder as applicable made the route denominator promise work the product
-    # could not attempt.  Until an executor exists, retain only implemented acquisition
-    # and reconstruction paths.
+    # re-derives a printed cell, and FOCUSED_VALIDATION_EXPERIMENT is that run. It was
+    # deliberately absent while no executor implemented its between-arms evidence
+    # contract — advertising a placeholder made the route denominator promise work the
+    # product could not attempt — and `harness.between_arms` plus `stages/validation.py`
+    # are that executor. It requires a repository for the same reason AUTHOR_CODE_EXECUTION
+    # does: a focused validation varies ONE thing in the AUTHORS' OWN code, and building
+    # both arms from nothing is a reconstruction, which is the next entry and is governed
+    # separately.
     # INDEPENDENT_RECONSTRUCTION is the no-artifact FALLBACK on all three, not a
     # preference: with no repository there is nothing to inspect and no arm to vary, and
     # the paper-only path is the one that reaches the governed reconstruction route. It
     # compares against a printed value, so it is offered only where the paper printed one
     # — which is why the printed-value requirement below is per-route as well as per-kind.
-    "ATTRIBUTION": ("ARTIFACT_INSPECTION", "INDEPENDENT_RECONSTRUCTION"),
-    "CONTROL_PRESENCE": ("ARTIFACT_INSPECTION", "INDEPENDENT_RECONSTRUCTION"),
-    "PROTOCOL_CONFORMANCE": ("ARTIFACT_INSPECTION", "INDEPENDENT_RECONSTRUCTION"),
+    "ATTRIBUTION": ("ARTIFACT_INSPECTION", "FOCUSED_VALIDATION_EXPERIMENT",
+                    "INDEPENDENT_RECONSTRUCTION"),
+    "CONTROL_PRESENCE": ("ARTIFACT_INSPECTION", "FOCUSED_VALIDATION_EXPERIMENT",
+                         "INDEPENDENT_RECONSTRUCTION"),
+    "PROTOCOL_CONFORMANCE": ("ARTIFACT_INSPECTION", "FOCUSED_VALIDATION_EXPERIMENT",
+                             "INDEPENDENT_RECONSTRUCTION"),
     # DELIBERATELY NOT EXECUTABLE. "Is the quantity the paper evaluates the quantity its
     # claim is about?" is not settled by producing that quantity again: a proxy measured
     # perfectly is still a proxy, and a ratio over the wrong population is still the same
@@ -162,7 +168,8 @@ ROUTES_FOR_QUESTION = {
 
 # A route that only exists when the paper's own artifact does. Kept as data beside the
 # table above so the structural facts a route can require are visible in one place.
-_NEEDS_REPO = ("ARTIFACT_INSPECTION", "AUTHOR_CODE_EXECUTION")
+_NEEDS_REPO = ("ARTIFACT_INSPECTION", "AUTHOR_CODE_EXECUTION",
+               "FOCUSED_VALIDATION_EXPERIMENT")
 
 # INDEPENDENT_RECONSTRUCTION used to be offered ONLY when no repository existed at all —
 # the sole fallback for a paper with nothing to inspect or run. **Step 6 widens that.**
@@ -601,14 +608,22 @@ def _self_check() -> None:
             assert got != ["NONE"], (
                 f"{qk} is not about a printed quantity and must reach a route without one")
 
-    # A question with no parsed quantity can still reach static artifact inspection, but
-    # the unimplemented focused-validation placeholder is not advertised.
+    # A question with no parsed quantity reaches static inspection AND the focused
+    # validation, and does NOT reach the reconstruction: that route is reconciled against
+    # a printed value and there is none. The three requirements are separate and the
+    # ordering is the escalation policy — read the cheapest thing first.
     for qk in ("ATTRIBUTION", "CONTROL_PRESENCE", "PROTOCOL_CONFORMANCE"):
         got = _routes("SCIENTIFIC_CLAIM", None, repo_available=True, has_value=False,
                       arithmetic_broken=False, lens="", question_kind=qk)
-        assert got == ["ARTIFACT_INSPECTION"], (qk, got)
-        assert "FOCUSED_VALIDATION_EXPERIMENT" not in got
+        assert got == ["ARTIFACT_INSPECTION", "FOCUSED_VALIDATION_EXPERIMENT"], (qk, got)
         assert got != ["NONE"], qk
+        # AND IT NEEDS THE AUTHORS' CODE. A focused validation with no repository would be
+        # two arms this review built from nothing, which is a reconstruction wearing
+        # another route's name.
+        none_repo = _routes("SCIENTIFIC_CLAIM", None, repo_available=False,
+                            has_value=False, arithmetic_broken=False, lens="",
+                            question_kind=qk)
+        assert "FOCUSED_VALIDATION_EXPERIMENT" not in none_repo, (qk, none_repo)
     # and one whose comparison IS against a printed value still does not
     assert _routes("SCIENTIFIC_CLAIM", None, repo_available=True, has_value=False,
                    arithmetic_broken=False, lens="",
@@ -636,7 +651,7 @@ def _self_check() -> None:
                         evidence_quote="Accuracy improves markedly.")]
     cobjs, _ = discover(doc, confound, questions_mod.derive(confound))
     anchored_obj = next(o for o in cobjs if o.question_kind == "ATTRIBUTION")
-    assert "FOCUSED_VALIDATION_EXPERIMENT" not in anchored_obj.routes
+    assert "FOCUSED_VALIDATION_EXPERIMENT" in anchored_obj.routes
     assert anchored_obj.harness_addressable, (
         "an attribution question with a resolved address and a repository is checkable")
     print("harness.discovery self-check ok")

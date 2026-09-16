@@ -709,6 +709,13 @@ INVARIANT_DISPOSITION: dict[int, str] = {
         "would have to be 'a bounded search ran', and that is a fact about the search "
         "recorded in LiteratureSearch.protocol — not a property this harness enforces "
         "about every review, since both literature gates are off by default",
+    37: "not reportable here: a focused validation is a route taken for SOME targets on "
+        "SOME papers, and a per-review process guarantee has to hold for every review. "
+        "What a review reports is per target — the design's state, the ingredients it "
+        "could not bind, and what the between-arms comparison was entitled to say. The "
+        "part of this invariant that IS a whole-review property is already carried by "
+        "EXECUTION_PROVENANCE_CEILING, because CONFORMANT_CONTROLLED_RESULT requires the "
+        "same provenance.admits that a reproduction does",
 }
 
 
