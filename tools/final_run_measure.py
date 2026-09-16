@@ -16,6 +16,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from harness.artifacts import PROTOCOL_COMPLETING_OUTCOMES  # noqa: E402
+
 PAPERS = ["0c06a98d7c818f6f", "2024-icml-sapg", "5993d35ff0996b52", "acl",
           "apt-icml", "cvpr", "iclr", "sanchez24a-icml"]
 
@@ -35,7 +37,10 @@ def measure(run_dir: Path, pid: str) -> dict:
     ledger = _load(root / "reports" / f"{pid}.ledger.json") or {}
     ctrl = _load(root / "controller.json") or {}
     search = _load(root / "literature" / f"{pid}.search.json")
-    inspection = _load(root / "artifact" / f"{pid}.inspection.json")
+    # `stages/artifact` writes `<pid>.route.json`, not `<pid>.inspection.json`. Reading
+    # the wrong name reported 0 facts for a paper whose route had established some, which
+    # is the direction a measurement must never fail in.
+    inspection = _load(root / "artifact" / f"{pid}.route.json")
 
     objects = ts.get("objects") or []
     plans = ts.get("plans") or []
@@ -50,6 +55,19 @@ def measure(run_dir: Path, pid: str) -> dict:
         by_disp[o.get("disposition", "?")] = by_disp.get(o.get("disposition", "?"), 0) + 1
 
     cov = ts.get("extraction_coverage") or {}
+    # `coverage.reading` is where `harness/stages/audit.reading_record` actually writes
+    # these four numbers, nested one level under `coverage` in the rendered report
+    # (`harness/coverage.py`'s `CoverageReport.reading`), never at `coverage` top level
+    # and never under `extraction_coverage` (that key belongs to `discover`, a different
+    # stage with a disjoint vocabulary). The first version of this reader guessed the
+    # wrong location twice and both guesses silently returned None on a live corpus,
+    # which is the direction a measurement must never fail in for the ceiling on every
+    # recall-shaped claim this system makes.
+    reading_top = rep.get("coverage") or {}
+    reading = dict(reading_top.get("reading") or {})
+    if "prose_presented" not in reading and "prose_presented_fraction" in reading_top:
+        reading["prose_presented"] = reading_top["prose_presented_fraction"]
+    reading["parts"] = reading.get("number_of_parts")
     links = _load(root / "links" / f"{pid}.claimlinks.json") or {}
     accepted = [l for l in (links.get("links") or []) if l.get("accepted")]
 
@@ -59,14 +77,21 @@ def measure(run_dir: Path, pid: str) -> dict:
                      "failure_kind": ctrl.get("failure_kind") or "",
                      "disposition": ctrl.get("disposition"),
                      "verdict": rep.get("verdict") or ctrl.get("verdict") or ""},
-        # READING
+        # READING — read off the CONTROLLER's own audit record, not off
+        # `targets.json`. `discovery` writes `extraction_coverage` and none of the four
+        # reading numbers is in it, so every one of these came back None: the §13 READING
+        # block reported nothing for a run whose readers in fact saw 100% of the
+        # extracted prose. A measurement that silently yields None for the ceiling on
+        # every recall-shaped claim this system makes is worse than one that is wrong,
+        # because None reads as "not applicable" rather than as "not measured".
         "reading": {
             "pages": doc.get("n_pages") or 0,
             "sections": len(doc.get("sections") or []),
-            "reader_visible_fraction": cov.get("reader_visible_fraction"),
-            "prose_presented": cov.get("prose_presented"),
-            "parts": cov.get("reading_parts"),
-            "syntheses": cov.get("reading_syntheses"),
+            "reader_visible_fraction": reading.get("reader_visible_fraction"),
+            "prose_presented": reading.get("prose_presented"),
+            "parts": reading.get("parts"),
+            "anchor_repeat_fraction": reading.get("anchor_repeat_fraction"),
+            "extracted_text_fraction": reading.get("extracted_text_fraction"),
         },
         # REVIEW
         "review": {
@@ -93,9 +118,19 @@ def measure(run_dir: Path, pid: str) -> dict:
             # protocol that had in fact completed, which is the direction this number
             # must never fail in — `protocol_completed` is what makes "exhausted" mean
             # anything, and understating it is as misleading as overstating it.
+            # READ OFF THE HARNESS'S OWN VOCABULARY, not a second copy of the rule.
+            # This tested `outcome == "COMPLETED"` and so counted `NO_RESULTS` as a
+            # protocol that did not complete. An index that answered and matched nothing
+            # HAS answered: `artifacts.PROTOCOL_COMPLETING_OUTCOMES` says so, and
+            # `iclr`'s six NO_RESULTS calls were enough to report a completed protocol as
+            # incomplete. Understating this is as misleading as overstating it, because
+            # `protocol_completed` is the whole of what "the route was exhausted" means.
             "protocol_completed": bool((search or {}).get("provider_calls")
-                                       and all(c.get("outcome") == "COMPLETED"
+                                       and all(c.get("outcome") in PROTOCOL_COMPLETING_OUTCOMES
                                                for c in (search or {}).get("provider_calls") or [])),
+            "provider_calls_rate_limited": sum(
+                1 for c in ((search or {}).get("provider_calls") or [])
+                if c.get("outcome") == "RATE_LIMITED"),
             "provider_calls": len((search or {}).get("provider_calls") or []),
             "raw_records": (search or {}).get("raw_results", 0),
             "candidates_reviewed": (search or {}).get("candidates_reviewed", 0),
@@ -112,6 +147,8 @@ def measure(run_dir: Path, pid: str) -> dict:
         "artifacts": {
             "code_available": bool(doc.get("repo_url")),
             "facts": len((inspection or {}).get("facts") or []),
+            "statements_examined": len((inspection or {}).get("statements_examined") or []),
+            "discharged": bool((inspection or {}).get("discharged")),
             "concerns": sum(1 for f in ((inspection or {}).get("facts") or [])
                             if f.get("authority") == "ENDPOINTS_VERIFIED_ARTIFACT_CONCERN"),
             "mismatches": sum(1 for f in ((inspection or {}).get("facts") or [])

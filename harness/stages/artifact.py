@@ -111,6 +111,39 @@ def _frameworks_named(doc: PaperDoc) -> set[str]:
             if name in text}
 
 
+def distinct_facts(facts: list[ArtifactFact]) -> list[ArtifactFact]:
+    """The same fact about the same checkout, established once rather than once per target.
+
+    `facts_for` runs per target and a fact about the CHECKOUT does not vary with which
+    paper statement it is being held against — so `acl`'s nine targets each produced the
+    identical `ENTRYPOINT_PRESENCE` fact about `npv.py`, and the route's own record then
+    read "9 bounded fact(s) were established about the checkout". One was. It was checked
+    against nine statements and answered none of them, which is a different sentence and
+    the true one.
+
+    The key is what makes two facts THE SAME FACT: the probe that produced it, the exact
+    span it relocated to, the bounded question it settles, and the paper reference it was
+    raised against. Identity is deliberately not the statement text — that is precisely
+    what varies while the fact does not — and deliberately not the `statement`, which is
+    the harness's own prose about the fact rather than the fact.
+
+    Order is preserved, so the first establishment of each fact is the one kept and the
+    record still reads in the order the route worked.
+    """
+    seen: set[tuple] = set()
+    out: list[ArtifactFact] = []
+    for f in facts:
+        span = f.span
+        key = (f.probe, f.settles, f.authority, f.paper_ref,
+               getattr(span, "file", ""), getattr(span, "line", 0),
+               getattr(span, "end_line", 0), getattr(span, "file_sha256", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(f)
+    return out
+
+
 def run_route(cfg: Config, pid: str, doc: PaperDoc, target_set: TargetSet | None,
               root: str | Path, *, url: str = "",
               extra_facts: list[ArtifactFact] | None = None
@@ -137,6 +170,9 @@ def run_route(cfg: Config, pid: str, doc: PaperDoc, target_set: TargetSet | None
 
     snap = artifact_evidence.snapshot(root, url)
     outcomes: list[TargetOutcome] = []
+    # ACCUMULATED PER TARGET AND DEDUPLICATED ONCE, at the bottom. Each target's own
+    # `inspect` call reasons over its OWN facts and is unaffected; what this fixes is the
+    # aggregate record and the number printed into it.
     all_facts: list[ArtifactFact] = list(extra_facts or [])
     statements: list[str] = []
     escalations: list[str] = []
@@ -192,7 +228,7 @@ def run_route(cfg: Config, pid: str, doc: PaperDoc, target_set: TargetSet | None
             reason=reason))
 
     whole = artifact_evidence.inspect(
-        doc, root, url=url, statements=statements, facts=all_facts,
+        doc, root, url=url, statements=statements, facts=distinct_facts(all_facts),
         scope="IMPLEMENTATION_CORRESPONDENCE",
         escalations=sorted(set(escalations)))
     try:

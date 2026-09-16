@@ -19,8 +19,8 @@ from pathlib import Path
 import pytest
 
 from harness import artifact_evidence, artifact_review_driver, planner, taxonomy
-from harness.artifacts import (ClaimRef, DiscoveredObject, PaperDoc, PlanDecision, Section,
-                               TargetOutcome, TargetSet)
+from harness.artifacts import (ArtifactFact, ClaimRef, DiscoveredObject, PaperDoc,
+                               PlanDecision, Section, SourceSpan, TargetOutcome, TargetSet)
 from harness.config import Config
 from harness.stages import artifact as artifact_stage
 
@@ -697,3 +697,45 @@ def test_an_escalation_is_keyed_on_the_probe_and_not_on_the_reading(checkout):
     assert all(isinstance(x, str) for x in got.escalations)
     assert artifact_evidence.outcome_disposition(got) \
         == "ARTIFACT_CONCERN_VERIFIED_ENDPOINTS"
+
+
+def test_one_fact_about_one_checkout_is_counted_once(tmp_path):
+    """Found on a live run, not by reading the code.
+
+    `facts_for` runs PER TARGET, and a fact about the CHECKOUT does not vary with which
+    paper statement it is being held against. So `acl`'s nine artifact-route targets each
+    produced the identical `ENTRYPOINT_PRESENCE` fact about the same file at the same
+    commit, and the route's own persisted record read *"9 bounded fact(s) were established
+    about the checkout"*. One was. It was checked against nine statements and answered
+    none of them — a different sentence, and the true one.
+
+    The count matters because it is the number this route reports about itself, and a
+    route that inflates what it established is the failure mode the whole authority ladder
+    exists to prevent, arriving through arithmetic instead of through a verdict.
+    """
+    from harness.stages.artifact import distinct_facts
+
+    def fact(file: str, line: int, probe: str = "entrypoint_present",
+             settles: str = "ENTRYPOINT_PRESENCE", ref: str = "P0:0-10") -> ArtifactFact:
+        return ArtifactFact(
+            probe=probe, settles=settles, authority="ARTIFACT_FACT", paper_ref=ref,
+            span=SourceSpan(file=file, line=line, end_line=line + 10,
+                            file_sha256="a" * 64, quote=""),
+            statement=f"The checkout advertises `{file}`.")
+
+    same = [fact("eval.py", 1) for _ in range(9)]
+    assert len(distinct_facts(same)) == 1, "one fact, established nine times, is one fact"
+
+    # AND IT MUST NOT MERGE WHAT IS GENUINELY DIFFERENT. A different file, a different
+    # line, a different probe, a different bounded question and a different paper
+    # reference are each a different fact.
+    varied = [fact("eval.py", 1), fact("train.py", 1), fact("eval.py", 44),
+              fact("eval.py", 1, probe="file_present"),
+              fact("eval.py", 1, settles="FILE_PRESENCE"),
+              fact("eval.py", 1, ref="P2:0-10")]
+    assert len(distinct_facts(varied)) == len(varied), [f.span.file for f in varied]
+
+    # Order is the order the route worked in, and the FIRST establishment is the one kept.
+    kept = distinct_facts([fact("b.py", 1), fact("a.py", 1), fact("b.py", 1)])
+    assert [f.span.file for f in kept] == ["b.py", "a.py"]
+    assert distinct_facts([]) == []
