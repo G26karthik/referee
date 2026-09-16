@@ -13,11 +13,11 @@ the one intentionally-varying byte in the output set.
 
 WHAT GOES IN is an ALLOW LIST, not a deny list: only the top-level entries
 named in `TOP_LEVEL_DIRS` / `TOP_LEVEL_FILES` / `README_GLOB` /
-`CLAUDE_LAUNCH_JSON`, plus a filtered `manuscript/`, are ever considered.
-Everything else at the repo root (`papers/`, `projects/`, `reports/`,
-`runs_*/`, `tmp/`, stray `*.zip` archives, `db/` backups, ...) is excluded by
-omission — it was never on the allow list, so no separate exclusion rule is
-needed for it.
+`CLAUDE_LAUNCH_JSON` / `AUTHORED_FIXTURES_DIR`, plus a filtered `manuscript/`,
+are ever considered. Everything else at the repo root (`papers/` EXCEPT its
+`authored/` fixture subdirectory, `projects/`, `reports/`, `runs_*/`, `tmp/`,
+stray `*.zip` archives, `db/` backups, ...) is excluded by omission — it was
+never on the allow list, so no separate exclusion rule is needed for it.
 
 Run:  PYTHONUTF8=1 python tools/make_release_zip.py
 """
@@ -48,6 +48,17 @@ FIXED_EXTERNAL_ATTR = (0o644 & 0xFFFF) << 16  # regular file, rw-r--r--, on ever
 # ---------------------------------------------------------------------------
 
 TOP_LEVEL_DIRS = ["harness", "tests", "tools", "docs"]
+
+# `papers/authored/` is this harness's own SYNTHETIC test fixtures — small, purpose-built
+# PDFs (`paper1_grokking.pdf`, ...) that `tests/conftest.py`'s `fixture_paper()` looks up
+# by name — never the real corpus under `papers/` itself, which is excluded from the
+# release deliberately (third-party copyrighted papers under review, not source). Found
+# missing by the release ZIP's own acceptance test: without this, `tests/test_review.py`
+# and `tests/test_reasoning_architecture.py` fail COLLECTION (not a graceful skip) on the
+# extracted archive, because those two call `fixture_paper()` at module import time
+# rather than behind a `skipif`. Listed as its own entry, not folded into `TOP_LEVEL_DIRS`,
+# so the rest of `papers/` stays excluded by omission exactly as before.
+AUTHORED_FIXTURES_DIR = "papers/authored"
 
 TOP_LEVEL_FILES = [
     "run.py",
@@ -287,6 +298,11 @@ def collect_files() -> list[Path]:
     for filename in TOP_LEVEL_FILES:
         f = REPO_ROOT / filename
         if f.is_file():
+            absolute.append(f)
+
+    fixtures_dir = REPO_ROOT / AUTHORED_FIXTURES_DIR
+    if fixtures_dir.is_dir():
+        for f in sorted(fixtures_dir.glob("*.pdf")):
             absolute.append(f)
 
     for f in sorted(REPO_ROOT.glob(README_GLOB)):
