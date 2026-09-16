@@ -51,6 +51,8 @@ _PHRASE = {
         "focused validation: not tried",
     ("FOCUSED_VALIDATION_EXPERIMENT", "DISCHARGED_BLOCKED", "SPECIFICATION_BLOCKED"):
         "focused validation: specification blocked",
+    ("INDEPENDENT_RECONSTRUCTION", "COMPLETED_INCONCLUSIVE", ""):
+        "reconstruction: attempted, completed inconclusive (environment limitation)",
 }
 
 

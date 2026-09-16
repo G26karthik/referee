@@ -345,7 +345,20 @@ def _attempt_for(q, route: str, objs: list, plans: list, outcomes: list, cfg) ->
             # boundary from an execution gate.
             state, blocker = "DISCHARGED_BLOCKED", "CONFORMANCE_BLOCKED"
             attempted, completed, exhausted = True, True, True
-        elif disposition == "AUTHORIZATION_BLOCKED" or _gate_closed(cfg, route):
+        elif (disposition == "AUTHORIZATION_BLOCKED" or _gate_closed(cfg, route)) \
+                and outcome.launched == 0:
+            # Guarded on `launched == 0`, matching the CONFORMANCE_BLOCKED branch above:
+            # a static gate-closed check must not overrule a REAL attempt. A reconstruction
+            # sealed through the manual/SESSION_SUBAGENT channel (`accept_reimplementation`)
+            # never consults `cfg.allow_reimplementation_driver` at all — that gate only
+            # guards the automated CLI-invoking generator — so a manually-sealed
+            # reconstruction can genuinely launch processes while the gate reads closed.
+            # Before this guard, such a target's real `INCONCLUSIVE` disposition (with
+            # `launched > 0`) was preempted by `_gate_closed`'s static config check and
+            # misreported as GATE_CLOSED/AUTHORIZATION_BLOCKED — a configuration outcome
+            # for a route this run genuinely attempted and completed. First exposed by
+            # this run's real reconstruction executions; `_gate_closed`'s own callers all
+            # assume the automated driver is the only way a reconstruction is ever tried.
             state, blocker, attempted = "GATE_CLOSED", "AUTHORIZATION_BLOCKED", True
         elif disposition in DISCHARGING_BLOCKERS:
             state, blocker = "DISCHARGED_BLOCKED", disposition
