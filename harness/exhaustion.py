@@ -247,6 +247,16 @@ def _gate_closed(cfg, route: str) -> bool:
     if route == "INDEPENDENT_RECONSTRUCTION":
         return (not bool(getattr(cfg, "allow_reimplementation_driver", False))
                 or not bool(getattr(cfg, "allow_reimplementation_exec", False)))
+    if route == "FOCUSED_VALIDATION_EXPERIMENT":
+        # BOTH gates, because either one alone stops the route completing for a reason
+        # that is ours. With the design gate shut, every design is SPECIFICATION_BLOCKED —
+        # which without this branch scores DISCHARGED_BLOCKED, i.e. "the paper does not
+        # say enough", when the truth is that nothing asked. With the execution gate shut,
+        # a bound design cannot run. This is the defect the module's own docstring warns
+        # about — exhaustion reading 1.0 while measuring the operator's environment —
+        # arriving on a new route.
+        return (not bool(getattr(cfg, "allow_validation_design", False))
+                or not bool(getattr(cfg, "allow_repo_exec", False)))
     return False
 
 
@@ -303,8 +313,23 @@ def _attempt_for(q, route: str, objs: list, plans: list, outcomes: list, cfg) ->
             state, attempted, completed, exhausted = (
                 "COMPLETED_INCONCLUSIVE", True, True, True)
         elif outcome.launched > 0 and admits(outcome.provenance) and disposition in (
-                "REPRODUCED", "FAILED_REPRODUCTION"):
+                "REPRODUCED", "FAILED_REPRODUCTION",
+                # THE TWO SETTLED FOCUSED-VALIDATION OUTCOMES, under exactly the same three
+                # conditions: a process really started, the provenance clears the
+                # reproduction ceiling, and the disposition is one that settles. Without
+                # them a genuinely run, genuinely settled controlled experiment fell
+                # through every branch below to NOT_TRIED, so `validation.discharge`'s
+                # judgement was unreachable from this module's view and the route sat in
+                # the denominator unable to discharge through any of its real outcomes.
+                "VALIDATION_DEFECT_ESTABLISHED", "VALIDATION_SUPPORTS_CLAIM"):
             state, attempted, completed, exhausted = "DISCHARGED_RAN", True, True, True
+        elif disposition in ("VALIDATION_OBSERVATION_ONLY", "VALIDATION_INCONCLUSIVE"):
+            # It RAN and it settled nothing — an observation whose conformance was never
+            # established, or a declared rule that fired in neither direction. Completed
+            # and inconclusive, never discharged: a route that discharged by failing to
+            # conclude is an exhaustion number that rises fastest where least was learned.
+            state, attempted, completed, exhausted = (
+                "COMPLETED_INCONCLUSIVE", True, True, True)
         elif disposition == "BUDGET_DEFERRED":
             state, blocker = "DEFERRED_BUDGET", disposition
         elif disposition == "SUPERSEDED_BY_ESTABLISHED_FAILURE":

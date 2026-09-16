@@ -343,6 +343,18 @@ def claim_status(findings: list[Finding],
                 f"target {getattr(source, 'target_id', '?')}: the paper's own "
                 f"printed composition does not evaluate to the total it states "
                 f"({getattr(source, 'reason', '') or 'see the ledger'})")
+        if getattr(source, "disposition", "") == "VALIDATION_DEFECT_ESTABLISHED":
+            # NOT "failed reproduction". A reproduction re-runs an experiment the AUTHORS
+            # published; a focused validation runs a contrast THIS REVIEW designed, and
+            # calling the second the first attributes our experiment to their paper. The
+            # disposition is separate from FAILED_REPRODUCTION precisely so a referee can
+            # tell the two apart, and folding them back together here would have undone
+            # that at the last layer, where a reader actually sees it.
+            return "VERIFIED_FAILURE", (
+                f"target {getattr(source, 'target_id', '?')}: a controlled experiment this "
+                f"review designed, run on {getattr(source, 'provenance', '?')} provenance, "
+                f"produced the opposite of what the claim predicts "
+                f"({getattr(source, 'reason', '') or 'see the ledger'})")
         return "VERIFIED_FAILURE", (
             f"target {getattr(source, 'target_id', '?')} failed reproduction on "
             f"{getattr(source, 'provenance', '?')} provenance")
@@ -477,6 +489,25 @@ def overall_verdict(findings: list[Finding],
                      "states. Nothing was executed and no artifact was required.")
             return "RED", (f"Paper-internal arithmetic contradiction at target {where}: "
                            f"{getattr(source, 'reason', '')} {blame}")
+        if getattr(source, "disposition", "") == "VALIDATION_DEFECT_ESTABLISHED":
+            # The same correction as in `claim_status`, at the sentence a reader sees
+            # first. What ran is not the paper's experiment and the sentence says so; what
+            # it establishes is bounded to the contrast that ran, and the sentence says
+            # that too. Nothing here may be read as "the mechanism does not work" —
+            # `CAUSAL_ATTRIBUTION_AUTHORITIES` is the empty tuple for that reason.
+            blame = ("The experiment was DESIGNED BY THIS REVIEW from what the paper and "
+                     "its pinned checkout specify, and it varied one declared variable "
+                     "against a settlement condition fixed before either arm ran. It is "
+                     "not a reproduction of anything the authors published, and it "
+                     "establishes what happened under that one contrast and nothing "
+                     "wider."
+                     if prov == "repo_exec" else
+                     "The arms were run by a reconstruction rather than the authors' "
+                     "checkout, so what it establishes is bounded twice over: to the one "
+                     "contrast that ran, and to the faithfulness of a program this review "
+                     "did not receive from the authors.")
+            return "RED", (f"Focused validation contradicted a predicted contrast at "
+                           f"target {where}: {getattr(source, 'reason', '')} {blame}")
         blame = ("The audited repository's own code does not reproduce the number it prints "
                  "for this target." if prov == "repo_exec" else
                  "The program that ran was a human-written reproduction of the paper's "
@@ -577,7 +608,17 @@ def admissible_target_failure(outcomes: list | None) -> object | None:
 # answer the question. "We were not permitted to check this", "the artifact does not
 # contain it" and "this host cannot host it" are facts about the review, and they belong
 # in the report's scope section, which states them plainly. They do not belong in a colour.
-_ATTEMPTED_AND_UNSETTLED = ("INCONCLUSIVE",)
+# `VALIDATION_INCONCLUSIVE` joins it for exactly the reason INCONCLUSIVE is here and
+# nothing else is: the arms ran, they were held against each other, and the rule declared
+# for them BEFORE the run fired in neither direction. That is evidence gathered by
+# something entitled to settle the question, which did not settle it — a fact about the
+# paper's checkability rather than about our probe.
+#
+# `VALIDATION_OBSERVATION_ONLY` is deliberately NOT here, on the same argument that keeps
+# a synthesized probe's INCONCLUSIVE out: a comparison whose conformance was never
+# established was never entitled to settle anything, so its silence says nothing about the
+# paper. It is reported in the scope section, where a limit of this review belongs.
+_ATTEMPTED_AND_UNSETTLED = ("INCONCLUSIVE", "VALIDATION_INCONCLUSIVE")
 
 
 def unresolved_central(objects: list | None, outcomes: list | None) -> list:
@@ -619,15 +660,23 @@ def unchecked_central(objects: list | None, outcomes: list | None) -> list:
     The other half of the split above, kept as its own function so the reviewer report can
     say how much of the paper went unchecked without that fact leaking into the triage.
     """
-    settled = {"REPRODUCED", "PAPER_ONLY_RESOLVED", "FAILED_REPRODUCTION", "INCONCLUSIVE",
-              "PAPER_ARITHMETIC_CONTRADICTION"}
+    # WAS THE PAPER'S CLAIM CHECKED — asked of `taxonomy`, not of a set written here. The
+    # set this replaces named five dispositions and there are now thirty-four: every
+    # terminal state of the artifact, literature and focused-validation routes was missing
+    # from it, so an ESTABLISHED paper/artifact mismatch, a bound prior-art relation and a
+    # settled controlled experiment were each printed under "Central claims this review did
+    # not check" — in the same report that reported what they established. A list that has
+    # to be extended whenever a route is added will be out of date again by the next route;
+    # the derivation cannot be, and it reproduces the old five exactly.
     by_id = {getattr(o, "target_id", ""): o for o in (outcomes or [])}
     out = []
+    from .. import taxonomy
     for obj in (objects or []):
         if getattr(obj, "centrality", "") != "CENTRAL" or not getattr(obj, "harness_addressable", False):
             continue
         outcome = by_id.get(getattr(obj, "target_id", ""))
-        if outcome is None or getattr(outcome, "disposition", "") not in settled:
+        if outcome is None or not taxonomy.claim_was_checked(
+                getattr(outcome, "evidence_state", "")):
             out.append(obj)
     return out
 
@@ -1496,6 +1545,44 @@ def render_eval_report(r: EvalReport) -> str:
 # construction rather than by hoping the paper is short. A first-pass reviewer who has to
 # read sixty-seven findings has been handed the machine trace with a nicer title.
 _MAX_RED, _MAX_YELLOW, _MAX_HELD, _MAX_OPEN = 5, 4, 3, 3
+_MAX_READING = 4
+
+# WHAT THE TWO READING ROUTES ESTABLISHED, and the only outcomes of theirs a referee is
+# shown. Both routes ran on every corpus paper and NEITHER reached the reviewer report at
+# all: their outcomes carry no `Reconciliation`, their plan actions are not in the
+# experiments section's tuple, and their `resolution_state` starts with RESOLVED so the
+# open-questions section excludes them too. A paper/artifact inconsistency this system
+# ESTABLISHED, and a prior-art relation it BOUND, reached a human only as a word in a
+# count under the scope section.
+#
+# Only outcomes that ESTABLISHED something are listed. A completed search that matched
+# nothing, an inspection that settled nothing, and a concern whose relation is still the
+# reader's own reading are all real results and none of them is news for a referee's two
+# pages; they stay in the scope counts and in the machine ledger, where a denominator
+# belongs. The two ENDPOINTS_VERIFIED states are included because each is a question a
+# referee must adjudicate, and the sentence says in those words that the relation between
+# two verified ends is a reading rather than a demonstrated fact.
+_READING_OUTCOMES = {
+    "ARTIFACT_MISMATCH_ESTABLISHED":
+        "the paper and the released code disagree, with the experiment identity "
+        "established from a deterministic source. It does NOT establish that the reported "
+        "number is wrong: which of the two configurations produced it is a question for "
+        "execution.",
+    "ARTIFACT_FACT_ESTABLISHED":
+        "a bounded fact about the released code, matching the bounded question it was "
+        "asked. About the CHECKOUT, not about the paper's result.",
+    "ARTIFACT_CONCERN_VERIFIED_ENDPOINTS":
+        "both locations are real and what connects them is the auditor's reading. A "
+        "question for a referee, not a demonstrated inconsistency.",
+    "PRIOR_ART_RELATION_STRUCTURALLY_BOUND":
+        "an earlier work and this paper's own priority claim were bound from the two "
+        "documents. Whether two contributions are the same contribution remains a "
+        "scholarly judgement in the authors' field.",
+    "LITERATURE_MATCH_VERIFIED_ENDPOINTS":
+        "an earlier work, a resolved passage and a verified chronology — and the OVERLAP "
+        "is the reviewer's reading. A question for a referee; it is not a finding that "
+        "the contribution is not new, which no search can establish.",
+}
 # Per scientific CATEGORY, not per report: a paper with issues in six
 # categories should show a few of each rather than six of one. The report
 # stays bounded because the vocabulary is closed and every category is capped.
@@ -1890,6 +1977,24 @@ def render_reviewer_report(report: EvalReport, target_set=None) -> str:
                       f"evaluate to the total it states. No code was executed and no "
                       f"artifact was required to reach this conclusion.",
                       _material_line]
+            elif o.disposition == "VALIDATION_DEFECT_ESTABLISHED":
+                # THE THIRD BRANCH, and the reason there are three. This section had two:
+                # the paper's own arithmetic, and a failed reproduction. A focused
+                # validation is neither — no quantity the paper printed was re-derived,
+                # because the paper printed neither arm — so it arrived wearing the
+                # reproduction sentence and told a referee the authors' artifact had
+                # failed to produce a number nobody had asked it for.
+                L += ["", f"- **Focused validation contradicted a predicted contrast — "
+                          f"{o.target_id}**",
+                      f"  - claim: {_short(getattr(obj, 'claim_text', ''))}",
+                      f"  - evidence: {_short(o.reason)}",
+                      f"  - why it matters: a controlled experiment derived from the paper "
+                      f"and its pinned checkout, varying one declared variable against a "
+                      f"condition fixed before either arm ran, came out the opposite way "
+                      f"to what the claim predicts. This is not a reproduction of anything "
+                      f"the authors published, and it establishes what happened under that "
+                      f"one contrast and nothing wider.",
+                      _material_line]
             else:
                 L += ["", f"- **Failed reproduction — {o.target_id}**",
                       f"  - claim: {_short(getattr(obj, 'claim_text', ''))}",
@@ -1959,7 +2064,15 @@ def render_reviewer_report(report: EvalReport, target_set=None) -> str:
                   f"  - {_short(getattr(o, 'reason', '') or 'not attempted', 200)}"]
         L.append("")
 
-    held = [o for o in outcomes if o.disposition in ("REPRODUCED", "PAPER_ONLY_RESOLVED")]
+    # VALIDATION_SUPPORTS_CLAIM belongs here and was missing: the outcome block said the
+    # contrast came out the way the claim predicts and this section said "nothing was
+    # positively verified", about the same target, in the same report. It does NOT reach
+    # `claim_status`, which stays NOT_VERIFIED — that axis is about a quantity the paper
+    # PRINTED and a focused validation re-derives none, exactly as PAPER_ONLY_RESOLVED
+    # appears here without unlocking VERIFIED_SUPPORT either.
+    held = [o for o in outcomes
+            if o.disposition in ("REPRODUCED", "PAPER_ONLY_RESOLVED",
+                                 "VALIDATION_SUPPORTS_CLAIM")]
     L += ["", "## What held up"]
     if not held:
         L += ["", "Nothing was positively verified. GREEN here would mean 'not checked', "
@@ -1971,6 +2084,26 @@ def render_reviewer_report(report: EvalReport, target_set=None) -> str:
               f"  - {_short(o.reason, 200)}"]
     if len(held) > _MAX_HELD:
         L.append(f"- …and {len(held) - _MAX_HELD} more; see `discovery/targets.json`.")
+
+    # --- what reading the artifact and the literature established ---------------------
+    # Printed only when one of them established something. A section that appears on every
+    # paper to say "nothing" costs a reader two pages of nothing across a corpus, and both
+    # routes' full accounting is already in the scope section and the ledger.
+    reading = [o for o in outcomes if o.disposition in _READING_OUTCOMES]
+    if reading:
+        L += ["", "## What reading the artifact and the literature established"]
+        for o in reading[:_MAX_READING]:
+            obj = next((x for x in objects if x.target_id == o.target_id), None)
+            L += ["", f"- **{o.target_id}** ({o.disposition.replace('_', ' ').lower()}) — "
+                      f"{_short(getattr(obj, 'claim_text', ''), 120)}",
+                  f"  - {_short(o.reason, 200)}",
+                  f"  - what this establishes: {_READING_OUTCOMES[o.disposition]}"]
+        if len(reading) > _MAX_READING:
+            L.append(f"- …and {len(reading) - _MAX_READING} more; see the ledger.")
+        L += ["", "Neither route runs anything and neither can reject a paper: an "
+                  "inconsistency with released code is a real result and not a "
+                  "demonstration that a reported number is wrong, and no bounded search "
+                  "establishes that a contribution is new."]
 
     triggered = [o for o in outcomes if o.action in
                  ("AUTHOR_CODE_REPRODUCTION", "INDEPENDENT_RECONSTRUCTION",

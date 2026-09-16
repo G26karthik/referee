@@ -596,6 +596,26 @@ def bind_mismatch(doc: PaperDoc, snap: ArtifactSnapshot, *, paper_quote: str,
             authority="ENDPOINTS_VERIFIED_ARTIFACT_CONCERN",
             identity=identity, basis=basis, ident_span=ident_span)
 
+    if not _derivable_from(span.quote, artifact_value):
+        # THE SAME RULE, ON THE SIDE THAT DID NOT HAVE IT. `paper_value` has been
+        # re-derived from the re-minted paper quotation since the `apt-icml` table case,
+        # and `artifact_value` was taken from the auditor's own JSON: relocating
+        # `code_quote` proves the LINE exists at that commit and proves nothing about the
+        # NUMBER the auditor says it sets. A fabricated or mis-read value beside a
+        # genuinely relocated line therefore reached `PAPER_ARTIFACT_MISMATCH` — the one
+        # artifact authority `EVIDENCE_ABOUT_THE_PAPER` admits — under a statement reading
+        # "BOTH LOCATIONS ARE VERIFIED", which was true of the locations and not of the
+        # values. Verifying one endpoint and believing the other is the shape invariant 2
+        # forbids, and a mismatch is exactly where it costs most.
+        return refuse("artifact_value_not_derivable", paper_ref=minted.ref, statement=endpoints + (
+            f"the identity is established, and {artifact_value!r} is not re-derivable from "
+            f"the relocated span {span.quote!r}: the span either does not set that value "
+            f"unambiguously or sets it more than once, so WHICH number in it the auditor "
+            f"means is its reading of the file rather than something this harness can "
+            f"check. Quote the assignment, not the block."),
+            authority="ENDPOINTS_VERIFIED_ARTIFACT_CONCERN",
+            identity=identity, basis=basis, ident_span=ident_span)
+
     agree = _same_value(paper_value, artifact_value)
     where = (f"established from {basis}"
              + (f", at `{ident_span.file}:{ident_span.line}`" if ident_span else ""))
@@ -622,7 +642,11 @@ def bind_mismatch(doc: PaperDoc, snap: ArtifactSnapshot, *, paper_quote: str,
 
 
 def _derivable_from(span_text: str, value: str) -> bool:
-    """Can the harness itself read `value` out of the quoted paper span, unambiguously?
+    """Can the harness itself read `value` out of the quoted span, unambiguously?
+
+    Applied to BOTH sides of a mismatch — the re-minted paper quotation and the relocated
+    source span — because relocating a line proves the line exists and proves nothing
+    about the number somebody says it carries.
 
     THE RULE THE CORPUS'S FIRST LEVEL-2 MISMATCH NEEDED. The auditor quoted the whole of
     `apt-icml`'s Table 6 — "Learning rate 2e-4 2e-4 2e-4 1e-4 1e-4 Batch size 32 32 32 16

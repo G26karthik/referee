@@ -586,9 +586,17 @@ def test_a_paper_value_the_harness_cannot_re_read_from_the_span_is_not_a_mismatc
     snap = artifact_evidence.snapshot(checkout)
     span = artifact_evidence.relocate(checkout, "config.yaml", "epochs: 100")
 
+    # `artifact_value` is set to what the relocated span itself cleanly derives (100, the
+    # committed `config.yaml`'s `epochs:` line) rather than an arbitrary number, so this
+    # test isolates the PAPER-side rule it was written for: with change 2
+    # (`_derivable_from` applied symmetrically) an artifact side the harness cannot
+    # re-read would trip its OWN refusal first and this test would stop meaning what its
+    # docstring says. The mirror rule, on the artifact side, is asserted by
+    # `test_an_artifact_value_the_harness_cannot_re_read_from_the_span_caps_at_endpoints_verified`
+    # below.
     picked = artifact_evidence.bind_mismatch(
         doc, snap, paper_quote=table_row, paper_value="Epochs 16 (CNN/DM column)",
-        span=span, artifact_value="12", root=checkout, experiment_id="Table 6, CNN/DM",
+        span=span, artifact_value="100", root=checkout, experiment_id="Table 6, CNN/DM",
         identity_basis="readme_maps_the_experiment", identity_file="README.md",
         identity_quote="Table 2 of the paper is produced by")
     assert picked.identity_state == "ESTABLISHED", "the identity itself is fine"
@@ -603,10 +611,45 @@ def test_a_paper_value_the_harness_cannot_re_read_from_the_span_is_not_a_mismatc
                 text="For CNN/DM we train T5-base for 16 epochs.")])
     bound = artifact_evidence.bind_mismatch(
         cell, snap, paper_quote="For CNN/DM we train T5-base for 16 epochs.",
-        paper_value="16", span=span, artifact_value="12", root=checkout,
+        paper_value="16", span=span, artifact_value="100", root=checkout,
         experiment_id="Table 6, CNN/DM", identity_basis="readme_maps_the_experiment",
         identity_file="README.md", identity_quote="Table 2 of the paper is produced by")
     assert bound.authority == "PAPER_ARTIFACT_MISMATCH", bound.refusal
+
+
+def test_an_artifact_value_the_harness_cannot_re_read_from_the_span_caps_at_endpoints_verified(
+        checkout):
+    """The mirror of the rule above, on the ARTIFACT side (change 2).
+
+    Relocating a `code_quote` proves the LINE exists at the pinned commit; it proves
+    nothing about which NUMBER on that line the auditor's `artifact_value` refers to. A
+    span quoting a whole block that states the same numeral more than once is exactly as
+    unreadable as a table quoting six numbers — the harness cannot tell which "16" the
+    auditor means — so this must cap at ENDPOINTS_VERIFIED_ARTIFACT_CONCERN and never
+    reach PAPER_ARTIFACT_MISMATCH, even though the paper side here is cleanly derivable.
+    """
+    block = "lr_first: 16\nlr_second: 32\nlr_third: 16\n"
+    (checkout / "config.yaml").write_text(block, encoding="utf-8")
+    _git(checkout, "add", "-A")
+    _git(checkout, "commit", "-qm", "a block that repeats a numeral")
+    snap = artifact_evidence.snapshot(checkout)
+    assert snap.audited
+    span = artifact_evidence.relocate(checkout, "config.yaml", block)
+    assert span is not None
+
+    doc = PaperDoc(paper_id="p", title="T", n_pages=1, sections=[
+        Section(section_idx=0, title="Method", page_start=1,
+                text="We use a batch size of 16.")])
+    picked = artifact_evidence.bind_mismatch(
+        doc, snap, paper_quote="We use a batch size of 16.", paper_value="16",
+        span=span, artifact_value="16 (first stage)", root=checkout,
+        experiment_id="lr schedule", identity_basis="readme_maps_the_experiment",
+        identity_file="README.md", identity_quote="Table 2 of the paper is produced by")
+    assert picked.identity_state == "ESTABLISHED", "the identity itself is fine"
+    assert picked.refusal == "artifact_value_not_derivable"
+    assert picked.authority == "ENDPOINTS_VERIFIED_ARTIFACT_CONCERN"
+    assert picked.paper_ref, "the paper citation DID relocate, and the record says so"
+    assert "Quote the assignment, not the block" in picked.statement
 
 
 def test_two_prose_descriptions_are_a_concern_and_never_a_mismatch(checkout):

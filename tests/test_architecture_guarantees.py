@@ -478,10 +478,31 @@ def test_no_execution_state_can_move_the_finding_state():
             assert outcome.finding_state(claim_status=cs, kept_findings=kept) == base
 
 
-def test_only_two_execution_states_say_anything_about_the_paper():
+def test_execution_about_the_paper_names_what_was_held_against_what_and_nothing_about_an_attempt():
+    """`EXECUTION_ABOUT_THE_PAPER` grew from two states to four: a contrast this review
+    itself designed and ran (`EXECUTION_CONTRADICTED_A_PREDICTED_CONTRAST` /
+    `EXECUTION_CONFIRMED_A_PREDICTED_CONTRAST`) is not a reproduction in either direction
+    — it holds a measured arm against a PREDICTION the claim committed to, not against a
+    QUANTITY the paper printed — and must not borrow the reproduction wording. So a bare
+    count of two no longer pins the rule; what the rule actually says is that this set
+    contains exactly the states that name what was held against what (a printed quantity,
+    or a predicted contrast) and none that merely names a fact about an attempt (that it
+    ran, that it was blocked, that it was warranted, that nothing came out of it)."""
     about = [s for s in outcome.EXECUTION_STATES if s in outcome.EXECUTION_ABOUT_THE_PAPER]
-    assert len(about) == 2
-    assert all("PRINTED_QUANTITY" in s for s in about)
+    assert set(about) == {
+        "EXECUTION_CONTRADICTED_A_PRINTED_QUANTITY",
+        "EXECUTION_REPRODUCED_A_PRINTED_QUANTITY",
+        "EXECUTION_CONTRADICTED_A_PREDICTED_CONTRAST",
+        "EXECUTION_CONFIRMED_A_PREDICTED_CONTRAST",
+    }
+    assert all("PRINTED_QUANTITY" in s or "PREDICTED_CONTRAST" in s for s in about)
+
+    not_about = [s for s in outcome.EXECUTION_STATES if s not in outcome.EXECUTION_ABOUT_THE_PAPER]
+    assert not_about, "there must be states that say nothing about the paper too"
+    attempt_words = ("ADMISSIBLE_EVIDENCE", "BLOCKED", "WARRANTED", "NOT_ATTEMPTED")
+    for s in not_about:
+        assert "PRINTED_QUANTITY" not in s and "PREDICTED_CONTRAST" not in s
+        assert any(w in s for w in attempt_words), s
 
 
 def test_the_outcome_block_forecloses_all_three_misreadings():

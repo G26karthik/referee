@@ -1231,6 +1231,15 @@ MISMATCH_REFUSALS = (
     # auditor's reading of a table layout this harness cannot re-derive. A level-2
     # mismatch may not rest on a number a model chose out of a row of numbers.
     "paper_value_not_derivable",
+    # AND THE SAME RULE ON THE OTHER SIDE, which did not have it. Relocating `code_quote`
+    # proves the LINE is in the pinned tree at that commit; it proves nothing about the
+    # NUMBER the auditor says the line sets. So an `artifact_value` that is fabricated, or
+    # picked out of a block the auditor quoted whole, reached PAPER_ARTIFACT_MISMATCH —
+    # the one artifact authority `EVIDENCE_ABOUT_THE_PAPER` admits — beneath a statement
+    # reading "BOTH LOCATIONS ARE VERIFIED", which was true of the locations and false of
+    # the values. Verifying one endpoint and believing the other is invariant 2's failure
+    # mode, and a mismatch is where it costs a referee most.
+    "artifact_value_not_derivable",
     "no_disagreement",               # both sides located and identity bound; they agree
 )
 
@@ -3129,6 +3138,18 @@ NECESSITY_FOR_ACTION = {
 NECESSITY_FOR_DISPOSITION = {
     "REPRODUCED": "EXPERIMENT_RESOLVED",
     "FAILED_REPRODUCTION": "EXPERIMENT_RESOLVED",
+    # THE TWO SETTLED FOCUSED-VALIDATION OUTCOMES, for the same reason the two above are
+    # RESOLVED: an experiment was needed, it ran, and it settled the question. Left to the
+    # fail-open default they read EXPERIMENT_UNRESOLVED — "it ran and did not settle it" —
+    # on the very same object whose `resolution_state` reads RESOLVED_BY_EXECUTION, so one
+    # target disagreed with itself across two axes and a material failure this system
+    # established was counted beside the runs that established nothing.
+    "VALIDATION_DEFECT_ESTABLISHED": "EXPERIMENT_RESOLVED",
+    "VALIDATION_SUPPORTS_CLAIM": "EXPERIMENT_RESOLVED",
+    # And the two that really did not settle it, mapped explicitly rather than by
+    # fallback: a table that answers by default cannot be read as a table that answered.
+    "VALIDATION_OBSERVATION_ONLY": "EXPERIMENT_UNRESOLVED",
+    "VALIDATION_INCONCLUSIVE": "EXPERIMENT_UNRESOLVED",
     "INCONCLUSIVE": "EXPERIMENT_UNRESOLVED",
     "SPECIFICATION_BLOCKED": "EXPERIMENT_UNDERSPECIFIED",
     "ADDRESSING_BLOCKED": "EXPERIMENT_NOT_EXECUTABLE",
@@ -4582,18 +4603,37 @@ class ArmComparison(_Base):
     def establishes_defect(self) -> bool:
         """May this comparison contribute a paper-level defect?
 
-        Three conditions and all of them are structural: the top authority rung, the rule
-        having fired AGAINST the claim's own prediction, and the comparison answering the
-        question it was designed for. Materiality then decides independently whether
-        anything follows for the paper — this property is never the last word.
+        FOUR conditions: the top authority rung, the rule having fired AGAINST the claim's
+        own prediction, the comparison answering the question it was designed for, and the
+        provenance ceiling — RE-APPLIED HERE rather than trusted from `authority`.
+
+        The re-application is the point. `between_arms.authority_for` is the only function
+        that reads `provenance` when it assigns the rung, and it is called from exactly one
+        place. An `ArmComparison` CONSTRUCTED DIRECTLY — a fixture, a hand-edited artifact
+        on disk, a future caller — can carry `CONFORMANT_CONTROLLED_RESULT` beside a
+        `synthesized` provenance, and this property would then convict on a rung nothing
+        earned. `TargetOutcome.establishes_failure` re-checks `admits` inline for exactly
+        this reason, and a ceiling that holds only while every caller keeps two fields in
+        step is the "one rule copied at five sites" fragility `harness.provenance` exists
+        to end.
+
+        Materiality then decides independently whether anything follows for the paper —
+        this property is never the last word.
         """
+        from .provenance import admits
         return (self.authority in DEFECT_CAPABLE_VALIDATION_AUTHORITIES
+                and admits(self.provenance)
                 and self.state == "SETTLED_AGAINST_PREDICTION"
                 and self.answers_question)
 
     @property
     def supports_claim(self) -> bool:
+        """The same four conditions, firing the other way. The ceiling is symmetric:
+        invariant 3 says "in either direction", so a comparison that may not convict may
+        not acquit either."""
+        from .provenance import admits
         return (self.authority in DEFECT_CAPABLE_VALIDATION_AUTHORITIES
+                and admits(self.provenance)
                 and self.state == "SETTLED_AS_PREDICTED"
                 and self.answers_question)
 

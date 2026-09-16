@@ -422,10 +422,12 @@ def discharge(fv: FocusedValidation | None) -> bool:
     """
     if fv is None or fv.comparison is None:
         return False
+    # THE SAME PROPERTIES THE CONVICTION USES, so a route cannot discharge on a rung the
+    # comparison itself is not entitled to. Reading `authority` directly here would let a
+    # directly-constructed comparison discharge a question the provenance ceiling refuses
+    # to let it settle — the ceiling is re-applied inside both properties.
     c = fv.comparison
-    return (c.state in ("SETTLED_AS_PREDICTED", "SETTLED_AGAINST_PREDICTION")
-            and c.answers_question
-            and c.authority in ("CONFORMANT_CONTROLLED_RESULT",))
+    return bool(c.establishes_defect or c.supports_claim)
 
 
 def summarise(fv: FocusedValidation | None) -> dict:
@@ -575,8 +577,12 @@ def _self_check() -> None:
             ("SETTLED_AGAINST_PREDICTION", "CONFORMANT_CONTROLLED_RESULT", False,
              "VALIDATION_OBSERVATION_ONLY"),
             ("NOT_SETTLED", "CONTROLLED_OBSERVATION", True, "VALIDATION_INCONCLUSIVE")):
+        # `repo_exec` throughout: the provenance ceiling is re-applied inside
+        # `establishes_defect` and `supports_claim`, so a comparison with no provenance
+        # can never reach the top rung whatever its `authority` field says. That is the
+        # property being relied on here, and it is asserted directly below.
         c = ArmComparison(state=state, authority=authority, answers_question=answers,
-                          statement="s.")
+                          provenance="repo_exec", statement="s.")
         got, why = outcome_disposition(fv(c))
         assert got == want, (state, authority, answers, got)
         assert got in TARGET_DISPOSITIONS and why
@@ -585,6 +591,22 @@ def _self_check() -> None:
 
     # A BLOCKED DESIGN DISCHARGES NOTHING, and neither does a refused comparison.
     assert not discharge(None) and not discharge(fv()) and not discharge(fv(d=build()))
+
+    # THE CEILING IS RE-APPLIED WHERE IT DECIDES. A comparison carrying the top authority
+    # rung beside an inadmissible provenance — which only a directly-constructed one can,
+    # since `between_arms.authority_for` would never have assigned it — convicts nothing
+    # and discharges nothing. `authority` alone is not the ceiling.
+    forged = ArmComparison(state="SETTLED_AGAINST_PREDICTION",
+                           authority="CONFORMANT_CONTROLLED_RESULT",
+                           conformance="CONFORMANT", answers_question=True,
+                           provenance="synthesized", statement="s.")
+    assert not forged.establishes_defect and not forged.supports_claim
+    assert not discharge(fv(forged))
+    assert outcome_disposition(fv(forged))[0] == "VALIDATION_OBSERVATION_ONLY"
+    blank = ArmComparison(state="SETTLED_AS_PREDICTED",
+                          authority="CONFORMANT_CONTROLLED_RESULT",
+                          answers_question=True, statement="s.")
+    assert not blank.supports_claim, "an empty provenance is not an admissible one"
 
     # --- `answers_question` IS THE HARNESS'S, AND IT IS KEYED ON THE QUESTION ---------
     assert answers_question(full, "DIRECTION_AGREES")

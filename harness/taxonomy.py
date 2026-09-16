@@ -282,6 +282,38 @@ EVIDENCE_ABOUT_THE_PAPER = ("REPRODUCTION_SUCCESS", "REPRODUCTION_FAILURE",
                             "PAPER_INTERNAL_EVIDENCE", "ARTIFACT_EVIDENCE",
                             "PRIOR_ART_EVIDENCE", "CONTROLLED_EXPERIMENT_EVIDENCE")
 
+# WAS THIS TARGET'S CLAIM CHECKED AT ALL? The question `stages/report.unchecked_central`
+# actually asks, derived here rather than kept there as a hand-written set of dispositions
+# — a set like that drifts every time a route is added, and by the time three had been
+# (artifact, literature, focused validation) an ESTABLISHED paper/artifact mismatch on a
+# CENTRAL target was printed under "Central claims this review did not check", three lines
+# below the section reporting what it had established.
+#
+# THE PREDICATE IS `EVIDENCE_ABOUT_THE_PAPER`, PLUS ONE. Producing evidence is not the
+# test, and a first attempt at this used it and was wrong: a citation re-verification
+# produces real evidence about a CONCERN'S QUOTATION and says nothing whatever about the
+# paper, so a central claim carrying one is unchecked and `tests/test_scientific_taxonomy`
+# has said so deliberately since `CITATION_VERIFIED` was split out. The same goes for a
+# completed prior-art search that matched nothing, for a bounded fact about the released
+# code, and for a controlled observation whose conformance was never established — every
+# one of them is a real result, and not one of them is the paper's claim checked.
+#
+# The "plus one" is `INCONCLUSIVE_EXECUTION`: a route that tried to settle a question
+# ABOUT THE PAPER and failed. That target was checked and the check did not conclude,
+# which is a different sentence from "nothing was run for it" and belongs in the scope
+# section's other half. It is what `_ATTEMPTED_AND_UNSETTLED` reports one layer up.
+_CHECKED_EVIDENCE = EVIDENCE_ABOUT_THE_PAPER + ("INCONCLUSIVE_EXECUTION",)
+
+
+def claim_was_checked(evidence: str = "") -> bool:
+    """Did anything bear on THE PAPER'S claim here, or is this a target nothing reached?
+
+    Deliberately NOT "was evidence gathered" and NOT "was the question settled". Three
+    routes gather evidence that resolves nothing about the paper, and a review that
+    counted those as checked would be claiming to have looked where it had not.
+    """
+    return (evidence or "").strip().upper() in _CHECKED_EVIDENCE
+
 
 def classify(*, lens: str = "", discrepancy_type: str = "", baseline_class: str = "",
              candidate_class: str = "", is_artifact_finding: bool = False) -> str:

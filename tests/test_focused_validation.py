@@ -494,13 +494,20 @@ def test_arms_from_comparison_refuses_a_control_chosen_by_position():
 
 
 def test_discharge_requires_authority_answers_question_and_a_settled_state():
+    """`discharge` delegates to `ArmComparison.supports_claim` /
+    `.establishes_defect`, both of which now also require `provenance.admits(...)` — the
+    provenance ceiling re-applied inside the property rather than trusted from
+    `authority` alone (see the docstring on `establishes_defect`). So every fixture that
+    is meant to discharge must carry an admissible provenance, or it is exercising the
+    ceiling rather than the authority/question/state rule this test names."""
     design = _design()
     settled = ArmComparison(state="SETTLED_AS_PREDICTED", authority="CONFORMANT_CONTROLLED_RESULT",
-                            answers_question=True)
+                            answers_question=True, provenance="repo_exec")
     unanswering = ArmComparison(state="SETTLED_AS_PREDICTED",
-                                authority="CONFORMANT_CONTROLLED_RESULT", answers_question=False)
+                                authority="CONFORMANT_CONTROLLED_RESULT", answers_question=False,
+                                provenance="repo_exec")
     observation = ArmComparison(state="SETTLED_AS_PREDICTED", authority="CONTROLLED_OBSERVATION",
-                                answers_question=True)
+                                answers_question=True, provenance="repo_exec")
     assert validation.discharge(FocusedValidation(paper_id="p", target_id="t1", design=design,
                                                   comparison=settled))
     assert not validation.discharge(FocusedValidation(paper_id="p", target_id="t1", design=design,
@@ -508,6 +515,32 @@ def test_discharge_requires_authority_answers_question_and_a_settled_state():
     assert not validation.discharge(FocusedValidation(paper_id="p", target_id="t1", design=design,
                                                        comparison=observation))
     assert not validation.discharge(None)
+
+
+def test_discharge_refuses_the_top_authority_when_provenance_is_not_admissible():
+    """A comparison built directly (a fixture, a hand-edited artifact, a future caller)
+    can carry the top authority rung, a settled state and `answers_question=True` while
+    its `provenance` is `synthesized` or empty — nothing earned that rung. Invariant 3
+    says the provenance ceiling applies "in either direction", so such a comparison must
+    establish nothing, support nothing, and must not discharge the route it sits under."""
+    design = _design()
+    top_rung_synthesized = ArmComparison(state="SETTLED_AS_PREDICTED",
+                                         authority="CONFORMANT_CONTROLLED_RESULT",
+                                         answers_question=True, provenance="synthesized")
+    top_rung_no_provenance = ArmComparison(state="SETTLED_AS_PREDICTED",
+                                           authority="CONFORMANT_CONTROLLED_RESULT",
+                                           answers_question=True, provenance="")
+    against_prediction_synthesized = ArmComparison(state="SETTLED_AGAINST_PREDICTION",
+                                                    authority="CONFORMANT_CONTROLLED_RESULT",
+                                                    answers_question=True,
+                                                    provenance="synthesized")
+    for c in (top_rung_synthesized, top_rung_no_provenance):
+        assert not c.supports_claim, c.provenance
+        assert not c.establishes_defect, c.provenance
+        assert not validation.discharge(FocusedValidation(
+            paper_id="p", target_id="t1", design=design, comparison=c))
+    assert not against_prediction_synthesized.establishes_defect
+    assert not against_prediction_synthesized.supports_claim
 
 
 def test_outcome_disposition_is_specification_blocked_when_design_never_established():
@@ -533,7 +566,7 @@ def test_measurement_authority_is_about_one_arm_and_nothing_else():
 def test_summarise_counts_are_never_a_sum_of_two_different_things():
     design = _design()
     settled = ArmComparison(state="SETTLED_AS_PREDICTED", authority="CONFORMANT_CONTROLLED_RESULT",
-                            answers_question=True)
+                            answers_question=True, provenance="repo_exec")
     fv = FocusedValidation(paper_id="p", target_id="t1", design=design, comparison=settled,
                            launched=3)
     got = validation.summarise(fv)

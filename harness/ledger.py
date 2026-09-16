@@ -54,6 +54,24 @@ _IMPLICATION = {
                   "noise band.",
     "FAILED_REPRODUCTION": "the executed program did not produce the printed quantity, "
                            "and the run reached the experiment before failing.",
+    "VALIDATION_DEFECT_ESTABLISHED":
+        "a controlled experiment derived from the paper and its pinned checkout, varying "
+        "one declared variable against a settlement condition fixed before either arm "
+        "ran, came out the opposite way to what the claim predicts. It establishes what "
+        "happened under that one contrast and nothing wider: it is not a reproduction of "
+        "anything the authors published, and it does not establish that the credited "
+        "mechanism fails in general.",
+    "VALIDATION_SUPPORTS_CLAIM":
+        "the same controlled experiment came out the way the claim predicts. A settled "
+        "question in the paper's favour, bounded to the contrast that ran.",
+    "VALIDATION_OBSERVATION_ONLY":
+        "two arms ran and were compared, and the conformance that would let the "
+        "comparison say something about the PAPER was not established — a scientific "
+        "choice in the experiment was this review's. A real measurement about our "
+        "experiment; nothing about the paper follows from it.",
+    "VALIDATION_INCONCLUSIVE":
+        "the controlled comparison ran and the rule declared for it before the run fired "
+        "in neither direction. Pursued, and it settled nothing.",
     "PAPER_ONLY_RESOLVED": "settled from the paper itself; no execution was warranted.",
     "CITATION_VERIFIED_ONLY": "the concern's quotation was re-verified against the paper, "
                               "so it cites the paper accurately. Nothing further follows: "
@@ -111,7 +129,16 @@ def _entry(idx: int, obj, plan, outcome, probe: ProbeResult | None) -> LedgerEnt
                         f"(2 sigma = {rec.noise_band})")
         compared = rec.claimed_raw or ""
     elif disposition in ("PAPER_ONLY_RESOLVED", "CITATION_VERIFIED_ONLY",
-                        "PAPER_ARITHMETIC_CONTRADICTION"):
+                        "PAPER_ARITHMETIC_CONTRADICTION",
+                        # THE FOUR FOCUSED-VALIDATION OUTCOMES. This route writes no
+                        # `Reconciliation` — its arithmetic is `between_arms.compare` and
+                        # its result is a comparison between two arms, not a measured
+                        # quantity against a printed one — so without this branch every
+                        # entry it produced had a blank `observed` and a blank
+                        # `compared_with`. A ledger entry for a target that can trigger a
+                        # STOP is the last place a trace may be empty.
+                        "VALIDATION_DEFECT_ESTABLISHED", "VALIDATION_SUPPORTS_CLAIM",
+                        "VALIDATION_OBSERVATION_ONLY", "VALIDATION_INCONCLUSIVE"):
         observed = getattr(outcome, "reason", "")
         compared = getattr(ref, "quote", "") if ref else ""
 
