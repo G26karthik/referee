@@ -534,11 +534,15 @@ Read this before you quote a capability to anyone.
   what each lens chose to write.
 - **The artifact route has established 0 `PAPER_ARTIFACT_MISMATCH` on real papers.**
   `harness/artifact_evidence.py` inspected all four repository papers: 4 inspections
-  completed, 8 narrow level-1 facts (`FILE_PRESENCE`/`DEPENDENCY_DECLARED`/…), 0 broad
-  implementation-correctness questions settled — that question is excluded from what a
-  bounded fact may discharge by construction. The gated authors'-code auditor
-  (`SH_ALLOW_ARTIFACT_REVIEW`) then ran on all four: 8 concerns proposed, 7 relocated on
-  both the code and the paper side, 1 experiment identity ESTABLISHED and 6 AMBIGUOUS, 7
+  completed, 6 narrow level-1 facts (`FILE_PRESENCE`/`DEPENDENCY_DECLARED`/…; acl=1,
+  apt-icml=2, cvpr=1, iclr=2), 0 broad implementation-correctness questions settled — that
+  question is excluded from what a bounded fact may discharge by construction. The gated
+  authors'-code auditor (`harness/artifact_review_driver.py`, behind `SH_ALLOW_ARTIFACT_REVIEW`)
+  has no production caller — `harness/stages/artifact.py` and `harness/controller.py` never
+  invoke it, so the gate currently gates nothing on the path a review actually takes. A
+  DIRECT, non-pipeline invocation of it against all four — not reproducible today by
+  running `run.py review` — produced 8 concerns proposed, 7 relocated on both the code and
+  the paper side, 1 experiment identity ESTABLISHED and 6 AMBIGUOUS, 7
   `ENDPOINTS_VERIFIED_ARTIFACT_CONCERN` and **0 mismatches** — the one candidate with an
   established identity had a paper value that could not be re-derived from its own quoted
   table span (it reports five numbers, not one), and was refused rather than accepted. See

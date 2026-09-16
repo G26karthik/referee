@@ -884,12 +884,16 @@ repository, so rendering a first-ever B hit as a reviewer observation would put 
 unmeasured detector in front of a human wearing a measured one's clothes.
 Reviewer-visible hits on this corpus: **1 of 6**.
 
-Measured over the four repository papers: 4 inspections completed, **8 level-1 facts,
-0 broad implementation-correctness questions settled**, 0 executions suppressed. With the
-authors'-code auditor run on all four: 8 concerns proposed, 7 code and 7 paper citations
-relocated, 1 identity ESTABLISHED / 6 AMBIGUOUS, **7 endpoint-verified concerns and 0
-level-2 mismatches**. `docs/ARTIFACT_ROUTE_MEASUREMENT.md` prints every fact, every
-concern, and why each refusal is the right one.
+Measured over the four repository papers: 4 inspections completed, **6 level-1 facts**
+(acl=1, apt-icml=2, cvpr=1, iclr=2), **0 broad implementation-correctness questions
+settled**, 0 executions suppressed. The authors'-code auditor (`artifact_review_driver`)
+has no production caller (see Known limitations) and was never invoked by this route on
+any of the four; a DIRECT, non-pipeline invocation of it against all four — not
+reproducible today by running `run.py review` — produced 8 concerns proposed, 7 code and 7
+paper citations relocated, 1 identity ESTABLISHED / 6 AMBIGUOUS, **7 endpoint-verified
+concerns and 0 level-2 mismatches**, which is real evidence the mechanism works and not a
+result this route currently produces on its own. `docs/ARTIFACT_ROUTE_MEASUREMENT.md`
+prints every fact, every concern, and why each refusal is the right one.
 
 ## What a bounded prior-art search can establish, and what it cannot
 
@@ -1110,6 +1114,15 @@ by grep:**
   argued design with test coverage, and because the ambiguous-candidate path in
   `experiment_id.resolve_experiment` is exactly where it belongs; it is listed here so that
   nobody reports it as a capability this system has.
+- **`harness/artifact_review_driver.py` is a second orphaned gate.** `harness/stages/artifact.py`
+  imports only `artifact_evidence`, `claims` and `state` — never `artifact_review_driver` —
+  and `harness/controller.py` has zero references to it, so `SH_ALLOW_ARTIFACT_REVIEW`
+  currently gates nothing on the path a review actually takes. `harness/artifact_evidence.py`
+  mentions it once, in a comment; `harness/config.py` declares the gate and its settings
+  fields but never calls `.run()`; the only caller that actually invokes it is
+  `tests/test_artifact_route.py`, as a unit test. So on every repository paper's
+  `route.json`, `"proposed": 0` means the auditor was never invoked, not that it ran and
+  proposed nothing — the same shape of defect as the entry above, on a second gate.
 - **`stages/report.unearned_support_language` is enforced at TEST time, not at run time.**
   It is the "GREEN may not borrow the words of evidence it does not have" guard and the
   renderer never calls it: `tests/test_guarantees.py` and `tests/test_reimplementation_path.py`
@@ -1279,10 +1292,13 @@ were current.
   only in text is discovered and is not executable.
 - **The artifact route has established ZERO paper/artifact mismatches on real papers, and
   it settles ZERO broad implementation-correctness questions.** Measured over the four
-  repository papers: 4 inspections completed, 8 narrow level-1 facts established, 0 broad
-  questions settled. The authors'-code auditor HAS now been run on all four — 8 concerns
-  proposed, 7 code citations and 7 paper citations relocated, 1 experiment identity
-  ESTABLISHED and 6 AMBIGUOUS, **7 endpoint-verified concerns and 0 level-2 mismatches**.
+  repository papers: 4 inspections completed, 6 narrow level-1 facts established
+  (acl=1, apt-icml=2, cvpr=1, iclr=2), 0 broad questions settled. The authors'-code auditor
+  (`artifact_review_driver`) has no production caller (see above) and was never invoked by
+  this route on any of the four; a DIRECT, non-pipeline invocation of it against all four —
+  not reproducible today by running `run.py review` — produced 8 concerns proposed, 7 code
+  citations and 7 paper citations relocated, 1 experiment identity ESTABLISHED and 6
+  AMBIGUOUS, **7 endpoint-verified concerns and 0 level-2 mismatches**.
   Six of the seven are refused because which config belongs to which experiment is the
   auditor's reading; the seventh had an ESTABLISHED identity and a paper value the harness
   could not re-read from the quoted span. Both refusals are correct and neither should be

@@ -5,13 +5,25 @@
 Measured 2026-09-16. The deterministic half spends no model call; §7 onward is one gated,
 isolated authors'-code reading per repository.
 
+**`artifact_review_driver` has no production caller.** `harness/stages/artifact.py` imports
+only `artifact_evidence`, `claims` and `state` — never `artifact_review_driver` — and
+`harness/controller.py` has zero references to it. `harness/config.py` declares the
+`SH_ALLOW_ARTIFACT_REVIEW` gate and its settings fields but never calls `.run()`; the only
+production-adjacent mention is a comment in `harness/artifact_evidence.py`; the only actual
+caller is `tests/test_artifact_route.py`, as a unit test. So §7's numbers below were
+obtained by invoking the driver DIRECTLY, outside the pipeline, and are not reproducible
+today by running `run.py review` — a route this document otherwise treats as measured end
+to end is, for its model half, measured only in isolation. §6's numbers are unaffected: the
+deterministic half runs from `harness/stages/artifact.py` on every review already.
+
 **The headline, at the authority it actually has:**
 
 ```
 4 artifact inspections completed
-8 narrow artifact facts established
+6 narrow artifact facts established (acl=1, apt-icml=2, cvpr=1, iclr=2)
 0 broad implementation-correctness questions settled
 8 authors'-code concerns proposed, 7 code citations and 7 paper citations relocated
+  (direct invocation of artifact_review_driver, not via run.py review — see above)
 1 experiment identity ESTABLISHED, 6 AMBIGUOUS
 7 endpoint-verified artifact concerns
 0 PAPER_ARTIFACT_MISMATCH
@@ -117,11 +129,15 @@ Every checkout clean and pinned; no model call.
 | `acl` | mbzuai-nlp/finchain | `146eaa8225` | `05cb5cde3f` | 43 | 1 | 1 | ARTIFACT_INSPECTION_INCONCLUSIVE |
 | `apt-icml` | ROIM1998/APT | `56eaf8bc86` | `869fe7f5c5` | 185 | 1 | 2 | ARTIFACT_INSPECTION_INCONCLUSIVE |
 | `cvpr` | wuyang98/weathergen | `1462374ef6` | `87820905fc` | 68 | 1 | 1 | ARTIFACT_INSPECTION_INCONCLUSIVE |
-| `iclr` | HanxunH/LDReg | `48956d25dc` | `8f0486e8aa` | 67 | 1 | 4 | ARTIFACT_INSPECTION_INCONCLUSIVE |
-| **total** | | | | **363** | **4** | **8** | **0 broad questions settled** |
+| `iclr` | HanxunH/LDReg | `48956d25dc` | `8f0486e8aa` | 67 | 1 | 2 | ARTIFACT_INSPECTION_INCONCLUSIVE |
+| **total** | | | | **363** | **4** | **6** | **0 broad questions settled** |
 
-**This is the corrected result, and it is four fewer settled questions than the first
-version reported.** The eight facts, in full:
+**This is the corrected result, re-measured on the 2026-09-16 fresh run after
+`distinct_facts` (`harness/stages/artifact.py`, committed at `aebd468`) collapsed a
+per-target duplication defect** — a paper's dependency check emitted one fact per
+UNDECLARED dependency name checked, so `iclr`'s three separately-named-but-identical
+"no manifest at all" observations counted as three facts instead of one, inflating the
+corpus total from 6 to 8. Six facts, in full:
 
 ```
 acl       entrypoint_present     advertises data/templates/investment_analysis/npv.py
@@ -130,13 +146,12 @@ apt-icml  dependency_declared    declares `transformers` in requirements.txt, en
 cvpr      entrypoint_present     advertises evaluate.py
 iclr      entrypoint_present     advertises main_simclr.py
 iclr      dependency_undeclared  no manifest declares `pytorch`  (no manifest was found)
-iclr      dependency_undeclared  no manifest declares `torch`    (no manifest was found)
-iclr      dependency_undeclared  no manifest declares `transformers` (no manifest was found)
 ```
 
-The three `iclr` lines are one fact stated three ways: that checkout publishes **no
-dependency manifest at all**. A genuine reproducibility observation about the artifact, at
-level 1 — about the code, not about the paper.
+`iclr`'s single remaining dependency fact stands for what were three duplicated lines
+before the fix: that checkout publishes **no dependency manifest at all**. A genuine
+reproducibility observation about the artifact, at level 1 — about the code, not about the
+paper.
 
 Every inspection also records what it buys a later route: on each paper, the advertised
 entrypoint narrows the candidate commands for any execution route. Recorded and acted on by
@@ -145,6 +160,13 @@ authorise. **Static inspection suppressed no execution on any of the four**:
 `ARTIFACT_INSPECTION_ONLY` is reachable only where no executable route applies.
 
 ## 7. The authors'-code auditor, run on all four (§5)
+
+**This section's numbers come from a direct, non-pipeline invocation of
+`artifact_review_driver`, not from `run.py review`.** As noted at the top of this
+document, nothing in `harness/stages/artifact.py` or `harness/controller.py` calls this
+driver, so `SH_ALLOW_ARTIFACT_REVIEW` gates nothing on the path a review actually takes
+today. What follows is real evidence that the mechanism works when invoked, not a result a
+reviewer running this harness end to end currently obtains.
 
 One fresh isolated context per repository, `claude` CLI, `sonnet`, gated by
 `SH_ALLOW_ARTIFACT_REVIEW`. Enforced policy identical on all four: `tools=Read,Grep`,
