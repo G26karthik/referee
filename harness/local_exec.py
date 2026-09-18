@@ -1155,11 +1155,6 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
 
     script = write_probe(root, spec, out_dir)
     out_dir = script.parent
-    # The directory a backend that runs ELSEWHERE would need staged — `runs/<pid>`,
-    # which covers `repo/`, `env/` and every `targets/<id>/reimplementation` output area
-    # under it. `stage()` is a no-op for a backend that already runs where this process
-    # does; only `ContainerBackend` overrides it. See `ExecutionBackend.stage`.
-    mount_root = str(root / "runs" / spec.paper_id)
 
     records: list[ExecutionRecord] = []
     mislabelled: list[str] = []
@@ -1175,8 +1170,7 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
     for seed in spec.seeds:
         for arm in spec.arms:
             cmd, cwd = resolve_command(cfg, spec, script, seed, arm)
-            cmd, cwd_staged = backend.stage(cmd, str(cwd), mount_root, pid=spec.paper_id)
-            p = backend.execute(ExecRequest(argv=cmd, cwd=cwd_staged,
+            p = backend.execute(ExecRequest(argv=cmd, cwd=str(cwd),
                                             timeout_s=cfg.probe_timeout_s,
                                             label=f"seed={seed} arm={arm}"))
             # Recorded BEFORE anything is parsed out of it, and for every ending. A record

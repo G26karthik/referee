@@ -1165,10 +1165,9 @@ if __name__ == "__main__":       # self-check: python -m harness.audit_driver
         assert available(open_gate)[0] is True, available(open_gate)[1]
         assert "{prompt}" in default_cmd() and "{out}" in default_cmd()
         assert "claude" in default_cmd().lower()
-        # the declared per-lens model reaches the command line — as of the 2026-09-18
-        # closure pass every lens declares `sonnet` (see `CLAUDE.md`), so this checks the
-        # declaration is honoured, not that the four lenses disagree
-        assert "--model sonnet" in default_cmd("overclaim"), default_cmd("overclaim")
+        # the declared per-lens model reaches the command line, so the panel is diverse
+        # in fact and not only in the table that declares it
+        assert "--model opus" in default_cmd("overclaim"), default_cmd("overclaim")
         assert "--model sonnet" in default_cmd("confound"), default_cmd("confound")
         assert "--model" not in default_cmd(), "no lens named, so no model is forced"
     else:
