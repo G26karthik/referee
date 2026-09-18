@@ -4,9 +4,11 @@ the Director and every stage read; it stores ARTIFACTS, never transcripts.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 import uuid
@@ -14,6 +16,36 @@ from pathlib import Path
 from typing import Any
 
 from .config import Config
+
+if sys.platform == "win32":
+    import msvcrt
+    import time as _time
+
+    def _lock_file(f) -> None:
+        # msvcrt.locking's LK_LOCK only retries internally for ~10s before raising
+        # OSError (errno 36, "Resource deadlock avoided") — it does NOT block
+        # indefinitely the way POSIX fcntl.flock(LOCK_EX) does. Retry-wrap it so a
+        # longer-held lock (a slow phase handler) is waited out rather than crashing
+        # the waiter, matching fcntl.flock's blocking contract.
+        while True:
+            f.seek(0)
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                return
+            except OSError:
+                _time.sleep(0.05)
+
+    def _unlock_file(f) -> None:
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+else:
+    import fcntl
+
+    def _lock_file(f) -> None:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+
+    def _unlock_file(f) -> None:
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 SUBDIRS = [
     "paper",     # S1 — the ingested PaperDoc
@@ -70,6 +102,30 @@ def create_project(cfg: Config, repo_url: str, direction: str, pid: str | None =
     return pid
 
 
+@contextlib.contextmanager
+def project_lock(cfg: Config, pid: str):
+    """Exclusive OS-level advisory lock over one case's state.
+
+    Not a lock-file-EXISTS convention — an actual `msvcrt`/`fcntl` lock on an open file
+    handle, released automatically by the OS if the holding process dies or is killed,
+    so a crash can never leave a case permanently unlockable the way a stale PID-file
+    lock could. Every phase transition (`controller.step`) holds this for its whole
+    body, so two invocations of the harness racing on the same paper id serialize
+    instead of interleaving writes to `project.json`, `controller.json`,
+    `discovery/targets.json`, or any other case-state file.
+    """
+    root = project_dir(cfg, pid)
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / ".lock"
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+b") as f:
+        _lock_file(f)
+        try:
+            yield
+        finally:
+            _unlock_file(f)
+
+
 def load_meta(cfg: Config, pid: str) -> dict[str, Any]:
     return json.loads((project_dir(cfg, pid) / "project.json").read_text(encoding="utf-8"))
 
@@ -86,9 +142,10 @@ def set_phase(cfg: Config, pid: str, phase: str) -> None:
 
 
 def add_cost(cfg: Config, pid: str, cost_usd: float) -> None:
-    meta = load_meta(cfg, pid)
-    meta["cost_usd"] = round(float(meta.get("cost_usd", 0.0)) + float(cost_usd or 0.0), 6)
-    save_meta(cfg, pid, meta)
+    with project_lock(cfg, pid):
+        meta = load_meta(cfg, pid)
+        meta["cost_usd"] = round(float(meta.get("cost_usd", 0.0)) + float(cost_usd or 0.0), 6)
+        save_meta(cfg, pid, meta)
 
 
 

@@ -690,68 +690,74 @@ def step(cfg: Config, case: CaseState, **opts) -> CaseState:
     Idempotent against a terminal case and safe to call on a `waiting` one — a waiting
     case re-attempts its phase, which is how a run resumes once the evidence it was
     waiting for has arrived.
+
+    The whole body runs under `state.project_lock` — a phase handler reads and writes
+    several case-state files (spec.json, targets.json, controller.json, ...), and
+    without serialization two concurrent invocations of the same paper id could
+    interleave those writes.
     """
     if case.terminal:
         return case
-    if case.phase == "done":
-        case.status = "complete"
-        return save_case(cfg, case)
-
-    handler = _HANDLERS[case.phase]
-    attempt = case.attempts.get(case.phase, 0) + 1
-    case.attempts[case.phase] = attempt
-    case.status = "running"
-
-    try:
-        out = handler(cfg, case, **opts)
-    except Exception as e:                       # noqa: BLE001 — a handler fault is a case error, not a crash
-        out = PhaseOutcome("error", f"{type(e).__name__}: {e}")
-
-    case.history.append(PhaseEvent(
-        phase=case.phase, outcome=out.outcome, reason=out.reason,
-        detail=out.detail or {}, attempt=attempt,
-        ts=state.now()))
-    if out.reproduction_class:
-        case.reproduction_class = out.reproduction_class
-
-    if out.outcome == "error":
-        case.status, case.blocked_reason = "error", out.reason
-    elif out.outcome == "waiting":
-        case.status, case.blocked_reason = "waiting", out.reason
-    elif out.outcome == "retry":
-        # The phase stays where it is; `drive` will call this function again. Bounding is
-        # the handler's job because only it knows what its own budget means.
-        case.status, case.blocked_reason = "running", out.reason
-        if case.phase not in RETRYABLE:
-            case.status, case.blocked_reason = "waiting", (
-                f"{case.phase} asked to retry, but only {', '.join(RETRYABLE)} may be "
-                f"re-attempted: {out.reason}")
-    else:                                        # ok | abstain
-        case.blocked_reason = ""
-        case.phase = _next_phase(case.phase)
+    with state.project_lock(cfg, case.paper_id):
         if case.phase == "done":
-            missing = audit_stage.missing_reading_artifacts(cfg, case.paper_id)
-            if missing:
-                # A review may not finish over readings it does not have. This is the
-                # audit phase's own completeness condition asked again at the last
-                # possible moment, because by here the case may have been resumed,
-                # rewound, or driven from a cached state that never re-entered `audit` —
-                # and the finished report gives a reader no way to tell. The parts alone
-                # still produce findings, still grade and still render; what is missing
-                # is a pass this review says it performs.
-                case.phase, case.status = "audit", "waiting"
-                case.blocked_reason = (
-                    f"{len(missing)} required reading artifact(s) are missing, so this "
-                    f"review cannot be completed as the one it describes: "
-                    f"{', '.join(missing[:8])}"
-                    + (f" (+{len(missing) - 8} more)" if len(missing) > 8 else ""))
-                case.history.append(PhaseEvent(
-                    phase="done", outcome="waiting", reason=case.blocked_reason,
-                    detail={"missing": missing}, attempt=attempt, ts=state.now()))
-                return save_case(cfg, case)
             case.status = "complete"
+            return save_case(cfg, case)
 
-    return save_case(cfg, case)
+        handler = _HANDLERS[case.phase]
+        attempt = case.attempts.get(case.phase, 0) + 1
+        case.attempts[case.phase] = attempt
+        case.status = "running"
+
+        try:
+            out = handler(cfg, case, **opts)
+        except Exception as e:                       # noqa: BLE001 — a handler fault is a case error, not a crash
+            out = PhaseOutcome("error", f"{type(e).__name__}: {e}")
+
+        case.history.append(PhaseEvent(
+            phase=case.phase, outcome=out.outcome, reason=out.reason,
+            detail=out.detail or {}, attempt=attempt,
+            ts=state.now()))
+        if out.reproduction_class:
+            case.reproduction_class = out.reproduction_class
+
+        if out.outcome == "error":
+            case.status, case.blocked_reason = "error", out.reason
+        elif out.outcome == "waiting":
+            case.status, case.blocked_reason = "waiting", out.reason
+        elif out.outcome == "retry":
+            # The phase stays where it is; `drive` will call this function again. Bounding is
+            # the handler's job because only it knows what its own budget means.
+            case.status, case.blocked_reason = "running", out.reason
+            if case.phase not in RETRYABLE:
+                case.status, case.blocked_reason = "waiting", (
+                    f"{case.phase} asked to retry, but only {', '.join(RETRYABLE)} may be "
+                    f"re-attempted: {out.reason}")
+        else:                                        # ok | abstain
+            case.blocked_reason = ""
+            case.phase = _next_phase(case.phase)
+            if case.phase == "done":
+                missing = audit_stage.missing_reading_artifacts(cfg, case.paper_id)
+                if missing:
+                    # A review may not finish over readings it does not have. This is the
+                    # audit phase's own completeness condition asked again at the last
+                    # possible moment, because by here the case may have been resumed,
+                    # rewound, or driven from a cached state that never re-entered `audit` —
+                    # and the finished report gives a reader no way to tell. The parts alone
+                    # still produce findings, still grade and still render; what is missing
+                    # is a pass this review says it performs.
+                    case.phase, case.status = "audit", "waiting"
+                    case.blocked_reason = (
+                        f"{len(missing)} required reading artifact(s) are missing, so this "
+                        f"review cannot be completed as the one it describes: "
+                        f"{', '.join(missing[:8])}"
+                        + (f" (+{len(missing) - 8} more)" if len(missing) > 8 else ""))
+                    case.history.append(PhaseEvent(
+                        phase="done", outcome="waiting", reason=case.blocked_reason,
+                        detail={"missing": missing}, attempt=attempt, ts=state.now()))
+                    return save_case(cfg, case)
+                case.status = "complete"
+
+        return save_case(cfg, case)
 
 
 def drive(cfg: Config, case: CaseState, *, max_steps: int = 40, **opts) -> CaseState:
