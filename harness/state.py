@@ -5,7 +5,9 @@ the Director and every stage read; it stores ARTIFACTS, never transcripts.
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -74,9 +76,7 @@ def load_meta(cfg: Config, pid: str) -> dict[str, Any]:
 
 def save_meta(cfg: Config, pid: str, meta: dict[str, Any]) -> None:
     meta["updated_at"] = now()
-    (project_dir(cfg, pid) / "project.json").write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    write_json(project_dir(cfg, pid) / "project.json", meta)
 
 
 def set_phase(cfg: Config, pid: str, phase: str) -> None:
@@ -119,8 +119,31 @@ def append_log(
 
 
 def write_json(path: Path, obj: Any) -> str:
+    """Write JSON atomically: build the full content, fsync it to a temp file in the
+    SAME directory as `path`, then `os.replace` it into place. `os.replace` is atomic
+    on both POSIX and Windows when source and destination share a volume, which they
+    always do here since the temp file is created next to its destination.
+
+    A process killed at any point before the `os.replace` call leaves `path` exactly
+    as it was; a process killed during or after `os.replace` leaves it exactly as the
+    new write intended. There is no window in which a reader can observe a truncated
+    or partially-written file.
+    """
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=2, default=str, ensure_ascii=False), encoding="utf-8")
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(obj, indent=2, default=str, ensure_ascii=False))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     return str(path)
 
 

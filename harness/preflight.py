@@ -36,6 +36,7 @@ from pathlib import Path
 
 from .config import Config
 from .stages import ingest
+from . import state
 
 # What a preflight can conclude about one requested file. Closed, and the two that stop a
 # run are named so a caller can key on them rather than on a message.
@@ -166,8 +167,7 @@ def run(cfg: Config, sources: list[str | Path], out: Path | None = None) -> dict
     result = check(cfg, sources)
     out = out or (cfg.projects_dir.parent / "reports")
     out.mkdir(parents=True, exist_ok=True)
-    (out / "preflight.json").write_text(json.dumps(result, indent=2, ensure_ascii=False),
-                                        encoding="utf-8")
+    state.write_json(out / "preflight.json", result)
     (out / "preflight.md").write_text(render(result), encoding="utf-8")
     result["paths"] = {"json": str(out / "preflight.json"), "md": str(out / "preflight.md")}
     return result
@@ -202,9 +202,8 @@ def _self_check() -> None:
         pid = ingest.paper_id_for(c)
         paper_dir = cfg.projects_dir / pid / "paper"
         paper_dir.mkdir(parents=True)
-        (paper_dir / "doc.json").write_text(json.dumps({
-            "paper_id": pid, "title": "Beta", "content_sha": ingest.content_sha(c)}),
-            encoding="utf-8")
+        state.write_json(paper_dir / "doc.json", {
+            "paper_id": pid, "title": "Beta", "content_sha": ingest.content_sha(c)})
         r2 = check(cfg, [c])
         assert r2["entries"][0]["state"] == "RESUMES", r2["entries"][0]
         assert r2["resumes"] == [pid]

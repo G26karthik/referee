@@ -52,6 +52,7 @@ from typing import Any, Callable
 
 from .artifacts import GIB
 from .config import Config
+from . import state
 
 # --------------------------------------------------------------------------- #
 # What the sandbox looks like from inside
@@ -321,8 +322,7 @@ def _remember(session: SandboxSession) -> SandboxSession:
     _SESSIONS[_key(session.local_path)] = session
     path = session_path(session.local_path)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(session.to_json(), indent=2), encoding="utf-8")
+        state.write_json(path, session.to_json())
     except OSError:
         pass                      # the in-process cache still works; the record is a bonus
     return session

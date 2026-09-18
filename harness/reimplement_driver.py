@@ -581,7 +581,7 @@ if __name__ == "__main__":       # self-check: python -m harness.reimplement_dri
         assert not lying_loaded[1].established
         # an edited artifact is not the artifact that was sealed
         out_path, _ = _paths(_cfg, "p", "t1")
-        out_path.write_text(json.dumps({"script": "tampered", "conformance": {}}), encoding="utf-8")
+        state.write_json(out_path, {"script": "tampered", "conformance": {}})
         assert load_accepted(_cfg, "p", "t1") is None
 
     # --- confinement -------------------------------------------------------------------

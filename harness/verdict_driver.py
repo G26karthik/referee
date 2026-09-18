@@ -388,7 +388,7 @@ if __name__ == "__main__":       # self-check: python -m harness.verdict_driver
         assert load_accepted(_cfg, "p", prompt_sha256="b" * 64) is not None
         # An edited opinion file is not the file that was sealed.
         _out = Path(_td) / "p" / "reports" / "p.substantive.json"
-        _out.write_text(json.dumps({"verdict": "STRONG"}), encoding="utf-8")
+        state.write_json(_out, {"verdict": "STRONG"})
         assert load_accepted(_cfg, "p") is None
 
     # --- this opinion is PRINTED and counted by nothing --------------------------------
