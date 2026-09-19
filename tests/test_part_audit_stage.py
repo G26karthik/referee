@@ -227,6 +227,70 @@ def test_a_two_part_paper_dispatches_both_parts_then_one_synthesis_per_lens(cfg:
     assert len(reviewer.calls) == len(units)
 
 
+# --------------------------------------------------------------------------- #
+# 2b. `tools/subagent_accept.py` — the SESSION_SUBAGENT manual-fill path for a
+# split paper. No test file existed for this tool before this one.
+# --------------------------------------------------------------------------- #
+def test_subagent_accept_fills_a_split_papers_parts_and_synthesis_with_no_subprocess(
+        cfg: Config):
+    """`accept_lens` only ever writes the COMPOSED `audit/<lens>.json`, which does not
+
+    exist until every part and synthesis is sealed — so a paper needing part-splitting
+    had no manual-fill path at all before `tools/subagent_accept.py`. This drives the
+    same two-part paper as the test above end to end through `seal`/`pending`/`sweep`
+    alone, one call per unit, exactly as a controller filling lenses through its own
+    subagents would, and checks that `run_audit`'s own `compose_lens` picks the lens up
+    the moment its units are in.
+    """
+    from tools import subagent_accept as sa
+
+    pid = _plant(cfg, _two_part_doc())
+
+    first = audit_stage.run_audit(cfg, pid)  # writes part prompts; dispatches nothing
+    part_units = [u for u in first["awaiting"] if "/part-" in u]
+    assert part_units and all("/synthesis" not in u for u in part_units)
+
+    pend = {row["unit_id"]: row for row in sa.pending(cfg, pid)}
+    for uid in part_units:
+        assert pend[uid]["state"] == "PENDING"
+        staged = cfg.projects_dir / pid / "audit" / sa.STAGE_DIR / f"{uid.replace('/', '__')}.json"
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_text(json.dumps(
+            {"lens": uid.split("/")[0], "schema_version": 2, "findings": []}),
+            encoding="utf-8")
+
+    swept = sa.sweep(cfg, pid)
+    assert len(swept) == len(part_units) and all("error" not in r for r in swept)
+    for rec in swept:
+        assert rec["delegation_mode"] == "SESSION_SUBAGENT"
+        assert rec["tool_policy"] == "unrecorded", "this mode cannot prove a tool policy"
+
+    second = audit_stage.run_audit(cfg, pid)
+    synth_units = [u for u in second["awaiting"] if u.endswith("/synthesis")]
+    assert set(synth_units) == {f"{ln}/synthesis" for ln in audit_stage.LENSES}, (
+        "sealing every part through subagent_accept must unblock that lens's synthesis")
+
+    for uid in synth_units:
+        staged = cfg.projects_dir / pid / "audit" / sa.STAGE_DIR / f"{uid.replace('/', '__')}.json"
+        staged.write_text(json.dumps(
+            {"lens": uid.split("/")[0], "schema_version": 2, "findings": []}),
+            encoding="utf-8")
+    swept2 = sa.sweep(cfg, pid)
+    assert len(swept2) == len(synth_units) and all("error" not in r for r in swept2)
+
+    third = audit_stage.run_audit(cfg, pid)
+    assert third["awaiting"] == [] and third["deferred"] == []
+    assert sorted(third["lenses_complete"]) == sorted(audit_stage.LENSES)
+    assert audit_stage.missing_reading_artifacts(cfg, pid) == []
+
+    # The composed lens file exists and honestly reports how it was assembled: from
+    # sealed units, not by a CLI subprocess this run never spawned.
+    composed = state.read_json(cfg.projects_dir / pid / "audit" / "overclaim.json")
+    assert composed["lens"] == "overclaim"
+    driver = state.read_json(cfg.projects_dir / pid / "audit" / "overclaim.driver.json")
+    assert driver["written_by"] == "composed_from_parts"
+
+
 def test_every_part_artifact_records_the_span_it_was_given(cfg: Config):
     """Requirement 1: a part output is reconstructible and its input is on disk."""
     pid = _plant(cfg, _two_part_doc())
