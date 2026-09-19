@@ -73,6 +73,19 @@ def project_dir(cfg: Config, pid: str) -> Path:
     return cfg.projects_dir / pid
 
 
+def control_dir(root: Path) -> Path:
+    """The trusted control-state directory for one case: `<project_root>/control/`.
+
+    Structurally separate from `runs/<pid>/`, which IS bind-mounted — in whole, by
+    `ContainerBackend` — into every execution that runs a paper's own (or a driver's,
+    or a reconstruction's) code. A file under `control/` must never be reachable from
+    inside a container or a subprocess running untrusted code; that separation is what
+    makes it safe for a LATER harness invocation to read a file here back as
+    pre-verified state, rather than as something the code it just ran could have
+    overwritten.
+    """
+    return Path(root) / "control"
+
 
 def new_project_id(direction: str) -> str:
     date = time.strftime("%Y%m%d", time.gmtime())

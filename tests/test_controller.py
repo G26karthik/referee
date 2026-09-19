@@ -399,7 +399,7 @@ def test_every_abstention_class_still_produces_a_review(cfg: Config, monkeypatch
     def writes_a_blocked_result(cfg_, pid):
         result = ProbeResult(paper_id=pid, verdict="blocked", reconciliation=Reconciliation(
             status="INCONCLUSIVE", failure_class=failure_class))
-        state.write_json(cfg_.projects_dir / pid / "runs" / pid / "probe_results.json",
+        state.write_json(state.control_dir(cfg_.projects_dir / pid) / "probe_results.json",
                          result.model_dump())
         return {"paper_id": pid, "verdict": "blocked", "reason": failure_class}
 

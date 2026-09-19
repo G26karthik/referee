@@ -127,7 +127,7 @@ def test_probe_resync_refolds_and_persists_completed_route(tmp_path, monkeypatch
     result = ProbeResult(
         paper_id="p", provenance="repo_exec", executions=1, script_path="runs/p/execution.jsonl",
         reconciliation=Reconciliation(status="RESOLVED_VERIFIED", provenance="repo_exec"))
-    state.write_json(cfg.projects_dir / "p" / "runs" / "p" / "probe_results.json",
+    state.write_json(state.control_dir(cfg.projects_dir / "p") / "probe_results.json",
                      result.model_dump())
     monkeypatch.setattr(
         probe_stage, "_executable_targets",
@@ -156,10 +156,10 @@ def test_probe_resync_preserves_runtime_author_code_fallback(tmp_path, monkeypat
                          reconciliation=Reconciliation(
                              status="INCONCLUSIVE", failure_class="execution_unauthorized",
                              reason="decision 'conformance_unproven': method not bound"))
-    state.write_json(root / "runs" / "p" / "probe_results.json", result.model_dump())
+    state.write_json(state.control_dir(root) / "probe_results.json", result.model_dump())
     state.write_json(root / "runs" / "p" / "spec.json", ProbeSpec(
         paper_id="p", experiment=ExperimentIdentity(state="no_candidate")).model_dump())
-    state.write_json(root / "runs" / "p" / "targets" / "T1" / "outcome.json",
+    state.write_json(state.control_dir(root) / "targets" / "T1" / "outcome.json",
                      TargetOutcome(
                          target_id="T1", route="INDEPENDENT_RECONSTRUCTION",
                          action="INDEPENDENT_RECONSTRUCTION",
@@ -206,7 +206,7 @@ def test_cached_secondary_without_legacy_result_gets_explicit_outcome(tmp_path, 
     ts.objects.append(second)
     ts.plans.append(p2)
     state.write_json(cfg.projects_dir / "p" / "discovery" / "targets.json", ts.model_dump())
-    state.write_json(cfg.projects_dir / "p" / "runs" / "p" / "probe_results.json",
+    state.write_json(state.control_dir(cfg.projects_dir / "p") / "probe_results.json",
                      ProbeResult(paper_id="p", verdict="not_started").model_dump())
     monkeypatch.setattr(probe_stage, "_executable_targets",
                         lambda *_: (ts, list(zip(ts.objects, ts.plans)), []))

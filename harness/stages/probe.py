@@ -387,7 +387,7 @@ def audited_commit(root: Path, pid: str) -> str:
     Read from the persisted probe result rather than recomputed, because the point is to
     pin to what was audited BEFORE, not to whatever is on disk now.
     """
-    path = root / "runs" / pid / "probe_results.json"
+    path = state.control_dir(root) / "probe_results.json"
     if not path.exists():
         return ""
     try:
@@ -688,7 +688,7 @@ def resync_cached_outcomes(cfg: Config, pid: str) -> dict:
     cache: no repeat execution), the `discovery/targets.json` THIS invocation's `discover`
     pass just wrote never receives that target's outcome, so every count that reads
     `target_set.outcomes` (`CaseLedger.efficiency`, `evaluate`'s funnel) reports it as never
-    launched — despite `runs/<pid>/probe_results.json` still holding a valid record.
+    launched — despite `control/probe_results.json` still holding a valid record.
 
     This repeats the bookkeeping `_review` does after a fresh run, reading every result
     from disk instead of running anything. It spends no execution and changes no
@@ -697,7 +697,7 @@ def resync_cached_outcomes(cfg: Config, pid: str) -> dict:
     """
     from . import discover as discover_stage
     root = state.project_dir(cfg, pid)
-    primary_path = root / "runs" / pid / "probe_results.json"
+    primary_path = state.control_dir(root) / "probe_results.json"
     if not primary_path.exists():
         return {"resynced": 0, "reason": "no cached probe result"}
 
@@ -708,7 +708,7 @@ def resync_cached_outcomes(cfg: Config, pid: str) -> dict:
     outcomes: list[TargetOutcome] = []
     primary_obj, primary_plan = pairs[0]
     primary_result = ProbeResult(**state.read_json(primary_path))
-    primary_outcome_path = (root / "runs" / pid / "targets" /
+    primary_outcome_path = (state.control_dir(root) / "targets" /
                             primary_obj.target_id / "outcome.json")
     if primary_outcome_path.exists():
         outcomes.append(TargetOutcome(**state.read_json(primary_outcome_path)))
@@ -717,8 +717,8 @@ def resync_cached_outcomes(cfg: Config, pid: str) -> dict:
                                     primary_plan.action, primary_plan.route))
 
     for obj, plan in pairs[1:]:
-        cached_outcome = root / "runs" / pid / "targets" / obj.target_id / "outcome.json"
-        cached = root / "runs" / pid / "targets" / obj.target_id / "probe_results.json"
+        cached_outcome = state.control_dir(root) / "targets" / obj.target_id / "outcome.json"
+        cached = state.control_dir(root) / "targets" / obj.target_id / "probe_results.json"
         if cached_outcome.exists():
             outcomes.append(TargetOutcome(**state.read_json(cached_outcome)))
         elif cached.exists():
@@ -1224,7 +1224,7 @@ def _review(cfg: Config, pid: str) -> dict:
     if pairs and pairs[0][1].action == validation_stage.ACTION:
         spec, fv, fv_record = validation_stage.prepare(
             cfg, doc, pairs[0][0], pairs[0][1], spec, fv_graph)
-        state.write_json(root / "runs" / pid / "validation.driver.json", fv_record)
+        state.write_json(state.control_dir(root) / "validation.driver.json", fv_record)
     # WHAT ITS RESULT WOULD BE HELD AGAINST, from the route the planner chose. Attached
     # whether or not it is established; only the gate below reads it.
     if pairs:
@@ -1301,7 +1301,7 @@ def _review(cfg: Config, pid: str) -> dict:
     # records under `literature/`, `artifact/` and `validation/`; none of them is an
     # execution and none belongs in this file.
     if pairs:
-        state.write_json(root / "runs" / pid / "probe_results.json", result.model_dump())
+        state.write_json(state.control_dir(root) / "probe_results.json", result.model_dump())
 
     # --- the remaining targets ---------------------------------------------------------
     # One blocked target used to end the paper's reproduction. It no longer does: the
@@ -1368,7 +1368,7 @@ def _review(cfg: Config, pid: str) -> dict:
                     other, other_fv, other_record = validation_stage.prepare(
                         cfg, doc, obj, plan, other, fv_graph)
                     state.write_json(
-                        root / "runs" / pid / "targets" / obj.target_id /
+                        state.control_dir(root) / "targets" / obj.target_id /
                         "validation.driver.json", other_record)
                     if not (other_fv.design is not None
                             and other_fv.design.established):
@@ -1381,6 +1381,7 @@ def _review(cfg: Config, pid: str) -> dict:
                                              and other_fv.design is not None
                                              and other_fv.design.established))
                 tdir = root / "runs" / pid / "targets" / obj.target_id
+                ctdir = state.control_dir(root) / "targets" / obj.target_id
                 state.write_json(tdir / "spec.json", other.model_dump())
                 # STEP 6 — the same re-plan, per remaining target. `plan` here is the
                 # target's ORIGINAL discover-time decision, exactly as for the primary.
@@ -1401,7 +1402,7 @@ def _review(cfg: Config, pid: str) -> dict:
                         out_dir=tdir / "reimplementation")
                     if (other_reconstruction_result is not None
                             and other_reconstruction is not None):
-                        state.write_json(tdir / "probe_results.json",
+                        state.write_json(ctdir / "probe_results.json",
                                          other_reconstruction_result.model_dump())
                         outcomes.append(outcome_for(
                             obj.target_id, other_reconstruction_result,
@@ -1415,8 +1416,8 @@ def _review(cfg: Config, pid: str) -> dict:
                         ("AUTHORIZATION_BLOCKED" if other_direct_reconstruction
                          else "IDENTITY_BLOCKED")))
                     continue
-                tres = _run(cfg, root, other, out_dir=tdir)
-                state.write_json(tdir / "probe_results.json", tres.model_dump())
+                tres = _run(cfg, root, other, out_dir=tdir, results_dir=ctdir)
+                state.write_json(ctdir / "probe_results.json", tres.model_dump())
                 if other_fv is not None:
                     other_fv = validation_stage.adjudicate(other_fv, other, tres)
                     outcomes.append(validation_stage.outcome_for(
@@ -1450,7 +1451,7 @@ def _review(cfg: Config, pid: str) -> dict:
         # can then reconstruct the exact route ledger without silently turning a prior
         # attempt into NOT_TRIED merely because no ProbeResult was produced.
         for out in outcomes:
-            odir = root / "runs" / pid / "targets" / out.target_id
+            odir = state.control_dir(root) / "targets" / out.target_id
             state.write_json(odir / "outcome.json", out.model_dump())
         keep = [o for o in target_set.outcomes if o.target_id not in {x.target_id for x in outcomes}]
         target_set.outcomes = keep + outcomes
@@ -1475,7 +1476,7 @@ def _review(cfg: Config, pid: str) -> dict:
     if target_set is not None and artifact_outcomes:
         for out in artifact_outcomes:
             state.write_json(
-                root / "runs" / pid / "targets" / out.target_id / "outcome.json",
+                state.control_dir(root) / "targets" / out.target_id / "outcome.json",
                 out.model_dump())
         replaced = {o.target_id for o in artifact_outcomes}
         target_set.outcomes = [o for o in target_set.outcomes
@@ -1498,7 +1499,7 @@ def _review(cfg: Config, pid: str) -> dict:
     if target_set is not None and literature_outcomes:
         for out in literature_outcomes:
             state.write_json(
-                root / "runs" / pid / "targets" / out.target_id / "outcome.json",
+                state.control_dir(root) / "targets" / out.target_id / "outcome.json",
                 out.model_dump())
         replaced = {o.target_id for o in literature_outcomes}
         target_set.outcomes = [o for o in target_set.outcomes
@@ -1522,7 +1523,7 @@ def _review(cfg: Config, pid: str) -> dict:
                  "provenance": result.provenance, "mechanism": result.mechanism,
                  "reconciliation": rec.status if rec else None,
                  "finding_id": result.finding_id, "seconds": result.seconds},
-        path=str(root / "runs" / pid / "probe_results.json"),
+        path=str(state.control_dir(root) / "probe_results.json"),
     )
     return {"paper_id": pid, "verdict": result.verdict, "device": result.device,
             "finding_id": result.finding_id or None,
@@ -1551,4 +1552,4 @@ def _review(cfg: Config, pid: str) -> dict:
             "literature_concerns": len(search.concerns()) if search else 0,
             "reconciliation": rec.status if rec else None,
             "seconds": result.seconds, "reason": result.reason,
-            "script": result.script_path, "results": f"runs/{pid}/probe_results.json"}
+            "script": result.script_path, "results": "control/probe_results.json"}

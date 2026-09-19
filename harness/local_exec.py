@@ -1065,7 +1065,7 @@ def verify_execution_commit(spec: ProbeSpec,
 
 def _blocked(cfg: Config, root: Path, spec: ProbeSpec, auth: ExecAuthorization,
              seconds: float, commit: CommitVerification | None = None,
-             out_dir: Path | None = None) -> ProbeResult:
+             results_dir: Path | None = None) -> ProbeResult:
     """The result of a run that was refused. Nothing executed; nothing is concluded.
 
     A distinct verdict rather than a reused one. 'failed' would say the probe ran and
@@ -1091,15 +1091,21 @@ def _blocked(cfg: Config, root: Path, spec: ProbeSpec, auth: ExecAuthorization,
         result.reconciliation = reconcile(spec, [], 0.0, [], authorization=auth)
     # `script_path` stays empty: no probe was written, and naming a file that does not
     # exist would invite a reader to go looking for the code that ran.
-    out_dir = out_dir or (root / "runs" / spec.paper_id)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    state.write_json(out_dir / "probe_results.json", result.model_dump())
+    #
+    # This is CONTROL STATE, not execution workspace — unlike `write_probe`'s own default
+    # (which must stay under `runs/<pid>/`, or the backend could never find the script to
+    # run) — so its default is `state.control_dir(root)`, never a bare `out_dir` fallback:
+    # nothing ran here, so there is no execution directory this result belongs beside.
+    results_dir = results_dir or state.control_dir(root)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    state.write_json(results_dir / "probe_results.json", result.model_dump())
     return result
 
 
 def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
               backend: ExecutionBackend | None = None,
-              out_dir: Path | None = None) -> ProbeResult:
+              out_dir: Path | None = None,
+              results_dir: Path | None = None) -> ProbeResult:
     """Write the probe, run every (arm, seed) through the backend, aggregate.
 
     The backend is asked for, not assumed: `backend_for` returns the local one for code
@@ -1112,8 +1118,25 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
     gate shut and no identity established — after which its crash was eligible to become
     FAILED_REPRODUCTION. A refused spec produces a result with verdict 'blocked': no
     process is started, no arms are measured, and the reconciliation is INCONCLUSIVE.
+
+    `out_dir` and `results_dir` answer two different questions and must not be conflated.
+    `out_dir` is EXECUTION WORKSPACE — where `probe.py`/the script and its `env/` live,
+    which a backend must be able to reach, so it stays under `runs/<pid>/...` (defaulted by
+    `write_probe`) and is bind-mounted whole by `ContainerBackend`. `results_dir` is where
+    THIS FUNCTION's own `probe_results.json` side effect is written — a later invocation's
+    trusted record, per `harness.state.control_dir`'s own contract — and must never be
+    reachable from inside a container. Defaulting `results_dir` to `out_dir` when the
+    caller gave one preserves every existing explicit-`out_dir` caller's behaviour
+    unchanged (a per-target caller that wants its own interim copy isolated passes
+    `results_dir` explicitly, as `stages/probe.py` now does; the `.../reimplementation`
+    fallback callers do not, because that directory is disposable execution workspace by
+    design and colocating its own `probe_results.json` there is no different from
+    colocating `execution.jsonl`). Only the bare call with NEITHER argument — the primary
+    target's own `_run(cfg, root, spec)` — silently wrote into the bind-mounted directory
+    before this default changed.
     """
     t0 = time.time()
+    results_dir = results_dir or out_dir or state.control_dir(root)
     # A SPEC THAT CLAIMS AN ADMISSIBLE PROVENANCE AND CONTAINS NO PROGRAM IS REFUSED.
     #
     # `write_probe` falls back to DEFAULT_TEMPLATE when a spec carries neither `script`
@@ -1145,13 +1168,13 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
                     f"noise-floor template and then reconcile its number against the "
                     f"paper's printed cell."))
         return _blocked(cfg, root, spec, blocked_auth, round(time.time() - t0, 1),
-                        verify_execution_commit(spec, backend), out_dir=out_dir)
+                        verify_execution_commit(spec, backend), results_dir=results_dir)
     backend = backend or backend_for(cfg, spec)
     commit = verify_execution_commit(spec, backend)
     auth = authorize(cfg, spec, backend, commit=commit)
     if not auth.allowed or backend is None:
         return _blocked(cfg, root, spec, auth, round(time.time() - t0, 1), commit,
-                        out_dir=out_dir)
+                        results_dir=results_dir)
 
     script = write_probe(root, spec, out_dir)
     out_dir = script.parent
@@ -1444,7 +1467,7 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
             for r in records:
                 fh.write(json.dumps(r.model_dump(), ensure_ascii=False) + "\n")
 
-    state.write_json(out_dir / "probe_results.json", result.model_dump())
+    state.write_json(results_dir / "probe_results.json", result.model_dump())
     if log:
         state.write_json(out_dir / "probe_log.json", log)
     return result

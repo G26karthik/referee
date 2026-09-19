@@ -29,6 +29,7 @@ from pathlib import Path
 
 import pytest
 
+from harness import state
 from harness.artifacts import (CommitVerification, ConfigurationIdentity, ExecCapability,
                                ExperimentIdentity, MetricIdentity, ProbeSpec,
                                RepoAcquisition, ResourceCapability)
@@ -393,7 +394,7 @@ def test_the_blocked_result_is_still_written_to_disk(tmp_path):
     spec = _qualified()
     spec.command = ["python", "eval.py"]
     run_probe(_cfg(allow_repo_exec=False), tmp_path, spec)
-    assert (tmp_path / "runs" / "p" / "probe_results.json").is_file()
+    assert (state.control_dir(tmp_path) / "probe_results.json").is_file()
 
 
 def test_the_local_template_is_unaffected_by_any_of_this(tmp_path):

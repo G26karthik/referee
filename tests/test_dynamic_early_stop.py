@@ -100,7 +100,7 @@ def loop(monkeypatch, tmp_path):
 
         calls: list[str] = []
 
-        def fake_run(cfg, root, spec, out_dir=None):
+        def fake_run(cfg, root, spec, out_dir=None, results_dir=None):
             calls.append(spec.target_id or "primary")
             if len(calls) == 1:
                 return _result(pid, status=first_status, provenance=first_provenance)
@@ -330,7 +330,7 @@ def test_material_target_beyond_numeric_budget_is_still_pursued(monkeypatch, tmp
 
     launched = []
 
-    def fake_run(cfg, root, spec, out_dir=None):
+    def fake_run(cfg, root, spec, out_dir=None, results_dir=None):
         launched.append(spec.target_id)
         return _result(pid, status="RESOLVED_VERIFIED", provenance="repo_exec")
 

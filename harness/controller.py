@@ -560,13 +560,13 @@ def _phase_probe(cfg: Config, case: CaseState, *, force_probe: bool = False,
     doc_path = state.project_dir(cfg, case.paper_id) / "paper" / "doc.json"
     doc = PaperDoc(**state.read_json(doc_path))
     root = state.project_dir(cfg, case.paper_id)
-    done = (root / "runs" / case.paper_id / "probe_results.json").exists()
+    done = (state.control_dir(root) / "probe_results.json").exists()
 
     if skip_probe:
         return PhaseOutcome("abstain", "reproduction skipped by request (--skip-probe)",
                             {"skipped": "--skip-probe"}, "skipped")
     if done and not force_probe:
-        existing = ProbeResult(**state.read_json(root / "runs" / case.paper_id / "probe_results.json"))
+        existing = ProbeResult(**state.read_json(state.control_dir(root) / "probe_results.json"))
         # `discover` just recomputed `targets.json` from scratch this invocation and knows
         # nothing about a prior execution; re-attach the cached outcome(s) onto it now,
         # rather than let a real execution silently vanish from the funnel counts because
@@ -641,7 +641,7 @@ def _phase_probe(cfg: Config, case: CaseState, *, force_probe: bool = False,
             f"a fault in this harness is not evidence about the paper.",
             {"error": f"{type(e).__name__}: {e}"}, "probe_error")
 
-    result_path = root / "runs" / case.paper_id / "probe_results.json"
+    result_path = state.control_dir(root) / "probe_results.json"
     result = ProbeResult(**state.read_json(result_path)) if result_path.exists() else None
     return PhaseOutcome("ok", res.get("reason", "") or "reproduction attempted", res,
                         _reproduction_class(result))

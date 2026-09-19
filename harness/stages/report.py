@@ -1206,7 +1206,7 @@ def _code_audit_block(c: CodeAudit) -> list[str]:
             out.append(f"  Alternative explanation: {_cell(f.counter_explanations[0], 200)}")
     if len(shown) > MAX_CODE_ROWS:
         out.append(f"- _…and {len(shown) - MAX_CODE_ROWS} further pattern(s); "
-                   f"full set in `runs/<paper_id>/probe_results.json`._")
+                   f"full set in `control/probe_results.json`._")
     out += suppressed
     if c.unparseable:
         out += ["", f"_{len(c.unparseable)} file(s) could not be parsed and were skipped._"]
@@ -2316,7 +2316,7 @@ def run_report(cfg: Config, pid: str) -> dict:
                          f"audit/<lens>.json for each, then re-run synthesize_report."}
     state.set_phase(cfg, pid, "report")
 
-    probe_path = root / "runs" / pid / "probe_results.json"
+    probe_path = state.control_dir(root) / "probe_results.json"
     probe = ProbeResult(**state.read_json(probe_path)) if probe_path.exists() else None
 
     # Local import: `stages.grade` imports `rank` from this module, so a module-level

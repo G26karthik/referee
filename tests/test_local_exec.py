@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from harness import state
 from harness.artifacts import ProbeSpec
 from harness.config import Config
 from harness.local_exec import _noise, _stats, run_probe, write_probe
@@ -111,9 +112,9 @@ def test_claimed_delta_is_tested_against_the_measured_band(tmp_path: Path):
     assert res2.claim_within_noise is True, "a 0.0001 claim is inside this band"
 
 
-def test_results_are_written_by_value_next_to_the_script(tmp_path: Path):
+def test_results_are_written_to_control_dir(tmp_path: Path):
     res = run_probe(Config.load(), tmp_path, _script(tmp_path, DELTA_SCRIPT % "0.001"))
-    out = tmp_path / "runs" / "p" / "probe_results.json"
-    assert out.exists(), "probe_results.json must be written beside probe.py"
+    out = state.control_dir(tmp_path) / "probe_results.json"
+    assert out.exists(), "probe_results.json must be written under state.control_dir(root)"
     assert res.script_path.endswith("probe.py")
     assert res.device == "cpu"
