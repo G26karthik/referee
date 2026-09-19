@@ -40,7 +40,6 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -49,13 +48,13 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import state
+from . import delegation, reviewer_cli, state
 from .artifacts import ReimplementationBinding, ReimplementationConformance, ReimplementationReadiness
-from .audit_driver import (KNOWN_TOOLS, Confinement, _kill_tree, denied_tools,
-                           envelope_provenance, operator_confinement, unwrap_envelope,
-                           write_pinned_settings)
 from .config import Config
 from .prompts import reimplement as RP
+from .reviewer_cli import (KNOWN_TOOLS, Confinement, _kill_tree, denied_tools,
+                           envelope_provenance, operator_confinement, unwrap_envelope,
+                           write_pinned_settings)
 
 # Every writer a validated reconstruction can carry: this module's own subprocess, a human
 # `accept_reimplementation` call, plus every mode `harness.delegation` admits — the same
@@ -107,7 +106,7 @@ class ReimplementationDriverError(RuntimeError):
 
 
 def role_model(cfg: Config) -> str:
-    return (cfg.reimplementation_model or "").strip() or str(RP.ROLE_SPEC.get("model", ""))
+    return delegation.resolve_model(cfg.reimplementation_model, RP.ROLE_SPEC.get("model", ""))
 
 
 def reimplementation_confinement(cfg: Config, *, settings_sha256: str = "") -> Confinement:
@@ -125,14 +124,12 @@ def reimplementation_confinement(cfg: Config, *, settings_sha256: str = "") -> C
 
 def default_cmd(cfg: Config | None = None, *, exe: str = "", settings: str = "") -> str:
     cfg = cfg or Config()
-    exe = ((exe or "").strip() or (cfg.reviewer_exe or "").strip()
-           or (shutil.which("claude") or ""))
+    exe = delegation.resolve_reviewer_exe(exe, cfg.reviewer_exe)
     if not exe:
         return ""
-    reader = "type" if os.name == "nt" else "cat"
     extra = reimplementation_confinement(Config(
         reimplementation_cmd="", reimplementation_model=cfg.reimplementation_model)).flags(settings)
-    return f'{reader} "{{prompt}}" | "{exe}" -p{extra} > "{{out}}"'
+    return reviewer_cli.cli_pipe_command(exe, extra)
 
 
 def resolve_cmd(cfg: Config, *, settings: str = "") -> str:
@@ -142,12 +139,7 @@ def resolve_cmd(cfg: Config, *, settings: str = "") -> str:
 def available(cfg: Config) -> tuple[bool, str]:
     if not cfg.allow_reimplementation_driver:
         return False, "reimplementation-driver gate is closed; set SH_ALLOW_REIMPLEMENTATION_DRIVER=1"
-    cmd = resolve_cmd(cfg)
-    if not cmd:
-        return False, "no reviewer available to write a reconstruction"
-    if "{prompt}" not in cmd or "{out}" not in cmd:
-        return False, "SH_REIMPLEMENTATION_CMD must contain both {prompt} and {out}"
-    return True, ""
+    return delegation.check_command(resolve_cmd(cfg), "SH_REIMPLEMENTATION_CMD")
 
 
 def _invoke_fresh(cfg: Config, prompt_text: str, timeout_s: int) -> tuple[str, dict] | None:

@@ -21,7 +21,6 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -29,12 +28,12 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import claimlink, delegation, state
+from . import claimlink, delegation, reviewer_cli, state
 from .artifacts import ClaimLink, ClaimLinkSet, PaperDoc
-from .audit_driver import (Confinement, _kill_tree, denied_tools, envelope_provenance,
-                           operator_confinement, unwrap_envelope, write_pinned_settings)
 from .config import Config
 from .prompts import claimlink as CP
+from .reviewer_cli import (Confinement, _kill_tree, denied_tools, envelope_provenance,
+                           operator_confinement, unwrap_envelope, write_pinned_settings)
 
 # Same reasoning as `verdict_driver.WRITERS`: read off the delegation vocabulary so a mode
 # cannot be sealed by one path and refused by another, which presents as "no links exist"
@@ -47,7 +46,7 @@ class ClaimLinkDriverError(RuntimeError):
 
 
 def role_model(cfg: Config) -> str:
-    return (cfg.claimlink_model or "").strip() or str(CP.ROLE_SPEC.get("model", ""))
+    return delegation.resolve_model(cfg.claimlink_model, CP.ROLE_SPEC.get("model", ""))
 
 
 def link_confinement(cfg: Config, *, settings_sha256: str = "",
@@ -74,15 +73,13 @@ def link_confinement(cfg: Config, *, settings_sha256: str = "",
 def default_cmd(cfg: Config | None = None, *, exe: str = "", settings: str = "",
                 pdf_dir: str = "") -> str:
     cfg = cfg or Config()
-    exe = ((exe or "").strip() or (cfg.reviewer_exe or "").strip()
-           or (shutil.which("claude") or ""))
+    exe = delegation.resolve_reviewer_exe(exe, cfg.reviewer_exe)
     if not exe:
         return ""
-    reader = "type" if os.name == "nt" else "cat"
     extra = link_confinement(Config(claimlink_cmd="",
                                     claimlink_model=cfg.claimlink_model),
                              pdf_dir=pdf_dir).flags(settings)
-    return f'{reader} "{{prompt}}" | "{exe}" -p{extra} > "{{out}}"'
+    return reviewer_cli.cli_pipe_command(exe, extra)
 
 
 def resolve_cmd(cfg: Config, *, settings: str = "", pdf_dir: str = "") -> str:
@@ -96,12 +93,7 @@ def available(cfg: Config) -> tuple[bool, str]:
                        "it closed the harness behaves exactly as it did before this "
                        "channel existed — no link is established and materiality falls "
                        "back to its own structural rule")
-    cmd = resolve_cmd(cfg)
-    if not cmd:
-        return False, "no reader available for the claim-link pass"
-    if "{prompt}" not in cmd or "{out}" not in cmd:
-        return False, "SH_CLAIMLINK_CMD must contain both {prompt} and {out}"
-    return True, ""
+    return delegation.check_command(resolve_cmd(cfg), "SH_CLAIMLINK_CMD")
 
 
 def parse_links(text: str) -> tuple[list[ClaimLink], str, dict]:

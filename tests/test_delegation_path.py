@@ -1078,6 +1078,7 @@ def test_a_whole_paper_opinion_still_degrades_to_nothing_rather_than_to_a_placeh
 # --------------------------------------------------------------------------- #
 DELEGATION_MODULES = ("harness/audit_driver.py", "harness/grade_driver.py",
                       "harness/verdict_driver.py", "harness/config.py",
+                      "harness/delegation.py",
                       "harness/prompts/audit.py", "harness/prompts/grade.py",
                       "harness/prompts/verdict.py")
 

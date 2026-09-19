@@ -27,7 +27,6 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -35,14 +34,14 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import artifact_evidence, delegation, state
+from . import artifact_evidence, delegation, reviewer_cli, state
 from .artifacts import (ARTIFACT_IDENTITY_BASES, ARTIFACT_IDENTITY_STATES,
                         ArtifactFact,
                         ArtifactInspection, ArtifactSnapshot, PaperDoc)
-from .audit_driver import (Confinement, _kill_tree, denied_tools, envelope_provenance,
-                           operator_confinement, unwrap_envelope, write_pinned_settings)
 from .config import Config
 from .prompts import artifact_review as AP
+from .reviewer_cli import (Confinement, _kill_tree, denied_tools, envelope_provenance,
+                           operator_confinement, unwrap_envelope, write_pinned_settings)
 
 WRITERS = ("artifact_review_driver",) + tuple(delegation.WRITTEN_BY.values())
 
@@ -69,7 +68,7 @@ class ArtifactReviewDriverError(RuntimeError):
 
 
 def role_model(cfg: Config) -> str:
-    return (cfg.artifact_review_model or "").strip() or str(AP.ROLE_SPEC.get("model", ""))
+    return delegation.resolve_model(cfg.artifact_review_model, AP.ROLE_SPEC.get("model", ""))
 
 
 def review_confinement(cfg: Config, *, settings_sha256: str = "",
@@ -98,15 +97,13 @@ def review_confinement(cfg: Config, *, settings_sha256: str = "",
 def default_cmd(cfg: Config | None = None, *, exe: str = "", settings: str = "",
                 repo_dir: str = "") -> str:
     cfg = cfg or Config()
-    exe = ((exe or "").strip() or (cfg.reviewer_exe or "").strip()
-           or (shutil.which("claude") or ""))
+    exe = delegation.resolve_reviewer_exe(exe, cfg.reviewer_exe)
     if not exe:
         return ""
-    reader = "type" if os.name == "nt" else "cat"
     extra = review_confinement(
         Config(artifact_review_cmd="", artifact_review_model=cfg.artifact_review_model),
         repo_dir=repo_dir).flags(settings)
-    return f'{reader} "{{prompt}}" | "{exe}" -p{extra} > "{{out}}"'
+    return reviewer_cli.cli_pipe_command(exe, extra)
 
 
 def resolve_cmd(cfg: Config, *, settings: str = "", repo_dir: str = "") -> str:
@@ -119,12 +116,7 @@ def available(cfg: Config) -> tuple[bool, str]:
         return False, ("authors'-code audit gate is closed: SH_ALLOW_ARTIFACT_REVIEW is "
                        "not set. With it closed the artifact route still runs on "
                        "deterministic probes alone")
-    cmd = resolve_cmd(cfg)
-    if not cmd:
-        return False, "no reader available for the authors'-code pass"
-    if "{prompt}" not in cmd or "{out}" not in cmd:
-        return False, "SH_ARTIFACT_REVIEW_CMD must contain both {prompt} and {out}"
-    return True, ""
+    return delegation.check_command(resolve_cmd(cfg), "SH_ARTIFACT_REVIEW_CMD")
 
 
 def parse_concerns(text: str) -> tuple[list[dict], str, dict]:

@@ -29,7 +29,6 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -37,13 +36,13 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import state
+from . import delegation, reviewer_cli, state
 from .artifacts import SubstantiveVerdict
-from .audit_driver import (KNOWN_TOOLS, Confinement, _kill_tree, denied_tools,
-                           envelope_provenance, operator_confinement, unwrap_envelope,
-                           write_pinned_settings)
 from .config import Config
 from .prompts import verdict as VP
+from .reviewer_cli import (KNOWN_TOOLS, Confinement, _kill_tree, denied_tools,
+                           envelope_provenance, operator_confinement, unwrap_envelope,
+                           write_pinned_settings)
 
 # Every writer a validated path can produce: this module's own subprocess, plus every
 # mode `harness.delegation` admits. Read off that vocabulary rather than written out, so a
@@ -59,7 +58,7 @@ class VerdictDriverError(RuntimeError):
 
 def role_model(cfg: Config) -> str:
     """WHICH model forms the opinion: `SH_VERDICT_MODEL`, else the declared role default."""
-    return (cfg.verdict_model or "").strip() or str(VP.ROLE_SPEC.get("model", ""))
+    return delegation.resolve_model(cfg.verdict_model, VP.ROLE_SPEC.get("model", ""))
 
 
 def verdict_confinement(cfg: Config, *, settings_sha256: str = "") -> Confinement:
@@ -87,14 +86,12 @@ def default_cmd(cfg: Config | None = None, *, exe: str = "", settings: str = "")
     came from whatever the operator's ambient settings said, unrecorded.
     """
     cfg = cfg or Config()
-    exe = ((exe or "").strip() or (cfg.reviewer_exe or "").strip()
-           or (shutil.which("claude") or ""))
+    exe = delegation.resolve_reviewer_exe(exe, cfg.reviewer_exe)
     if not exe:
         return ""
-    reader = "type" if os.name == "nt" else "cat"
     extra = verdict_confinement(Config(verdict_cmd="",
                                        verdict_model=cfg.verdict_model)).flags(settings)
-    return f'{reader} "{{prompt}}" | "{exe}" -p{extra} > "{{out}}"'
+    return reviewer_cli.cli_pipe_command(exe, extra)
 
 
 def resolve_cmd(cfg: Config, *, settings: str = "") -> str:
@@ -104,12 +101,7 @@ def resolve_cmd(cfg: Config, *, settings: str = "") -> str:
 def available(cfg: Config) -> tuple[bool, str]:
     if not cfg.allow_substantive_verdict:
         return False, "substantive-verdict gate is closed; set SH_ALLOW_SUBSTANTIVE_VERDICT=1"
-    cmd = resolve_cmd(cfg)
-    if not cmd:
-        return False, "no reviewer available for the substantive verdict"
-    if "{prompt}" not in cmd or "{out}" not in cmd:
-        return False, "SH_VERDICT_CMD must contain both {prompt} and {out}"
-    return True, ""
+    return delegation.check_command(resolve_cmd(cfg), "SH_VERDICT_CMD")
 
 
 def parse_verdict_json(text: str) -> SubstantiveVerdict:

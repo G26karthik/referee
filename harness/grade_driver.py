@@ -33,7 +33,6 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -41,14 +40,14 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import state
+from . import delegation, reviewer_cli, state
 from .artifacts import Grade
-from .audit_driver import (KNOWN_TOOLS, Confinement, NonRetryable, RateLimited,
+from .config import Config
+from .prompts import grade as GP
+from .reviewer_cli import (KNOWN_TOOLS, Confinement, NonRetryable, RateLimited,
                            _kill_tree, classify_delegated_failure, denied_tools,
                            envelope_provenance, keep_prompt_copy, operator_confinement,
                            prompt_fingerprint, unwrap_envelope, write_pinned_settings)
-from .config import Config
-from .prompts import grade as GP
 
 
 class GradeDriverError(RuntimeError):
@@ -92,7 +91,7 @@ def role_model(cfg: Config) -> str:
     vendor. `prompts.grade.ROLE_SPEC` says the same thing where a reader of the panel table
     will see it.
     """
-    return (cfg.grade_model or "").strip() or str(GP.ROLE_SPEC.get("model", ""))
+    return delegation.resolve_model(cfg.grade_model, GP.ROLE_SPEC.get("model", ""))
 
 
 def grade_confinement(cfg: Config, *, settings_sha256: str = "") -> Confinement:
@@ -123,13 +122,11 @@ def default_cmd(cfg: Config | None = None, *, exe: str = "", settings: str = "")
     gives.
     """
     cfg = cfg or Config()
-    exe = ((exe or "").strip() or (cfg.reviewer_exe or "").strip()
-           or (shutil.which("claude") or ""))
+    exe = delegation.resolve_reviewer_exe(exe, cfg.reviewer_exe)
     if not exe:
         return ""
-    reader = "type" if os.name == "nt" else "cat"
     extra = grade_confinement(Config(grade_cmd="", grade_model=cfg.grade_model)).flags(settings)
-    return f'{reader} "{{prompt}}" | "{exe}" -p{extra} > "{{out}}"'
+    return reviewer_cli.cli_pipe_command(exe, extra)
 
 
 def resolve_cmd(cfg: Config, *, settings: str = "") -> str:
@@ -142,15 +139,7 @@ def available(cfg: Config) -> tuple[bool, str]:
         return False, ("grading gate is closed: SH_ALLOW_GRADING is not set. Set it (in "
                        "the environment or .env.sandbox) to let the controller "
                        "independently grade findings")
-    cmd = resolve_cmd(cfg)
-    if not cmd:
-        return False, ("no grader is available: SH_GRADE_CMD is empty, SH_REVIEWER_EXE is "
-                       "empty and the `claude` CLI is not on PATH, so there is nothing to "
-                       "delegate grading to")
-    if "{prompt}" not in cmd or "{out}" not in cmd:
-        return False, (f"SH_GRADE_CMD must contain both {{prompt}} and {{out}} placeholders; "
-                       f"got: {cfg.grade_cmd!r}")
-    return True, ""
+    return delegation.check_command(resolve_cmd(cfg), "SH_GRADE_CMD")
 
 
 def parse_grade_json(text: str) -> Grade:

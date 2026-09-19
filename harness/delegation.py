@@ -99,6 +99,47 @@ def cli_available(command: str = "") -> tuple[bool, str]:
     return False, "no reviewer command is configured and no `claude` is on PATH"
 
 
+# --------------------------------------------------------------------------- #
+# THE PER-ROLE SKELETON — the part of every driver's `role_model`/`default_cmd`/
+# `available` that is genuinely duplicated, not merely similar
+# --------------------------------------------------------------------------- #
+# These three are pure string/`shutil` operations, deliberately: `harness/reviewer_cli.py`
+# holds everything else a delegated CLI call needs (confinement, envelope parsing,
+# kill-tree, failure classification) precisely because those need `os`/`sys`/`subprocess`,
+# which this module's own purity test (see the module docstring above) forbids it from
+# importing. `cli_pipe_command` — the fourth member of the original duplicated skeleton —
+# lives in `reviewer_cli.py` for exactly that reason: it needs `os.name`.
+def resolve_model(override: str, declared_default: str) -> str:
+    """An operator's model override, or the role's own declared default. Shared by every
+    driver's `role_model(cfg)`, which reads `override` off its own `Config` field and
+    `declared_default` off its own `prompts.<role>.*_SPEC["model"]`."""
+    return (override or "").strip() or str(declared_default or "")
+
+
+def resolve_reviewer_exe(explicit: str = "", cfg_exe: str = "") -> str:
+    """The reviewer executable a built-in command template invokes: an explicit override,
+    else the operator's configured `SH_REVIEWER_EXE`, else `claude` on PATH. Every driver's
+    `default_cmd` resolved this chain independently; `audit_driver.default_cmd` is the one
+    exception that skipped the `cfg_exe` step internally (its caller supplied it instead) —
+    preserve that at the call site, not by weakening this function."""
+    return ((explicit or "").strip() or (cfg_exe or "").strip()
+            or (shutil.which("claude") or ""))
+
+
+def check_command(cmd: str, cmd_field: str) -> tuple[bool, str]:
+    """The empty-command and {prompt}/{out}-placeholder checks every driver's `available()`
+    performs on whatever `resolve_cmd()` returned, once its own gate check has already
+    passed. `cmd_field` is the env var name to name in the refusal (e.g. "SH_GRADE_CMD")."""
+    if not cmd:
+        return False, (f"no reviewer is available: {cmd_field} is empty, SH_REVIEWER_EXE "
+                       f"is empty and the `claude` CLI is not on PATH, so there is nothing "
+                       f"to delegate to")
+    if "{prompt}" not in cmd or "{out}" not in cmd:
+        return False, (f"{cmd_field} must contain both {{prompt}} and {{out}} "
+                       f"placeholders; got: {cmd!r}")
+    return True, ""
+
+
 def modes_available(*, cli_command: str = "", cli_gate_open: bool = False,
                     session_can_delegate: bool = False) -> tuple[str, ...]:
     """Which delegation modes this environment actually offers, most capable first.
@@ -266,6 +307,27 @@ def _self_check() -> None:
     assert cli_available("my-reviewer --flag")[0] is True
     ok, why = cli_available("")
     assert isinstance(ok, bool) and why
+
+    # --- the per-role skeleton: an override wins, a blank falls to the declared default -
+    assert resolve_model("haiku", "sonnet") == "haiku"
+    assert resolve_model("", "sonnet") == "sonnet"
+    assert resolve_model("   ", "sonnet") == "sonnet", "a blank override is not an override"
+    assert resolve_model("", "") == ""
+
+    assert resolve_reviewer_exe("/explicit/claude", "/configured/claude") == "/explicit/claude"
+    assert resolve_reviewer_exe("", "/configured/claude") == "/configured/claude"
+    assert resolve_reviewer_exe("  ", "/configured/claude") == "/configured/claude"
+    # falls all the way to PATH discovery only once both overrides are blank
+    assert resolve_reviewer_exe("", "") == (shutil.which("claude") or "")
+
+    # --- the tail every available() shares once its own gate has already passed --------
+    assert check_command("", "SH_GRADE_CMD") == (
+        False, "no reviewer is available: SH_GRADE_CMD is empty, SH_REVIEWER_EXE is empty "
+        "and the `claude` CLI is not on PATH, so there is nothing to delegate to")
+    assert check_command("review --in {prompt}", "SH_GRADE_CMD") == (
+        False, "SH_GRADE_CMD must contain both {prompt} and {out} placeholders; "
+        "got: 'review --in {prompt}'")
+    assert check_command("cp {prompt} {out}", "SH_GRADE_CMD") == (True, "")
 
     # --- what each environment offers --------------------------------------------------
     assert modes_available() == ("MANUAL",), "a human is always available"

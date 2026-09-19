@@ -36,7 +36,6 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -44,13 +43,13 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import claims, delegation, state
+from . import claims, delegation, reviewer_cli, state
 from .artifacts import (FocusedValidation, NEVER_ASSUMED, PREDICTED_DIRECTIONS,
                         PaperDoc, SETTLEMENT_RULES, SettlementCondition)
-from .audit_driver import (Confinement, _kill_tree, denied_tools, operator_confinement,
-                           unwrap_envelope, write_pinned_settings)
 from .config import Config
 from .prompts import validation as VP
+from .reviewer_cli import (Confinement, _kill_tree, denied_tools, operator_confinement,
+                           unwrap_envelope, write_pinned_settings)
 
 WRITERS = ("validation_driver",) + tuple(delegation.WRITTEN_BY.values())
 
@@ -76,7 +75,7 @@ class ValidationDriverError(RuntimeError):
 
 
 def role_model(cfg: Config) -> str:
-    return (cfg.validation_model or "").strip() or str(VP.DESIGN_ROLE_SPEC.get("model", ""))
+    return delegation.resolve_model(cfg.validation_model, VP.DESIGN_ROLE_SPEC.get("model", ""))
 
 
 def design_confinement(cfg: Config, *, settings_sha256: str = "") -> Confinement:
@@ -98,14 +97,12 @@ def design_confinement(cfg: Config, *, settings_sha256: str = "") -> Confinement
 
 def default_cmd(cfg: Config | None = None, *, exe: str = "", settings: str = "") -> str:
     cfg = cfg or Config()
-    exe = ((exe or "").strip() or (cfg.reviewer_exe or "").strip()
-           or (shutil.which("claude") or ""))
+    exe = delegation.resolve_reviewer_exe(exe, cfg.reviewer_exe)
     if not exe:
         return ""
-    reader = "type" if os.name == "nt" else "cat"
     extra = design_confinement(
         Config(validation_cmd="", validation_model=cfg.validation_model)).flags(settings)
-    return f'{reader} "{{prompt}}" | "{exe}" -p{extra} > "{{out}}"'
+    return reviewer_cli.cli_pipe_command(exe, extra)
 
 
 def resolve_cmd(cfg: Config, *, settings: str = "") -> str:
@@ -119,12 +116,7 @@ def available(cfg: Config) -> tuple[bool, str]:
                        "SH_ALLOW_VALIDATION_DESIGN is not set. With it closed the route "
                        "still runs and every design reports SPECIFICATION_BLOCKED naming "
                        "the ingredients the paper does not bind")
-    cmd = resolve_cmd(cfg)
-    if not cmd:
-        return False, "no reader available for the focused-validation design pass"
-    if "{prompt}" not in cmd or "{out}" not in cmd:
-        return False, "SH_VALIDATION_CMD must contain both {prompt} and {out}"
-    return True, ""
+    return delegation.check_command(resolve_cmd(cfg), "SH_VALIDATION_CMD")
 
 
 # --------------------------------------------------------------------------------------

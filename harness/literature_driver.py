@@ -28,7 +28,6 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -36,13 +35,13 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import delegation, literature, state
+from . import delegation, literature, reviewer_cli, state
 from .artifacts import (LITERATURE_RELATIONS, LiteratureSearch, PaperDoc, PriorArtFact,
                         SearchClaim, SearchCutoff, WorkIdentity)
-from .audit_driver import (Confinement, _kill_tree, denied_tools, operator_confinement,
-                           unwrap_envelope, write_pinned_settings)
 from .config import Config
 from .prompts import literature as LP
+from .reviewer_cli import (Confinement, _kill_tree, denied_tools, operator_confinement,
+                           unwrap_envelope, write_pinned_settings)
 
 WRITERS = ("literature_driver",) + tuple(delegation.WRITTEN_BY.values())
 
@@ -68,7 +67,7 @@ class LiteratureDriverError(RuntimeError):
 
 
 def role_model(cfg: Config) -> str:
-    return (cfg.literature_model or "").strip() or str(LP.REVIEW_ROLE_SPEC.get("model", ""))
+    return delegation.resolve_model(cfg.literature_model, LP.REVIEW_ROLE_SPEC.get("model", ""))
 
 
 def review_confinement(cfg: Config, *, settings_sha256: str = "") -> Confinement:
@@ -91,14 +90,12 @@ def review_confinement(cfg: Config, *, settings_sha256: str = "") -> Confinement
 
 def default_cmd(cfg: Config | None = None, *, exe: str = "", settings: str = "") -> str:
     cfg = cfg or Config()
-    exe = ((exe or "").strip() or (cfg.reviewer_exe or "").strip()
-           or (shutil.which("claude") or ""))
+    exe = delegation.resolve_reviewer_exe(exe, cfg.reviewer_exe)
     if not exe:
         return ""
-    reader = "type" if os.name == "nt" else "cat"
     extra = review_confinement(
         Config(literature_cmd="", literature_model=cfg.literature_model)).flags(settings)
-    return f'{reader} "{{prompt}}" | "{exe}" -p{extra} > "{{out}}"'
+    return reviewer_cli.cli_pipe_command(exe, extra)
 
 
 def resolve_cmd(cfg: Config, *, settings: str = "") -> str:
@@ -112,12 +109,7 @@ def available(cfg: Config) -> tuple[bool, str]:
                        "not set. With it closed the prior-art route still runs, on the "
                        "paper's own novelty sentences and deterministic queries, and "
                        "adjudicates nothing semantically")
-    cmd = resolve_cmd(cfg)
-    if not cmd:
-        return False, "no reader available for the literature pass"
-    if "{prompt}" not in cmd or "{out}" not in cmd:
-        return False, "SH_LITERATURE_CMD must contain both {prompt} and {out}"
-    return True, ""
+    return delegation.check_command(resolve_cmd(cfg), "SH_LITERATURE_CMD")
 
 
 # --------------------------------------------------------------------------------------
