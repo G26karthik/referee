@@ -201,6 +201,12 @@ def cmd_accept(args: argparse.Namespace) -> int:
                      tool_policy=args.tool_policy,
                      mode=args.mode)["findings"]) + " finding(s)")
 
+    # A paper long enough to need part-splitting has no `audit/<lens>.json` to stage into
+    # until every one of that lens's units is sealed — `accept_lens` above only ever
+    # targets the composed file. `tools/subagent_accept.py` is the gate for a part or a
+    # synthesis unit (`python tools/subagent_accept.py seal <pid> <unit-id> <staged-file>`
+    # or `sweep <pid>` over `audit/.staged_subagent/`); this command does not duplicate it.
+
     # Grades live one level down, keyed by candidate slug rather than by lens name, so
     # this takes whatever is there instead of iterating a known vocabulary.
     grade_dir = root / "audit" / "grade" / ".staged"
