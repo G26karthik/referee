@@ -1173,10 +1173,27 @@ by grep:**
   route again in the hope of reproducing the earlier hit would be selecting a result
   rather than reporting one, so this is not attempted; the honest statement is that a real
   mismatch was established once, under this same production wiring, and was lost to an
-  unrelated rerun before this document could record it more permanently. The gap this
-  reveals — no caching on the artifact-review route — is real and is not fixed by this
-  revision; a future one should give this route the same seal-once discipline reconstruction
-  already has.
+  unrelated rerun before this document could record it more permanently.
+
+  **This gap is now closed.** `_reviewer_facts` (`harness/stages/artifact.py`) checks
+  `artifact_review_driver.load(cfg, pid, commit=snap.commit, prompt_sha256=...)` — a
+  read/verify guard that already existed, already had the correct hash+writer+commit
+  mechanics, and had zero callers anywhere in the codebase before the 2026-09-19
+  consolidation pass — before dispatching a fresh reviewer call. `load()` gained the
+  `prompt_sha256` parameter its three siblings (`claimlink_driver.load`,
+  `verdict_driver.load_accepted`, `reimplement_driver.load_accepted`) already had, so a
+  cached inspection is reused only when both the pinned commit AND the paper-derived
+  prompt inputs (title, method text, tree text, url, reported text) are unchanged;
+  absent-on-either-side is never treated as a mismatch, matching those three siblings
+  exactly. `route.json` itself is not separately sealed — its content is a deterministic
+  function of the (now-cached) reviewer facts plus the current invocation's own target
+  set, which is legitimately free to vary run to run, and `ArtifactInspection` carries no
+  timestamp to seal against. `tests/test_artifact_route_caching.py` (7 tests) proves
+  reuse across an identical commit/prompt and invalidation on a changed commit, method
+  text, or title, and confirms a changed target-set's `statements` do NOT wrongly bust
+  the cache (checked by temporarily forcing the cache lookup to fail: exactly the
+  reuse-dependent tests failed, exactly the invalidation tests still passed). The
+  reconstruction-execution half of this same gap (next bullet) remains open.
 - **`stages/report.unearned_support_language` is enforced at TEST time, not at run time.**
   It is the "GREEN may not borrow the words of evidence it does not have" guard and the
   renderer never calls it: `tests/test_guarantees.py` and `tests/test_reimplementation_path.py`
@@ -1197,6 +1214,24 @@ by grep:**
   described anywhere in the prose above beyond the invariants that reference them**, even
   though `disposition` supplies the first line `run.py` prints and `container` is the
   backend the v2 run actually selected. `docs/CODEBASE_CLAIM_MAP.md` covers them.
+- **Three more modules join that list, added by the 2026-09-19 consolidation pass**:
+  `harness/delegation.py` decides which delegation MODE an environment offers and owns the
+  provenance vocabulary (`WRITTEN_BY`, `provenance_record`) plus the small per-role
+  resolution helpers (`resolve_model`, `resolve_reviewer_exe`, `check_command`) — it
+  carries its own hard architectural-purity test restricting its imports to
+  `{shutil, inspect, __future__}`, enforcing that it never owns execution mechanics.
+  `harness/reviewer_cli.py` is the sibling that owns exactly that execution mechanics half
+  for a CLI-subprocess delegate (confinement flags, pinned settings, envelope parsing,
+  kill-tree teardown, prompt fingerprinting, failure classification) — all 8
+  `*_driver.py` files import it; before this pass, 7 of them imported the same names
+  directly from `harness/audit_driver.py`, which had accidentally become the shared
+  library `delegation.py` was designed to be. `harness/sealing.py` is the third: the
+  write-then-verify content-hash mechanism (`seal`/`verify_seal`) that 9 independent
+  accept/seal instances across `stages/audit.py`, `stages/probe.py`, `stages/grade.py`,
+  and 5 of the `*_driver.py` files each reimplemented on their own before this pass, each
+  now layering its own schema-specific extra check (a prompt-freshness check, a commit
+  match, an independent-verification cross-check) on top of the shared core exactly the
+  way `stages/audit.py`'s `unit_is_accepted` already layered one on `_sealed`.
 
 **THE SEVEN SHIPPED REVIEWS IN `projects/` PREDATE EVERYTHING BELOW.** They were produced
 under older code and are the record of that run. Nothing in this section has been
@@ -1536,6 +1571,26 @@ were current.
   seal-once discipline its SCRIPT and CONFORMANCE already have, so a probe re-invocation
   for an unrelated reason cannot silently overwrite a completed result with a transient
   environment fact.
+
+  **Still open, and the 2026-09-19 consolidation pass found the concrete reason a naive
+  fix would be unsound rather than merely unfinished.** The obvious cache key — script
+  `content_sha256` + seeds + backend + interpreter + commit — does NOT determine what
+  actually executes for the exact case this gap already bit: a container backend whose
+  checkout supplies no environment of its own gets `torch`/`numpy`/`transformers`/
+  `datasets` installed by `container.install_reconstruction_baseline` with **no version
+  pins and no lockfile** (`container.RECONSTRUCTION_BASELINE_REQUIREMENTS` is four bare
+  package names). Two provisioning events separated in time can resolve different actual
+  releases from PyPI while every field of the proposed key stays byte-identical, and
+  nothing records what was actually installed afterward (`ExecutionRecord.environment`
+  captures backend/platform/Docker version, not package versions) — so a drift is not
+  just possible, it is currently undetectable even in hindsight. A cache keyed this way
+  could therefore reuse a result produced under a materially different dependency set and
+  report it as the same experiment, which is a worse failure than today's always-
+  re-execute behavior. Fixing this for real needs either pinning the baseline
+  requirements (a lockfile, not four bare names) or recording the resolved versions
+  alongside the execution result so a cache key can include them — neither is implemented
+  here; this pass deliberately did not ship a caching key it had concrete evidence could
+  alias two different executions as one.
 - `severity` is still model-asserted by the lens that wrote it. What changed:
   `harness/grading.py` now runs a second, blinded reviewer over every FATAL/MAJOR
   candidate (`--auto-grade`) and independently re-verifies its own pass-B work
