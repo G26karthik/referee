@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -30,6 +31,8 @@ from harness.artifacts import (CommitVerification, ConfigurationIdentity, ExecCa
                                ExecutionRecord, ExperimentIdentity, MetricIdentity,
                                ProbeSpec, RepoAcquisition, ResourceCapability)
 from harness.config import Config
+from harness.local_exec import run_probe
+from harness.repo import head_commit
 
 
 def _daemon() -> bool:
@@ -438,3 +441,132 @@ def test_provision_builds_the_environment_inside_the_container(tmp_path):
     # environment landed on the host, not that Windows can follow a Linux symlink.
     assert (mount / "env" / "bin").is_dir(), "the venv must land on the host disk"
     assert (mount / "env" / "pyvenv.cfg").is_file()
+
+
+# --------------------------------------------------------------------------- #
+# The staging gap: `local_exec.run_probe` must call `stage()` before `execute()`
+# --------------------------------------------------------------------------- #
+# `ContainerBackend.execute`'s own docstring says it "expects req.argv/req.cwd to already
+# be in this container's /work namespace — stage() is the translation step, called by
+# local_exec.run_probe before this". Nothing enforced that until now: `run_probe`'s main
+# execution loop passed `resolve_command`'s host `cwd` straight to `execute()`, which the
+# refusal branch a few lines below this docstring correctly rejected as "not inside
+# /work". A synthetic fixture, not a paper: this proves the staging wire-up, not any
+# reproduction.
+def _git(repo: Path, *args: str) -> None:
+    p = subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                        "-c", "commit.gpgsign=false", *args],
+                       cwd=str(repo), capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0, f"git {' '.join(args)}: {p.stderr}"
+
+
+def _repo_at(path: Path, body: str) -> str:
+    """A throwaway git checkout at an EXACT path — it must sit under the `mount_root`
+    `run_probe` derives (`runs/<pid>`) for staging to have anything to translate.
+    Returns its commit."""
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "run.py").write_text(body, encoding="utf-8")
+    _git(path, "init", "--quiet")
+    _git(path, "add", "-A")
+    _git(path, "commit", "--quiet", "-m", "fixture")
+    return head_commit(path)
+
+
+EMITS_METRIC = """\
+import argparse
+p = argparse.ArgumentParser()
+p.add_argument("--seed", type=int, default=0)
+a = p.parse_args()
+print("SH_DEVICE cpu")
+print(f"SH_METRIC arm=reproduction seed={a.seed} value={1.00 + a.seed * 0.01:.4f}")
+"""
+
+
+def _established(cls):
+    return cls(state="established", established=True, reason="fixture")
+
+
+def _container_spec(repo: Path, commit: str, *, interpreter: str = "") -> ProbeSpec:
+    """A fully qualified repo_exec spec whose command names a BARE `python` — exactly what
+    `resolve_command` rewrites to `spec.interpreter or cfg.python` before this harness's
+    OWN venv (a host path with no meaning inside the container) reaches `stage()`, which
+    is the fallback-substitution branch `stage()`'s own docstring describes.
+    """
+    return ProbeSpec(
+        paper_id="fixture", provenance="repo_exec", backend="container",
+        command=["python", "run.py", "--seed", "{seed}"],
+        cwd=str(repo), interpreter=interpreter, commit=commit,
+        arms=["reproduction"], seeds=[0, 1, 2],
+        table_ref="T1:r0:c1", claimed_cell_value="1.00", target_id="T1",
+        experiment=_established(ExperimentIdentity),
+        metric_identity=_established(MetricIdentity),
+        configuration=_established(ConfigurationIdentity),
+        capability=ExecCapability(established=True, reason_code="established",
+                                  interpreter_is_repo_env=True),
+        resources=ResourceCapability(state="satisfied", reason="fixture fits"),
+    )
+
+
+def test_run_probe_stages_a_container_backends_paths_before_executing(tmp_path):
+    """No daemon needed: `execute()` is swapped for a spy that records the request it
+    actually received, isolating `run_probe`'s own behaviour from whether Docker happens
+    to be reachable on the machine running the suite.
+    """
+    root = tmp_path / "projects" / "fixture"
+    repo = root / "runs" / "fixture" / "repo"
+    commit = _repo_at(repo, EMITS_METRIC)
+    cfg = Config(projects_dir=tmp_path / "projects", allow_repo_exec=True)
+    spec = _container_spec(repo, commit)
+
+    captured: list[backends.ExecRequest] = []
+
+    class _Spy(backends.ContainerBackend):
+        def execute(self, req):
+            captured.append(req)
+            seed = int(req.argv[-1])
+            value = 1.00 + seed * 0.01
+            return backends.ExecOutcome(
+                launched=True, completed=True, returncode=0,
+                stdout=f"SH_DEVICE cpu\nSH_METRIC arm=reproduction seed={seed} value={value:.4f}\n",
+                stderr="", seconds=0.1, started_at="t", ended_at="t",
+                backend=self.name, argv=req.argv, cwd=req.cwd, environment="container")
+
+    result = run_probe(cfg, root, spec, backend=_Spy())
+
+    assert len(captured) == 3, "one execute() call per (seed, arm) pair"
+    for req in captured:
+        assert req.cwd.startswith(container_mod.MOUNT), (
+            f"run_probe passed {req.cwd!r} straight to execute() without staging it into "
+            f"the container's {container_mod.MOUNT} namespace — the exact gap "
+            f"ContainerBackend.execute's own docstring already warns about")
+        assert req.argv[0] == "python3", (
+            "this harness's own host interpreter path must be substituted for the image's "
+            "own interpreter, never relayed into the container")
+    assert result.reconciliation is not None
+    assert result.reconciliation.status == "RESOLVED_VERIFIED", result.reconciliation.reason
+
+
+@docker
+@requires_docker
+def test_a_real_repo_exec_reaches_resolved_verified_through_the_container_backend(tmp_path):
+    """End to end, against a real daemon. Before the staging fix, EVERY repo_exec run on
+    the container backend refused at `execute()`'s own `not inside /work` guard, because
+    `run_probe` hand it a host `cwd` unmodified — `authorize()`, commit verification and
+    identity all passed, and the run still produced nothing. This is the scenario
+    CLAUDE.md's Known Limitations section once described as already fixed and verified;
+    run for real here rather than trusted from prose.
+    """
+    root = tmp_path / "projects" / "fixture"
+    repo = root / "runs" / "fixture" / "repo"
+    commit = _repo_at(repo, EMITS_METRIC)
+    cfg = Config(projects_dir=tmp_path / "projects", allow_repo_exec=True)
+    spec = _container_spec(repo, commit)
+
+    result = run_probe(cfg, root, spec, backend=backends.ContainerBackend())
+
+    assert result.authorization is not None and result.authorization.allowed, (
+        result.authorization.detail if result.authorization else "no authorization recorded")
+    assert result.seeds_run == [0, 1, 2] and not result.seeds_failed, result.reason
+    rec = result.reconciliation
+    assert rec is not None and rec.status == "RESOLVED_VERIFIED", (
+        rec.reason if rec else "no reconciliation")

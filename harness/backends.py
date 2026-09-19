@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -66,6 +67,23 @@ def _text(buf) -> str:
     if buf is None:
         return ""
     return buf.decode("utf-8", "replace") if isinstance(buf, bytes) else str(buf)
+
+
+def _looks_like_host_interpreter(token: str) -> bool:
+    """Is `token` a filesystem path this harness's OWN host wrote, not a bare PATH name?
+
+    Used only on `argv[0]` in `ContainerBackend.stage`, and only once
+    `to_container_path` has already failed to place it under the mount — so this decides
+    between two remaining explanations: a bare command name a container image resolves
+    for itself (`python3`, already correct and left alone) and a host filesystem path
+    (this harness's own venv interpreter, meaningless inside the image). A Windows drive
+    letter, a UNC path, a backslash, or a POSIX path outside the mount are all the second
+    kind; a name with no separator at all is the first.
+    """
+    if not token:
+        return False
+    return bool(re.match(r"^[A-Za-z]:[\\/]", token) or token.startswith("\\\\")
+               or "\\" in token or token.startswith("/"))
 
 
 # Provenances whose code the *authors* wrote. Only these may be run as repo execution,
@@ -404,6 +422,19 @@ class ExecutionBackend(ABC):
         """
         return None
 
+    def stage(self, argv: list[str], cwd: str, mount_root: str,
+             pid: str = "") -> tuple[list[str], str]:
+        """Translate a host-built (argv, cwd) into whatever namespace `execute()` expects.
+
+        Default: no translation. A backend that runs where its caller already is — the
+        local one, and the remote sandbox, which does its own translation inside
+        `sandbox.run_in` keyed on `cwd` itself — is handed exactly what
+        `local_exec.resolve_command` built. Only a backend whose `execute()` runs
+        somewhere ELSE than the path this harness wrote files to needs to override this;
+        `ContainerBackend` is the one that does.
+        """
+        return list(argv), cwd
+
 
 class LocalBackend(ExecutionBackend):
     """This machine, this OS, subprocesses. Exactly the behaviour that existed before.
@@ -651,17 +682,22 @@ class ContainerBackend(ExecutionBackend):
         if acq.status not in ("cloned", "cached") or not acq.path:
             acq.env_status = "not_attempted"
             return acq
-        ok, why = container_mod.daemon_status()
-        if not ok:
-            acq.env_status, acq.reason = "blocked", why
-            return acq
         if not (cfg.allow_install and cfg.allow_network):
             acq.env_status = "blocked"
             acq.reason = "the install or network gate is shut, so no environment was built"
             return acq
+        ok, why = container_mod.daemon_status()
+        if not ok:
+            acq.env_status, acq.reason = "blocked", why
+            return acq
 
         mount = self._mount(acq)
         image, image_note = container_mod.image_for(getattr(acq, "declared_python", "") or "")
+        # Remembered so `execute()` (and `stage()`, ahead of it) run the SAME image and
+        # mount this env was built against, rather than `execute()`'s previous default of
+        # always `DEFAULT_IMAGE` regardless of what `provision` actually used — a real
+        # mismatch whenever a repository declared a non-default Python version.
+        self._host_mount, self._image_name, self._pid = mount, image, pid
         repo_in = container_mod.to_container_path(str(acq.path), mount)
         if not repo_in:
             acq.env_status = "failed"
@@ -711,11 +747,63 @@ class ContainerBackend(ExecutionBackend):
                             "install from: " + ", ".join(acq.dependency_files))
         return acq
 
+    # --- staging ------------------------------------------------------------------------
+    def stage(self, argv: list[str], cwd: str, mount_root: str,
+             pid: str = "") -> tuple[list[str], str]:
+        """Translate a host-built (argv, cwd) into this container's `/work` namespace.
+
+        `provision()` already bind-mounts `mount_root` — the paper's `runs/<pid>`
+        directory, which covers `repo/`, `env/` and every `targets/<id>/reimplementation`
+        output area under it — at `container.MOUNT`. This is the SAME translation that
+        gap left unapplied to an actual RUN: `local_exec.write_probe` writes a generated
+        reconstruction script to a host path under exactly that directory, and
+        `local_exec.resolve_command` returns cwd/argv built from host paths, because
+        neither function knows a container exists. Every seven real reconstruction
+        executions this harness ever performed ended `INCONCLUSIVE` at exactly this gap —
+        `execute()` correctly refusing a host path it was never asked to translate.
+
+        Only entries actually rooted at `mount_root` are rewritten
+        (`container.to_container_path` returns "" for anything else and this leaves
+        those untouched), so a bare flag, a seed number or an already-translated
+        `/work/...` interpreter path is never touched, and a host path OUTSIDE the mount
+        is never silently relayed — precisely `to_container_path`'s own refusal,
+        inherited rather than re-implemented.
+
+        The one entry that is never simply "under the mount or not" is `argv[0]`, the
+        interpreter: `spec.interpreter` is the AUTHOR checkout's own env when one was
+        built (`ContainerBackend.provision`'s own `env_path`, already `/work/env/bin/
+        python` and left alone here), but a reconstruction with no such env falls back to
+        `cfg.python` — this harness's OWN venv, a host path with no meaning inside this
+        image. Relaying it would ask the container to exec a binary that is not in its
+        filesystem, a confusing "no such file" rather than the truth: no interpreter was
+        ever staged for this run. Substituted with the image's own `python3` instead.
+        """
+        self._host_mount = mount_root or getattr(self, "_host_mount", "")
+        if pid:
+            self._pid = pid
+        translated: list[str] = []
+        for i, token in enumerate(argv):
+            hit = container_mod.to_container_path(token, mount_root) if mount_root else ""
+            if hit:
+                translated.append(hit)
+            elif i == 0 and _looks_like_host_interpreter(token):
+                translated.append("python3")
+            else:
+                translated.append(token)
+        cwd_in = (container_mod.to_container_path(cwd, mount_root) if mount_root else "") or cwd
+        return translated, cwd_in
+
     # --- execution --------------------------------------------------------------------
     def execute(self, req: ExecRequest) -> ExecOutcome:
-        """Run one process in a container. Never raises; every ending comes back as data."""
+        """Run one process in a container. Never raises; every ending comes back as data.
+
+        Expects `req.argv`/`req.cwd` to already be in this container's `/work`
+        namespace — `stage()` is the translation step, called by `local_exec.run_probe`
+        before this. Anything that arrives untranslated is refused rather than rewritten
+        here: silently patching a host path up at the last moment would hide exactly the
+        staging gap `stage()` exists to close.
+        """
         started, t0 = _utc(), time.time()
-        mount = str(Path(req.cwd).parents[0]) if req.cwd else ""
         stamp: dict = dict(backend=self.name, argv=list(req.argv), cwd=req.cwd,
                      environment=self.environment(), started_at=started)
         if not req.cwd.startswith(container_mod.MOUNT):
@@ -727,7 +815,7 @@ class ContainerBackend(ExecutionBackend):
                                error=(f"refusing to run: cwd {req.cwd!r} is not inside "
                                       f"{container_mod.MOUNT}, so this command was not "
                                       f"prepared for a container"), **stamp)
-        host_mount = getattr(self, "_host_mount", "") or mount
+        host_mount = getattr(self, "_host_mount", "")
         name = container_mod.container_name(getattr(self, "_pid", ""), req.label)
         argv = container_mod.run_argv(
             list(req.argv), host_mount=host_mount, workdir=req.cwd,
