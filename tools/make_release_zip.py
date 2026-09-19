@@ -106,9 +106,13 @@ def _is_real_dotenv(name: str) -> bool:
 # `working_tree.patch` that embeds rows of `data/exports/*.csv`) — a run
 # artefact that happens to sit under `docs/`, not curated documentation, and
 # its CSV-derived noise is exactly what defeats a naive secret grep (e.g. a
-# paper titled "Mask-to-Correct" contributes a `sk-` hit).
+# paper titled "Mask-to-Correct" contributes a `sk-` hit). `docs/archive` is
+# checkpoints, step logs, closure notes and superseded "final" drafts moved
+# there so the live `docs/` tree describes only the current system; excluded
+# here for the same reason `handoff_snapshot_*` is, and explained to anyone
+# who does open the working tree by `docs/archive/README.md`.
 EXTRA_PRUNE_SUBDIRS = {
-    "docs": ["handoff_snapshot_*"],
+    "docs": ["handoff_snapshot_*", "archive"],
 }
 
 
