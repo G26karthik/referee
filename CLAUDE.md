@@ -226,15 +226,16 @@ python run.py dossier                                         # consolidate fini
 python run.py evaluate                                        # system metrics over the corpus
 python run.py sandbox [--release]                             # leased remote machines
 python run.py preflight                                       # is this batch N distinct papers?
-python -m pytest tests -q                                     # 2332 tests
-python -m pytest tests -q -m "not network"                    # 2290 passed, 33 skipped,
-                                                                # 7 deselected, 2 failures
-                                                                # (confirmed pre-existing/
-                                                                # environment-dependent —
-                                                                # a container runtime and a
+python -m pytest tests -q                                     # 2332 tests (2299 passed,
+                                                                # 31 skipped, 2 failures —
+                                                                # confirmed pre-existing/
+                                                                # environment-dependent: a
+                                                                # container runtime and a
                                                                 # second-boundary timing
                                                                 # race, neither touched by
                                                                 # the 2026-09-19 pass)
+python -m pytest tests -q -m "not network"                    # 2290 passed, 33 skipped,
+                                                                # 7 deselected, same 2 failures
 ```
 
 **The two env vars above are not decoration.** `--auto-audit` and `--auto-grade` select a
