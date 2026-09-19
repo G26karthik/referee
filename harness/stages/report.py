@@ -1059,8 +1059,9 @@ def _probe_block(p: ProbeResult) -> list[str]:
         out += ["", f"Read this as a detectability floor: on this hardware and metric, any claimed "
                     f"gain below {p.noise_band:.4f} could not be distinguished from run-to-run "
                     f"variation at {len(p.seeds_run)} seeds. It is a measurement of this machine, "
-                    f"not of the paper. Supply a reproduction script at "
-                    f"`runs/<paper_id>/spec.json` to test an actual claim."]
+                    f"not of the paper. Stage a reproduction script at "
+                    f"`control/.staged/spec.json` and seal it with `run.py accept` "
+                    f"to test an actual claim."]
     if p.claim_within_noise:
         out += ["", f"**The paper's claimed delta of {p.claimed_delta:+.4f} is smaller than this "
                     f"machine's 2σ seed-noise band of {p.noise_band:.4f}.** A gain that size cannot "
