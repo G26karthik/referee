@@ -19,7 +19,7 @@ import hashlib
 import re
 import time
 
-from .. import delegation, grade_driver, grading, pdf, state
+from .. import delegation, grade_driver, grading, pdf, sealing, state
 from ..artifacts import Finding, Grade, LensReport, PaperDoc
 from ..config import Config
 from ..prompts import grade as G
@@ -118,23 +118,8 @@ def grade_is_accepted(gdir, slug: str) -> tuple[bool, str]:
     the harness recorded writing it, sealed by a content hash. See that function's
     docstring; the reasoning is identical, substituting 'grader' for 'lens'."""
     path = gdir / f"{slug}.json"
-    if not path.exists():
-        return False, "no grade file"
-    sidecar = path.with_suffix(".driver.json")
-    if not sidecar.exists():
-        return False, "no provenance sidecar"
-    try:
-        rec = state.read_json(sidecar)
-    except Exception:
-        return False, "provenance sidecar is not valid JSON"
-    if not isinstance(rec, dict) or rec.get("written_by") not in _ACCEPTED_GRADE_WRITERS:
-        return False, f"provenance sidecar written_by={rec.get('written_by') if isinstance(rec, dict) else None!r} not recognized"
-    want = rec.get("content_sha256")
-    if not want:
-        return False, "provenance sidecar has no content_sha256"
-    if hashlib.sha256(path.read_bytes()).hexdigest() != want:
-        return False, "grade file content changed after its provenance sidecar was written"
-    return True, ""
+    ok, why = sealing.verify_seal(path, accepted_writers=_ACCEPTED_GRADE_WRITERS)
+    return ok, ("no grade file" if why == "no output file" else why)
 
 
 # Every writer a validated grade path can produce: the CLI grader, plus every mode the
@@ -165,21 +150,20 @@ def accept_grade(cfg: Config, pid: str, slug: str, raw: str, *,
     grade = grade_driver.parse_grade_json(raw)
     gdir = state.project_dir(cfg, pid) / "audit" / "grade"
     out = gdir / f"{slug}.json"
-    state.write_json(out, grade.model_dump())
     # The mode, recorded, exactly as `accept_lens` records it. A grade produced by an
     # isolated subagent the controller dispatched and a grade a human typed are different
     # provenance, and `grade_coverage` reporting one number over both would say a paper's
     # severities were independently weighed when some of them were not.
-    prov = delegation.provenance_record(mode=mode, reviewer=grader,
-                                        tool_policy=tool_policy)
-    record = {"slug": slug, "paper_id": pid, "written_by": prov["written_by"],
-              "delegation_mode": prov["delegation_mode"],
-              "grader": prov["reviewer"], "tool_policy": prov["tool_policy"],
-              "isolation_claim": prov["isolation_claim"],
-              "tool_policy_provable": prov["tool_policy_provable"],
-              "verdict": grade.verdict,
-              "content_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
-              "ts": state.now()}
+    record = sealing.seal(out, grade.model_dump(), mode=mode, reviewer=grader,
+                          tool_policy=tool_policy,
+                          extra={"slug": slug, "paper_id": pid, "verdict": grade.verdict})
+    # The sidecar's own field has always been `grader`, never `reviewer` — `sealing.seal`
+    # derives a generic `reviewer` field internally (shared with every other instance,
+    # already defaulted to "unnamed" and stripped by `delegation.provenance_record`), and
+    # this is the one instance whose schema-specific name differs, so it is RENAMED
+    # rather than duplicated: `grade_is_accepted` and every existing reader of this
+    # sidecar has only ever read `grader`.
+    record["grader"] = record.pop("reviewer")
     state.write_json(out.with_suffix(".driver.json"), record)
     return record
 

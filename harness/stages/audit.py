@@ -48,8 +48,8 @@ import hashlib
 import re
 import time
 
-from .. import (audit_driver, delegation, grading, materiality, pdf, reading, state,
-                taxonomy)
+from .. import (audit_driver, delegation, grading, materiality, pdf, reading, sealing,
+                state, taxonomy)
 from ..artifacts import (BASELINE_CLASSES, CANDIDATE_CLASSES, CONFIDENCES, DISCREPANCY_TYPES,
                          EVIDENCE_ORIGINS, PRIOR_ART_BASES, SEVERITIES, Equation,
                          EvidencePointer, Figure, Finding, LensReport, PaperDoc)
@@ -375,29 +375,11 @@ def units_for(root: Path, lenses: tuple[str, ...], plan: reading.ReadingPlan) ->
 def _sealed(path: Path) -> tuple[bool, str]:
     """Does a sealed provenance sidecar beside `path` describe `path`'s CURRENT bytes?
 
-    The body `lens_is_accepted` had, extracted so a part artifact and a composed lens
-    artifact are held to the identical standard rather than to a second implementation of
-    it. See `lens_is_accepted` for the real six-paper run this check exists because of.
+    A thin wrapper around `harness.sealing.verify_seal`, so a part artifact and a composed
+    lens artifact are held to the identical standard rather than to a second implementation
+    of it. See `lens_is_accepted` for the real six-paper run this check exists because of.
     """
-    if not path.exists():
-        return False, "no output file"
-    sidecar = path.with_suffix(".driver.json")
-    if not sidecar.exists():
-        return False, ("no provenance sidecar (.driver.json) — most likely side-written "
-                       "by the reviewer instead of produced through the validated staging path")
-    try:
-        rec = state.read_json(sidecar)
-    except Exception:
-        return False, "provenance sidecar is not valid JSON"
-    if not isinstance(rec, dict) or rec.get("written_by") not in _ACCEPTED_WRITERS:
-        return False, (f"provenance sidecar written_by="
-                       f"{rec.get('written_by') if isinstance(rec, dict) else None!r} not recognized")
-    want = rec.get("content_sha256")
-    if not want:
-        return False, "provenance sidecar has no content_sha256"
-    if hashlib.sha256(path.read_bytes()).hexdigest() != want:
-        return False, "output file content changed after its provenance sidecar was written"
-    return True, ""
+    return sealing.verify_seal(path, accepted_writers=_ACCEPTED_WRITERS)
 
 
 def unit_is_accepted(unit: AuditUnit) -> tuple[bool, str]:
@@ -489,21 +471,16 @@ def accept_lens(cfg: Config, pid: str, lens: str, raw: str, *,
     report = audit_driver.parse_lens_json(raw, lens)
     root = state.project_dir(cfg, pid)
     out = root / "audit" / f"{lens}.json"
-    state.write_json(out, report.model_dump())
-    content_sha256 = hashlib.sha256(out.read_bytes()).hexdigest()
     # WHICH MODE, recorded, and `harness.delegation` decides what that mode is entitled
     # to claim. `mode` defaults to MANUAL because that is the mode that promises least: a
     # caller who does not say gets the token asserting no isolation, rather than
     # inheriting an autonomous mode's guarantees by omission. This function used to
     # hard-code `manual_accept`, which made an isolated subagent the controller dispatched
     # autonomously and a human pasting JSON into a file the same provenance.
-    record = {"lens": lens, "paper_id": pid,
-              **delegation.provenance_record(mode=mode, reviewer=reviewer,
-                                             tool_policy=tool_policy),
-              "content_sha256": content_sha256, "findings": len(report.findings),
-              "ts": state.now()}
-    state.write_json(out.with_suffix(".driver.json"), record)
-    return record
+    return sealing.seal(out, report.model_dump(), mode=mode, reviewer=reviewer,
+                        tool_policy=tool_policy,
+                        extra={"lens": lens, "paper_id": pid,
+                               "findings": len(report.findings)})
 
 
 def claimlink_prompt(doc: PaperDoc) -> str:
@@ -687,11 +664,14 @@ def compose_lens(cfg: Config, pid: str, lens: str,
             "findings": len(raw),
         })
     out = root / "audit" / f"{lens}.json"
-    state.write_json(out, {"lens": lens, "schema_version": 2, "findings": findings,
-                           "unasked_question": unasked, "notes": "  ".join(notes)})
-    record = {
+    payload = {"lens": lens, "schema_version": 2, "findings": findings,
+              "unasked_question": unasked, "notes": "  ".join(notes)}
+    # `compose_lens` has no real `mode`/`reviewer` to record — it is a synthesis over
+    # already-sealed parts, not a delegated reading of its own. `mode="MANUAL"` produces
+    # harmless defaults, and `extra`'s own explicit `written_by`/`tool_policy` below
+    # override them, exactly preserving this artifact's literal historical content.
+    return sealing.seal(out, payload, mode="MANUAL", extra={
         "lens": lens, "paper_id": pid, "written_by": COMPOSED_WRITER,
-        "content_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
         "composed_from": composed_from,
         "parts": sum(1 for u in mine if u.kind == "part"),
         "synthesis": any(u.kind == "synthesis" for u in mine),
@@ -699,10 +679,7 @@ def compose_lens(cfg: Config, pid: str, lens: str,
         # NOT a tool policy this harness enforced. Each reading records its own, and a
         # composed artifact must not inherit a guarantee it did not produce.
         "tool_policy": "composed; each reading in composed_from records its own policy",
-        "ts": state.now(),
-    }
-    state.write_json(out.with_suffix(".driver.json"), record)
-    return record
+    })
 
 
 def reading_record(cfg: Config, pid: str, doc: PaperDoc,

@@ -43,7 +43,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import claims, delegation, reviewer_cli, state
+from . import claims, delegation, reviewer_cli, sealing, state
 from .artifacts import (FocusedValidation, NEVER_ASSUMED, PREDICTED_DIRECTIONS,
                         PaperDoc, SETTLEMENT_RULES, SettlementCondition)
 from .config import Config
@@ -284,29 +284,31 @@ def _paths(cfg: Config, pid: str) -> tuple[Path, Path]:
 
 
 def seal(cfg: Config, pid: str, fv: FocusedValidation, record: dict) -> dict:
-    out, sidecar = _paths(cfg, pid)
-    state.write_json(out, fv.model_dump())
-    record = dict(record)
-    record.update({"paper_id": pid, "target_id": fv.target_id,
-                   "designed": int(bool(fv.design is not None and fv.design.established)),
-                   "disposition": fv.disposition, "launched": fv.launched,
-                   "content_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
-                   "ts": state.now()})
-    state.write_json(sidecar, record)
-    return record
+    """Dead code today (see the module docstring) — no live caller builds `record` for
+    this yet, but this is refactored for consistency with the other 8 seal instances, on
+    the same terms `literature_driver.seal` is: `mode`/`reviewer`/`tool_policy` fall back
+    to harmless generic defaults when `record` does not state them, and the caller's own
+    literal fields always win via `extra`.
+    """
+    out, _sidecar = _paths(cfg, pid)
+    return sealing.seal(
+        out, fv.model_dump(),
+        mode=record.get("delegation_mode", "MANUAL"),
+        reviewer=record.get("reviewer") or record.get("reader", ""),
+        tool_policy=record.get("tool_policy", "unrecorded"),
+        extra={**record, "paper_id": pid, "target_id": fv.target_id,
+              "designed": int(bool(fv.design is not None and fv.design.established)),
+              "disposition": fv.disposition, "launched": fv.launched},
+    )
 
 
 def load(cfg: Config, pid: str) -> FocusedValidation | None:
     """A sealed focused validation for `pid`, or None. Verifies the seal before trusting it."""
-    out, sidecar = _paths(cfg, pid)
-    if not (out.exists() and sidecar.exists()):
+    out, _sidecar = _paths(cfg, pid)
+    ok, _why = sealing.verify_seal(out, accepted_writers=WRITERS)
+    if not ok:
         return None
     try:
-        rec = state.read_json(sidecar)
-        if not isinstance(rec, dict) or rec.get("written_by") not in WRITERS:
-            return None
-        if hashlib.sha256(out.read_bytes()).hexdigest() != rec.get("content_sha256"):
-            return None
         return FocusedValidation(**state.read_json(out))
     except Exception:                              # noqa: BLE001 — a bad seal is no seal
         return None

@@ -81,7 +81,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import delegation, failures, reviewer_cli, state
+from . import delegation, failures, reviewer_cli, sealing, state
 from .artifacts import Finding, LensReport
 from .config import Config
 from .prompts import audit as P
@@ -622,21 +622,19 @@ def run_lens(cfg: Config, pid: str, lens: str, prompt: Path, out: Path, *,
         staged.replace(raw_kept)
         # Written normalised, and only now: downstream reads this file, so what is on
         # disk is exactly what was validated rather than whatever prose the command
-        # wrapped it in.
-        state.write_json(out, report.model_dump())
-
-        record = {
+        # wrapped it in. `sealing.seal` performs that write.
+        #
+        # This IS a `CLI_SUBPROCESS` call — the argv above was built and spawned by this
+        # module — so `mode="CLI_SUBPROCESS"` is passed explicitly rather than derived
+        # from anything, which is also what makes `written_by` come out "audit_driver"
+        # (`delegation.WRITTEN_BY["CLI_SUBPROCESS"]`) without a literal override here.
+        return sealing.seal(out, report.model_dump(), mode="CLI_SUBPROCESS",
+                            tool_policy=conf.summary(), extra={
             "lens": lens, "unit_id": unit_id or lens,
             "paper_id": pid, "command": cmd, "returncode": p.returncode,
             "seconds": round(time.time() - started, 1), "findings": len(report.findings),
-            "written_by": "audit_driver",
             # TWO REPRESENTATIONS OF ONE FACT, on purpose — see `Confinement.summary`.
-            "tool_policy": conf.summary(),
             "tool_policy_detail": conf.policy(),
-            # The seal `stages.audit.lens_is_accepted` checks against the lens file's
-            # CURRENT bytes — without this, every lens this driver produces fails its
-            # own provenance check the moment `lens_is_accepted` starts requiring it.
-            "content_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
             # REPLAY. The prompt is regenerated on every run, so the hash is the only
             # thing that says whether the prompt on disk is the one that produced this.
             "prompt_sha256": prompt_sha,
@@ -651,10 +649,7 @@ def run_lens(cfg: Config, pid: str, lens: str, prompt: Path, out: Path, *,
             # name and the value was removed before the artifact was sealed.
             "harness_keys_stripped": meta.get("harness_keys_stripped", 0),
             "unknown_keys_dropped": meta.get("unknown_keys_dropped", 0),
-            "ts": state.now(),
-        }
-        state.write_json(out.with_suffix(".driver.json"), record)
-        return record
+        })
     finally:
         shutil.rmtree(sandbox, ignore_errors=True)
         shutil.rmtree(policy_dir, ignore_errors=True)

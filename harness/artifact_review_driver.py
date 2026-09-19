@@ -34,7 +34,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import artifact_evidence, delegation, reviewer_cli, state
+from . import artifact_evidence, delegation, reviewer_cli, sealing, state
 from .artifacts import (ARTIFACT_IDENTITY_BASES, ARTIFACT_IDENTITY_STATES,
                         ArtifactFact,
                         ArtifactInspection, ArtifactSnapshot, PaperDoc)
@@ -294,16 +294,20 @@ def _paths(cfg: Config, pid: str) -> tuple[Path, Path]:
 
 
 def seal(cfg: Config, pid: str, inspection: ArtifactInspection, record: dict) -> dict:
-    out, sidecar = _paths(cfg, pid)
-    state.write_json(out, inspection.model_dump())
-    record = dict(record)
-    record.update({"paper_id": pid, "proposed": inspection.proposed,
-                   "relocated": inspection.relocated,
-                   "discharged": inspection.discharged,
-                   "content_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
-                   "ts": state.now()})
-    state.write_json(sidecar, record)
-    return record
+    """`record` already carries whatever `delegation.provenance_record` produced —
+    `accept` builds it explicitly, and `run()`'s own inline record states its mode
+    directly, since it IS a `CLI_SUBPROCESS` call. See `verdict_driver._seal` for why
+    `mode`/`reviewer`/`tool_policy` are re-derived FROM `record` rather than recomputed a
+    second, independent time."""
+    out, _sidecar = _paths(cfg, pid)
+    return sealing.seal(
+        out, inspection.model_dump(),
+        mode=record.get("delegation_mode", "MANUAL"),
+        reviewer=record.get("reviewer") or record.get("reader", ""),
+        tool_policy=record.get("tool_policy", "unrecorded"),
+        extra={**record, "paper_id": pid, "proposed": inspection.proposed,
+              "relocated": inspection.relocated, "discharged": inspection.discharged},
+    )
 
 
 def accept(cfg: Config, pid: str, doc: PaperDoc, root: str | Path, raw: str, *,
@@ -340,15 +344,11 @@ def load(cfg: Config, pid: str, *, commit: str = "") -> ArtifactInspection | Non
     nobody looked at, which is the failure `extraction_version` describes for the paper
     side and this one enforces.
     """
-    out, sidecar = _paths(cfg, pid)
-    if not (out.exists() and sidecar.exists()):
+    out, _sidecar = _paths(cfg, pid)
+    ok, _why = sealing.verify_seal(out, accepted_writers=WRITERS)
+    if not ok:
         return None
     try:
-        rec = state.read_json(sidecar)
-        if not isinstance(rec, dict) or rec.get("written_by") not in WRITERS:
-            return None
-        if hashlib.sha256(out.read_bytes()).hexdigest() != rec.get("content_sha256"):
-            return None
         inspection = ArtifactInspection(**state.read_json(out))
         if commit and (inspection.snapshot is None
                        or inspection.snapshot.commit != commit):
@@ -459,6 +459,7 @@ def run(cfg: Config, pid: str, doc: PaperDoc, root: str | Path, prompt_text: str
             try:
                 seal(cfg, pid, inspection, {
                     "written_by": "artifact_review_driver", "reader": "",
+                    "delegation_mode": "CLI_SUBPROCESS",
                     "command": cmd, "returncode": proc.returncode,
                     "seconds": round(time.time() - started, 1),
                     "tool_policy": conf.summary(), "tool_policy_detail": conf.policy(),

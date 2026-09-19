@@ -48,7 +48,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import delegation, reviewer_cli, state
+from . import delegation, reviewer_cli, sealing, state
 from .artifacts import ReimplementationBinding, ReimplementationConformance, ReimplementationReadiness
 from .config import Config
 from .prompts import reimplement as RP
@@ -337,17 +337,23 @@ def _paths(cfg: Config, pid: str, target_id: str) -> tuple[Path, Path]:
 
 def _seal(cfg: Config, pid: str, target_id: str, script: str,
          conf: ReimplementationConformance, record: dict) -> dict:
-    out, sidecar = _paths(cfg, pid, target_id)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    state.write_json(out, {"script": script, "conformance": conf.model_dump()})
-    record = dict(record)
-    record.update({
-        "paper_id": pid, "target_id": target_id, "established": conf.established,
-        "content_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
-        "ts": state.now(),
-    })
-    state.write_json(sidecar, record)
-    return record
+    """`record` already carries whatever `delegation.provenance_record` produced —
+    `accept_reimplementation` builds it explicitly, and `run()`'s own inline record states
+    its mode directly, since it IS a `CLI_SUBPROCESS` call (two of them: a generator and a
+    separately attributed verifier). See `verdict_driver._seal` for why
+    `mode`/`reviewer`/`tool_policy` are re-derived FROM `record` rather than recomputed a
+    second, independent time. The payload is a plain wrapper dict, never a pydantic
+    `model_dump()` — `sealing.seal` takes `payload: dict` for exactly this reason.
+    """
+    out, _sidecar = _paths(cfg, pid, target_id)
+    return sealing.seal(
+        out, {"script": script, "conformance": conf.model_dump()},
+        mode=record.get("delegation_mode", "MANUAL"),
+        reviewer=record.get("reviewer") or record.get("reader", ""),
+        tool_policy=record.get("tool_policy", "unrecorded"),
+        extra={**record, "paper_id": pid, "target_id": target_id,
+              "established": conf.established},
+    )
 
 
 def accept_reimplementation(cfg: Config, pid: str, target_id: str, raw: str,
@@ -377,14 +383,11 @@ def load_accepted(cfg: Config, pid: str, target_id: str, *,
     """A sealed (script, conformance) for `pid`/`target_id`, or None. Verifies the seal
     before trusting it, exactly as `verdict_driver.load_accepted` does."""
     out, sidecar = _paths(cfg, pid, target_id)
-    if not (out.exists() and sidecar.exists()):
+    ok, _why = sealing.verify_seal(out, accepted_writers=WRITERS)
+    if not ok:
         return None
     try:
         rec = state.read_json(sidecar)
-        if not isinstance(rec, dict) or rec.get("written_by") not in WRITERS:
-            return None
-        if hashlib.sha256(out.read_bytes()).hexdigest() != rec.get("content_sha256"):
-            return None
         recorded_prompt = str(rec.get("prompt_sha256") or "")
         if prompt_sha256 and recorded_prompt and recorded_prompt != prompt_sha256:
             return None
@@ -438,6 +441,7 @@ def run(cfg: Config, prompt_text: str, readiness: ReimplementationReadiness, *,
         try:
             _seal(cfg, pid, target_id, script, conf, {
                 "written_by": "reimplement_driver",
+                "delegation_mode": "CLI_SUBPROCESS",
                 "reviewer": "reimplementation_verifier" if approved else "",
                 "generated_by": "reimplementation_generator",
                 "independent_verification": conf.independently_verified,

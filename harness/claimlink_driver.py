@@ -28,7 +28,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import claimlink, delegation, reviewer_cli, state
+from . import claimlink, delegation, reviewer_cli, sealing, state
 from .artifacts import ClaimLink, ClaimLinkSet, PaperDoc
 from .config import Config
 from .prompts import claimlink as CP
@@ -161,16 +161,23 @@ def _paths(cfg: Config, pid: str) -> tuple[Path, Path]:
 
 
 def seal(cfg: Config, pid: str, linkset: ClaimLinkSet, record: dict) -> dict:
-    """Write the verified link set and its sidecar. One writer for both channels."""
-    out, sidecar = _paths(cfg, pid)
-    state.write_json(out, linkset.model_dump())
-    record = dict(record)
-    record.update({"paper_id": pid, "proposed": linkset.proposed,
-                   "accepted": linkset.accepted, "refusals": linkset.refusals,
-                   "content_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
-                   "ts": state.now()})
-    state.write_json(sidecar, record)
-    return record
+    """Write the verified link set and its sidecar. One writer for both channels.
+
+    `record` already carries whatever `delegation.provenance_record` produced —
+    `accept` builds it explicitly, and `run()`'s own inline record states its mode
+    directly, since it IS a `CLI_SUBPROCESS` call. See `verdict_driver._seal` for why
+    `mode`/`reviewer`/`tool_policy` are re-derived FROM `record` rather than recomputed a
+    second, independent time.
+    """
+    out, _sidecar = _paths(cfg, pid)
+    return sealing.seal(
+        out, linkset.model_dump(),
+        mode=record.get("delegation_mode", "MANUAL"),
+        reviewer=record.get("reviewer") or record.get("reader", ""),
+        tool_policy=record.get("tool_policy", "unrecorded"),
+        extra={**record, "paper_id": pid, "proposed": linkset.proposed,
+              "accepted": linkset.accepted, "refusals": linkset.refusals},
+    )
 
 
 def accept(cfg: Config, pid: str, doc: PaperDoc, raw: str, *, reader: str = "",
@@ -208,14 +215,11 @@ def load(cfg: Config, pid: str, *, prompt_sha256: str = "") -> ClaimLinkSet | No
     is new and has no archive to invalidate.
     """
     out, sidecar = _paths(cfg, pid)
-    if not (out.exists() and sidecar.exists()):
+    ok, _why = sealing.verify_seal(out, accepted_writers=WRITERS)
+    if not ok:
         return None
     try:
         rec = state.read_json(sidecar)
-        if not isinstance(rec, dict) or rec.get("written_by") not in WRITERS:
-            return None
-        if hashlib.sha256(out.read_bytes()).hexdigest() != rec.get("content_sha256"):
-            return None
         recorded = str(rec.get("prompt_sha256") or "")
         if prompt_sha256 and recorded and recorded != prompt_sha256:
             return None
@@ -284,6 +288,7 @@ def run(cfg: Config, pid: str, doc: PaperDoc, prompt_text: str, *,
             try:
                 seal(cfg, pid, linkset, {
                     "written_by": "claimlink_driver", "reader": "",
+                    "delegation_mode": "CLI_SUBPROCESS",
                     "command": cmd, "returncode": proc.returncode,
                     "seconds": round(time.time() - started, 1),
                     "tool_policy": conf.summary(), "tool_policy_detail": conf.policy(),

@@ -43,7 +43,6 @@ carries no claim at all, and a claim that is not grounded in a cell is not a cla
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from pathlib import Path
@@ -54,7 +53,7 @@ from . import validation as validation_stage
 from .. import (backends, claimgraph, claims, code_audit, comparison as comparison_mod,
                 delegation, exhaustion, experiment_id, materiality, planner, probe_synth,
                 provenance as provenance_mod, reimplement, reimplement_driver,
-                repo as repo_mod, resources as resources_mod, state)
+                repo as repo_mod, resources as resources_mod, sealing, state)
 from ..artifacts import (CodeAudit, DiscoveredObject, Finding, FocusedValidation,
                          PaperDoc, PlanDecision, ProbeResult, ProbeSpec,
                          ReimplementationReadiness, RepoAcquisition, TargetOutcome)
@@ -145,22 +144,7 @@ def spec_is_accepted(root: Path) -> tuple[bool, str]:
     """
     control = state.control_dir(root)
     path = control / "spec.json"
-    sidecar = control / "spec.driver.json"
-    if not path.exists() or not sidecar.exists():
-        return False, "no sealed spec.json (or no sidecar) for this case"
-    try:
-        rec = state.read_json(sidecar)
-    except (OSError, ValueError):
-        return False, "spec.driver.json is not valid JSON"
-    if not isinstance(rec, dict) or rec.get("written_by") not in _SPEC_ACCEPTED_WRITERS:
-        return False, (f"provenance sidecar written_by="
-                       f"{rec.get('written_by') if isinstance(rec, dict) else None!r} not recognized")
-    want = rec.get("content_sha256")
-    if not want:
-        return False, "provenance sidecar has no content_sha256"
-    if hashlib.sha256(path.read_bytes()).hexdigest() != want:
-        return False, "spec.json content changed after its provenance sidecar was written"
-    return True, ""
+    return sealing.verify_seal(path, accepted_writers=_SPEC_ACCEPTED_WRITERS)
 
 
 def accept_spec(cfg: Config, pid: str, raw: str, *, reviewer: str = "",
@@ -217,22 +201,17 @@ def accept_spec(cfg: Config, pid: str, raw: str, *, reviewer: str = "",
     root = state.project_dir(cfg, pid)
     control = state.control_dir(root)
     out = control / "spec.json"
-    state.write_json(out, spec.model_dump())
-    content_sha256 = hashlib.sha256(out.read_bytes()).hexdigest()
-    record = {
-        "paper_id": pid,
-        **delegation.provenance_record(mode=mode, reviewer=reviewer, tool_policy=tool_policy),
-        "content_sha256": content_sha256,
-        "ts": state.now(),
-    }
     # `written_by` in the sidecar is ALWAYS this function's own fixed token, never the
     # raw proposal's and never merely whatever `delegation.provenance_record` derived
     # from `mode` — a driver spec is sealed as "driver_accept" however it was produced,
     # so `spec_is_accepted` has exactly one token to recognize on this channel rather
     # than the whole delegation vocabulary, mirroring `stages.audit.COMPOSED_WRITER`.
-    record["written_by"] = "driver_accept"
-    state.write_json(control / "spec.driver.json", record)
-    return {"accepted": True, "paper_id": pid, "content_sha256": content_sha256}
+    # `extra`'s own literal `written_by` overrides whatever `mode` would otherwise derive.
+    record = sealing.seal(out, spec.model_dump(), mode=mode, reviewer=reviewer,
+                          tool_policy=tool_policy,
+                          extra={"paper_id": pid, "written_by": "driver_accept"})
+    return {"accepted": True, "paper_id": pid,
+           "content_sha256": record["content_sha256"]}
 
 
 def build_spec(cfg: Config, pid: str, doc: PaperDoc, target=None) -> ProbeSpec:

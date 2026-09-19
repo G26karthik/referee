@@ -40,7 +40,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import delegation, reviewer_cli, state
+from . import delegation, reviewer_cli, sealing, state
 from .artifacts import Grade
 from .config import Config
 from .prompts import grade as GP
@@ -292,17 +292,19 @@ def run_candidate(cfg: Config, pid: str, slug: str, prompt: Path, out: Path, *,
             staged.replace(rejected)
             raise
         staged.replace(raw_kept)                 # kept on success too — see `run_lens`
-        state.write_json(out, grade.model_dump())
 
-        record = {
+        # This IS a `CLI_SUBPROCESS` call, exactly as `audit_driver.run_lens`'s own inline
+        # seal is — but this driver's OWN written_by token is "grade_driver", not the
+        # generic delegation vocabulary's "audit_driver", so it is forced via `extra`
+        # exactly as `stages.probe.accept_spec` forces "driver_accept".
+        return sealing.seal(out, grade.model_dump(), mode="CLI_SUBPROCESS",
+                            tool_policy=conf.summary(), extra={
             "slug": slug, "paper_id": pid, "command": cmd, "returncode": p.returncode,
             "seconds": round(time.time() - started, 1), "verdict": grade.verdict,
             "written_by": "grade_driver", "withheld": withheld,
             # Recorded at last. This was the one delegated role with the strongest
             # isolation claim and the only sidecar that wrote nothing about it.
-            "tool_policy": conf.summary(),
             "tool_policy_detail": conf.policy(),
-            "content_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
             "prompt_sha256": prompt_sha,
             "prompt_copy": str(prompt_copy) if prompt_copy else "",
             "raw_sha256": hashlib.sha256(raw_kept.read_bytes()).hexdigest(),
@@ -317,10 +319,7 @@ def run_candidate(cfg: Config, pid: str, slug: str, prompt: Path, out: Path, *,
             "desiderata_passed": meta.get("desiderata_passed"),
             "unknown_desiderata": meta.get("unknown_desiderata") or [],
             "unknown_keys_dropped": meta.get("unknown_keys_dropped", 0),
-            "ts": state.now(),
-        }
-        state.write_json(out.with_suffix(".driver.json"), record)
-        return record
+        })
     finally:
         shutil.rmtree(sandbox, ignore_errors=True)
         shutil.rmtree(policy_dir, ignore_errors=True)

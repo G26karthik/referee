@@ -36,7 +36,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import delegation, reviewer_cli, state
+from . import delegation, reviewer_cli, sealing, state
 from .artifacts import SubstantiveVerdict
 from .config import Config
 from .prompts import verdict as VP
@@ -146,17 +146,24 @@ def _seal(cfg: Config, pid: str, verdict: SubstantiveVerdict, record: dict) -> d
     used to be structurally different: the first sealed a file, the second sealed nothing.
     Sharing this makes `written_by` the only difference between them, which is the only
     difference there should ever have been.
+
+    `record` already carries whatever `delegation.provenance_record` produced —
+    `accept_verdict` builds it explicitly, and `run()`'s own inline record states its mode
+    directly, since it IS a `CLI_SUBPROCESS` call. `mode`/`reviewer`/`tool_policy` are
+    re-derived FROM `record` here rather than recomputed independently by each caller, so
+    `sealing.seal`'s own internal call to `provenance_record` reproduces the identical
+    values `record` already carries, and `extra={**record, ...}` then confirms them (or,
+    for a caller-forced field such as `written_by`, overrides with the literal the caller
+    chose) rather than computing them a second, independent time.
     """
     out = state.project_dir(cfg, pid) / "reports" / f"{pid}.substantive.json"
-    state.write_json(out, verdict.model_dump())
-    record = dict(record)
-    record.update({
-        "paper_id": pid, "verdict": verdict.verdict,
-        "content_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
-        "ts": state.now(),
-    })
-    state.write_json(out.with_suffix(".driver.json"), record)
-    return record
+    return sealing.seal(
+        out, verdict.model_dump(),
+        mode=record.get("delegation_mode", "MANUAL"),
+        reviewer=record.get("reviewer") or record.get("reader", ""),
+        tool_policy=record.get("tool_policy", "unrecorded"),
+        extra={**record, "paper_id": pid, "verdict": verdict.verdict},
+    )
 
 
 def accept_verdict(cfg: Config, pid: str, raw: str, *, reader: str = "",
@@ -297,6 +304,7 @@ def run(cfg: Config, prompt_text: str, *, timeout_s: int = 300,
                 try:
                     _seal(cfg, pid, verdict, {
                         "written_by": "verdict_driver", "reader": "",
+                        "delegation_mode": "CLI_SUBPROCESS",
                         "command": cmd, "returncode": proc.returncode,
                         "seconds": round(time.time() - started, 1),
                         "tool_policy": conf.summary(),

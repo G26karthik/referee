@@ -35,7 +35,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import delegation, literature, reviewer_cli, state
+from . import delegation, literature, reviewer_cli, sealing, state
 from .artifacts import (LITERATURE_RELATIONS, LiteratureSearch, PaperDoc, PriorArtFact,
                         SearchClaim, SearchCutoff, WorkIdentity)
 from .config import Config
@@ -257,29 +257,32 @@ def _paths(cfg: Config, pid: str) -> tuple[Path, Path]:
 
 
 def seal(cfg: Config, pid: str, search: LiteratureSearch, record: dict) -> dict:
-    out, sidecar = _paths(cfg, pid)
-    state.write_json(out, search.model_dump())
-    record = dict(record)
-    record.update({"paper_id": pid, "proposed": search.proposed,
-                   "concerns": len(search.concerns()),
-                   "structurally_bound": len(search.bound_relations()),
-                   "content_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
-                   "ts": state.now()})
-    state.write_json(sidecar, record)
-    return record
+    """`record`'s only caller (`stages.literature.run_route`) builds it as a plain literal
+    dict — an aggregate over potentially many `call()`s, with no single delegation mode of
+    its own — so `mode`/`reviewer`/`tool_policy` fall back to harmless generic defaults
+    when `record` does not state them, exactly as `verdict_driver._seal` derives them from
+    whatever `record` already carries; the caller's own literal `written_by` always wins
+    via `extra`, regardless of what a fallback `mode` would otherwise have derived.
+    """
+    out, _sidecar = _paths(cfg, pid)
+    return sealing.seal(
+        out, search.model_dump(),
+        mode=record.get("delegation_mode", "MANUAL"),
+        reviewer=record.get("reviewer") or record.get("reader", ""),
+        tool_policy=record.get("tool_policy", "unrecorded"),
+        extra={**record, "paper_id": pid, "proposed": search.proposed,
+              "concerns": len(search.concerns()),
+              "structurally_bound": len(search.bound_relations())},
+    )
 
 
 def load(cfg: Config, pid: str) -> LiteratureSearch | None:
     """A sealed search for `pid`, or None. Verifies the seal before trusting it."""
-    out, sidecar = _paths(cfg, pid)
-    if not (out.exists() and sidecar.exists()):
+    out, _sidecar = _paths(cfg, pid)
+    ok, _why = sealing.verify_seal(out, accepted_writers=WRITERS)
+    if not ok:
         return None
     try:
-        rec = state.read_json(sidecar)
-        if not isinstance(rec, dict) or rec.get("written_by") not in WRITERS:
-            return None
-        if hashlib.sha256(out.read_bytes()).hexdigest() != rec.get("content_sha256"):
-            return None
         return LiteratureSearch(**state.read_json(out))
     except Exception:                              # noqa: BLE001 — a bad seal is no seal
         return None
