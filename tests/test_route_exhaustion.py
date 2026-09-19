@@ -157,7 +157,7 @@ def test_probe_resync_preserves_runtime_author_code_fallback(tmp_path, monkeypat
                              status="INCONCLUSIVE", failure_class="execution_unauthorized",
                              reason="decision 'conformance_unproven': method not bound"))
     state.write_json(state.control_dir(root) / "probe_results.json", result.model_dump())
-    state.write_json(root / "runs" / "p" / "spec.json", ProbeSpec(
+    state.write_json(state.control_dir(root) / "spec.json", ProbeSpec(
         paper_id="p", experiment=ExperimentIdentity(state="no_candidate")).model_dump())
     state.write_json(state.control_dir(root) / "targets" / "T1" / "outcome.json",
                      TargetOutcome(

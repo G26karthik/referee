@@ -217,6 +217,13 @@ def cmd_accept(args: argparse.Namespace) -> int:
                  cfg, args.paper, raw, reader=args.reviewer,
                  tool_policy=args.tool_policy, mode=args.mode)["verdict"])
 
+    # A driver-supplied faithful reproduction: one spec, one staged file.
+    if (src := root / "control" / ".staged" / "spec.json").exists():
+        take(src, "spec",
+             lambda raw: (
+                 f"sealed, sha256={probe_stage.accept_spec(cfg, args.paper, raw, reviewer=args.reviewer, tool_policy=args.tool_policy, mode=args.mode)['content_sha256'][:12]}"
+             ))
+
     from harness import delegation
     if accepted:
         print(f"mode     : {args.mode} — {delegation.ISOLATION_CLAIM.get(args.mode, '?')}")

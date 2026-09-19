@@ -17,12 +17,18 @@ If nothing justifies an execution the stage still runs: a probe with no interven
 measures this machine's seed-noise floor, which is the number every "is this gain real?"
 question divides by — worth having even with nothing to test.
 
-A hand-written `spec.json` under `runs/<paper_id>/` overrides all of this, which is
-how the driver supplies a faithful reproduction of the paper's actual setup.
+A hand-written, SEALED `control/spec.json` overrides all of this, which is how the
+driver supplies a faithful reproduction of the paper's actual setup. Sealed, not merely
+present: `accept_spec` validates and hash-seals the proposal (never trusting `command`,
+`provenance`, or any identity/capability/resources/commit field from the raw file), and
+`build_spec` trusts a `control/spec.json` only when `spec_is_accepted` confirms that seal
+— a file dropped at that path by any other means is ignored outright, the same discipline
+`stages.audit.accept_lens`/`lens_is_accepted` apply to a lens file.
 
 **Where `claimed_delta` may come from.** Only two places, both traceable:
 
-  1. The driver writes it into `spec.json` alongside a real reproduction script.
+  1. The driver writes it into `spec.json` alongside a real reproduction script, and
+     seals it with `run.py accept`.
   2. It is read off the `QuantFinding.delta` the extractor already parsed for the
      ADDRESSED CELL the target finding cites — the same provenance chain the audit
      stage enforces on evidence quotes.
@@ -37,6 +43,8 @@ carries no claim at all, and a claim that is not grounded in a cell is not a cla
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from pathlib import Path
 
@@ -44,7 +52,7 @@ from . import artifact as artifact_stage
 from . import literature as literature_stage
 from . import validation as validation_stage
 from .. import (backends, claimgraph, claims, code_audit, comparison as comparison_mod,
-                exhaustion, experiment_id, materiality, planner, probe_synth,
+                delegation, exhaustion, experiment_id, materiality, planner, probe_synth,
                 provenance as provenance_mod, reimplement, reimplement_driver,
                 repo as repo_mod, resources as resources_mod, state)
 from ..artifacts import (CodeAudit, DiscoveredObject, Finding, FocusedValidation,
@@ -98,6 +106,118 @@ def grounded_quantity(target) -> tuple[float | None, str]:
     return q.value, (q.raw or "")
 
 
+# Fields a hand-authored, unsealed spec proposal may ever supply. Everything else —
+# every `.established` identity/capability/resources block, `commit`, `commit_state`,
+# and `provenance` itself — is stripped before the proposal is even considered, and is
+# recomputed or reassigned by this harness alone. This is the allowlist that makes
+# forging trusted provenance by writing a plausible-looking JSON file impossible: no
+# field this list omits can ever reach `backends.authorize` from a hand file, sealed or
+# not.
+_SPEC_PROPOSAL_ALLOWED_FIELDS = frozenset({
+    "paper_id", "finding_id", "claim", "claimed_delta", "metric", "arms", "seeds",
+    "dataset", "epochs", "script", "table_ref", "claim_ref", "claim_kind",
+    "claimed_cell_value", "target_id", "mechanism", "rationale", "aux_metrics",
+})
+
+# `delegation.WRITTEN_BY.values()` names every token a real delegation mode can seal
+# with, exactly as `stages.audit._ACCEPTED_WRITERS` builds its own allowlist. Neither
+# "harness" nor "driver_accept" is a delegation mode: "harness" marks `build_spec`'s own
+# generated output (never sidecar-sealed, so it never reaches this check at all — kept
+# here only for symmetry with the vocabulary `written_by` draws from) and
+# "driver_accept" is the ONE token `accept_spec` ever stamps into `spec.driver.json`,
+# regardless of which delegation `mode` produced the proposal — the same role
+# `stages.audit.COMPOSED_WRITER` plays for a composed lens file: a fixed, extra token
+# alongside the delegation vocabulary, not a member of it.
+_SPEC_ACCEPTED_WRITERS = tuple(delegation.WRITTEN_BY.values()) + ("harness", "driver_accept")
+
+
+def _strip_to_allowed_fields(data: dict) -> dict:
+    return {k: v for k, v in (data or {}).items() if k in _SPEC_PROPOSAL_ALLOWED_FIELDS}
+
+
+def spec_is_accepted(root: Path) -> tuple[bool, str]:
+    """Does `control/spec.json` carry a valid seal — the same discipline
+    `stages.audit.lens_is_accepted` applies to lens files, on this channel.
+
+    A spec with no sidecar, a sidecar whose `written_by` is not a real accept-path
+    token, or a sidecar whose recorded hash does not match the file's current bytes is
+    NOT accepted — refused outright, never partially trusted.
+    """
+    control = state.control_dir(root)
+    path = control / "spec.json"
+    sidecar = control / "spec.driver.json"
+    if not path.exists() or not sidecar.exists():
+        return False, "no sealed spec.json (or no sidecar) for this case"
+    try:
+        rec = state.read_json(sidecar)
+    except (OSError, ValueError):
+        return False, "spec.driver.json is not valid JSON"
+    if not isinstance(rec, dict) or rec.get("written_by") not in _SPEC_ACCEPTED_WRITERS:
+        return False, (f"provenance sidecar written_by="
+                       f"{rec.get('written_by') if isinstance(rec, dict) else None!r} not recognized")
+    want = rec.get("content_sha256")
+    if not want:
+        return False, "provenance sidecar has no content_sha256"
+    if hashlib.sha256(path.read_bytes()).hexdigest() != want:
+        return False, "spec.json content changed after its provenance sidecar was written"
+    return True, ""
+
+
+def accept_spec(cfg: Config, pid: str, raw: str, *, reviewer: str = "",
+                tool_policy: str = "", mode: str = "MANUAL") -> dict:
+    """Validate and seal a hand-authored `spec.json` proposal — the "driver" provenance
+    path — through the same explicit accept discipline `stages.audit.accept_lens`
+    already applies to lens files.
+
+    Every field NOT in `_SPEC_PROPOSAL_ALLOWED_FIELDS` is stripped before this function
+    does anything else with the proposal: `provenance`, `command`, every `.established`
+    identity/capability/resources block, `commit`, and `commit_state` can never be
+    supplied by the proposal, whatever it claims — they are always assigned here or, for
+    `repo_exec`, exclusively by `plan_execution`'s own real-audit-gated promotion.
+
+    A `command` in the raw proposal REFUSES outright: `driver` provenance is a hand
+    -written script (a faithful reproduction this harness could not derive on its own),
+    never the paper's own repository entrypoint, which may only ever be attributed by
+    `plan_execution` after a real clone, a real static audit, and a real identity match.
+    """
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("spec proposal must be a JSON object")
+    if data.get("command"):
+        raise ValueError(
+            "a spec proposal may not set 'command' — that is the authors' own "
+            "repository entrypoint and may only be attributed by this harness's own "
+            "plan_execution, never accepted from a hand file")
+    proposal = _strip_to_allowed_fields(data)
+    proposal["paper_id"] = pid
+    script = (proposal.get("script") or "").strip()
+    if script and not Path(script).is_file():
+        raise ValueError(f"script {script!r} does not exist; a driver spec must point "
+                         f"at a real, readable file")
+    proposal["provenance"] = "driver"
+    spec = ProbeSpec(**proposal)
+
+    root = state.project_dir(cfg, pid)
+    control = state.control_dir(root)
+    out = control / "spec.json"
+    state.write_json(out, spec.model_dump())
+    content_sha256 = hashlib.sha256(out.read_bytes()).hexdigest()
+    record = {
+        "paper_id": pid,
+        **delegation.provenance_record(mode=mode, reviewer=reviewer, tool_policy=tool_policy),
+        "content_sha256": content_sha256,
+        "ts": state.now(),
+    }
+    # `written_by` in the sidecar is ALWAYS this function's own fixed token, never the
+    # raw proposal's and never merely whatever `delegation.provenance_record` derived
+    # from `mode` — a driver spec is sealed as "driver_accept" however it was produced,
+    # so `spec_is_accepted` has exactly one token to recognize on this channel rather
+    # than the whole delegation vocabulary, mirroring `stages.audit.COMPOSED_WRITER`.
+    record["written_by"] = "driver_accept"
+    state.write_json(control / "spec.driver.json", record)
+    return {"accepted": True, "paper_id": pid, "content_sha256": content_sha256}
+
+
 def build_spec(cfg: Config, pid: str, doc: PaperDoc, target=None) -> ProbeSpec:
     """The spec to run, with `claimed_delta` allowed only where it is grounded.
 
@@ -108,7 +228,6 @@ def build_spec(cfg: Config, pid: str, doc: PaperDoc, target=None) -> ProbeSpec:
       - otherwise       =>  keep an explicit driver value, else ground it in a cell.
     """
     root = state.project_dir(cfg, pid)
-    override = root / "runs" / pid / "spec.json"
 
     reports, _, _ = audit_stage.load_reports(cfg, pid, doc)
     # THE FALLBACK, not the selector. This line used to BE the selector — one target, from
@@ -133,25 +252,39 @@ def build_spec(cfg: Config, pid: str, doc: PaperDoc, target=None) -> ProbeSpec:
                 finding_target = next(
                     (f for f in candidates if f.finding_id == target_finding_id), None)
 
-    # `written_by == "harness"` marks OUR OWN previous output — set only at the bottom of
-    # `run()`, below, right before it persists the spec it just built. A human-authored
-    # override never carries it, since a human editing spec.json by hand has no reason to
-    # know the field exists. Without this distinction a stale run's finding_id/table_ref/
-    # claimed_cell_value — and `synthesize_probe`'s stale script, which skips regenerating
-    # once `spec.script` is already set — kept feeding back into every later run even after
-    # the audit moved its verifiable target elsewhere, so the report's chain named a
-    # finding the CURRENT findings table no longer contained, reconciled against a cell
-    # that was no longer the target. Treating a harness-written file as absent forces every
-    # run to re-derive its target from the CURRENT audit, which is what `else` already does.
-    override_data = state.read_json(override) if override.exists() else None
-    if override_data is not None and override_data.get("written_by") != "harness":
-        spec = ProbeSpec(**{**override_data, "paper_id": pid})
-        # A spec.json a human wrote and pointed at real code is the one non-repo source
-        # allowed to reconcile against a printed cell. A spec.json this stage wrote on a
-        # previous run is not, and re-labelling it here would launder it.
-        if spec.provenance == "template" and (spec.script or spec.command):
-            spec.provenance = "driver"
+    # A SEALED driver spec is the only hand-authored source ever trusted here.
+    # `spec_is_accepted` requires a content-hash-verified sidecar written by
+    # `accept_spec` itself — file existence and a `written_by != "harness"` claim are NOT
+    # enough, which is the exact gap that let a forged `control/spec.json` (or, before
+    # Task 3, a forged `runs/<pid>/spec.json` reachable from inside a container) claim
+    # `provenance: "repo_exec"` with fabricated `established=true` identity/capability/
+    # resources blocks and reach `backends.authorize` with those claims intact — only the
+    # commit was freshly re-verified there; everything else was trusted from the file.
+    control = state.control_dir(root)
+    accepted, _why = spec_is_accepted(root)
+    if accepted:
+        # Only the fields `accept_spec` could ever have sealed are trusted here — the
+        # same `_strip_to_allowed_fields` allowlist it applies, applied again, so a
+        # `control/spec.json` a container process managed to overwrite in place (see
+        # `test_container_writing_into_the_mount_cannot_forge_a_seal`) still cannot widen
+        # what it grants beyond the allowlist even if it also forged a matching hash.
+        # `provenance` is always "driver" (accept_spec never seals anything else) and
+        # every identity/capability/resources/commit field starts unestablished here,
+        # exactly as a freshly-built spec's would, so `plan_execution`'s own real
+        # assessment is what fills them in, never this file.
+        sealed = state.read_json(control / "spec.json")
+        proposal = _strip_to_allowed_fields(sealed)
+        proposal["paper_id"] = pid
+        spec = ProbeSpec(**proposal)
+        spec.provenance = "driver"
+        spec.written_by = "driver_accept"
     else:
+        # No sealed proposal for this case (nothing staged, or staged but not yet
+        # `accept_spec`'d, or a `control/spec.json` that failed its own hash/sidecar
+        # check — see `spec_is_accepted`). The harness's own auto-built spec is the only
+        # other source; a hand file that skipped the explicit accept step is never
+        # partially trusted.
+        #
         # `written_by="harness"` here, not left blank: this is what makes the file this
         # function is about to be re-read as (via `run()`'s persistence below) identify
         # itself correctly on the NEXT call, so a fresh audit target keeps being honored
@@ -321,8 +454,10 @@ def write_reimplementation_prompt(root: Path, pid: str, doc: PaperDoc, spec: Pro
     same reason: a phase that can only proceed through a model must still leave something
     on disk a person can pick up, or the manual path is not first-class. This is the
     MANUAL channel — an operator who wants to review a reconstruction themselves before
-    sealing it still writes into `runs/<pid>/spec.json` and seals it with `run.py accept`
-    under the existing `driver` provenance, unconditionally admissible, exactly as before.
+    sealing it stages a `script` (never a `command`, which only `plan_execution`'s own
+    real-audit-gated promotion may ever set) at `control/.staged/spec.json` and seals it
+    with `run.py accept`, which validates it and hash-seals it under `driver` provenance
+    through `accept_spec` — never trusted unconditionally, unlike before.
 
     Step 8 added an AUTOMATED channel alongside this one, not in place of it:
     `harness.reimplement_driver` delegates the writing, and machine-VERIFIES every
@@ -365,10 +500,13 @@ def write_reimplementation_prompt(root: Path, pid: str, doc: PaperDoc, spec: Pro
                      f"{('`' + i.ref + '`') if i.ref else ''} | {quote} |")
     lines += [
         "", "## What to produce", "",
-        "A `runs/<pid>/spec.json` carrying `command` (or `script`), `metric`, `seeds`, and the",
-        "identity fields, plus the implementation itself. Print one `METRIC <name> <value>` line",
-        "per seed on stdout — the same contract every probe in this harness uses.", "",
-        "Seal it with:", "",
+        "A `spec.json` naming your `script` (never `command` — that field is reserved for ",
+        "this harness's own repository-entrypoint promotion and a staged proposal setting it ",
+        "is refused outright), plus `metric`, `seeds`, and the identity fields, plus the ",
+        "implementation itself. Print one `METRIC <name> <value>` line per seed on stdout — ",
+        "the same contract every probe in this harness uses.", "",
+        f"Stage it at `control/.staged/spec.json` under this case's project directory, then seal it with:",
+        "",
         f"    python run.py accept --paper {pid} --reviewer \"<who wrote this>\"", "",
         "## The paper", "",
     ]
@@ -757,8 +895,8 @@ def resync_cached_outcomes(cfg: Config, pid: str) -> dict:
         obj, plan = pair
         if plan.route != "AUTHOR_CODE_EXECUTION":
             continue
-        spec_path = (root / "runs" / pid / "spec.json" if obj is primary_obj else
-                     root / "runs" / pid / "targets" / obj.target_id / "spec.json")
+        spec_path = (state.control_dir(root) / "spec.json" if obj is primary_obj else
+                     state.control_dir(root) / "targets" / obj.target_id / "spec.json")
         if not spec_path.exists():
             continue
         fallback = replan_after_author_code_exhausted(
@@ -1233,7 +1371,14 @@ def _review(cfg: Config, pid: str) -> dict:
             settlement_declared=bool(fv is not None and fv.design is not None
                                      and fv.design.established))
 
-    state.write_json(root / "runs" / pid / "spec.json", spec.model_dump())
+    # Only the harness's OWN generated spec is re-persisted here. A sealed `driver_accept`
+    # spec (`spec.written_by == "driver_accept"`, set in `build_spec` above) must never be
+    # overwritten by this run's own regenerated output — that would silently unseal a
+    # human's accepted proposal (the file's bytes would no longer match the hash
+    # `accept_spec` recorded in `spec.driver.json`, so the NEXT invocation would refuse to
+    # trust it, discarding a real driver reproduction for no reason the operator asked for).
+    if spec.written_by == "harness":
+        state.write_json(state.control_dir(root) / "spec.json", spec.model_dump())
 
     # THE RULE: nothing starts unless its result could speak. See
     # `admissible_if_it_succeeds` for what this stopped costing, and `may_be_compared` for
@@ -1382,7 +1527,7 @@ def _review(cfg: Config, pid: str) -> dict:
                                              and other_fv.design.established))
                 tdir = root / "runs" / pid / "targets" / obj.target_id
                 ctdir = state.control_dir(root) / "targets" / obj.target_id
-                state.write_json(tdir / "spec.json", other.model_dump())
+                state.write_json(ctdir / "spec.json", other.model_dump())
                 # STEP 6 — the same re-plan, per remaining target. `plan` here is the
                 # target's ORIGINAL discover-time decision, exactly as for the primary.
                 other_fallback = replan_after_author_code_exhausted(obj, plan, other)
