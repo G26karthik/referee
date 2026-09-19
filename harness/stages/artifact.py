@@ -22,15 +22,37 @@ only where NO executable route applies, so a target that could be run is never d
 here. That is the defect `PAPER_INTERNAL_CHECK` had when it sat in `planner._RESOLVING`:
 it was cheap, it settled nothing, and it cancelled 100% of the shipped corpus's
 escalations.
+
+**The authors'-code auditor is called from HERE, once per paper, and nowhere else.**
+`harness/artifact_review_driver.py` has been a complete, tested, read-only reader since it
+was written, and nothing on the production path ever called `.run()` — every `route.json`
+this stage ever wrote had `"proposed": 0` because the reader was never dispatched, not
+because it ran and found nothing. `_reviewer_facts` below is the missing call: gated on
+`cfg.allow_artifact_review` AND on an AUDITED snapshot existing (no gate, or no clean
+pinned checkout, means no call, exactly as before this existed), it asks the one question
+this route could not ask on its own — does the released code do what the method section
+says — and gets back `ArtifactFact`s that are ALREADY relocated, ALREADY authority-ranked,
+and ALREADY capped at `PAPER_ARTIFACT_MISMATCH` only where the auditor named a
+DETERMINISTIC identity basis that itself relocated. Nothing here re-derives or loosens any
+of that; it only decides WHERE a fact the auditor earned may be counted. A fact whose
+`about_the_paper`/`endpoints_only` reading answers the BROAD implementation-correspondence
+question is folded into a per-target inspection only when that target's OWN scope is
+`IMPLEMENTATION_CORRESPONDENCE` — the scope essentially every real repository-paper
+artifact target carries — and always into the paper-level aggregate, which asks nothing
+narrower. It is never folded into a NARROW bounded per-target question
+(`ENTRYPOINT_PRESENCE`, `FILE_PRESENCE`, ...): those stay answered purely by the
+deterministic probes below, so a mismatch found anywhere in the checkout can never be
+mistaken for an answer to an unrelated bounded question a different target asked.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
-from .. import artifact_evidence, claims, state
+from .. import artifact_evidence, artifact_review_driver, claims, state
 from ..artifacts import (ArtifactFact, ArtifactInspection, DiscoveredObject, PaperDoc,
                          PlanDecision, TargetOutcome, TargetSet)
 from ..config import Config
+from ..prompts import artifact_review as AP
 
 ACTION = "ARTIFACT_INSPECTION_ONLY"
 
@@ -144,6 +166,118 @@ def distinct_facts(facts: list[ArtifactFact]) -> list[ArtifactFact]:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# The authors'-code auditor: what it is shown, and what comes back
+# --------------------------------------------------------------------------- #
+# Bounded exactly the way `stages.validation.method_text` bounds a designer's method text:
+# a reader handed the whole paper is being asked to find the method section, which is not
+# the task, and an unbounded prompt is a cost nobody agreed to pay.
+_METHOD_CHARS = 6000
+_METHOD_TITLE_HINTS = ("method", "approach", "model", "architecture", "implementation",
+                       "experiment", "setup", "training", "algorithm")
+
+
+def _method_text(doc: PaperDoc) -> str:
+    """The paper's own account of what it did, bounded — never the whole paper.
+
+    Sections whose OWN title names a method/experimental concern, in document order. This
+    is the closest bounded substitute for "the method section" this harness can name
+    without asking a model to find it first — the same reasoning `stages.validation.
+    method_text` uses, generalised from "names one of these arm labels" (which the
+    artifact route has no arm labels for) to "looks like the part of the paper that
+    describes how it was built or run". A title convention this extraction did not
+    recognise falls back to the whole document, still bounded: an auditor shown nothing
+    cannot read the paper any better than one shown everything within the same budget.
+    """
+    picked = [s for s in doc.sections
+             if any(h in (s.title or "").lower() for h in _METHOD_TITLE_HINTS)]
+    text = "\n\n".join(f"[{s.title or f'section {s.section_idx}'}] {s.text or ''}"
+                       for s in picked)
+    if not text.strip():
+        text = "\n\n".join((s.text or "") for s in doc.sections)
+    return text[:_METHOD_CHARS]
+
+
+_REPORTED_MAX = 24
+
+
+def _reported_text(doc: PaperDoc) -> str:
+    """A bounded summary of the quantities THIS HARNESS already extracted, for context only.
+
+    Not a new extraction, and not offered as anything the reader may cite in place of the
+    paper: every code citation the reader returns is still relocated by `artifact_evidence.
+    relocate`, and every paper citation still by `claims`, regardless of what it read here.
+    This exists so the reader knows which numbers this review already has an address for,
+    the same courtesy `_paths_named` extends by naming which paths are already claimed.
+    """
+    lines = []
+    for q in doc.reported_numbers[:_REPORTED_MAX]:
+        bits = " ".join(x for x in (q.benchmark, q.metric, q.method) if x)
+        if bits and q.value:
+            lines.append(f"{bits}: {q.value}")
+    return "\n".join(lines)
+
+
+_TREE_MAX_ENTRIES = 400
+_TREE_SKIP_DIRS = {".git", "__pycache__", "node_modules", "venv", ".venv", "env"}
+
+
+def _tree_text(root: str | Path) -> str:
+    """A bounded file listing of the pinned checkout — the MAP, not the contents.
+
+    The reader's own confinement grants it `Read` and `Grep` over the checkout directly,
+    so this is only what tells it the checkout has a shape at all; a hundred-thousand-file
+    repository must not become a hundred-thousand-line prompt. Sorted, so the listing is
+    the same call to call rather than a filesystem's own arbitrary order.
+    """
+    root = Path(root)
+    out: list[str] = []
+    for p in sorted(root.rglob("*")):
+        if not p.is_file():
+            continue
+        try:
+            rel = p.relative_to(root)
+        except ValueError:                      # pragma: no cover — rglob only yields children
+            continue
+        if any(part in _TREE_SKIP_DIRS for part in rel.parts[:-1]):
+            continue
+        out.append(str(rel).replace("\\", "/"))
+        if len(out) >= _TREE_MAX_ENTRIES:
+            break
+    return "\n".join(out)
+
+
+def _reviewer_facts(cfg: Config, pid: str, doc: PaperDoc, root: str | Path, snap,
+                    url: str, statements: list[str]) -> list[ArtifactFact]:
+    """The authors'-code auditor's facts for this paper, or `[]` — THE MISSING CALLER.
+
+    Two preconditions, checked HERE rather than left to `artifact_review_driver.available`
+    alone, because that function only knows about the gate and the reader command: a
+    paper with no checkout, or a checkout that is not cleanly pinned, is a reason this call
+    must never happen, and `available()` has no way to know either. `snap.audited`
+    requires a commit, a tree hash and a clean working tree — exactly "there IS a pinned,
+    audited repository checkout" — so a directory that exists but is not a git checkout,
+    or is a dirty one, gets no call, same as no directory at all.
+
+    One best-effort call per paper, matching `artifact_review_driver.run`'s own contract:
+    it returns `None` on ANY failure (gate closed, no reader, timeout, unusable output) and
+    never raises, so a reviewer that never answers changes nothing about the deterministic
+    facts this route already establishes. What comes back has already been through
+    `artifact_evidence.relocate` for every code citation and `claims` for every paper
+    citation — this function trusts the driver's OWN discipline rather than repeating it,
+    the same way every other stage in this pipeline trusts a lens's finding only after the
+    harness's OWN re-verification has already run, once, inside the thing that produced it.
+    """
+    if not cfg.allow_artifact_review or snap is None or not snap.audited:
+        return []
+    prompt_text = AP.build(
+        doc.title, _method_text(doc), _tree_text(root), snap.commit,
+        repo_url=url, repo_path=str(root), reported_text=_reported_text(doc))
+    insp = artifact_review_driver.run(cfg, pid, doc, root, prompt_text, url=url,
+                                      statements=statements)
+    return list(insp.facts) if insp is not None else []
+
+
 def run_route(cfg: Config, pid: str, doc: PaperDoc, target_set: TargetSet | None,
               root: str | Path, *, url: str = "",
               extra_facts: list[ArtifactFact] | None = None
@@ -169,12 +303,26 @@ def run_route(cfg: Config, pid: str, doc: PaperDoc, target_set: TargetSet | None
         return [], None
 
     snap = artifact_evidence.snapshot(root, url)
+    # EVERY CLAIM THIS ROUTE WAS ASKED ABOUT, computed ONCE rather than accumulated across
+    # the loop below: the auditor is dispatched before any target's own inspection runs,
+    # so it needs the full statement list up front, and the loop's own `statements.append`
+    # would otherwise duplicate exactly this list one entry at a time.
+    statements: list[str] = [s for s in ((o.claim_text or "").strip() for o, _ in pairs) if s]
+    # THE AUTHORS'-CODE AUDITOR, ONCE PER PAPER, GATED, BEFORE ANY PER-TARGET INSPECTION.
+    # `_reviewer_facts` is a no-op unless `cfg.allow_artifact_review` is set AND `snap` is
+    # an audited (clean, pinned) checkout — see its own docstring for why both are checked
+    # here rather than left to the driver's own gate alone. What comes back is already
+    # relocated and already authority-ranked; this stage decides only WHERE it may count.
+    reviewer_facts = _reviewer_facts(cfg, pid, doc, root, snap, url, statements)
+
     outcomes: list[TargetOutcome] = []
     # ACCUMULATED PER TARGET AND DEDUPLICATED ONCE, at the bottom. Each target's own
     # `inspect` call reasons over its OWN facts and is unaffected; what this fixes is the
-    # aggregate record and the number printed into it.
-    all_facts: list[ArtifactFact] = list(extra_facts or [])
-    statements: list[str] = []
+    # aggregate record and the number printed into it. `reviewer_facts` seeds it up front
+    # for the same reason `extra_facts` already does: the aggregate asks the one BROAD
+    # question (`IMPLEMENTATION_CORRESPONDENCE`) a verified paper/code mismatch actually
+    # bears on, whichever target's claim happened to raise it.
+    all_facts: list[ArtifactFact] = list(extra_facts or []) + reviewer_facts
     escalations: list[str] = []
     for obj, plan in pairs:
         # A MEASUREMENT IS NOT READABLE. Refused per target rather than filtered at plan
@@ -195,13 +343,23 @@ def run_route(cfg: Config, pid: str, doc: PaperDoc, target_set: TargetSet | None
         scope = artifact_evidence.question_scope(obj.question_kind, statement)
         facts = facts_for(doc, root, snap, obj)
         all_facts += facts
-        if statement:
-            statements.append(statement)
+
+        # THE AUDITOR'S FACTS REACH A NARROW PER-TARGET QUESTION ONLY WHEN THAT TARGET'S
+        # OWN SCOPE IS THE BROAD ONE. A verified mismatch found anywhere in the checkout
+        # is real evidence about "does the code implement the paper" — the scope every
+        # real repository-paper artifact target carries (measured: all four corpus
+        # targets ask exactly this) — and is never real evidence about an unrelated
+        # NARROW question (does an entrypoint exist, is a path present, ...) that some
+        # other target happens to be asking. Scope is the harness's OWN, already-derived
+        # classification (`question_scope`), so this is the same bounded-fact discipline
+        # `discharge`'s `matching` list already applies to level-1 facts — not a new rule.
+        target_reviewer_facts = (reviewer_facts if scope == "IMPLEMENTATION_CORRESPONDENCE"
+                                 else [])
 
         one = artifact_evidence.inspect(
             doc, root, url=url, target_id=obj.target_id, scope=scope,
             statements=[statement] if statement else [],
-            facts=list(extra_facts or []) + facts)
+            facts=list(extra_facts or []) + facts + target_reviewer_facts)
         disposition = artifact_evidence.outcome_disposition(one)
 
         # WHAT THIS BUYS A LATER ROUTE, which is the honest value of an inspection that
@@ -339,5 +497,78 @@ if __name__ == "__main__":       # self-check: python -m harness.stages.artifact
 
         # A checkout that is not there is not a route.
         assert run_route(cfg, "p", doc, ts, Path(td) / "nope") == ([], None)
+
+        # ----------------------------------------------------------------------------- #
+        # THE WIRING THIS RELEASE ADDS: `_reviewer_facts` is the previously-missing call
+        # to `artifact_review_driver.run`, gated exactly like every other reason this route
+        # already declines a checkout it cannot use. A fake stands in for a real reviewer
+        # subprocess so this self-check stays offline; the wiring under test is the GATING
+        # and the FACT-FLOW, not the driver's own subprocess mechanics (that module has its
+        # own self-check for those).
+        # ----------------------------------------------------------------------------- #
+        calls: list[tuple] = []
+
+        def _fake_reviewer(cfg, pid, doc, root, prompt_text, *, url="",
+                           statements=None, facts=None):
+            calls.append((pid, url, bool(prompt_text)))
+            return ArtifactInspection(paper_id=pid, facts=[ArtifactFact(
+                probe="code_review:SUSPICIOUS_IMPLEMENTATION", authority="ARTIFACT_FACT",
+                statement="a code-only observation the auditor located and the harness "
+                          "relocated — UNVERIFIED reading, verified location")])
+
+        real_run = artifact_review_driver.run
+        artifact_review_driver.run = _fake_reviewer
+        try:
+            # GATE CLOSED -> never dispatched, whatever else is true.
+            assert cfg.allow_artifact_review is False
+            run_route(cfg, "p", doc, ts, root, url="u")
+            assert calls == [], "the gate is closed; the auditor must not be dispatched"
+
+            gated = Config(projects_dir=Path(td) / "projects-gated",
+                           allow_artifact_review=True)
+            state.create_project(gated, "", "T", pid="p")
+
+            # GATE OPEN, NO CHECKOUT -> still never dispatched.
+            assert run_route(gated, "p", doc, ts, Path(td) / "nope") == ([], None)
+            assert calls == [], "no audited checkout, whatever the gate says"
+
+            # GATE OPEN, A REAL AUDITED CHECKOUT -> dispatched exactly once, and its
+            # relocated fact reaches the paper-level aggregate — the broad question a
+            # code-only observation actually bears on.
+            _outs, whole_r = run_route(gated, "p", doc, ts, root, url="u")
+            assert len(calls) == 1, "one best-effort call per paper, not one per target"
+            assert calls[0][0] == "p" and calls[0][2] is True
+            assert whole_r is not None and any(
+                f.probe == "code_review:SUSPICIOUS_IMPLEMENTATION" for f in whole_r.facts)
+
+            # A PROPOSAL THE DRIVER COULD NOT PROMOTE PAST ENDPOINTS-VERIFIED STAYS THERE.
+            # `locate_all`/`bind_mismatch` are what decide authority, unchanged by this
+            # wiring; this only proves the wiring does not itself launder a concern into a
+            # stronger claim on the way through.
+            def _fake_concern(cfg, pid, doc, root, prompt_text, *, url="",
+                              statements=None, facts=None):
+                return ArtifactInspection(paper_id=pid, facts=[ArtifactFact(
+                    probe="code_review:PAPER_CODE_MISMATCH",
+                    authority="ENDPOINTS_VERIFIED_ARTIFACT_CONCERN",
+                    paper_ref="P0:0-10", refusal="experiment_identity_not_deterministic",
+                    statement="BOTH LOCATIONS ARE VERIFIED; the correspondence between "
+                              "them is the auditor's reading")])
+
+            artifact_review_driver.run = _fake_concern
+            capped_out, _whole_c = run_route(gated, "p", doc, ts, root, url="u")
+            broad_c = capped_out[0]
+            assert broad_c.disposition == "ARTIFACT_CONCERN_VERIFIED_ENDPOINTS", broad_c
+            assert broad_c.disposition != "ARTIFACT_MISMATCH_ESTABLISHED"
+            assert broad_c.evidence_state not in taxonomy.EVIDENCE_ABOUT_THE_PAPER
+            assert broad_c.establishes_failure is False
+
+            # AND A NARROW TARGET'S OWN BOUNDED QUESTION IS UNTOUCHED BY A CONCERN THAT
+            # HAS NOTHING TO DO WITH IT — the scope gate above, not just the authority
+            # ceiling, is what keeps a checkout-wide finding from contaminating a target
+            # asking something unrelated.
+            narrow_capped, _ = run_route(gated, "p", doc, narrow_ts, root, url="u")
+            assert narrow_capped[0].disposition == "ARTIFACT_FACT_ESTABLISHED", narrow_capped[0]
+        finally:
+            artifact_review_driver.run = real_run
 
     print("harness.stages.artifact self-check ok")

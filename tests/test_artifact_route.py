@@ -14,13 +14,15 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from harness import artifact_evidence, artifact_review_driver, planner, taxonomy
-from harness.artifacts import (ArtifactFact, ClaimRef, DiscoveredObject, PaperDoc,
-                               PlanDecision, Section, SourceSpan, TargetOutcome, TargetSet)
+from harness.artifacts import (ArtifactFact, ArtifactInspection, ClaimRef,
+                               DiscoveredObject, PaperDoc, PlanDecision, Section,
+                               SourceSpan, TargetOutcome, TargetSet)
 from harness.config import Config
 from harness.stages import artifact as artifact_stage
 
@@ -739,3 +741,206 @@ def test_one_fact_about_one_checkout_is_counted_once(tmp_path):
     kept = distinct_facts([fact("b.py", 1), fact("a.py", 1), fact("b.py", 1)])
     assert [f.span.file for f in kept] == ["b.py", "a.py"]
     assert distinct_facts([]) == []
+
+
+# --------------------------------------------------------------------------- #
+# 34-39. THE MISSING CALLER: `artifact_review_driver.run` is actually dispatched from
+# `stages/artifact.py`, and only under the preconditions this route itself checks.
+#
+# Before this section, `harness/stages/artifact.py` imported only `artifact_evidence`,
+# `claims` and `state` — never `artifact_review_driver` — so every `route.json` this
+# stage ever wrote had `"proposed": 0` because the reviewer was never dispatched, not
+# because it ran and found nothing. These tests call `artifact_stage.run_route` itself
+# (the production entry point `stages/probe.py` calls), never the driver directly.
+# --------------------------------------------------------------------------- #
+def _reader_cmd(tmp_path: Path, payload: dict, name: str = "fake_reader") -> str:
+    """A REAL subprocess that writes a fixed JSON payload to `{out}` and ignores `{prompt}`.
+
+    Exercises `artifact_review_driver.run`'s actual subprocess path — `Popen`, the pinned
+    tool-policy file, `parse_concerns`, `locate_all`'s relocate-or-drop — rather than
+    standing in for it, so a test built on this is a test of the production wiring and
+    not of a stand-in for it.
+    """
+    script = tmp_path / f"{name}.py"
+    script.write_text(
+        "import sys, json\n"
+        f"payload = {payload!r}\n"
+        "with open(sys.argv[2], 'w', encoding='utf-8') as fh:\n"
+        "    json.dump(payload, fh)\n",
+        encoding="utf-8")
+    return f'"{sys.executable}" "{script}" "{{prompt}}" "{{out}}"'
+
+
+_BROAD_CLAIM = "The released repository implements the described method."
+
+
+def test_gate_closed_never_dispatches_the_reviewer(checkout, tmp_path, monkeypatch):
+    """`SH_ALLOW_ARTIFACT_REVIEW` unset (the default) means the driver is never called —
+    not called-and-ignored, never called at all."""
+    calls: list[object] = []
+    monkeypatch.setattr(artifact_stage.artifact_review_driver, "run",
+                        lambda *a, **k: calls.append(1) or None)
+    cfg = Config(projects_dir=tmp_path / "projects")
+    assert cfg.allow_artifact_review is False
+    outcomes, whole = _route(cfg, checkout, [_target("t1", "", claim=_BROAD_CLAIM)])
+    assert calls == []
+    # The route still runs, on the deterministic probes alone — the gate is closed, not
+    # the route.
+    assert outcomes and whole is not None
+
+
+def test_gate_open_with_a_real_checkout_dispatches_the_reviewer(checkout, tmp_path,
+                                                                monkeypatch):
+    """The gate open and an audited checkout present is the ONE condition that dispatches
+    it, and its relocated fact reaches the paper-level record through the ordinary
+    `ArtifactFact` channel — no second channel was added for it."""
+    calls: list[tuple] = []
+
+    def fake_run(cfg, pid, doc, root, prompt_text, *, url="", statements=None, facts=None):
+        calls.append((pid, url, bool(prompt_text), root))
+        return ArtifactInspection(paper_id=pid, facts=[ArtifactFact(
+            probe="code_review:SUSPICIOUS_IMPLEMENTATION", authority="ARTIFACT_FACT",
+            statement="a code-only observation the auditor located and the harness "
+                      "relocated")])
+
+    monkeypatch.setattr(artifact_stage.artifact_review_driver, "run", fake_run)
+    cfg = Config(projects_dir=tmp_path / "projects", allow_artifact_review=True)
+    _outcomes, whole = _route(cfg, checkout, [_target("t1", "", claim=_BROAD_CLAIM)])
+    assert len(calls) == 1, "one best-effort call per paper, not one per target"
+    assert calls[0][0] == "p" and calls[0][2] is True
+    assert whole is not None and any(
+        f.probe == "code_review:SUSPICIOUS_IMPLEMENTATION" for f in whole.facts)
+
+
+def test_no_checkout_never_dispatches_the_reviewer_even_with_the_gate_open(tmp_path,
+                                                                           monkeypatch):
+    """No directory at all: the route's own top-of-function guard returns before a
+    snapshot is even taken, so the reviewer is never reached."""
+    calls: list[object] = []
+    monkeypatch.setattr(artifact_stage.artifact_review_driver, "run",
+                        lambda *a, **k: calls.append(1) or None)
+    cfg = Config(projects_dir=tmp_path / "projects", allow_artifact_review=True)
+    result = _route(cfg, tmp_path / "nope", [_target("t1", "", claim=_BROAD_CLAIM)])
+    assert calls == []
+    assert result == ([], None)
+
+
+def test_a_dirty_checkout_never_dispatches_the_reviewer_even_with_the_gate_open(
+        checkout, tmp_path, monkeypatch):
+    """A directory exists and is a git repository, but its working tree is not clean:
+    `snap.audited` is False, which is exactly "not a pinned checkout" and gates the
+    reviewer the same way a missing directory does."""
+    (checkout / "config.yaml").write_text("batch_size: 999\n", encoding="utf-8")  # uncommitted
+    calls: list[object] = []
+    monkeypatch.setattr(artifact_stage.artifact_review_driver, "run",
+                        lambda *a, **k: calls.append(1) or None)
+    cfg = Config(projects_dir=tmp_path / "projects", allow_artifact_review=True)
+    assert not artifact_evidence.snapshot(checkout).audited
+    _route(cfg, checkout, [_target("t1", "", claim=_BROAD_CLAIM)])
+    assert calls == []
+
+
+def test_an_unlocatable_citation_is_dropped_through_the_production_path(checkout, tmp_path):
+    """One relocatable citation and one that is nowhere in the pinned tree: the second is
+    DROPPED WHOLE by `artifact_review_driver.locate_all`, and the route this stage
+    produces reflects only the first — proving the wiring does not bypass relocation on
+    its way from the driver into this stage's own facts."""
+    payload = {"concerns": [
+        {"kind": "HARD_CODED_RESULT", "title": "t", "statement": "s",
+         "file": "config.yaml", "code_quote": "this exact string is nowhere in the file"},
+        {"kind": "SUSPICIOUS_IMPLEMENTATION", "title": "t2", "statement": "s2",
+         "file": "config.yaml", "code_quote": "batch_size: 32"},
+    ], "notes": "n"}
+    cfg = Config(projects_dir=tmp_path / "projects", allow_artifact_review=True,
+                artifact_review_cmd=_reader_cmd(tmp_path, payload))
+    _outcomes, whole = _route(cfg, checkout, [_target("t1", "", claim=_BROAD_CLAIM)])
+    assert whole is not None
+    reviewer_facts = [f for f in whole.facts if f.probe.startswith("code_review:")]
+    assert len(reviewer_facts) == 1, "the unlocatable citation must not survive"
+    assert reviewer_facts[0].span is not None
+    assert reviewer_facts[0].span.file == "config.yaml"
+
+
+def test_a_concern_cannot_self_certify_a_mismatch_through_the_production_path(
+        checkout, tmp_path):
+    """Only a DETERMINISTIC identity basis that itself relocates reaches
+    `PAPER_ARTIFACT_MISMATCH`; the auditor's own reading, however confident, caps at
+    `ARTIFACT_CONCERN_VERIFIED_ENDPOINTS` — asserted at the production entry point, not
+    only inside `artifact_evidence.bind_mismatch` itself."""
+    ambiguous = {"concerns": [{
+        "kind": "PAPER_CODE_MISMATCH", "title": "batch size", "statement": "s",
+        "file": "config.yaml", "code_quote": "batch_size: 32",
+        "paper_quote": _PAPER_BATCH, "paper_value": "128", "artifact_value": "32",
+        "experiment_id": "probably Table 2", "identity_basis": "auditor_assertion"}],
+        "notes": "n"}
+    cfg_amb = Config(projects_dir=tmp_path / "projects-amb", allow_artifact_review=True,
+                     artifact_review_cmd=_reader_cmd(tmp_path, ambiguous, "amb"))
+    out_amb, _whole = _route(cfg_amb, checkout, [_target("t1", "", claim=_BROAD_CLAIM)])
+    assert out_amb[0].disposition == "ARTIFACT_CONCERN_VERIFIED_ENDPOINTS"
+    assert out_amb[0].disposition != "ARTIFACT_MISMATCH_ESTABLISHED"
+    assert out_amb[0].evidence_state not in taxonomy.EVIDENCE_ABOUT_THE_PAPER
+    assert out_amb[0].establishes_failure is False
+
+    # The contrast: the SAME shape of concern, with a deterministic identity basis that
+    # DOES relocate (the fixture's own README, exactly as `_bind`'s defaults use it), does
+    # reach the top of the ladder — proving the cap above is a real ceiling and not a bug
+    # that would have capped everything regardless of what the auditor supplied.
+    bound = {"concerns": [{
+        "kind": "PAPER_CODE_MISMATCH", "title": "batch size", "statement": "s",
+        "file": "config.yaml", "code_quote": "batch_size: 32",
+        "paper_quote": _PAPER_BATCH, "paper_value": "128", "artifact_value": "32",
+        "config_key": "batch_size", "experiment_id": "Table 2",
+        "identity_basis": "readme_maps_the_experiment", "identity_file": "README.md",
+        "identity_quote": "Table 2 of the paper is produced by"}], "notes": "n"}
+    cfg_bound = Config(projects_dir=tmp_path / "projects-bound", allow_artifact_review=True,
+                       artifact_review_cmd=_reader_cmd(tmp_path, bound, "bound"))
+    out_bound, _whole2 = _route(cfg_bound, checkout, [_target("t1", "", claim=_BROAD_CLAIM)])
+    assert out_bound[0].disposition == "ARTIFACT_MISMATCH_ESTABLISHED"
+    assert out_bound[0].evidence_state == "ARTIFACT_EVIDENCE"
+    # AND EVEN HERE — a real, harness-verified paper/code disagreement — it is never a
+    # material failure on its own. That is invariant 8 and requirement 7 of this wiring,
+    # not a property this test is free to assume: it is asserted directly.
+    assert out_bound[0].establishes_failure is False
+
+
+def test_a_verified_concern_never_touches_a_target_this_route_does_not_own(
+        checkout, tmp_path):
+    """A verified concern reaches the artifact-inspection target that actually raises the
+    broad question it bears on; a target planned for EXECUTION is invisible to this route
+    by construction — `planned()` only ever returns `ARTIFACT_INSPECTION_ONLY` pairs — so
+    nothing this route does can suppress it, whatever the auditor found in the same
+    checkout. This is what "may narrow or inform execution planning but must never
+    suppress a required execution" means operationally: this route returns NO outcome at
+    all for the executing target, so `stages/probe.py`'s own merge
+    (`target_set.outcomes = [... not in replaced ...] + artifact_outcomes`) leaves that
+    target's real outcome untouched.
+    """
+    from harness import state
+
+    payload = {"concerns": [{
+        "kind": "PAPER_CODE_MISMATCH", "title": "batch size", "statement": "s",
+        "file": "config.yaml", "code_quote": "batch_size: 32",
+        "paper_quote": _PAPER_BATCH, "paper_value": "128", "artifact_value": "32",
+        "config_key": "batch_size", "experiment_id": "Table 2",
+        "identity_basis": "readme_maps_the_experiment", "identity_file": "README.md",
+        "identity_quote": "Table 2 of the paper is produced by"}], "notes": "n"}
+    cfg = Config(projects_dir=tmp_path / "projects", allow_artifact_review=True,
+                artifact_review_cmd=_reader_cmd(tmp_path, payload))
+    state.create_project(cfg, "", "T", pid="p")
+
+    inspection_target = _target("t1", "", claim=_BROAD_CLAIM)
+    executing_target = _target("t2", "PRINTED_QUANTITY", claim="our method reaches "
+                                                               "91.4 accuracy")
+    ts = TargetSet(
+        paper_id="p", objects=[inspection_target, executing_target],
+        plans=[_plan("t1"),
+              PlanDecision(target_id="t2", action="AUTHOR_CODE_EXECUTION",
+                          route="AUTHOR_CODE_EXECUTION", requires_execution=True)])
+    outcomes, _whole = artifact_stage.run_route(cfg, "p", _doc(), ts, checkout, url="u")
+
+    # The concern was found and DID reach the target whose own claim is the broad one.
+    assert len(outcomes) == 1 and outcomes[0].target_id == "t1"
+    assert outcomes[0].disposition == "ARTIFACT_MISMATCH_ESTABLISHED"
+    # The executing target has no outcome here AT ALL — this route does not own it and
+    # cannot suppress, defer, or overwrite it.
+    assert all(o.target_id != "t2" for o in outcomes)
