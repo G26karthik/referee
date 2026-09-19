@@ -401,14 +401,16 @@ you write directly is discarded unread, however well-formed.
 # declared and unread, so all four lenses ran on whatever the CLI defaulted to — four
 # readings from one model presented as a panel, invisible precisely because the key
 # existed. The corpus records the same collapse from the other side: `reviewer:
-# claude-sonnet-5` on all four lenses, including `overclaim`, whose declared model here is
+# claude-sonnet-5` on all four lenses, including `overclaim`, which for that run declared
 # `opus`.
 #
-# THE CEILING, stated rather than implied: this is one vendor's CLI, so "independent"
-# means four separate processes with four separate contexts and two distinct model names.
-# It is not cross-family diversity, and no arrangement of this table would make it so.
-# `audit_driver` records the model each call actually reported (`envelope.model_reported`)
-# so the panel's real composition is a fact on disk rather than a property of this table.
+# `overclaim` is `sonnet` now, like the other three, as of the 2026-09-18 closure pass —
+# an explicit operator decision (see `CLAUDE.md`) that the two-model-names property this
+# split bought was a ceiling ("one vendor's CLI", never cross-family diversity) rather
+# than a real independence guarantee, and not worth its cost at this system's scale.
+# `audit_driver` still records the model each call actually reported
+# (`envelope.model_reported`), so the panel's real composition remains a fact on disk
+# rather than a property of this table, whichever way this declaration is ever set again.
 # EVERY LENS IS READ-ONLY, AND `WebSearch` IS NOT ON THIS TABLE.
 #
 # `overclaim` held it. A lens reads the paper's own text, which `SECURITY` below states is
@@ -424,7 +426,7 @@ you write directly is discarded unread, however well-formed.
 # not inside a reader of the document it would be searching about.
 LENSES: dict[str, dict] = {
     "overclaim": {
-        "model": "opus",
+        "model": "sonnet",
         "tools": ["Read"],
         "focus": """\
 Audit, in this order:

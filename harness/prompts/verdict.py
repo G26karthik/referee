@@ -22,13 +22,18 @@ from __future__ import annotations
 # operator's notes or the web would be forming its judgement partly from material nobody
 # recorded — and this is the one delegated output that can flip `run.py` to exit 3.
 ROLE_SPEC: dict = {
-    "model": "opus",
+    "model": "sonnet",
     "tools": (),
     "bare": True,
-    "why_this_model": ("the whole-paper judgement is the one thing a threshold table "
-                       "structurally cannot do, so the strongest available reader; it is "
-                       "printed and counted by nothing, and the model that produced it is "
-                       "recorded on the sidecar so a later reader knows whose opinion it is"),
+    "why_this_model": ("as of the 2026-09-18 closure pass, the same default as every "
+                       "other role in this harness: the whole-paper judgement is the one "
+                       "thing a threshold table structurally cannot do, but the stronger "
+                       "reader this role used to default to bought only a one-vendor-CLI "
+                       "ceiling, not real independence, and was not worth its cost at this "
+                       "system's scale — override with SH_VERDICT_MODEL where the stronger "
+                       "reader is wanted back, and the model that produced this opinion is "
+                       "recorded on the sidecar either way so a later reader knows whose "
+                       "opinion it is"),
 }
 
 SECURITY = """\

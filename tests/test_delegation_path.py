@@ -216,22 +216,19 @@ def test_every_known_tool_is_either_granted_or_explicitly_denied(role: str, conf
         assert tool in conf.disallowed_tools, (role, tool)
 
 
-def test_the_declared_panel_diversity_is_in_the_command_that_actually_runs():
+def test_the_declared_model_is_in_the_command_that_actually_runs():
     """`prompts.audit.LENSES` declared a per-lens `model` that nothing read for a long time.
 
-    Prevents four readings from one model presented as a four-model panel. The defect was
-    invisible precisely because the key existed: the table said 1 opus + 3 sonnet and every
-    lens ran on the CLI's default. The corpus records the same collapse from the other
-    direction — `reviewer: claude-sonnet-5` on all four lenses including `overclaim`,
-    whose declared model is `opus`.
+    Prevents a declared model from being decoration: the defect was invisible precisely
+    because the key existed while every lens actually ran on the CLI's own default. As of
+    the 2026-09-18 closure pass all four lenses declare `sonnet` — the one-vendor-CLI
+    "diversity" a single `opus` lens used to buy was a ceiling, not real independence, and
+    was retired as not worth its cost at this system's scale (see `CLAUDE.md`) — so this
+    now checks that the uniform declaration reaches the command line, not that it varies.
     """
-    assert "--model opus" in audit_driver.default_cmd("overclaim", exe=FAKE_EXE)
-    for lens in ("protocol", "confound", "contradiction"):
-        assert "--model sonnet" in audit_driver.default_cmd(lens, exe=FAKE_EXE), lens
     for lens in LENSES:
-        assert audit_driver.lens_confinement(lens).model, lens
-    # More than one model is actually named, or the panel is diverse only on paper.
-    assert len({audit_driver.lens_confinement(ln).model for ln in LENSES}) > 1
+        assert "--model sonnet" in audit_driver.default_cmd(lens, exe=FAKE_EXE), lens
+        assert audit_driver.lens_confinement(lens).model == "sonnet", lens
 
 
 @pytest.mark.parametrize("role,build", [(r, b) for r, b in ROLES if r != "lens:overclaim"],
@@ -468,7 +465,7 @@ def test_the_tool_policy_records_the_flags_that_were_passed_and_not_which_templa
     assert detail["restricted"] is True and isinstance(detail["restricted"], bool)
     assert detail["strict_mcp"] is True
     assert detail["enforced"] is True and detail["template"] == "built_in"
-    assert detail["model_requested"] == "opus"
+    assert detail["model_requested"] == "sonnet"
     # Read-only, and the NETWORK tools are on the deny side. No lens may search: see
     # `prompts.audit.LENSES` and `tests/test_isolation_boundary.py` for the same posture
     # applied to execution.

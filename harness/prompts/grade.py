@@ -38,13 +38,16 @@ from __future__ import annotations
 # hooks and plugins from loading. For a lens those are uncontrolled variance; for this
 # reader they are a channel by which the operator's own view of the paper arrives.
 ROLE_SPEC: dict = {
-    "model": "opus",
+    "model": "sonnet",
     "tools": (),
     "bare": True,
-    "why_this_model": ("the adjudicating role, so the stronger reader; it differs from "
-                       "three of the four lenses and shares a family with `overclaim`, "
-                       "which is a ceiling of running one vendor's CLI and is recorded "
-                       "on every grade sidecar rather than described as independence"),
+    "why_this_model": ("as of the 2026-09-18 closure pass, the same model as every lens: "
+                       "the stronger-reader default this role and `overclaim` both carried "
+                       "bought only a ceiling ('one vendor's CLI'), never real cross-family "
+                       "independence, and was not worth its cost at this system's scale — "
+                       "override with SH_GRADE_MODEL where the stronger reader is wanted "
+                       "back, and the choice actually made is recorded on every grade "
+                       "sidecar either way"),
 }
 
 # The CLOSED list. A grader may name any subset of these and nothing else; an invented
