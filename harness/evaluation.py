@@ -446,14 +446,18 @@ def render(summary: dict) -> str:
     L += ["", "## From discovery to a settled question", "",
           "Six terms, each read off a different artifact. They are NOT interchangeable: "
           "`warranting an experiment` is a judgement this system made, `launched` is a "
-          "count of processes it actually started.", "",
+          "count of TARGETS on which execution started (`targets_launched`) — a separate, "
+          "smaller `processes_launched` total (below) counts the underlying seed/process "
+          "launches those targets produced.", "",
           "| Stage | Targets |", "|---|---:|",
           f"| discovered | {f.get('discovered', 0)} |",
           f"| structurally checkable | {f.get('checkable', 0)} |",
           f"| judged to warrant an experiment | {f.get('warranting_experiment', 0)} |",
-          f"| actually launched a process | {f.get('launched', 0)} |",
+          f"| targets with execution launched | {f.get('launched', 0)} |",
           f"| ran to a reconciliation | {f.get('completed', 0)} |",
-          f"| settled the question about the paper | {f.get('resolved', 0)} |"]
+          f"| settled the question about the paper | {f.get('resolved', 0)} |",
+          f"| (underlying seed/process launches across those targets) | "
+          f"{summary.get('processes_launched', 0)} |"]
 
     rex = summary.get("route_exhaustion") or {}
     if rex.get("questions"):
