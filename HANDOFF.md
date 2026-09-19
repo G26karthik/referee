@@ -532,21 +532,21 @@ Read this before you quote a capability to anyone.
 - **`scientific_class` falls back to the lens name** when a finding declared neither a
   `discrepancy_type` nor a `baseline_class`. In those cases the count is partly a count of
   what each lens chose to write.
-- **The artifact route has established 0 `PAPER_ARTIFACT_MISMATCH` on real papers.**
-  `harness/artifact_evidence.py` inspected all four repository papers: 4 inspections
-  completed, 6 narrow level-1 facts (`FILE_PRESENCE`/`DEPENDENCY_DECLARED`/…; acl=1,
-  apt-icml=2, cvpr=1, iclr=2), 0 broad implementation-correctness questions settled — that
-  question is excluded from what a bounded fact may discharge by construction. The gated
-  authors'-code auditor (`harness/artifact_review_driver.py`, behind `SH_ALLOW_ARTIFACT_REVIEW`)
-  has no production caller — `harness/stages/artifact.py` and `harness/controller.py` never
-  invoke it, so the gate currently gates nothing on the path a review actually takes. A
-  DIRECT, non-pipeline invocation of it against all four — not reproducible today by
-  running `run.py review` — produced 8 concerns proposed, 7 relocated on both the code and
-  the paper side, 1 experiment identity ESTABLISHED and 6 AMBIGUOUS, 7
-  `ENDPOINTS_VERIFIED_ARTIFACT_CONCERN` and **0 mismatches** — the one candidate with an
-  established identity had a paper value that could not be re-derived from its own quoted
-  table span (it reports five numbers, not one), and was refused rather than accepted. See
-  `docs/ARTIFACT_ROUTE_MEASUREMENT.md`.
+- **The artifact route has established 0 `PAPER_ARTIFACT_MISMATCH` on the current
+  `runs_final_2026-09-16` corpus.** The gated authors'-code auditor
+  (`harness/artifact_review_driver.py`, behind `SH_ALLOW_ARTIFACT_REVIEW`) is genuinely
+  wired into the production route: `harness/stages/artifact.py`'s `run_route` calls it once
+  per paper, gated on the env var and on an audited, cleanly pinned checkout, and what it
+  returns is merged through the same `ArtifactFact` channel the deterministic probes
+  already use — `tests/test_artifact_route.py` proves the wiring. All four repository
+  papers were inspected and produced 7 distinct narrow, scoped facts about the checkouts
+  (`acl=2, apt-icml=2, cvpr=1, iclr=2`) — entry points, declared dependencies, one source
+  pattern needing a human read — and 0 reached a bound mismatch or even an endpoint-verified
+  concern this run. Broad implementation-correctness questions remain excluded from what a
+  bounded fact may discharge by construction regardless. The driver is a live model
+  subprocess with no fixed seed, so this count can shift across regenerations of the same
+  run directory; see `docs/ARTIFACT_ROUTE_MEASUREMENT.md` and the manuscript's own
+  artifact-route paragraph for the currently-checked-in numbers.
 - **The prior-art route runs and establishes no novelty, by construction.**
   `harness/literature.py` searches public indexes for work predating the paper, against
   the paper's own novelty sentences. It can raise a concern a referee must adjudicate; it

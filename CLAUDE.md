@@ -226,8 +226,8 @@ python run.py dossier                                         # consolidate fini
 python run.py evaluate                                        # system metrics over the corpus
 python run.py sandbox [--release]                             # leased remote machines
 python run.py preflight                                       # is this batch N distinct papers?
-python -m pytest tests -q                                     # 2220 tests
-python -m pytest tests -q -m "not network"                    # 2213, no third party
+python -m pytest tests -q                                     # 2307 tests (2304 passed, 3 skipped)
+python -m pytest tests -q -m "not network"                    # 2300 passed, 7 deselected
 ```
 
 **The two env vars above are not decoration.** `--auto-audit` and `--auto-grade` select a
@@ -893,7 +893,19 @@ reproducible today by running `run.py review` — produced 8 concerns proposed, 
 paper citations relocated, 1 identity ESTABLISHED / 6 AMBIGUOUS, **7 endpoint-verified
 concerns and 0 level-2 mismatches**, which is real evidence the mechanism works and not a
 result this route currently produces on its own. `docs/ARTIFACT_ROUTE_MEASUREMENT.md`
-prints every fact, every concern, and why each refusal is the right one.
+prints every fact, every concern, and why each refusal is the right one. **This whole
+paragraph describes a PAST measured run, under code where the driver had no production
+caller at all** — not the current code, where it is wired in (see above): the fresh
+eight-paper run this revision produced dispatched the driver on all four repository papers
+through `run.py review` itself and, on `apt-icml`, it once proposed one concern, relocated
+both ends, and bound an ESTABLISHED identity, producing the corpus's first
+`PAPER_ARTIFACT_MISMATCH` from the production route rather than a direct invocation — a
+result since overwritten by later, unrelated reruns of the same route (see the Known
+Limitations bullet on this route's missing caching), which cost the corpus a second fact
+the same way in the 2026-09 closure pass — an unrelated rerun of `acl` re-dispatched this
+route and it established one fact about `acl`'s checkout rather than the two it had
+established before; the corpus's current, final state is 6 `ARTIFACT_FACT`s across the
+four repository papers and 0 established mismatches.
 
 ## What a bounded prior-art search can establish, and what it cannot
 
@@ -1114,15 +1126,57 @@ by grep:**
   argued design with test coverage, and because the ambiguous-candidate path in
   `experiment_id.resolve_experiment` is exactly where it belongs; it is listed here so that
   nobody reports it as a capability this system has.
-- **`harness/artifact_review_driver.py` is a second orphaned gate.** `harness/stages/artifact.py`
-  imports only `artifact_evidence`, `claims` and `state` — never `artifact_review_driver` —
-  and `harness/controller.py` has zero references to it, so `SH_ALLOW_ARTIFACT_REVIEW`
-  currently gates nothing on the path a review actually takes. `harness/artifact_evidence.py`
-  mentions it once, in a comment; `harness/config.py` declares the gate and its settings
-  fields but never calls `.run()`; the only caller that actually invokes it is
-  `tests/test_artifact_route.py`, as a unit test. So on every repository paper's
-  `route.json`, `"proposed": 0` means the auditor was never invoked, not that it ran and
-  proposed nothing — the same shape of defect as the entry above, on a second gate.
+- **`harness/artifact_review_driver.py` is no longer an orphaned gate.**
+  `harness/stages/artifact.py`'s `run_route` now calls `artifact_review_driver.run()` once
+  per paper (`_reviewer_facts`, `harness/stages/artifact.py:250`), gated on
+  `cfg.allow_artifact_review` AND on `artifact_evidence.snapshot(...).audited` — a real,
+  clean, pinned checkout — so a paper with no repository or an unaudited one still gets no
+  call. What comes back is merged through the same `ArtifactFact`/`ArtifactInspection`
+  channel the deterministic probes already use: unconditionally into the paper-level
+  aggregate, and into a per-target inspection only when that target's own scope is
+  `IMPLEMENTATION_CORRESPONDENCE`, so a checkout-wide finding can never answer an unrelated
+  narrow bounded question. `SH_ALLOW_ARTIFACT_REVIEW` now genuinely gates something on the
+  production path, and `route.json`'s `"proposed": 0` again means the reviewer ran and found
+  nothing, not that it was never dispatched. `tests/test_artifact_route.py` proves the wiring
+  itself (7 new tests). The fresh eight-paper run this revision produced is the first real
+  exercise of it: the driver was dispatched on all four repository papers and, on
+  `apt-icml`, proposed one config-literal disagreement (the paper's Table 2 / README-mapped
+  T5-base CNN/DM run states 16 epochs at `P25:885-901`; the pinned
+  `scripts/adaptpruning/t5_base_lm_adapt_cnndm_momentum.sh:49` sets 12), relocated it, and
+  bound its experiment identity to the checkout's own README — the corpus's first
+  `PAPER_ARTIFACT_MISMATCH` produced by the production route rather than a direct,
+  non-pipeline invocation. It settled nothing about which of the two values the paper's
+  reported numbers actually used; that would have remained a question for execution.
+
+  **And this route has no caching, which cost the corpus that exact result — twice now.**
+  `stages/artifact.run_route` calls `_reviewer_facts` — a live, temperature-bearing model
+  subprocess with no fixed seed — on EVERY invocation with the gate open. The SEALING half
+  of a governed reconstruction (`accept_reimplementation`/`ReimplementationConformance`,
+  which persists a verified binding to disk and is never silently re-authored) is genuinely
+  immune to this; nothing checks the artifact-review route the same way, and — discovered
+  during the 2026-09 closure pass — nothing checks reconstruction's own EXECUTION the same
+  way either (see the Known Limitations bullet on reconstruction execution's own missing
+  result-caching). A later pass of this same revision re-ran `run.py review` for `apt-icml`
+  three more times for reasons unrelated to artifact review (a reconstruction-sealing
+  correction, a wording fix, a cache-resync fix), each with `SH_ALLOW_ARTIFACT_REVIEW=1`
+  set, and each silently re-dispatched the driver and overwrote `apt-icml.route.json` with a
+  fresh, independent proposal. The 16-vs-12-epochs mismatch above is consequently no longer
+  reproducible from this run directory. The 2026-09 closure pass then lost a second fact the
+  same way: an unrelated rerun of `acl` (testing a fix to its one open material question)
+  re-dispatched this route and it established one fact about `acl`'s checkout rather than
+  the two it had established before. The corpus's actual, final artifact-review state (read
+  directly from `runs_final_2026-09-16/projects/<pid>/artifact/<pid>.route.json` on every
+  repository paper) is **6 `ARTIFACT_FACT`s — `acl`=1, `apt-icml`=2, `cvpr`=1, `iclr`=2 — and
+  0 established mismatches**, every `*_MISMATCH`-named probe this final dispatch proposed
+  having `authority: NONE` (refused, exactly per the discipline above: the auditor's
+  reading did not establish which config belongs to which experiment). Re-running the
+  route again in the hope of reproducing the earlier hit would be selecting a result
+  rather than reporting one, so this is not attempted; the honest statement is that a real
+  mismatch was established once, under this same production wiring, and was lost to an
+  unrelated rerun before this document could record it more permanently. The gap this
+  reveals — no caching on the artifact-review route — is real and is not fixed by this
+  revision; a future one should give this route the same seal-once discipline reconstruction
+  already has.
 - **`stages/report.unearned_support_language` is enforced at TEST time, not at run time.**
   It is the "GREEN may not borrow the words of evidence it does not have" guard and the
   renderer never calls it: `tests/test_guarantees.py` and `tests/test_reimplementation_path.py`
@@ -1224,6 +1278,23 @@ were current.
   is not cross-family diversity.** The `SESSION_SUBAGENT` lenses cannot report an enforced
   tool policy at all — `tool_policy_provable_for` is 2 of 32, exactly the CLI ones — real
   context isolation without a provable sandbox is what that mode honestly claims.
+
+  **This paragraph describes that archived run and is not the live policy.** As of the
+  2026-09-18 closure pass, `overclaim`'s declared model (`prompts/audit.py`), the blinded
+  grader's (`prompts/grade.py`) and the whole-paper verdict reader's (`prompts/verdict.py`)
+  are all `sonnet` — an explicit operator decision to stop spending the stronger model by
+  default, made once it was clear the two-model-names property above was a ceiling
+  ("one vendor's CLI") rather than real cross-family diversity, and not worth its cost at
+  this system's scale. A future run that still wants that property back can override any
+  role's model per invocation (`SH_GRADE_MODEL`, `SH_VERDICT_MODEL`, and the equivalent for
+  a lens); nothing about the mechanism above changed, only the declared defaults. No role
+  anywhere in this harness's live model-facing path defaults to `haiku` either — every
+  reading and adjudication task here (auditing, grading, the whole-paper verdict, the
+  literature query proposer and reviewer, the focused-validation designer, the
+  reconstruction generator, the authors'-code auditor, the claim-link reader) involves
+  genuine scientific judgement over open text, which is not what a basic-task model tier
+  is for; `sonnet` is the floor as well as the ceiling until a specific role is shown to
+  need less.
 - **The grader and the assessor have now run on a real corpus, to 100% coverage.** All 38
   in-scope candidates across the eight papers were independently, blindly graded
   (`grade_coverage` is `N of N` on every paper, 0 pending anywhere), and all 8 papers
@@ -1307,6 +1378,24 @@ were current.
   rather than a measurement; a rule firing for the first time on a fifth paper should be
   re-audited before its output is believed.
   `docs/ARTIFACT_ROUTE_MEASUREMENT.md` has the whole record, including every concern.
+  **This bullet, like the paragraph it summarises, describes a PAST measured run under code
+  where the driver had no production caller — not the current code.** Now that
+  `stages/artifact.run_route` calls it, the fresh eight-paper run genuinely dispatched the
+  driver through `run.py review` on all four repository papers and, on `apt-icml`, it once
+  established the corpus's first production-route `PAPER_ARTIFACT_MISMATCH`: the paper's
+  Table 2 / README-mapped T5-base CNN/DM run states 16 epochs, the pinned
+  `t5_base_lm_adapt_cnndm_momentum.sh` sets 12, and the identity bound to the checkout's own
+  README. A bounded config-literal disagreement, established once, would still not have been
+  a broad implementation-correctness verdict, and would have settled nothing about which
+  value the paper's own reported numbers were actually produced under — and this exact
+  result no longer holds: the route has no caching (see the Known Limitations bullet above
+  on this route's missing caching discipline), and this session's own later, unrelated
+  reruns of `run.py review` for `apt-icml` silently re-dispatched the same live, seedless
+  model call and overwrote it — and, in the 2026-09 closure pass, a same-session rerun of
+  `acl` for an unrelated investigation did the same thing to `acl`'s own count. The corpus's
+  current, final artifact-review state, read directly off every repository paper's
+  `artifact/<pid>.route.json`, is 6 `ARTIFACT_FACT`s (`acl`=1, `apt-icml`=2, `cvpr`=1,
+  `iclr`=2) and 0 established mismatches.
 - **The prior-art route runs and produces NO novelty conclusion, which is the design and
   not a shortfall.** Measured over the eight-paper corpus with both gates open: 23 claims
   searched, 306 queries across two indexes, 5,692 records folded to 3,798 distinct works,
@@ -1373,6 +1462,80 @@ were current.
   independent reimplementation has actually been written and sealed through
   `run.py accept`, so the INDEPENDENT_REIMPLEMENTATION provenance is exercised by tests
   and by the `driver` path, not yet end to end from a real no-code paper.
+- **A real container-execution staging gap existed and is now fixed.** `ContainerBackend`
+  had no translation step between the host paths `local_exec.write_probe`/`resolve_command`
+  build and the `/work`-rooted namespace `execute()` requires — every governed
+  reconstruction that reached execution refused with `refusing to run: cwd '...' is not
+  inside '/work'` (`harness/backends.py`'s `ContainerBackend.execute`), which is why every
+  reconstruction this harness had run before this fix ended INCONCLUSIVE for an
+  infrastructure reason rather than a scientific one. `ExecutionBackend.stage()` (default
+  identity, overridden by `ContainerBackend.stage`) now does this translation, and
+  `ContainerBackend.provision()` persists the image and mount it built
+  (`self._host_mount, self._image_name, self._pid`) so `execute()` uses the same ones
+  instead of always falling back to `DEFAULT_IMAGE`; a reconstruction with no environment of
+  its own falls back to the image's bare `python3` rather than this harness's own host
+  interpreter. Verified on real reruns of `acl` and `sanchez24a-icml`: reconstructions now
+  genuinely execute inside their assigned container (40 processes launched across the two
+  papers this run — 5 on `acl`'s one executed reconstruction, 35 across `sanchez24a-icml`'s
+  seven) and reach honest `INCONCLUSIVE` dispositions for real reasons — zero seed-to-seed
+  variance leaving the reconciler's own noise band with nothing to test against, or a
+  dependency (`torch` or `numpy`) missing from the fallback interpreter — never the old
+  infrastructure refusal. The fix applies equally to `apt-icml`'s execution path, but no
+  `apt-icml` reconstruction reached execution in the run this corpus now reflects: a later
+  verification pass found that all five of `apt-icml`'s sealed reconstructions had their
+  `comparison_target` wrongly bound, at sealing time, to a table caption unrelated to the
+  cited cell plus a dict of the paper's own literal cited values, when each reconstruction
+  script's own docstring already states that its output must never be compared against those
+  values, because the paper never specifies the third-party LoRA+Prune/Mask-Tuning baseline's
+  own training procedure. The conformance checker verifies that a quotation is
+  verbatim-present and does not judge what it is being compared against, so it had
+  mechanically accepted the binding, and the reconciler went on to compare the
+  reconstruction's output against the cited cell anyway — a since-corrected defect in what
+  was proposed as a binding, not in the checker, which is working as designed. Correcting the
+  binding rather than relaxing the non-invention/binding contract left all five honestly
+  `unbound`, and re-running this paper's probe stage lets `authorize()` correctly refuse all
+  five at `CONFORMANCE_BLOCKED` before any process starts, an unstated baseline training
+  procedure the non-invention/binding contract refuses to invent.
+- **The seven `torch`/`numpy` `ModuleNotFoundError`s above are now fixed at the code
+  level, and the fix was correctly judged impracticable to exercise against those seven
+  targets this pass.** `harness/container.py`'s `RECONSTRUCTION_BASELINE_REQUIREMENTS`
+  (`torch`, `numpy`, `transformers`, `datasets` — fixed and declared, never inferred from
+  a script's own imports) is now installed by `stages/probe.attempt_reimplementation_fallback`
+  into any reconstruction's venv that the checkout itself supplied no environment for,
+  and only for `INDEPENDENT_RECONSTRUCTION` — an `AUTHOR_CODE_EXECUTION` venv is untouched,
+  still exactly what the checkout declared. `tests/test_reconstruction_environment.py`
+  proves the mechanism for real against a live container (5 tests, one of them installing
+  a real package into a real venv and importing it back). It was NOT run against the
+  seven affected `sanchez24a-icml` targets: each of their scripts loads
+  `EleutherAI/pythia-1.4b` (several GB) fresh from HuggingFace Hub, `docker run --rm`
+  discards the container filesystem after every invocation, and the model cache is not
+  part of the bind-mounted `/work` directory — so five seeds across seven targets would
+  re-download the full model 35 times rather than once, an estimated bandwidth and
+  wall-clock cost this pass judged genuinely impracticable rather than merely
+  inconvenient. Making the cache persist (redirecting `HF_HOME` into the bind-mounted
+  `/work` directory, which DOES survive between invocations) is the identified next step
+  and is not implemented here.
+- **Reconstruction EXECUTION has no result-caching, the same gap the artifact-review
+  route already discloses above, discovered the same way: by losing a result to it.**
+  `stages/probe.attempt_reimplementation_fallback` reuses a sealed SCRIPT and its
+  CONFORMANCE verification (`reimplement_driver.load_accepted`) rather than re-authoring
+  either — that half of the "seal-once" discipline is real — but it re-executes that
+  sealed script, through the ordinary `backends.authorize()` path, on every probe
+  invocation that reaches this branch. A same-session rerun of `acl` for an unrelated
+  reason (testing a fix to Section 3's one open material question) re-attempted execution
+  for all three of `acl`'s sealed reconstruction targets while this host's Docker daemon
+  happened to be transiently unreachable, and `backends.authorize()` reports backend
+  reachability before it reports conformance (see its own docstring: "the reported reason
+  is the one an operator can act on first"), so all three were overwritten with a generic
+  `ENVIRONMENT_BLOCKED`/backend-unavailable disposition — silently discarding the
+  previously-established zero-variance execution result and two conformance refusals.
+  Recovered by re-deriving each outcome directly from the untouched underlying evidence
+  (`execution.jsonl`, the sealed conformance JSON) rather than by re-executing, and
+  verified byte-identical to the pre-incident state. The gap this reveals is real and is
+  not fixed here: a future revision should give reconstruction EXECUTION the same
+  seal-once discipline its SCRIPT and CONFORMANCE already have, so a probe re-invocation
+  for an unrelated reason cannot silently overwrite a completed result with a transient
+  environment fact.
 - `severity` is still model-asserted by the lens that wrote it. What changed:
   `harness/grading.py` now runs a second, blinded reviewer over every FATAL/MAJOR
   candidate (`--auto-grade`) and independently re-verifies its own pass-B work
