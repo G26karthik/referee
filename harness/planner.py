@@ -290,6 +290,7 @@ def plan(obj: DiscoveredObject, *, artifact_available: bool = False,
          environment_state: str = "unassessed",
          investigation_open: bool = True,
          author_code_exhausted: bool = False,
+         focused_validation_exhausted: bool = False,
          attempt: int = 1) -> PlanDecision:
     """The decision for one discovered object: resolve it cheaply, escalate, or refuse.
 
@@ -316,14 +317,24 @@ def plan(obj: DiscoveredObject, *, artifact_available: bool = False,
     is a per-call filter, not a mutation: `obj.routes` is never changed, and a fresh
     `plan()` call without the flag reproduces the original decision exactly.
 
+    `focused_validation_exhausted` is the same re-plan primitive for the OTHER route that
+    can precede a reconstruction: a design `stages.validation.prepare` could not bind is
+    also a fact only a real attempt establishes, never known at first `plan()` time. A
+    caller that re-invokes with this set gets the same treatment - FOCUSED_VALIDATION_
+    EXPERIMENT removed for THIS call only, so a comparison the paper's own method section
+    could not support falls through to INDEPENDENT_RECONSTRUCTION exactly where the
+    object's own `routes` already offer it, and to nothing otherwise.
+
     `attempt` is carried straight onto `PlanDecision.attempt` and decided by nothing here;
     the caller numbers its own attempts, and `plan()` stays a pure function of what it is
     told.
     """
     why_material = _why_material(obj)
     paper_only_no, inspection_no = _cheaper_routes_ruled_out(obj)
-    executable_order = tuple(r for r in _EXECUTABLE_ORDER
-                             if not (author_code_exhausted and r == "AUTHOR_CODE_EXECUTION"))
+    executable_order = tuple(
+        r for r in _EXECUTABLE_ORDER
+        if not (author_code_exhausted and r == "AUTHOR_CODE_EXECUTION")
+        and not (focused_validation_exhausted and r == "FOCUSED_VALIDATION_EXPERIMENT"))
 
     # THE EARLY STOP, ahead of the route ladder. A cheap route that SETTLES something is
     # still worth taking when the paper has already been disproved -- it costs nothing and
