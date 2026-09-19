@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -23,10 +24,23 @@ if sys.platform == "win32":
 
     def _lock_file(f) -> None:
         # msvcrt.locking's LK_LOCK only retries internally for ~10s before raising
-        # OSError (errno 36, "Resource deadlock avoided") — it does NOT block
+        # OSError (errno 36 / EDEADLK, "Resource deadlock avoided") — it does NOT block
         # indefinitely the way POSIX fcntl.flock(LOCK_EX) does. Retry-wrap it so a
         # longer-held lock (a slow phase handler) is waited out rather than crashing
         # the waiter, matching fcntl.flock's blocking contract.
+        #
+        # EDEADLK is NOT a reliable signal of a genuine same-thread self-deadlock on
+        # this platform: msvcrt raises the identical errno 36 once its own internal
+        # retry budget (~10 attempts) is exhausted, whether the conflicting lock is
+        # held by another thread in this same process, another process, or (the real
+        # bug this would otherwise indicate) this same thread. Measured directly against
+        # this CRT: two threads in the same process legitimately contending for this
+        # lock for longer than ~9s reproduce errno 36 with no distinguishing attribute
+        # (`winerror` is None) from a true self-deadlock — so narrowing this except to
+        # re-raise on EDEADLK was tried and reverted; it turned ordinary contention
+        # (`test_project_lock_serializes_concurrent_add_cost`) into a spurious failure.
+        # The real fix for self-deadlock is reentrancy in `project_lock` itself, below,
+        # which never reaches this function a second time on the same thread/case.
         while True:
             f.seek(0)
             try:
@@ -115,6 +129,18 @@ def create_project(cfg: Config, repo_url: str, direction: str, pid: str | None =
     return pid
 
 
+# Per-thread re-entrancy depth, keyed by paper id. `project_lock` is held for the
+# whole body of `controller.step`, and a phase handler running inside that body is
+# entitled to call `add_cost`/`append_log` itself — that is the normal shape of future
+# per-call cost tracking, not a caller bug. The OS-level lock below is not reentrant
+# (a second acquire by the same thread would block on a lock it already holds — forever
+# on POSIX `fcntl.flock`, and on Windows until `EDEADLK` is raised), so a thread that
+# already holds this case's lock must skip re-acquiring it rather than deadlock itself.
+# `threading.local` scopes the counter to this thread alone: a DIFFERENT thread or
+# process must still contend for the real OS lock, exactly as before.
+_reentrancy = threading.local()
+
+
 @contextlib.contextmanager
 def project_lock(cfg: Config, pid: str):
     """Exclusive OS-level advisory lock over one case's state.
@@ -126,16 +152,34 @@ def project_lock(cfg: Config, pid: str):
     body, so two invocations of the harness racing on the same paper id serialize
     instead of interleaving writes to `project.json`, `controller.json`,
     `discovery/targets.json`, or any other case-state file.
+
+    Reentrant per THREAD per CASE: a call already holding this case's lock on this
+    thread (e.g. a phase handler calling `add_cost` from inside `controller.step`)
+    re-enters without touching the OS lock. A different thread, a different process, or
+    the same thread on a DIFFERENT case still takes the real lock and blocks normally.
     """
+    depths = getattr(_reentrancy, "depths", None)
+    if depths is None:
+        depths = _reentrancy.depths = {}
+    if depths.get(pid, 0) > 0:
+        depths[pid] += 1
+        try:
+            yield
+        finally:
+            depths[pid] -= 1
+        return
+
     root = project_dir(cfg, pid)
     root.mkdir(parents=True, exist_ok=True)
     lock_path = root / ".lock"
     lock_path.touch(exist_ok=True)
     with open(lock_path, "r+b") as f:
         _lock_file(f)
+        depths[pid] = 1
         try:
             yield
         finally:
+            depths[pid] -= 1
             _unlock_file(f)
 
 
