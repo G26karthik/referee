@@ -336,19 +336,35 @@ def accept(cfg: Config, pid: str, doc: PaperDoc, root: str | Path, raw: str, *,
     return inspection
 
 
-def load(cfg: Config, pid: str, *, commit: str = "") -> ArtifactInspection | None:
-    """A sealed inspection for `pid`, or None. Verifies the seal, and the COMMIT.
+def load(cfg: Config, pid: str, *, commit: str = "",
+        prompt_sha256: str = "") -> ArtifactInspection | None:
+    """A sealed inspection for `pid`, or None. Verifies the seal, the COMMIT, and — when
+    given — the PROMPT.
 
     `commit`, when given, must match the snapshot's. An inspection is a set of statements
     about one tree; served for a different checkout it would be citations into a tree
     nobody looked at, which is the failure `extraction_version` describes for the paper
     side and this one enforces.
+
+    `prompt_sha256`, when given, must match what the sidecar recorded — the same shape
+    `claimlink_driver.load`/`verdict_driver.load_accepted` already use: an absent value on
+    EITHER side is never treated as a mismatch, so a sidecar sealed before this parameter
+    existed (or a caller not yet passing one) is not refused over a field that did not
+    exist then. `run()`'s prompt is a function of the paper's title, its method text, the
+    checkout's file tree, the pinned commit, the advertised URL and the paper's own
+    reported quantities (`stages.artifact._reviewer_facts`, via `prompts.artifact_review.
+    build`); a changed hash means one of those moved, and a cached reading against the OLD
+    inputs is not a cheaper answer to a question that has since changed.
     """
-    out, _sidecar = _paths(cfg, pid)
+    out, sidecar = _paths(cfg, pid)
     ok, _why = sealing.verify_seal(out, accepted_writers=WRITERS)
     if not ok:
         return None
     try:
+        rec = state.read_json(sidecar)
+        recorded_prompt = str(rec.get("prompt_sha256") or "") if isinstance(rec, dict) else ""
+        if prompt_sha256 and recorded_prompt and recorded_prompt != prompt_sha256:
+            return None
         inspection = ArtifactInspection(**state.read_json(out))
         if commit and (inspection.snapshot is None
                        or inspection.snapshot.commit != commit):
@@ -610,6 +626,24 @@ if __name__ == "__main__":       # self-check: python -m harness.artifact_review
         assert back is not None and back.relocated == 3
         assert load(cfg, "p", commit="0" * 40) is None, \
             "an inspection is about ONE tree and may not be served for another"
+
+        # `prompt_sha256`: an ABSENT value on either side is never a mismatch. This
+        # fixture was sealed through `accept()`, whose sidecar never records one (only
+        # `run()`'s own live-subprocess path does) — so a caller supplying one here must
+        # still get the inspection back, exactly like `claimlink_driver.load`/
+        # `verdict_driver.load_accepted`.
+        assert load(cfg, "p", prompt_sha256="c" * 64) is not None
+
+        # A REAL prompt-hash mismatch — the sidecar recorded one, the caller asks for a
+        # different one — is refused; the same hash back is served; and asking with none
+        # at all skips the check entirely, the identical comparison shape those two
+        # siblings already use.
+        seal(cfg, "p", back, {"written_by": "artifact_review_driver", "reader": "",
+                              "delegation_mode": "CLI_SUBPROCESS", "tool_policy": "unrecorded",
+                              "prompt_sha256": "a" * 64})
+        assert load(cfg, "p", prompt_sha256="a" * 64) is not None
+        assert load(cfg, "p", prompt_sha256="b" * 64) is None
+        assert load(cfg, "p") is not None
 
         # A file edited after sealing is not the file that was sealed.
         out, _sidecar = _paths(cfg, "p")

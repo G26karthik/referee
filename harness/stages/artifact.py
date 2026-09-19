@@ -46,6 +46,7 @@ mistaken for an answer to an unrelated bounded question a different target asked
 """
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from .. import artifact_evidence, artifact_review_driver, claims, state
@@ -259,6 +260,23 @@ def _reviewer_facts(cfg: Config, pid: str, doc: PaperDoc, root: str | Path, snap
     audited repository checkout" — so a directory that exists but is not a git checkout,
     or is a dirty one, gets no call, same as no directory at all.
 
+    **A valid sealed inspection for THIS commit and THIS prompt is reused, never
+    re-dispatched.** `artifact_review_driver.load` has done the correct read/verify
+    mechanics — hash, writer, and now the prompt — since it was written, and had zero
+    callers: every rerun of `run.py review` for an unrelated reason silently re-dispatched
+    this live, temperature-bearing model subprocess and overwrote `artifact/<pid>.
+    route.json`, which is exactly how this corpus lost a `PAPER_ARTIFACT_MISMATCH` on
+    `apt-icml` and then a fact on `acl` (see CLAUDE.md's Known limitations). The prompt
+    hash is computed from the SAME `prompt_text` this function already builds, hashed the
+    SAME way `artifact_review_driver.run` hashes it — no second, possibly different hash —
+    so a cache hit requires the pinned commit AND every paper-derived input the model was
+    actually shown (title, method text, tree listing, URL, reported quantities) to still
+    match. `statements` is deliberately NOT part of that hash: it is not shown to the
+    auditor at all (`AP.build`'s signature has no such parameter) — it only shapes what
+    `ArtifactInspection.statements_examined` records — so a target set that changed
+    between runs (a new grade, a different discovery pass) does not by itself force a
+    live model call to re-read code that has not moved.
+
     One best-effort call per paper, matching `artifact_review_driver.run`'s own contract:
     it returns `None` on ANY failure (gate closed, no reader, timeout, unusable output) and
     never raises, so a reviewer that never answers changes nothing about the deterministic
@@ -273,6 +291,11 @@ def _reviewer_facts(cfg: Config, pid: str, doc: PaperDoc, root: str | Path, snap
     prompt_text = AP.build(
         doc.title, _method_text(doc), _tree_text(root), snap.commit,
         repo_url=url, repo_path=str(root), reported_text=_reported_text(doc))
+    prompt_sha = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+    cached = artifact_review_driver.load(cfg, pid, commit=snap.commit,
+                                         prompt_sha256=prompt_sha)
+    if cached is not None:
+        return list(cached.facts)
     insp = artifact_review_driver.run(cfg, pid, doc, root, prompt_text, url=url,
                                       statements=statements)
     return list(insp.facts) if insp is not None else []
@@ -389,6 +412,19 @@ def run_route(cfg: Config, pid: str, doc: PaperDoc, target_set: TargetSet | None
         doc, root, url=url, statements=statements, facts=distinct_facts(all_facts),
         scope="IMPLEMENTATION_CORRESPONDENCE",
         escalations=sorted(set(escalations)))
+    # UNSEALED, DELIBERATELY. `route.json` is a plain overwrite rather than a third
+    # hand-rolled hash+sidecar, because it is not this stage's own cache to protect: its
+    # content is `inspect()` applied to `doc` (fixed per paper), `root` at `snap.commit`
+    # (fixed once the checkout is pinned), `statements` and `extra_facts` (this INVOCATION's
+    # own target set — legitimately free to differ run to run as discovery/grading changes,
+    # and it is correct for a rerun to reflect that), and `reviewer_facts` — which
+    # `_reviewer_facts` above now serves from `artifact_review_driver.load`'s cache whenever
+    # the commit and prompt are unchanged, rather than re-dispatching the live model call.
+    # With the model call itself made idempotent, this write is: given the same target set,
+    # byte-identical (`ArtifactInspection`/`ArtifactFact` carry no timestamp field), and
+    # given a changed target set, correctly different. Sealing this file would either
+    # duplicate a cache the inspection-level seal already provides, or — worse — freeze a
+    # target-set-dependent artifact against a legitimate reason for it to change.
     try:
         state.write_json(
             state.project_dir(cfg, pid) / "artifact" / f"{pid}.route.json",
