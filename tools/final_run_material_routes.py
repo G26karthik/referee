@@ -51,8 +51,22 @@ _PHRASE = {
         "focused validation: not tried",
     ("FOCUSED_VALIDATION_EXPERIMENT", "DISCHARGED_BLOCKED", "SPECIFICATION_BLOCKED"):
         "focused validation: specification blocked",
-    ("INDEPENDENT_RECONSTRUCTION", "COMPLETED_INCONCLUSIVE", ""):
-        "reconstruction: attempted, completed inconclusive (environment limitation)",
+    ("INDEPENDENT_RECONSTRUCTION", "COMPLETED_INCONCLUSIVE", "DEPENDENCY_MISSING"):
+        "reconstruction: attempted, completed inconclusive (environment limitation -- a "
+        "declared dependency could not be imported)",
+    ("INDEPENDENT_RECONSTRUCTION", "COMPLETED_INCONCLUSIVE", "ZERO_VARIANCE"):
+        "reconstruction: attempted, completed inconclusive (measurement boundary -- zero "
+        "seed-to-seed variance left the reconciler's noise band empty)",
+    ("INDEPENDENT_RECONSTRUCTION", "DISCHARGED_BLOCKED", "CONFORMANCE_BLOCKED"):
+        "reconstruction: attempted, failed the non-invention/binding contract (a required "
+        "ingredient the paper does not state could not be bound)",
+    ("FOCUSED_VALIDATION_EXPERIMENT", "GATE_CLOSED", "AUTHORIZATION_BLOCKED"):
+        "focused validation: gate closed (SH_ALLOW_VALIDATION_DESIGN not open)",
+    ("INDEPENDENT_RECONSTRUCTION", "DISCHARGED_BLOCKED", "SPECIFICATION_BLOCKED"):
+        "reconstruction: the paper does not specify enough to attempt one "
+        "(no stated training procedure or comparison target)",
+    ("AUTHOR_CODE_EXECUTION", "DEFERRED_POLICY", "outranked_by_a_central_target"):
+        "author code: deferred (a central target for this question already ran)",
 }
 
 

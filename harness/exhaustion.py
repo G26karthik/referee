@@ -345,6 +345,27 @@ def _attempt_for(q, route: str, objs: list, plans: list, outcomes: list, cfg) ->
             # boundary from an execution gate.
             state, blocker = "DISCHARGED_BLOCKED", "CONFORMANCE_BLOCKED"
             attempted, completed, exhausted = True, True, True
+        elif (route == "INDEPENDENT_RECONSTRUCTION" and disposition == "SPECIFICATION_BLOCKED"
+              and outcome.launched == 0):
+            # CHECKED BEFORE the gate-closed fallback below, and NARROWLY — unlike the
+            # general `disposition in DISCHARGING_BLOCKERS` branch further down, which
+            # deliberately stays AFTER the gate-closed check so a disposition like
+            # IDENTITY_BLOCKED, reached only by way of an execution gate that was itself
+            # shut, still reads as our own configuration rather than a paper fact.
+            #
+            # This one case is different in kind: `planner.plan` writes
+            # SPECIFICATION_BLOCKED for INDEPENDENT_RECONSTRUCTION at DISCOVER time, from
+            # `reimplement.assess`'s own paper-level eligibility (`requires_execution` is
+            # already False here), before ANY execution gate — SH_ALLOW_REPO_EXEC,
+            # SH_ALLOW_REIMPLEMENTATION_DRIVER, SH_ALLOW_REIMPLEMENTATION_EXEC — is ever
+            # consulted. `_gate_closed` cannot tell that apart from a route that reached
+            # this same disposition BY WAY OF a shut gate, and treated a paper that
+            # simply never states a training procedure or a comparison target
+            # (`5993d35ff0996b52`'s overclaim-05) as "open — blocked by this harness's own
+            # configuration" — attributing the paper's own silence to this harness's
+            # `.env` file, on a target the driver gate was never even asked about.
+            state, blocker = "DISCHARGED_BLOCKED", disposition
+            attempted, completed, exhausted = True, True, True
         elif (disposition == "AUTHORIZATION_BLOCKED" or _gate_closed(cfg, route)) \
                 and outcome.launched == 0:
             # Guarded on `launched == 0`, matching the CONFORMANCE_BLOCKED branch above:
@@ -366,6 +387,31 @@ def _attempt_for(q, route: str, objs: list, plans: list, outcomes: list, cfg) ->
         elif disposition == "INCONCLUSIVE" and outcome.launched > 0:
             state, attempted, completed, exhausted = (
                 "COMPLETED_INCONCLUSIVE", True, True, True)
+            # An executed reconstruction can be INCONCLUSIVE for two unrelated reasons, and
+            # reporting both under one label overstates one of them: a dependency the
+            # container's fallback interpreter could not import is a fact about THIS
+            # HARNESS's execution environment, while zero seed-to-seed variance leaving the
+            # reconciler's noise band empty is a fact about the MEASUREMENT itself, not the
+            # environment. Only the reason string distinguishes them today.
+            if route == "INDEPENDENT_RECONSTRUCTION":
+                low = (reason or "").lower()
+                if "modulenotfounderror" in low or "importerror" in low:
+                    blocker = "DEPENDENCY_MISSING"
+                elif "seed-to-seed noise measured as zero" in low or "no band to test against" in low:
+                    blocker = "ZERO_VARIANCE"
+        elif (disposition == "NOT_ATTEMPTED" and plan is not None
+              and plan.blocking_gate in ("outranked_by_a_central_target",
+                                         "answered_by_another_target")):
+            # A SUPPORTING target this run deliberately did not spend an execution on,
+            # because a CENTRAL target for the same question already absorbed the
+            # review's budget — a disclosed, reasoned POLICY choice, not a route nobody
+            # considered. Before this, `outcome.disposition == "NOT_ATTEMPTED"` matched
+            # none of the branches above (the final catch-all explicitly excludes it,
+            # since most `NOT_ATTEMPTED` outcomes really are just that), so a question
+            # whose only remaining unsettled route belonged to a deliberately-deferred
+            # supporting target stayed NOT_TRIED even though the run's own reason string
+            # already explained the deferral in plain words.
+            state, blocker = "DEFERRED_POLICY", plan.blocking_gate
         elif disposition not in ("PENDING", "NOT_ATTEMPTED"):
             attempted = True
     elif plan is not None:
