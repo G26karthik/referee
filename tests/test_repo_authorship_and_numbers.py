@@ -77,6 +77,45 @@ def test_a_paper_with_no_urls_at_all_yields_nothing():
     assert official_repo_url(doc) == "" and find_repo_urls(doc) == []
 
 
+def test_a_hyphen_the_owner_name_really_contains_survives_a_typesetter_line_break():
+    """Found auditing a Section-5 capability-study candidate: the paper's own footnote
+
+    reads "https://github.com/hassan- mahmood/SemanticMLLAttacks.git" because the PDF's
+    line wrap fell exactly on the real hyphen in "hassan-mahmood" and text extraction
+    turned that break into a space. The old regex required a bare `/` (only whitespace
+    around it) to end the owner segment, so this URL matched nothing at all and the
+    paper was misclassified as advertising no repository, despite an unambiguous
+    availability cue two words earlier.
+    """
+    doc = _doc(("Introduction",
+                "1The code of this work is available at "
+                "https://github.com/hassan- mahmood/SemanticMLLAttacks.git"))
+    assert official_repo_url(doc) == "https://github.com/hassan-mahmood/SemanticMLLAttacks"
+
+
+def test_a_line_break_inside_the_host_literal_itself_still_resolves():
+    """A second Section-5 candidate (FedSaC): "Code is accessible at
+
+    https://github. com/yankd22/FedSaC/." — the wrap fell between "github." and "com",
+    inside the host token the old regex required byte-for-byte, so the URL matched
+    nothing and the paper was misclassified as advertising no repository.
+    """
+    doc = _doc(("Introduction", "Code is accessible at https://github. com/yankd22/FedSaC/."))
+    assert official_repo_url(doc) == "https://github.com/yankd22/FedSaC"
+
+
+def test_a_run_on_hyphen_break_does_not_swallow_unrelated_prose():
+    """The fix bounds the whitespace it will absorb after a hyphen to two characters, so
+
+    an ordinary hyphenated word followed by unrelated text and, eventually, some other
+    paper's URL does not get fused into one bogus owner/repo pair.
+    """
+    doc = _doc(("Introduction",
+                "This is a well-known result, discussed at length over several "
+                "paragraphs before we mention https://github.com/someone/theirs."))
+    assert find_repo_urls(doc) == ["https://github.com/someone/theirs"]
+
+
 # --------------------------------------------------------------------------- #
 # 2. numeric parsing of a cited cell
 # --------------------------------------------------------------------------- #

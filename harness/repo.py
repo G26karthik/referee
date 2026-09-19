@@ -16,10 +16,20 @@ easy to see once you look at real output:
     "project is available at https: //github.com/.../finchain.git." both, plus .git
     "2https://github.com/facebookresearch/vissl"                   a FOOTNOTE to someone
                                                                    else's code
+    "https://github.com/hassan- mahmood/SemanticMLLAttacks.git"    a hyphen the owner
+                                                                   name really contains,
+                                                                   line-broken by the
+                                                                   typesetter into a space
+    "Code is accessible at https://github. com/yankd22/FedSaC/."   the break fell
+                                                                   inside the HOST
+                                                                   literal itself
 
 The last one is why proximity to an availability cue is scored rather than taking the
 first match: a paper's related-work footnotes routinely point at other people's
-repositories, and cloning one of those would audit the wrong project entirely.
+repositories, and cloning one of those would audit the wrong project entirely. The
+hyphen-break one is why owner/name matching tolerates a hyphen followed by a SHORT run
+of whitespace: bounded to at most two characters so a stray hyphen deep in unrelated
+prose cannot make the match run on until it finds an unrelated slash.
 """
 from __future__ import annotations
 
@@ -39,14 +49,28 @@ from .config import Config
 
 # Hosts worth cloning. Anything else (project pages, personal sites) is not a repo.
 _HOSTS = ("github.com", "gitlab.com", "bitbucket.org", "huggingface.co")
+
+
+def _host_pattern(host: str) -> str:
+    """A host literal that tolerates PDF-inserted whitespace around each dot.
+
+    A line wrap can fall on either side of the dot in "github.com" as easily as
+    anywhere else in a URL ("github. com/owner/repo", measured on a real paper) — the
+    dot itself carries no defense against it that the rest of the URL doesn't already
+    need, so it gets the same treatment as `\\s*` around `://` and `/`.
+    """
+    return re.escape(host).replace(r"\.", r"\s*\.\s*")
+
+
 _URL = re.compile(
-    r"https?\s*:\s*/\s*/\s*(?:www\.)?(" + "|".join(re.escape(h) for h in _HOSTS) + r")"
-    r"\s*/\s*([A-Za-z0-9_.\-]+)\s*/\s*([A-Za-z0-9_.\-]+)",
+    r"https?\s*:\s*/\s*/\s*(?:www\.)?(" + "|".join(_host_pattern(h) for h in _HOSTS) + r")"
+    r"\s*/\s*((?:[A-Za-z0-9_.]|-\s{0,2})+)\s*/\s*((?:[A-Za-z0-9_.]|-\s{0,2})+)",
     re.IGNORECASE,
 )
 # Phrases that mark a link as THIS paper's code rather than a citation to someone else's.
 _CUES = (
     "code is available", "code are available", "code available", "code will be",
+    "code is accessible", "code are accessible", "accessible at",
     "code and models", "code and data", "project is available", "project page",
     "open source code", "our code", "our implementation", "implementation is available",
     "source code", "codebase is", "released at", "available at", "available here", "code:",
@@ -82,8 +106,13 @@ def _normalize(host: str, owner: str, name: str) -> str:
     """Rebuild a canonical clone URL from the three captured pieces.
 
     The pieces are captured separately precisely so the whitespace PDF extraction
-    injects (`https: //github .com / owner / repo`) never reaches the output.
+    injects (`https: //github .com / owner / repo`) never reaches the output, including
+    whitespace the typesetter inserted mid-identifier by breaking a line at a real hyphen
+    (`hassan- mahmood` -> `hassan-mahmood`).
     """
+    host = re.sub(r"\s+", "", host)
+    name = re.sub(r"-\s+", "-", name)
+    owner = re.sub(r"-\s+", "-", owner)
     name = name.rstrip(".,;:)]}")               # sentence punctuation glued to the path
     if name.lower().endswith(".git"):
         name = name[:-4]
@@ -136,10 +165,11 @@ def find_repo_urls(doc: PaperDoc) -> list[str]:
     text = "\n".join(s.text for s in doc.sections)
     best: dict[str, tuple[int, int]] = {}
     for m in _URL.finditer(text):
-        url = _normalize(m.group(1), m.group(2), m.group(3))
+        host = re.sub(r"\s+", "", m.group(1))
+        url = _normalize(host, m.group(2), m.group(3))
         if not url:
             continue
-        rank = (_score(text, m.start(), m.group(1), m.group(0)), -m.start())
+        rank = (_score(text, m.start(), host, m.group(0)), -m.start())
         if url not in best or rank > best[url]:
             best[url] = rank
     return [u for u, _ in sorted(best.items(), key=lambda kv: kv[1], reverse=True)]
@@ -1040,6 +1070,21 @@ if __name__ == "__main__":  # self-check: python -m harness.repo
     assert urls[0] == "https://github.com/wuyang98/weathergen", urls
     assert "https://github.com/mbzuai-nlp/finchain" in urls, urls
     assert urls[-1] == "https://github.com/facebookresearch/vissl", "footnote cite must rank last"
+
+    hyphen_broken = PaperDoc(paper_id="t2", sections=[Section(
+        section_idx=0,
+        text="The code of this work is available at "
+             "https://github.com/hassan- mahmood/SemanticMLLAttacks.git")])
+    assert official_repo_url(hyphen_broken) == \
+        "https://github.com/hassan-mahmood/SemanticMLLAttacks", \
+        "a hyphen the owner name really contains must survive a typesetter's line break"
+
+    host_broken = PaperDoc(paper_id="t3", sections=[Section(
+        section_idx=0,
+        text="Code is accessible at https://github. com/yankd22/FedSaC/.")])
+    assert official_repo_url(host_broken) == "https://github.com/yankd22/FedSaC", \
+        "a line break inside the host literal itself must still resolve to that host"
+
     assert _parse_requirements("torch>=2.0  # comment\n-r other.txt\n\nnumpy==1.26\n") == \
         ["torch", "numpy"]
     assert _parse_environment_yml(
