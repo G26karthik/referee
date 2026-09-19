@@ -434,7 +434,7 @@ def test_the_report_states_what_it_judged_apart_from_what_it_ran():
                                       "completed": 0, "resolved": 1}}
     text = report_stage.render_reviewer_report(r, TargetSet(paper_id="p"))
     assert "2 judged to warrant an experiment" in text
-    assert "0 actually launched a process" in text
+    assert "0 target(s) with execution launched" in text
 
 
 def test_the_scope_funnel_reads_the_ledgers_own_flat_keys():
@@ -449,7 +449,7 @@ def test_the_scope_funnel_reads_the_ledgers_own_flat_keys():
     assert "25 target(s) discovered" in text
     assert "19 structurally checkable" in text
     assert "2 judged to warrant an experiment" in text
-    assert "2 actually launched a process" in text
+    assert "2 target(s) with execution launched" in text
     assert "1 settled a question about the paper" in text
 
 
@@ -461,7 +461,7 @@ def test_the_scope_funnel_is_identical_to_the_ledger_it_summarises():
     r.review_efficiency = eff
     text = report_stage.render_reviewer_report(r, ts)
     assert f"{eff['targets_warranting_experiment']} judged to warrant" in text
-    assert f"{eff['targets_launched']} actually launched" in text
+    assert f"{eff['targets_launched']} target(s) with execution launched" in text
     assert f"{eff['targets_resolved']} settled a question" in text
 
 

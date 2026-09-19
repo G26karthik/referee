@@ -2234,14 +2234,17 @@ def render_reviewer_report(report: EvalReport, target_set=None) -> str:
           f"- {fun.get('discovered', eff.get('targets_discovered', 0))} target(s) discovered, "
           f"{fun.get('checkable', eff.get('targets_addressable', 0))} structurally checkable, "
           f"{fun.get('warranting_experiment', 0)} judged to warrant an experiment, "
-          f"{fun.get('launched', 0)} actually launched a process, "
+          f"{fun.get('launched', 0)} target(s) with execution launched, "
           f"{fun.get('resolved', 0)} settled a question about the paper",
           # What ran, in the reader's vocabulary, WITHOUT the bare `reproduction_status`
           # token: `NOT_VERIFIED` belongs to two different vocabularies in this codebase
           # and reads as a verdict in both. The state is the outcome block's execution
-          # row; this line says only what program was executed.
+          # row; this line says only what program was executed. `targets_launched` counts
+          # TARGETS with execution started, never processes — `processes_launched` is the
+          # separate, larger seed/process count those targets actually produced.
           f"- what was executed: {report.execution_provenance or 'nothing'}"
-          + (f" ({fun.get('launched', 0)} process(es) launched, "
+          + (f" ({fun.get('launched', 0)} target(s) launched, "
+             f"{eff.get('processes_launched', 0)} process(es) across them, "
              f"{fun.get('completed', 0)} reached a reconciliation)"
              if fun.get('launched', 0) else ""),
           # The per-disposition breakdown, here rather than under a heading that looked
