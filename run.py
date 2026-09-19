@@ -308,8 +308,33 @@ def reviewed_papers(cfg: Config) -> list[str]:
 
 
 def cmd_stage(args: argparse.Namespace) -> int:
-    """Run ONE stage and print its compact result. For debugging, not for review."""
-    print(json.dumps(STAGES[args.name](Config.load(), args.paper), indent=2, default=str))
+    """Run ONE stage and print its compact result. For debugging, not for review.
+
+    Locked exactly the way `controller.step` locks a phase handler —
+    `with state.project_lock(cfg, case.paper_id): ...` — so this debug entrypoint cannot
+    interleave writes to `control/probe_results.json`, `control/targets/<id>/outcome.json`,
+    `artifact/<pid>.route.json`, or any other case-state file with a concurrent `review`
+    run or a second `stage` invocation against the same paper. Unlike `controller.step`,
+    there is no `CaseState` here to read a `paper_id` off, so the lock key is derived the
+    same way `controller.open_case` derives one: `--paper` for the `ingest` stage is a PDF
+    path, and the paper id is not allocated until ingestion runs, which is exactly the
+    situation `open_case` represents with an empty `case.paper_id` — so the lock key here
+    is `""` for that same situation, matching what `step` actually locks on today rather
+    than inventing a different key. (Locking on the raw PDF path itself would be worse
+    than no lock: `state.project_dir` joins it under `projects_dir` with `Path.__truediv__`,
+    which for an ABSOLUTE path silently discards `projects_dir` entirely and resolves to
+    the PDF's own path, so `project_lock` would then try to `mkdir` a directory at the
+    location of the PDF file itself.) Every other stage's `--paper` is already a case id.
+    """
+    cfg = Config.load()
+    pid = args.paper
+    if args.name == "ingest":
+        src = Path(args.paper).expanduser()
+        if src.suffix.lower() == ".pdf" or src.exists():
+            pid = ""  # not yet ingested — same lock key `step` uses pre-ingest
+    with state.project_lock(cfg, pid):
+        result = STAGES[args.name](cfg, args.paper)
+    print(json.dumps(result, indent=2, default=str))
     return 0
 
 
