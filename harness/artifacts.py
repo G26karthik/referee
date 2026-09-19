@@ -3435,6 +3435,16 @@ class TargetOutcome(_Base):
     reason: str = ""
     execution_ref: str = Field(
         default="", description="where the whole record lives, e.g. 'runs/<pid>/execution.jsonl'")
+    authorized: bool | None = Field(
+        default=None,
+        description="this target's OWN `ProbeResult.authorization.allowed`, for the "
+                    "execution that produced this outcome — None when no authorization "
+                    "record exists because nothing was executed for this target. "
+                    "`harness.guarantees` folds this, per target, into "
+                    "EXECUTION_AUTHORIZED_BY_ONE_CONJUNCTION rather than reading only the "
+                    "paper-level probe: a paper can execute several targets, including a "
+                    "reconstruction's own run, and each carries its own authorization "
+                    "record that a paper-level-only check never saw.")
     attempts: int = 0
 
     launched: int = Field(

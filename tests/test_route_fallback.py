@@ -446,7 +446,7 @@ def test_review_attempts_direct_reconstruction_for_primary_and_later_targets(
     attempted = []
 
     def fake_reconstruction(cfg, root, paper_id, paper, base_spec, reconstruction_plan,
-                            out_dir=None):
+                            out_dir=None, acq=None):
         attempted.append((base_spec.target_id, reconstruction_plan.route, out_dir))
         return ProbeResult(
             paper_id=paper_id, provenance="reimpl_exec", verdict="done",

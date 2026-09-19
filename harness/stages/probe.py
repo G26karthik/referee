@@ -830,7 +830,17 @@ def outcome_for(target_id: str, result: ProbeResult, action: str, route: str) ->
         # having started nothing, and a target can be INCONCLUSIVE having started three
         # processes, and only this number tells those apart.
         launched=result.executions,
-        execution_ref=result.script_path or "", attempts=1)
+        # `execution_ref` names "where the whole record lives" (its own description) —
+        # `result.execution_log`, this target's own `execution.jsonl`, not the script that
+        # ran. `or result.script_path` is the fallback for a result with no log at all (a
+        # refused spec writes neither), so a reader still has something to open.
+        execution_ref=(result.execution_log or result.script_path or ""),
+        # This target's OWN authorization, so a paper that ran several targets — including
+        # a reconstruction — has EVERY one's conjunction checkable, not only whichever
+        # ProbeResult happens to be `report.probe`. None when nothing was executed for this
+        # target at all (a refused-before-`authorize()` spec never reaches one).
+        authorized=(result.authorization.allowed if result.authorization is not None else None),
+        attempts=1)
 
 
 def resync_cached_outcomes(cfg: Config, pid: str) -> dict:
@@ -1161,9 +1171,40 @@ def identity_failed(spec: ProbeSpec) -> bool:
     return False
 
 
+def author_code_route_blocked(spec: ProbeSpec) -> bool:
+    """Did AUTHOR_CODE_EXECUTION genuinely fail to bind — on ANY of the gates
+    `plan_execution` checks before promoting a spec to `repo_exec` — as opposed to never
+    having been assessed at all?
+
+    `identity_failed` alone is too narrow: a prose claim naming no population never
+    reaches identity resolution at all (`experiment.state` stays `unmapped`, correctly
+    NOT a failure by that function's own design), yet the checkout can still have been
+    genuinely capability-refused — this harness's own `--seed` convention not matching
+    what the repository's entrypoint accepts is a real, ASSESSED fact about the checkout,
+    not an unassessed one. Before this, such a target's reconstruction fallback was
+    never even considered: `spec.provenance` stayed `synthesized`, `identity_failed`
+    correctly read False (identity was never reached), and the material question this
+    target answers sat NOT_TRIED — the same defect as an unattempted identity fallback,
+    on a different one of the four promotion gates.
+
+    `spec.provenance == "repo_exec"` short-circuits True immediately: a spec that DID
+    bind has nothing to fall back from, and every check below would otherwise still be
+    looking at whatever capability/identity state preceded the promotion.
+    """
+    if spec.provenance == "repo_exec":
+        return False
+    if identity_failed(spec):
+        return True
+    # `established=False` here is a GENUINE, checked refusal — `capability` is None only
+    # when no checkout was ever assessed, and that case must not trigger this.
+    if spec.capability is not None and not spec.capability.established:
+        return True
+    return False
+
+
 def replan_after_author_code_exhausted(
         obj: DiscoveredObject, plan: PlanDecision, spec: ProbeSpec) -> PlanDecision | None:
-    """Step 6's re-plan: fall back to INDEPENDENT_RECONSTRUCTION once identity has
+    """Step 6's re-plan: fall back to INDEPENDENT_RECONSTRUCTION once author code has
     genuinely failed to bind the authors' checkout to the cited claim.
 
     Discovery cannot decide this — whether AUTHOR_CODE_EXECUTION binds is a fact only a
@@ -1176,7 +1217,8 @@ def replan_after_author_code_exhausted(
     (a re-plan of anything else is not this fallback); the object's own routes offer
     INDEPENDENT_RECONSTRUCTION (which — see `discovery._routes` — only happens when the
     paper specifies enough, so this function never invents a route discovery refused);
-    and identity genuinely failed rather than being merely unassessed.
+    and `author_code_route_blocked` found a genuine, ASSESSED refusal — identity or
+    capability — rather than a gate this review simply never reached.
 
     `plan.superseded_by` is set on the ORIGINAL PlanDecision to the fallback's route —
     mutated, not replaced, so the attempt that was actually tried first stays in the
@@ -1188,7 +1230,7 @@ def replan_after_author_code_exhausted(
         return None
     if "INDEPENDENT_RECONSTRUCTION" not in obj.routes:
         return None
-    if not identity_failed(spec):
+    if not author_code_route_blocked(spec):
         return None
     fallback = planner.plan(
         obj, artifact_available=True, specification_complete=True,
@@ -1197,7 +1239,81 @@ def replan_after_author_code_exhausted(
     return fallback
 
 
-def _fallback_note(cfg: Config, fallback_plan: PlanDecision | None) -> str:
+def replan_after_validation_blocked(
+        obj: DiscoveredObject, plan: PlanDecision,
+        fv: "FocusedValidation | None") -> PlanDecision | None:
+    """The SAME re-plan primitive as `replan_after_author_code_exhausted`, for the other
+    route that can precede a reconstruction.
+
+    A material question left NOT_TRIED because nothing carried a FOCUSED_VALIDATION_
+    EXPERIMENT design's own specification-block onward is the identical defect on a
+    second route: `validation_stage.prepare` can determine that the paper's method
+    section does not support a controlled contrast (a `SPECIFICATION_BLOCKED` design),
+    and until this function existed that fact went no further — `obj.routes` could still
+    OFFER `INDEPENDENT_RECONSTRUCTION` alongside `FOCUSED_VALIDATION_EXPERIMENT`, exactly
+    as it offers it alongside `AUTHOR_CODE_EXECUTION`, and nothing ever asked whether it
+    applied.
+
+    Two conditions, both required: the target's ORIGINAL plan chose
+    `FOCUSED_VALIDATION_EXPERIMENT` (a re-plan of anything else is not this fallback),
+    and the design GENUINELY failed to bind (`fv.design` absent or `not established`) —
+    a design this review never reached (`fv is None`) is not grounds for a fallback, the
+    same distinction `identity_failed` draws for identity never having been assessed.
+    `obj.routes` must still offer `INDEPENDENT_RECONSTRUCTION` — see `discovery._routes`:
+    that only happens when the paper's specification is otherwise complete enough to
+    attempt a reconstruction, so this function cannot invent a route discovery refused.
+    """
+    if plan.route != "FOCUSED_VALIDATION_EXPERIMENT":
+        return None
+    if "INDEPENDENT_RECONSTRUCTION" not in obj.routes:
+        return None
+    if fv is None or (fv.design is not None and fv.design.established):
+        return None
+    fallback = planner.plan(
+        obj, artifact_available=True, specification_complete=True,
+        investigation_open=True, focused_validation_exhausted=True, attempt=plan.attempt + 1)
+    plan.superseded_by = fallback.route
+    return fallback
+
+
+def _reconstruction_gate_detail(cfg: Config, readiness: ReimplementationReadiness | None) -> str:
+    """The ONE reason a reconstruction did not run, checked in the order that keeps a
+    scientific fact from being reported as one of this harness's own settings.
+
+    Eligibility FIRST: `readiness.established is False` means the PAPER does not specify
+    enough (a missing REQUIRED ingredient — training, dataset, comparison target, ...),
+    which is true whatever this harness's gates are set to and must never be reported as
+    "no reviewer configured" or "the gate is shut". Before this check, a paper that failed
+    eligibility and one that simply had no driver configured produced the SAME sentence,
+    and `harness.exhaustion._gate_closed`'s static config-only test then classified both
+    as GATE_CLOSED — attributing a fact about the PAPER's own method section to this
+    harness's `.env` file, the exact defect invariant 17 names for a different mechanism.
+    """
+    if readiness is not None and not readiness.established:
+        missing = [i.kind for i in readiness.ingredients if not (i.ref or "").strip()]
+        return (f"the paper does not specify enough to attempt a governed reconstruction "
+                f"(missing: {', '.join(missing) if missing else 'a required ingredient'})")
+    ok, why = reimplement_driver.available(cfg)
+    if not ok:
+        return f"no reviewer is configured to write one ({why})"
+    if not cfg.allow_reimplementation_exec:
+        return "SH_ALLOW_REIMPLEMENTATION_EXEC is not set"
+    return ("either it did not produce a conformant reconstruction, or this backend's "
+           "isolation is insufficient to run one — see backends.authorize's "
+           "'reimpl_exec' branch")
+
+
+def reconstruction_specification_blocked(readiness: ReimplementationReadiness | None) -> bool:
+    """Is THIS the reason a reconstruction did not run: the paper's own specification,
+    not one of this harness's gates? Read by the outcome-disposition choice at both call
+    sites, so a paper like `5993d35ff0996b52` — no stated training procedure, no stated
+    comparison target — reports `SPECIFICATION_BLOCKED` (a real, DISCHARGING boundary)
+    rather than `AUTHORIZATION_BLOCKED` (this harness's own configuration, which is not)."""
+    return readiness is not None and not readiness.established
+
+
+def _fallback_note(cfg: Config, fallback_plan: PlanDecision | None,
+                   readiness: ReimplementationReadiness | None = None) -> str:
     """A short, honest suffix for a target outcome's `reason`, or '' when no fallback
     applied. Reached only when `attempt_reimplementation_fallback` returned None — a
     fallback the planner itself refused is reported with the planner's own reason; one it
@@ -1207,15 +1323,7 @@ def _fallback_note(cfg: Config, fallback_plan: PlanDecision | None) -> str:
     if fallback_plan is None:
         return ""
     if fallback_plan.requires_execution:
-        ok, why = reimplement_driver.available(cfg)
-        if not ok:
-            detail = f"no reviewer is configured to write one ({why})"
-        elif not cfg.allow_reimplementation_exec:
-            detail = "SH_ALLOW_REIMPLEMENTATION_EXEC is not set"
-        else:
-            detail = ("either it did not produce a conformant reconstruction, or this "
-                     "backend's isolation is insufficient to run one — see "
-                     "backends.authorize's 'reimpl_exec' branch")
+        detail = _reconstruction_gate_detail(cfg, readiness)
         return (f" A fallback to {fallback_plan.route} (attempt {fallback_plan.attempt}) "
                 f"was also considered, because the paper specifies enough to attempt one; "
                 f"it did not run: {detail}.")
@@ -1223,7 +1331,8 @@ def _fallback_note(cfg: Config, fallback_plan: PlanDecision | None) -> str:
            f"considered and refused: {fallback_plan.reason}")
 
 
-def _direct_reconstruction_note(cfg: Config, plan: PlanDecision | None) -> str:
+def _direct_reconstruction_note(cfg: Config, plan: PlanDecision | None,
+                                readiness: ReimplementationReadiness | None = None) -> str:
     """Why a directly planned reconstruction did not run.
 
     `_fallback_note` deliberately describes a second attempt after authors' code was
@@ -1235,15 +1344,7 @@ def _direct_reconstruction_note(cfg: Config, plan: PlanDecision | None) -> str:
     if plan is None:
         return ""
     if plan.requires_execution:
-        ok, why = reimplement_driver.available(cfg)
-        if not ok:
-            detail = f"no reviewer is configured to write one ({why})"
-        elif not cfg.allow_reimplementation_exec:
-            detail = "SH_ALLOW_REIMPLEMENTATION_EXEC is not set"
-        else:
-            detail = ("either it did not produce a conformant reconstruction, or this "
-                      "backend's isolation is insufficient to run one — see "
-                      "backends.authorize's 'reimpl_exec' branch")
+        detail = _reconstruction_gate_detail(cfg, readiness)
         return (f" The planned {plan.route} route (attempt {plan.attempt}) did not run: "
                 f"{detail}.")
     return (f" The planned {plan.route} route (attempt {plan.attempt}) was refused: "
@@ -1263,7 +1364,8 @@ def _full_paper_text(doc: PaperDoc) -> str:
 
 def attempt_reimplementation_fallback(
         cfg: Config, root: Path, pid: str, doc: PaperDoc, base_spec: ProbeSpec,
-        fallback_plan: PlanDecision | None, out_dir: Path | None = None) -> ProbeResult | None:
+        fallback_plan: PlanDecision | None, out_dir: Path | None = None,
+        acq: RepoAcquisition | None = None) -> ProbeResult | None:
     """Execute Step 6's INDEPENDENT_RECONSTRUCTION fallback with Step 8's governed
     reconstruction, when one is available or can be produced. Returns None — never a
     placeholder result — whenever no CONFORMANT sealed reconstruction exists to run, so
@@ -1277,6 +1379,15 @@ def attempt_reimplementation_fallback(
     conformant-but-under-insufficient-isolation, reconstruction is refused there exactly as
     any other inadmissible spec would be; this function only avoids attempting one that
     plainly cannot even be produced.
+
+    `acq` is the SAME checkout `_review` already acquired for the author-code attempt this
+    is a fallback from — reused, never re-cloned. When it built an environment
+    (`acq.env_path`), the reconstruction runs in it, for the same reason the authors' own
+    command does: a reconstruction with no interpreter of its own must not silently fall
+    back to this harness's OWN venv, which under a container backend is a host path with
+    no meaning inside the image (`ContainerBackend.stage` cannot place it and would have
+    to substitute a bare interpreter instead). Passing it here is the correct place to
+    settle that, once, rather than leaving each backend to guess at execution time.
     """
     if fallback_plan is None or not fallback_plan.requires_execution:
         return None
@@ -1303,11 +1414,37 @@ def attempt_reimplementation_fallback(
         table_ref=base_spec.table_ref, claimed_cell_value=base_spec.claimed_cell_value,
         metric=base_spec.metric or "accuracy", seeds=list(base_spec.seeds) or [0, 1, 2],
         arms=["reproduction"], script=script, provenance="reimpl_exec",
+        interpreter=(acq.env_path if acq is not None else "") or "",
         reimplementation_conformance=conf, written_by="harness")
     fspec = establish_comparison(fspec, fallback_plan.route)
     fdir = out_dir or (root / "runs" / pid / "reimplementation")
     fdir.mkdir(parents=True, exist_ok=True)
     state.write_json(fdir / f"{target_id}.spec.json", fspec.model_dump())
+
+    # Section 4 (2026-09 closure pass): a reconstruction whose checkout supplied no
+    # environment of its own (`acq.dependency_files` empty, so `provision()` left the venv
+    # bare) previously ran against a fallback interpreter this script's own `import torch`
+    # could never satisfy -- every governed reconstruction that reached this branch and
+    # imported a standard ML library failed with ModuleNotFoundError, a fact about this
+    # harness's own environment rather than about the paper. This installs THIS HARNESS'S
+    # OWN declared, fixed baseline (`container.RECONSTRUCTION_BASELINE_REQUIREMENTS`) --
+    # never a package this run inferred from the script's imports, and never anything for
+    # AUTHOR_CODE_EXECUTION, whose venv stays exactly what the checkout itself declared.
+    if (acq is not None and acq.env_path and not acq.dependency_files
+            and cfg.exec_backend == "container"):
+        from .. import container as container_mod
+        mount = str(Path(acq.path).parent) if acq.path else ""
+        image = container_mod.image_for(getattr(acq, "declared_python", "") or "")[0]
+        if mount:
+            ok, why = container_mod.install_reconstruction_baseline(
+                acq.env_path, mount, image, cfg.install_timeout_s)
+            if not ok:
+                # Recorded on the acquisition so it reaches `TargetOutcome.reason` the
+                # same way every other environment fact does; the reconciler still runs
+                # the script, which will fail its own ModuleNotFoundError check and be
+                # reported for that reason, never silently substituted for this one.
+                acq.reason = (acq.reason + "; " if acq.reason else "") + why
+
     return _run(cfg, root, fspec, out_dir=fdir)
 
 
@@ -1318,6 +1455,12 @@ def _review(cfg: Config, pid: str) -> dict:
         return {"error": f"no ingested paper for '{pid}' — run ingest_paper first"}
     doc = PaperDoc(**state.read_json(doc_path))
     state.set_phase(cfg, pid, "probe")
+    # PAPER-LEVEL, computed once: whether the paper itself specifies enough for a governed
+    # reconstruction at all. Read by every reconstruction-fallback note below so a paper
+    # that never named a training procedure or a comparison target reports
+    # SPECIFICATION_BLOCKED — a real, discharging boundary about the PAPER — rather than
+    # the driver-availability sentence that made it indistinguishable from a shut gate.
+    reconstruction_readiness = reimplement.assess(doc)
 
     from . import discover as discover_stage
 
@@ -1419,9 +1562,19 @@ def _review(cfg: Config, pid: str) -> dict:
         target_set.plans.append(fallback_plan)
     reconstruction_plan = original_plan if direct_reconstruction else fallback_plan
     reconstruction_result = None
-    if comparable and (direct_reconstruction or not may_run):
+    # `not may_run` is provenance-admissibility only (`admissible_if_it_succeeds`), which
+    # says nothing about identity — a repo_exec spec is "may_run" regardless of whether
+    # identity ever bound, so an identity failure on AUTHOR_CODE_EXECUTION never reached
+    # this call without `fallback_plan is not None` here: `replan_after_author_code_
+    # exhausted` already decided a genuine identity failure warrants the fallback, and
+    # that decision — not the unrelated admissibility of the ORIGINAL spec — is what must
+    # gate attempting it. Before this, every one of these targets ran the doomed
+    # author-code spec, recorded IDENTITY_BLOCKED, and never tried the reconstruction the
+    # planner had already approved: the exact "material question left NOT_TRIED because
+    # the run stopped iterating" defect, on the one route built to answer it.
+    if comparable and (direct_reconstruction or not may_run or fallback_plan is not None):
         reconstruction_result = attempt_reimplementation_fallback(
-            cfg, root, pid, doc, spec, reconstruction_plan)
+            cfg, root, pid, doc, spec, reconstruction_plan, acq=acq)
     if direct_reconstruction and reconstruction_result is not None:
         result = reconstruction_result
     elif direct_reconstruction:
@@ -1480,6 +1633,35 @@ def _review(cfg: Config, pid: str) -> dict:
             # which would report a limit of our arithmetic for a limit of their reporting.
             outcomes.append(validation_stage.outcome_for(fv, pairs[0][1]))
             validations.append(fv)
+            # THE SAME FALLBACK AUTHOR_CODE_EXECUTION GETS, on the route the design's own
+            # refusal opens rather than the identity layer's. A blocked design that never
+            # tries the reconstruction the object's own routes already offer is the exact
+            # "material question left NOT_TRIED" defect on a second originating route.
+            validation_fallback = replan_after_validation_blocked(pairs[0][0], pairs[0][1], fv)
+            if validation_fallback is not None:
+                target_set.plans.append(validation_fallback)
+                validation_reconstruction_result = attempt_reimplementation_fallback(
+                    cfg, root, pid, doc, spec, validation_fallback, acq=acq)
+                if validation_reconstruction_result is not None:
+                    outcomes.append(outcome_for(
+                        pairs[0][0].target_id, validation_reconstruction_result,
+                        validation_fallback.action, validation_fallback.route))
+                else:
+                    note = _fallback_note(cfg, validation_fallback, reconstruction_readiness)
+                    outcomes.append(TargetOutcome(
+                        target_id=pairs[0][0].target_id,
+                        disposition=("SPECIFICATION_BLOCKED"
+                                    if reconstruction_specification_blocked(
+                                        reconstruction_readiness)
+                                    else "AUTHORIZATION_BLOCKED"),
+                        action=validation_fallback.action, route=validation_fallback.route,
+                        launched=0,
+                        reason=(note.strip()
+                               or "a fallback to this route was considered and did not run"),
+                        failure_class=("none"
+                                      if reconstruction_specification_blocked(
+                                          reconstruction_readiness)
+                                      else "execution_unauthorized")))
         elif fv is not None and may_run and not direct_reconstruction:
             fv = validation_stage.adjudicate(fv, spec, result)
             outcomes.append(validation_stage.outcome_for(
@@ -1494,14 +1676,40 @@ def _review(cfg: Config, pid: str) -> dict:
             outcomes.append(outcome_for(pairs[0][0].target_id, result,
                                         pairs[0][1].action, pairs[0][1].route))
         else:
-            note = (_direct_reconstruction_note(cfg, reconstruction_plan)
+            note = (_direct_reconstruction_note(cfg, reconstruction_plan, reconstruction_readiness)
                     if direct_reconstruction else
-                    (_fallback_note(cfg, fallback_plan) if comparable else ""))
+                    (_fallback_note(cfg, fallback_plan, reconstruction_readiness) if comparable else ""))
+            spec_blocked = (comparable
+                           and (direct_reconstruction or fallback_plan is not None)
+                           and reconstruction_specification_blocked(reconstruction_readiness))
             outcomes.append(_not_started(
                 pairs[0][0], pairs[0][1],
                 (uncomparable_why if not comparable else refusal + note),
-                ("AUTHORIZATION_BLOCKED" if direct_reconstruction and comparable
+                ("SPECIFICATION_BLOCKED" if spec_blocked else
+                 "AUTHORIZATION_BLOCKED" if direct_reconstruction and comparable
                  else "IDENTITY_BLOCKED" if comparable else "COMPARISON_BLOCKED")))
+        # A FALLBACK THAT WAS CONSIDERED AND DID NOT RUN gets its OWN outcome, on the
+        # INDEPENDENT_RECONSTRUCTION route, separate from whatever the ORIGINAL
+        # AUTHOR_CODE_EXECUTION route recorded. Without this, the fallback's fate lived
+        # only as a PROSE sentence folded into the author-code outcome's `reason` — human-
+        # readable, but invisible to `harness.exhaustion`, which looks for a TargetOutcome
+        # or a PlanDecision.blocking_gate keyed on THIS route specifically. A route this
+        # review genuinely asked about — and was told "no reviewer is configured" or "the
+        # paper does not specify enough" — is not the same fact as a route nobody asked
+        # about, and route-exhaustion accounting cannot tell them apart without this.
+        if (comparable and not direct_reconstruction and fallback_plan is not None
+                and reconstruction_result is None):
+            outcomes.append(TargetOutcome(
+                target_id=pairs[0][0].target_id,
+                disposition=("SPECIFICATION_BLOCKED"
+                            if reconstruction_specification_blocked(reconstruction_readiness)
+                            else "AUTHORIZATION_BLOCKED"),
+                action=fallback_plan.action, route=fallback_plan.route, launched=0,
+                reason=(_fallback_note(cfg, fallback_plan, reconstruction_readiness).strip()
+                       or "a fallback to this route was considered and did not run"),
+                failure_class=("none"
+                              if reconstruction_specification_blocked(reconstruction_readiness)
+                              else "execution_unauthorized")))
         for obj, plan in pairs[1:]:
             # THE DYNAMIC EARLY STOP, and the only place it exists. `harness/assessment.py`
             # stops BEFORE investigation, from findings already counted at grade time; it
@@ -1536,6 +1744,41 @@ def _review(cfg: Config, pid: str) -> dict:
                             and other_fv.design.established):
                         outcomes.append(validation_stage.outcome_for(other_fv, plan))
                         validations.append(other_fv)
+                        # Same fallback as the primary target's: a blocked design that
+                        # never tries the reconstruction the object's own routes already
+                        # offer leaves that route NOT_TRIED rather than genuinely refused.
+                        other_validation_fallback = replan_after_validation_blocked(
+                            obj, plan, other_fv)
+                        if other_validation_fallback is not None:
+                            target_set.plans.append(other_validation_fallback)
+                            vtdir = root / "runs" / pid / "targets" / obj.target_id
+                            other_validation_result = attempt_reimplementation_fallback(
+                                cfg, root, pid, doc, other, other_validation_fallback,
+                                out_dir=vtdir / "reimplementation", acq=acq)
+                            if other_validation_result is not None:
+                                state.write_json(
+                                    state.control_dir(root) / "targets" / obj.target_id /
+                                    "probe_results.json",
+                                    other_validation_result.model_dump())
+                                outcomes.append(outcome_for(
+                                    obj.target_id, other_validation_result,
+                                    other_validation_fallback.action,
+                                    other_validation_fallback.route))
+                            else:
+                                vnote = _fallback_note(cfg, other_validation_fallback,
+                                                       reconstruction_readiness)
+                                v_spec_blocked = reconstruction_specification_blocked(
+                                    reconstruction_readiness)
+                                outcomes.append(TargetOutcome(
+                                    target_id=obj.target_id,
+                                    disposition=("SPECIFICATION_BLOCKED" if v_spec_blocked
+                                                else "AUTHORIZATION_BLOCKED"),
+                                    action=other_validation_fallback.action,
+                                    route=other_validation_fallback.route, launched=0,
+                                    reason=(vnote.strip() or "a fallback to this route "
+                                           "was considered and did not run"),
+                                    failure_class=("none" if v_spec_blocked
+                                                  else "execution_unauthorized")))
                         continue
                 other = establish_comparison(
                     other, plan.route,
@@ -1558,10 +1801,15 @@ def _review(cfg: Config, pid: str) -> dict:
                     outcomes.append(_not_started(obj, plan, why_here, "COMPARISON_BLOCKED"))
                     continue
                 ok_here, why_here = admissible_if_it_succeeds(cfg, other)
-                if other_direct_reconstruction or not ok_here:
+                # Same correction as the primary target's: `ok_here` is provenance
+                # admissibility, not identity, so `other_fallback is not None` — a genuine
+                # identity failure the planner already approved a fallback for — must also
+                # trigger the attempt, or this secondary target's reconstruction is left
+                # NOT_TRIED exactly as the primary's was.
+                if other_direct_reconstruction or not ok_here or other_fallback is not None:
                     other_reconstruction_result = attempt_reimplementation_fallback(
                         cfg, root, pid, doc, other, other_reconstruction,
-                        out_dir=tdir / "reimplementation")
+                        out_dir=tdir / "reimplementation", acq=acq)
                     if (other_reconstruction_result is not None
                             and other_reconstruction is not None):
                         state.write_json(ctdir / "probe_results.json",
@@ -1570,13 +1818,35 @@ def _review(cfg: Config, pid: str) -> dict:
                             obj.target_id, other_reconstruction_result,
                             other_reconstruction.action, other_reconstruction.route))
                         continue
-                    note = (_direct_reconstruction_note(cfg, other_reconstruction)
+                    note = (_direct_reconstruction_note(cfg, other_reconstruction,
+                                                        reconstruction_readiness)
                             if other_direct_reconstruction else
-                            _fallback_note(cfg, other_fallback))
+                            _fallback_note(cfg, other_fallback, reconstruction_readiness))
+                    other_spec_blocked = (
+                        (other_direct_reconstruction or other_fallback is not None)
+                        and reconstruction_specification_blocked(reconstruction_readiness))
                     outcomes.append(_not_started(
                         obj, plan, why_here + note,
-                        ("AUTHORIZATION_BLOCKED" if other_direct_reconstruction
+                        ("SPECIFICATION_BLOCKED" if other_spec_blocked else
+                         "AUTHORIZATION_BLOCKED" if other_direct_reconstruction
                          else "IDENTITY_BLOCKED")))
+                    # Same correction as the primary target's: a fallback that was
+                    # genuinely considered and did not run gets its OWN outcome on the
+                    # INDEPENDENT_RECONSTRUCTION route, not only a sentence folded into
+                    # the AUTHOR_CODE_EXECUTION outcome above.
+                    if not other_direct_reconstruction and other_fallback is not None:
+                        outcomes.append(TargetOutcome(
+                            target_id=obj.target_id,
+                            disposition=("SPECIFICATION_BLOCKED" if other_spec_blocked
+                                        else "AUTHORIZATION_BLOCKED"),
+                            action=other_fallback.action, route=other_fallback.route,
+                            launched=0,
+                            reason=(_fallback_note(cfg, other_fallback,
+                                                   reconstruction_readiness).strip()
+                                   or "a fallback to this route was considered and did "
+                                      "not run"),
+                            failure_class=("none" if other_spec_blocked
+                                          else "execution_unauthorized")))
                     continue
                 tres = _run(cfg, root, other, out_dir=tdir, results_dir=ctdir)
                 state.write_json(ctdir / "probe_results.json", tres.model_dump())

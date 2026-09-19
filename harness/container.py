@@ -61,6 +61,23 @@ _SUPPORTED_MINORS = (9, 10, 11, 12, 13)
 
 _DOCKER_TIMEOUT_S = 60
 
+# The declared, fixed baseline this harness installs for a GOVERNED RECONSTRUCTION whose
+# checkout supplies no environment of its own (`RepoAcquisition.dependency_files` empty,
+# so the venv `ContainerBackend.provision` built is a bare interpreter). These are never
+# "the paper's dependencies" -- a reconstruction script is authored by THIS HARNESS'S OWN
+# driver from the paper's stated method, never copied from the paper's repository, and it
+# commonly needs the same standard ML runtime a Python interpreter itself already is: a
+# fact about what this harness's generated code requires to exist at all, not a value the
+# paper specifies. Fixed and auditable rather than inferred from a script's own imports --
+# installing whatever a script happens to import would let the reconstruction's own text
+# choose what gets installed, which is exactly the undeclared-package risk this stays
+# clear of. Measured against the seven `sanchez24a-icml` reconstructions this exists for:
+# every one imports `torch` and `transformers`; five of seven also import `datasets`; one
+# imports `numpy`. All four cover every import across the whole set.
+RECONSTRUCTION_BASELINE_REQUIREMENTS: tuple[str, ...] = (
+    "torch", "numpy", "transformers", "datasets",
+)
+
 
 def docker_cli() -> str:
     """Path to the docker client, or "" when there is none on PATH."""
@@ -159,6 +176,35 @@ def image_for(python_version: str = "") -> tuple[str, str]:
         return DEFAULT_IMAGE, (f"the repository declares python 3.{minor}, which has no "
                                f"official slim image; {DEFAULT_IMAGE} was used instead")
     return f"python:3.{minor}-slim", ""
+
+
+def install_reconstruction_baseline(
+        py_in: str, host_mount: str, image: str, timeout: int) -> tuple[bool, str]:
+    """Install `RECONSTRUCTION_BASELINE_REQUIREMENTS` into an already-built venv.
+
+    Called ONLY from the governed-reconstruction fallback (`stages.probe
+    .attempt_reimplementation_fallback`), never from author-code execution: an
+    AUTHOR_CODE_EXECUTION spec runs the checkout's OWN declared dependencies exactly as
+    `ContainerBackend.provision` installed them, and adding anything beyond that would be
+    the undeclared-package risk this module's own docstring forbids. A reconstruction is
+    different in kind -- the script came from `harness.reimplement_driver`, not from the
+    paper's repository -- so this is this harness supplying its own generated code with a
+    runtime, the same relationship it already has with the Python interpreter itself.
+
+    Returns `(True, "")` on success and `(False, detail)` otherwise; never raises, so a
+    caller can fold the failure into `TargetOutcome.reason` exactly like every other
+    container step.
+    """
+    rc, out, err = _run(
+        run_argv([py_in, "-m", "pip", "install", "--quiet",
+                 *RECONSTRUCTION_BASELINE_REQUIREMENTS],
+                host_mount=host_mount, image=image),
+        timeout=timeout)
+    if rc != 0:
+        return False, (f"installing this harness's reconstruction baseline "
+                       f"({', '.join(RECONSTRUCTION_BASELINE_REQUIREMENTS)}) failed: "
+                       f"{(err or out).strip()[-300:]}")
+    return True, ""
 
 
 def to_container_path(host_path: str, host_mount: str) -> str:
