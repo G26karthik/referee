@@ -108,7 +108,12 @@ def test_accept_spec_seals_a_legitimate_script_and_it_is_then_trusted(tmp_path):
     doc = _bare_doc(pid)
     spec = probe_stage.build_spec(cfg, pid, doc, None)
     assert spec.provenance == "driver"
-    assert spec.script == str(script_path)
+    assert spec.script == script_path.read_text(encoding="utf-8"), (
+        "the sealed spec must carry the script's CONTENT, never the path string — "
+        "every other consumer of ProbeSpec.script (local_exec.write_probe, probe_synth) "
+        "treats it as literal source text, and storing the path here would also let the "
+        "referenced file be edited after sealing with no seal violation at all"
+    )
     assert spec.written_by == "driver_accept", (
         "written_by must be stamped by accept_spec itself, never trusted from the input")
 

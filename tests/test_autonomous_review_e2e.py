@@ -496,7 +496,12 @@ def test_an_unauthorized_experiment_produces_no_measurement(cfg: Config, tmp_pat
 
 def test_a_stale_target_state_is_not_carried_into_a_new_run(cfg: Config, tmp_path):
     """`written_by == 'harness'` marks this stage's own previous output, so a target the
-    audit has since moved past is never mistaken for an instruction to keep running it."""
+    audit has since moved past is never mistaken for an instruction to keep running it.
+
+    Since Task 4 this is refused even more directly: the write below carries no
+    `accept_spec` seal, so `spec_is_accepted` refuses it and `build_spec` never reads it
+    at all, regardless of `written_by` — a strictly stronger guarantee than the one this
+    test was originally written to pin down."""
     repo, _ = _repo(tmp_path, GENERATOR)
     doc = _doc(repo.as_uri())
     _plant(cfg, doc)
@@ -505,7 +510,7 @@ def test_a_stale_target_state_is_not_carried_into_a_new_run(cfg: Config, tmp_pat
 
     stale = ProbeSpec(paper_id=PID, written_by="harness", finding_id="gone-01",
                       table_ref="T9:r9:c9", claimed_cell_value="999")
-    state.write_json(cfg.projects_dir / PID / "runs" / PID / "spec.json", stale.model_dump())
+    state.write_json(state.control_dir(cfg.projects_dir / PID) / "spec.json", stale.model_dump())
     rebuilt = probe_stage.build_spec(cfg, PID, doc)
     assert rebuilt.finding_id != "gone-01" and rebuilt.table_ref != "T9:r9:c9"
 

@@ -179,6 +179,19 @@ def accept_spec(cfg: Config, pid: str, raw: str, *, reviewer: str = "",
     -written script (a faithful reproduction this harness could not derive on its own),
     never the paper's own repository entrypoint, which may only ever be attributed by
     `plan_execution` after a real clone, a real static audit, and a real identity match.
+
+    `script` is a PATH ONLY IN THE PROPOSAL — a real, readable file this call verifies
+    and then reads. The sealed spec's own `script` field carries the file's CONTENT, never
+    the path string, which is what every other consumer of `ProbeSpec.script` in this
+    codebase already assumes (`local_exec.write_probe` writes it directly as the probe's
+    source, `probe_synth` and `reimplement_driver` `ast.parse` it as source) — storing the
+    path instead would make a `driver_accept` spec's own execution write a filesystem path
+    into `probe.py` as if it were Python. Reading the content in HERE, at seal time, is
+    also what makes the seal mean something: `content_sha256` below hashes `spec.json`'s
+    own bytes, and hashing a spec that carries only a path would let the referenced file
+    be edited on disk after sealing with no seal violation at all — the exact
+    TOCTOU (time-of-check to time-of-use) gap this function exists to close on every
+    OTHER field. The path itself is never persisted anywhere.
     """
     data = json.loads(raw)
     if not isinstance(data, dict):
@@ -194,6 +207,10 @@ def accept_spec(cfg: Config, pid: str, raw: str, *, reviewer: str = "",
     if script and not Path(script).is_file():
         raise ValueError(f"script {script!r} does not exist; a driver spec must point "
                          f"at a real, readable file")
+    if script:
+        # Read now, once, under the same validated path checked above — never re-derive
+        # or re-open it later, so nothing downstream ever sees the path at all.
+        proposal["script"] = Path(script).read_text(encoding="utf-8")
     proposal["provenance"] = "driver"
     spec = ProbeSpec(**proposal)
 

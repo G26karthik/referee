@@ -71,8 +71,24 @@ def write_lens(cfg: Config, evidence_ref: str, statement: str) -> None:
 
 
 def write_spec(cfg: Config, **fields) -> None:
-    state.write_json(state.project_dir(cfg, PID) / "runs" / PID / "spec.json",
-                     {"paper_id": PID, **fields})
+    """Seal a driver-supplied spec through the real accept_spec path (Task 4) — a bare
+    file dropped at the old `runs/<pid>/spec.json` location is no longer trusted at all.
+
+    `script`, when given, is literal probe source text, exactly as this suite's own
+    fixtures always wrote it. `accept_spec` requires a `script` proposal to be a real,
+    readable file (which it then reads into the sealed spec's `script` field, never the
+    path — see `accept_spec`'s own docstring), so it is written to a real file here first,
+    exactly as a genuine driver submission would be.
+    """
+    fields = dict(fields)
+    script_text = fields.get("script")
+    if script_text:
+        script_path = state.project_dir(cfg, PID) / "runs" / PID / "probe.py"
+        script_path.parent.mkdir(parents=True, exist_ok=True)
+        script_path.write_text(script_text, encoding="utf-8")
+        fields["script"] = str(script_path)
+    raw = json.dumps({"paper_id": PID, **fields})
+    probe_stage.accept_spec(cfg, PID, raw, reviewer="test", mode="MANUAL")
 
 
 # --------------------------------------------------------------------------- #
@@ -179,8 +195,12 @@ def test_a_harness_written_spec_is_re_derived_against_the_current_audit(cfg: Con
     assert (spec1.finding_id, spec1.table_ref, spec1.claimed_cell_value) == (
         "overclaim-01", "T0:r0:c1", "11.11")
     assert spec1.written_by == "harness"
-    # Exactly what `stages/probe.run` does at the end of a run.
-    state.write_json(state.project_dir(cfg, PID) / "runs" / PID / "spec.json",
+    # Exactly what `stages/probe.run` does at the end of a run (Task 4 moved this write
+    # to `control/`). Since Task 4, this is doubly refused: it is not merely
+    # `written_by == "harness"`, it also carries no `accept_spec` seal at all, so
+    # `spec_is_accepted` refuses it outright and `build_spec` never even reads it —
+    # a strictly stronger guarantee than the one this test was written to pin down.
+    state.write_json(state.control_dir(state.project_dir(cfg, PID)) / "spec.json",
                      spec1.model_dump())
 
     # The audit is re-run; the target has moved to a different finding and cell.
@@ -217,15 +237,25 @@ def test_selected_target_cannot_inherit_another_findings_claim_or_value(cfg: Con
 
 
 def test_a_genuine_human_override_survives_across_runs(cfg: Config):
-    """The fix must not cost the driver override its whole purpose: a hand-written
-    spec.json (no `written_by`) must still be honoured verbatim, run after run, even
-    after `stages/probe.run` would have persisted a spec of its own in its place."""
+    """The fix must not cost the driver override its whole purpose: a SEALED, genuine
+    driver override must still be honoured verbatim, even after `stages/probe.run` would
+    have persisted a spec of its own in its place (`_review`'s own guard: it only ever
+    re-persists a `written_by == "harness"` spec, never a sealed `driver_accept` one).
+
+    Before Task 4, "no `written_by`" alone was what made a hand-written spec.json
+    trusted — the exact unauthenticated-override gap that task closed. The genuine
+    replacement for "driver override" is now an explicit `accept_spec` seal, which
+    `write_spec` performs; `written_by` is `driver_accept`, not empty, and that is
+    itself the proof the seal — not a file's mere absence of a flag — is what admits it.
+    """
     _lens_finding(cfg, "overclaim-01", "T0:r0:c1", "11.11")
     write_spec(cfg, script="print('driver script')\n", finding_id="overclaim-01",
               table_ref="T0:r0:c1", claimed_cell_value="11.11")
     spec = probe_stage.build_spec(cfg, PID, _doc_with_two_cells())
     assert spec.script == "print('driver script')\n"
-    assert spec.written_by == ""
+    assert spec.written_by == "driver_accept", (
+        "a genuine driver override is sealed, and its written_by says so — it no longer "
+        "survives merely by lacking the harness's own marker")
 
 
 def test_grounded_delta_helper_reads_percent_and_pp(cfg: Config):
