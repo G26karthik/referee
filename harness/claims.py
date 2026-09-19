@@ -225,9 +225,9 @@ def parse_quantity(text: str) -> ReportedQuantity | None:
       3. Anything else  =>  None.
 
     Rule 3 is why a table caption listing six numbers yields nothing. Picking one would
-    be positional coincidence, which is the same defect `local_exec.json_metric`'s
-    last-object-wins fallback is criticised for; a span that reports two unrelated
-    numbers reports no single quantity, and saying so is the honest answer.
+    be positional coincidence, the same defect a last-object-wins JSON scan would commit;
+    a span that reports two unrelated numbers reports no single quantity, and saying so
+    is the honest answer.
     """
     raw = _THOUSANDS.sub("", (text or "").strip())
     if not raw:

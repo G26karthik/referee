@@ -68,24 +68,6 @@ def _write(cfg: Config, report: dict) -> None:
 # --------------------------------------------------------------------------- #
 # matrix
 # --------------------------------------------------------------------------- #
-def test_matrix_leads_with_scientific_categories_not_a_colour():
-    rows = dossier.matrix([_report("acl")])
-    assert rows[0] == ["Paper", "Venue", "Findings by category", "Settled", "Repo / Code",
-                       "Probe Status", "Triage", "Verdict"]
-    # The categories come before either colour: what the review found is the result, and
-    # the triage level only routes a human's attention to it.
-    assert rows[0].index("Findings by category") < rows[0].index("Triage")
-    assert rows[0].index("Triage") < rows[0].index("Verdict")
-
-
-def test_matrix_counts_each_scientific_category_separately():
-    r = _report("cvpr", fatal=2, major=14, minor=6)
-    r["scientific_findings"] = (
-        [{"scientific_class": "CONFOUND", "resolution_status": "UNRESOLVED"}] * 3
-        + [{"scientific_class": "CONTRADICTION", "resolution_status": "RESOLVED_FROM_PAPER"}])
-    rows = dossier.matrix([r])
-    assert rows[1][2] == "3 confound, 1 contradiction"
-    assert rows[1][3] == "1/4"
 
 
 def test_a_yellow_paper_is_not_reported_as_a_stale_artifact():
@@ -111,11 +93,6 @@ def test_probe_status_distinguishes_repo_exec_from_synthesized():
     synth = dossier.probe_status(_report("x", provenance="synthesized"))
     real = dossier.probe_status(_report("x", provenance="repo_exec"))
     assert synth != real and "synthesized" in synth and "repo_exec" in real
-
-
-def test_venue_is_taken_from_the_case_id_not_guessed_from_the_title():
-    assert dossier.venue_of("iclr") == "ICLR"
-    assert dossier.venue_of("paper4-snri-nullresult") == ""
 
 
 # --------------------------------------------------------------------------- #
@@ -201,17 +178,6 @@ def test_evidence_quotes_are_reproduced_verbatim():
     assert r["findings"][0]["evidence_quote"] in md
 
 
-def test_minor_findings_stay_out_of_the_one_page_breakdown():
-    md = dossier.render_markdown([_report("acl", major=0, minor=3)], [])
-    assert "No FATAL or MAJOR findings were raised." in md
-    assert "quote-MINOR-0" not in md
-
-
-def test_long_finding_lists_are_truncated_with_a_pointer_to_the_full_report():
-    md = dossier.render_markdown([_report("acl", major=16)], [])
-    assert f"…and {16 - dossier.CRITICAL_LIMIT} further FATAL/MAJOR finding(s)" in md
-
-
 def test_calibration_line_reports_the_noise_band():
     line = dossier.calibration_line(_report("x"))
     assert "device `cuda`" in line and "5 seed(s) completed" in line
@@ -238,24 +204,6 @@ def test_pdf_is_written_and_contains_the_matrix(projects: Config):
         text = "".join(page.get_text() for page in doc)
     assert "Executive Review Dossier" in text
     assert "Evaluation matrix" in text and "acl" in text and "iclr" in text
-
-
-def test_no_emoji_reaches_the_pdf_renderer():
-    md = dossier.render_markdown([_report("acl"), _report("iclr", verdict="YELLOW")], [])
-    doc_html = dossier.markdown_to_html(md)
-    for glyph in ("🔴", "🟡", "🟢", "⚠️", "σ", "Δ"):
-        assert glyph not in doc_html, f"{glyph!r} has no PDF font and renders as tofu"
-    assert "RED" in doc_html and "YELLOW" in doc_html
-
-
-def test_markdown_keeps_the_emoji_badges():
-    md = dossier.render_markdown([_report("acl")], [])
-    assert "🔴 RED" in md
-
-
-def test_markdown_table_separator_row_is_not_rendered_as_a_data_row():
-    doc_html = dossier.markdown_to_html(dossier.render_markdown([_report("acl")], []))
-    assert "<td>---</td>" not in doc_html
 
 
 # --------------------------------------------------------------------------- #

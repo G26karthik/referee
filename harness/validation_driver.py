@@ -43,15 +43,13 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import claims, delegation, reviewer_cli, sealing, state
-from .artifacts import (FocusedValidation, NEVER_ASSUMED, PREDICTED_DIRECTIONS,
+from . import claims, delegation, reviewer_cli
+from .artifacts import (NEVER_ASSUMED, PREDICTED_DIRECTIONS,
                         PaperDoc, SETTLEMENT_RULES, SettlementCondition)
 from .config import Config
 from .prompts import validation as VP
 from .reviewer_cli import (Confinement, _kill_tree, denied_tools, operator_confinement,
                            unwrap_envelope, write_pinned_settings)
-
-WRITERS = ("validation_driver",) + tuple(delegation.WRITTEN_BY.values())
 
 # What a designer may supply. Everything that decides what the design IS, or what its
 # result would be entitled to say, is the harness's.
@@ -276,45 +274,6 @@ def settlement_from(proposed: dict) -> SettlementCondition | None:
 
 
 # --------------------------------------------------------------------------------------
-# SEALING
-# --------------------------------------------------------------------------------------
-def _paths(cfg: Config, pid: str) -> tuple[Path, Path]:
-    out = state.project_dir(cfg, pid) / "validation" / f"{pid}.validation.json"
-    return out, out.with_suffix(".driver.json")
-
-
-def seal(cfg: Config, pid: str, fv: FocusedValidation, record: dict) -> dict:
-    """Dead code today (see the module docstring) — no live caller builds `record` for
-    this yet, but this is refactored for consistency with the other 8 seal instances, on
-    the same terms `literature_driver.seal` is: `mode`/`reviewer`/`tool_policy` fall back
-    to harmless generic defaults when `record` does not state them, and the caller's own
-    literal fields always win via `extra`.
-    """
-    out, _sidecar = _paths(cfg, pid)
-    return sealing.seal(
-        out, fv.model_dump(),
-        mode=record.get("delegation_mode", "MANUAL"),
-        reviewer=record.get("reviewer") or record.get("reader", ""),
-        tool_policy=record.get("tool_policy", "unrecorded"),
-        extra={**record, "paper_id": pid, "target_id": fv.target_id,
-              "designed": int(bool(fv.design is not None and fv.design.established)),
-              "disposition": fv.disposition, "launched": fv.launched},
-    )
-
-
-def load(cfg: Config, pid: str) -> FocusedValidation | None:
-    """A sealed focused validation for `pid`, or None. Verifies the seal before trusting it."""
-    out, _sidecar = _paths(cfg, pid)
-    ok, _why = sealing.verify_seal(out, accepted_writers=WRITERS)
-    if not ok:
-        return None
-    try:
-        return FocusedValidation(**state.read_json(out))
-    except Exception:                              # noqa: BLE001 — a bad seal is no seal
-        return None
-
-
-# --------------------------------------------------------------------------------------
 # THE CALL
 # --------------------------------------------------------------------------------------
 def call(cfg: Config, prompt_text: str, *, tag: str = "validation") -> tuple[str, dict]:
@@ -407,7 +366,7 @@ if __name__ == "__main__":       # self-check: python -m harness.validation_driv
     assert conf.allowed_tools == (), conf.allowed_tools
     for tool in ("WebSearch", "WebFetch", "Bash", "Read", "Grep", "Write"):
         assert tool in conf.disallowed_tools, tool
-    assert conf.model == "sonnet" and conf.enforced is True
+    assert conf.model == VP.DESIGN_ROLE_SPEC["model"] and conf.enforced is True
 
     # A DESIGNER MAY NOT SIGN THE HARNESS'S NAME.
     proposal, meta = parse_design(json.dumps({

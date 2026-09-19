@@ -38,6 +38,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import delegation, reviewer_cli, sealing, state
@@ -105,9 +106,11 @@ def grade_confinement(cfg: Config, *, settings_sha256: str = "") -> Confinement:
     """
     if cfg.grade_cmd.strip():
         return operator_confinement("grader")
+    allowed = GP.ROLE_SPEC.get("tools", ())
     return Confinement(
-        role="grader", allowed_tools=(), disallowed_tools=denied_tools(()),
-        add_dir=(), model=role_model(cfg), restricted=True, strict_mcp=True, bare=True,
+        role="grader", allowed_tools=allowed, disallowed_tools=denied_tools(allowed),
+        add_dir=(), model=role_model(cfg), restricted=True, strict_mcp=True,
+        bare=GP.ROLE_SPEC.get("bare", True),
         settings_sha256=settings_sha256, output_format="json",
     )
 
@@ -325,36 +328,54 @@ def run_candidate(cfg: Config, pid: str, slug: str, prompt: Path, out: Path, *,
         shutil.rmtree(policy_dir, ignore_errors=True)
 
 
+_WITHHELD = ["severity", "severity_rationale", "lens", "other_findings",
+            "prior_grades", "verdict_thresholds", "derivation_table"]
+
+
+def _fill_one(cfg: Config, pid: str, slug: str, prompt: Path,
+              out_path: Path) -> tuple[str, dict | None, Exception | None]:
+    try:
+        rec = run_candidate(cfg, pid, slug, prompt, out_path, withheld=_WITHHELD)
+        detail = rec.get("tool_policy_detail") or {}
+        state.append_log(cfg, pid, artifact_type="grade_auto", phase="grade",
+                         headers={"slug": slug, "verdict": rec["verdict"],
+                                  "seconds": rec["seconds"],
+                                  "model_requested": detail.get("model_requested", ""),
+                                  "model_reported": (rec.get("envelope") or {}).get(
+                                      "model_reported", ""),
+                                  "confinement_enforced": bool(detail.get("enforced")),
+                                  "desiderata_passed": rec.get("desiderata_passed")},
+                         path=str(out_path))
+        return slug, rec, None
+    except (GradeDriverError, RateLimited, NonRetryable) as e:
+        return slug, None, e
+
+
 def fill(cfg: Config, pid: str, awaiting: list[str], prompts: dict[str, str]) -> dict:
     """Attempt every pending candidate. Mirrors `audit_driver.fill` exactly, including
     the retry-policy buckets — a `later` or `never` failure must not consume a grading
-    retry any more than it should consume an audit one."""
+    retry any more than it should consume an audit one — and the same bounded concurrent
+    dispatch (`cfg.grade_concurrency`): graders are blinded from each other by
+    construction (zero tools, no shared context), so running several at once weakens
+    nothing the stage exists to guarantee.
+    """
     filled, failed, rate_limited, blocked, kinds = [], {}, {}, {}, {}
     grade_dir = state.project_dir(cfg, pid) / "audit" / "grade"
-    withheld = ["severity", "severity_rationale", "lens", "other_findings",
-               "prior_grades", "verdict_thresholds", "derivation_table"]
-    for slug in awaiting:
-        prompt = Path(prompts[slug])
-        try:
-            rec = run_candidate(cfg, pid, slug, prompt, grade_dir / f"{slug}.json",
-                                withheld=withheld)
-            filled.append(slug)
-            detail = rec.get("tool_policy_detail") or {}
-            state.append_log(cfg, pid, artifact_type="grade_auto", phase="grade",
-                             headers={"slug": slug, "verdict": rec["verdict"],
-                                      "seconds": rec["seconds"],
-                                      "model_requested": detail.get("model_requested", ""),
-                                      "model_reported": (rec.get("envelope") or {}).get(
-                                          "model_reported", ""),
-                                      "confinement_enforced": bool(detail.get("enforced")),
-                                      "desiderata_passed": rec.get("desiderata_passed")},
-                             path=str(grade_dir / f"{slug}.json"))
-        except (GradeDriverError, RateLimited, NonRetryable) as e:
-            kind = getattr(e, "kind", "unknown")
-            retry = getattr(e, "retry", "now")
-            kinds[slug] = {"kind": kind, "retry": retry,
-                           "reset_hint": getattr(e, "reset_hint", "")}
-            {"later": rate_limited, "never": blocked}.get(retry, failed)[slug] = str(e)
+
+    def _dispatch(slug: str):
+        return _fill_one(cfg, pid, slug, Path(prompts[slug]), grade_dir / f"{slug}.json")
+
+    workers = max(1, min(len(awaiting), cfg.grade_concurrency))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for slug, _rec, e in pool.map(_dispatch, awaiting):
+            if e is None:
+                filled.append(slug)
+            else:
+                kind = getattr(e, "kind", "unknown")
+                retry = getattr(e, "retry", "now")
+                kinds[slug] = {"kind": kind, "retry": retry,
+                               "reset_hint": getattr(e, "reset_hint", "")}
+                {"later": rate_limited, "never": blocked}.get(retry, failed)[slug] = str(e)
     return {"filled": filled, "failed": failed, "rate_limited": rate_limited,
             "blocked": blocked, "kinds": kinds}
 

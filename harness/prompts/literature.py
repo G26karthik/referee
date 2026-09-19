@@ -30,11 +30,13 @@ from __future__ import annotations
 from ..artifacts import LITERATURE_RELATIONS
 from .audit import SECURITY
 
-# `sonnet` for both. Proposing search terms is a language task and comparing two abstracts
-# is a bounded reading; neither is the kind of judgement the expensive model buys, and the
-# harness re-checks the only things that could be got wrong silently — the addresses, the
-# passages and the dates.
-QUERY_ROLE_SPEC = {"role": "literature query proposer", "model": "sonnet", "tools": ()}
+# Two tiers, not one. Proposing search terms from a closed 6-family list is a language
+# task — rewriting a claim sentence into a handful of keyword strings — and the harness
+# re-checks the only things that could be got wrong silently (the addresses, the passages,
+# the dates), so `haiku` buys nothing less here than `sonnet` did. Comparing a retrieved
+# abstract against an addressed claim is real reading comprehension — does this overlap
+# undermine novelty — so it keeps the stronger tier.
+QUERY_ROLE_SPEC = {"role": "literature query proposer", "model": "haiku", "tools": ()}
 REVIEW_ROLE_SPEC = {"role": "literature reviewer", "model": "sonnet", "tools": ()}
 
 # The query families the proposer may use. Closed, because an open one turns a bounded

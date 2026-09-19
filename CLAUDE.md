@@ -226,8 +226,15 @@ python run.py dossier                                         # consolidate fini
 python run.py evaluate                                        # system metrics over the corpus
 python run.py sandbox [--release]                             # leased remote machines
 python run.py preflight                                       # is this batch N distinct papers?
-python -m pytest tests -q                                     # 2307 tests (2304 passed, 3 skipped)
-python -m pytest tests -q -m "not network"                    # 2300 passed, 7 deselected
+python -m pytest tests -q                                     # 2332 tests
+python -m pytest tests -q -m "not network"                    # 2290 passed, 33 skipped,
+                                                                # 7 deselected, 2 failures
+                                                                # (confirmed pre-existing/
+                                                                # environment-dependent —
+                                                                # a container runtime and a
+                                                                # second-boundary timing
+                                                                # race, neither touched by
+                                                                # the 2026-09-19 pass)
 ```
 
 **The two env vars above are not decoration.** `--auto-audit` and `--auto-grade` select a
@@ -352,7 +359,10 @@ Do not weaken these to make more papers executable or more findings reportable.
 18. **Positional coincidence may not establish a reconciliation.** `parse_metric` prefers
     a target-bound output object over a named one over a structured one over a bare key,
     and REFUSES when the winning tier disagrees with itself. The generic last-JSON-wins
-    scan (`json_metric`) is diagnostic-only and is not on the execution path.
+    scan this used to fall back to (`json_metric`) was proven unused — nothing but its own
+    self-check and a diagnostic flag ever called it — and was deleted in the 2026-09-19
+    simplification pass; positional last-JSON-wins now has no path to a reconciliation at
+    all, rather than an unused one.
 19. **The reviewer's report and the machine trace are two artifacts.** The report is
     bounded BY CONSTRUCTION — a per-category cap, a global finding cap, and a cap on
     every other section — not by hoping the paper is short: over the current corpus it
@@ -1057,7 +1067,6 @@ first, at `no_arms`, and the designer is never called.
 | execute | `SH_ALLOW_REPO_EXEC` | off | running the repository's own entrypoint |
 | reimpl. driver | `SH_ALLOW_REIMPLEMENTATION_DRIVER` | off | delegating the governed reconstruction's authoring and its separate conformance verification |
 | reimpl. exec | `SH_ALLOW_REIMPLEMENTATION_EXEC` | off | running a reconstruction that conformance verification bound; checked inside `authorize()` |
-| alignment trial | `SH_ALLOW_ALIGNMENT_TRIAL` | off | probing a candidate command's `--help` surface. **Gates nothing today: `alignment/trial.py` has no production caller** (see Known limitations) |
 | diagnostic | `SH_DIAGNOSTIC_MODE` | off | running an inadmissible probe anyway and recording its result SEPARATELY, where it settles nothing |
 
 `SH_AUDIT_BUDGET_CHARS` lives outside `Config` and now decides how much of the paper one
@@ -1070,6 +1079,24 @@ is the default (70,000), not the live value.
 `SH_MAX_TARGETS` (default 3) is a BUDGET, not a gate: which targets are worth pursuing is
 `planner`'s decision and the order is `priority`'s, so lowering it drops the least useful
 targets rather than an arbitrary subset. Raising it costs compute and changes no rule.
+
+**Lens/part dispatch, grading and the artifact+literature routes now run concurrently,
+bounded.** Before the 2026-09-19 simplification pass every one of these was a plain
+sequential `for` loop over blocking subprocess calls — nothing in `harness/` used
+`concurrent.futures`, `threading` (beyond `project_lock`'s own reentrancy bookkeeping) or
+`asyncio` at all. `audit_driver.fill` and `grade_driver.fill` now dispatch their pending
+units on a bounded `ThreadPoolExecutor` (`SH_AUDIT_CONCURRENCY` / `SH_GRADE_CONCURRENCY`,
+default 4 each), and `stages/probe.run_probe` runs `artifact_stage.run_route` and
+`literature_stage.run_route` concurrently on a 2-worker pool before applying their two
+outcome-merges sequentially. None of this weakens isolation — it strengthens it, in the
+same sense running four lenses as four separate operator terminals would: each unit
+already gets its own subprocess, its own sandboxed cwd, its own pinned settings, and its
+own prompt/output files, and the two routes read only `target_set` and write to disjoint
+files. The one real hazard found was `state.append_log`'s plain `open(..., "a").write(...)`,
+unsynchronized because every prior caller ran on one thread; it now takes an in-process
+`threading.Lock`. Reading-part synthesis units still wait for their own lens's parts to
+seal first (`stages/audit.py`'s existing deferred-dispatch bookkeeping), so a synthesis is
+never dispatched concurrently with the parts it reads.
 
 The audit lenses themselves run with `--allowedTools`, `--add-dir <papers dir>`, and a
 sandboxed empty cwd (`audit_driver.py`) — a lens can `Read` the original PDF to settle a
@@ -1119,13 +1146,16 @@ rather than the paper.
 **Found by the 2026-09-16 release audit, each verified by reading the code rather than
 by grep:**
 
-- **`harness/alignment/trial.py` is orphaned.** `may_trial` and `run_trial` are called only
-  from the module's own self-check and from `tests/test_alignment.py`. Nothing in
-  `experiment_id`, `backends` or `stages/probe` invokes them, so `SH_ALLOW_ALIGNMENT_TRIAL`
-  currently gates nothing. The module is kept rather than deleted because it is a complete,
-  argued design with test coverage, and because the ambiguous-candidate path in
-  `experiment_id.resolve_experiment` is exactly where it belongs; it is listed here so that
-  nobody reports it as a capability this system has.
+- **`harness/alignment/trial.py` was deleted in the 2026-09-19 simplification pass.** It
+  gated nothing (`may_trial`/`run_trial` had no caller outside their own self-check and
+  `tests/test_alignment.py`), and the 2026-09-16 audit's argument for keeping it — "a
+  complete, argued design with test coverage" — was an argument for a future capability,
+  not a present one. `SH_ALLOW_ALIGNMENT_TRIAL`, `Config.allow_alignment_trial` and
+  `artifacts.TrialResult` were removed with it; `ArgSpec` and the rest of
+  `harness/alignment/` (`argparse_surface`, `candidates`, `configs`, `configuration`,
+  `evaluator`) are unaffected and remain wired into `experiment_id.resolve_experiment`.
+  Re-adding a `--help`-confirmation step is still exactly the ambiguous-candidate path's
+  to make, if a future revision wants it.
 - **`harness/artifact_review_driver.py` is no longer an orphaned gate.**
   `harness/stages/artifact.py`'s `run_route` now calls `artifact_review_driver.run()` once
   per paper (`_reviewer_facts`, `harness/stages/artifact.py:250`), gated on
@@ -1201,10 +1231,11 @@ by grep:**
   over the renderer beats a filter inside it) and it is not what "the report refuses to say
   it" would mean. Same for `stages/report.material_failures`, whose body is `return []`: it
   makes invariant 8 statically checkable and is not on any path.
-- **`json_metric` is unused, not merely diagnostic-only.** CLAUDE.md called it
-  diagnostic-only; `local_exec` reads it for a `saw_json_metric` flag and nothing else
-  consumes the value. The stronger statement is the true one: positional last-JSON-wins
-  never reaches a reconciliation.
+- **`json_metric` was deleted in the 2026-09-19 simplification pass.** It was proven
+  unused rather than merely diagnostic-only — nothing consumed its return value, and
+  `local_exec.StartupEvidence.saw_json_metric` (a real, separate, still-live raw-stdout
+  scan for JSON-shaped startup evidence) is not to be confused with it. Positional
+  last-JSON-wins now has no path to a reconciliation.
 - **`docs/HARNESS_ARCHITECTURE.md` §3 is stale in three ways** and is superseded by the
   phase table above: it lists six phases rather than nine, says only `audit` is retryable
   when `controller.RETRYABLE` is `("audit", "grade")`, and says `--force-probe` rewinds to
@@ -1232,6 +1263,31 @@ by grep:**
   now layering its own schema-specific extra check (a prompt-freshness check, a commit
   match, an independent-verification cross-check) on top of the shared core exactly the
   way `stages/audit.py`'s `unit_is_accepted` already layered one on `_sealed`.
+- **A round of scattered dead code was found and removed in the 2026-09-19 simplification
+  pass, beyond `alignment/trial.py` and `json_metric` above.**
+  `harness/validation_driver.py`'s `seal`/`load`/`_paths` and their `WRITERS` constant were
+  deleted — the module's own docstring already called `seal` "dead code today," and nothing
+  ever called `load`; `FocusedValidation`'s persistence for this route remains exactly what
+  it was, the in-memory accumulation `stages/probe.py` already does plus the plain
+  diagnostic `validation.driver.json` it already writes. `DiscoveredObject.discovery_confidence`
+  (declared, never set by `discovery._object`, never read anywhere) was deleted from
+  `artifacts.py`; `_Base`'s `extra="allow"` means old run artifacts that still carry the key
+  remain readable. `harness.controller.PhaseOutcome.advances` (an orphaned property nothing
+  called) and `harness.config.Config.device` / `.validation_max_designs` (two declared,
+  never-read config fields — `SH_DEVICE` and `SH_VALIDATION_MAX_DESIGNS` never gated or
+  budgeted anything) were also removed. The `src.suffix.lower() == ".pdf" or src.exists()`
+  predicate that `controller.open_case`, `controller._phase_ingest` and `run.py cmd_stage`
+  each carried as an identical, independently-typed copy is now the one function
+  `controller.is_new_pdf_source`, called from all three. Two items surfaced but were
+  deliberately NOT deleted after closer reading found them load-bearing:
+  `state.add_cost`/`append_log`'s `cost_usd` threading has no production caller either, but
+  is the direct subject of four real concurrency-safety regression tests in
+  `tests/test_state_locking.py` (a lost-update race and a reentrant-self-deadlock proof),
+  so it stays; `harness/claimgraph.py`'s `compare_with_existing`/`Delta` are reachable only
+  from the module's own `python -m harness.claimgraph <pid>` CLI and self-check, but the
+  module's own docstring frames them as the deliberately-kept measurement a future
+  `discovery._centrality` rewrite would need first, which is a project decision rather than
+  dead weight.
 
 **THE SEVEN SHIPPED REVIEWS IN `projects/` PREDATE EVERYTHING BELOW.** They were produced
 under older code and are the record of that run. Nothing in this section has been
@@ -1322,14 +1378,45 @@ were current.
   ("one vendor's CLI") rather than real cross-family diversity, and not worth its cost at
   this system's scale. A future run that still wants that property back can override any
   role's model per invocation (`SH_GRADE_MODEL`, `SH_VERDICT_MODEL`, and the equivalent for
-  a lens); nothing about the mechanism above changed, only the declared defaults. No role
-  anywhere in this harness's live model-facing path defaults to `haiku` either — every
-  reading and adjudication task here (auditing, grading, the whole-paper verdict, the
-  literature query proposer and reviewer, the focused-validation designer, the
-  reconstruction generator, the authors'-code auditor, the claim-link reader) involves
-  genuine scientific judgement over open text, which is not what a basic-task model tier
-  is for; `sonnet` is the floor as well as the ceiling until a specific role is shown to
-  need less.
+  a lens); nothing about the mechanism above changed, only the declared defaults.
+
+  **This paragraph in turn describes the policy through the 2026-09-18 closure pass and is
+  no longer the live one.** The 2026-09-19 simplification pass re-examined the blanket
+  "no role defaults to `haiku`" claim above against what each role is actually asked to
+  produce, rather than against what its name suggests, and found the claim held for the
+  roles with real decision authority but not for two roles this harness's own prompt-file
+  docstrings already called mechanical: `prompts.literature.QUERY_ROLE_SPEC` (proposing up
+  to six search strings from a closed 6-family taxonomy — "a language task... the expensive
+  model buys nothing here that verification does not already guarantee," `literature.py`'s
+  own words, predating this pass) and `prompts.claimlink.ROLE_SPEC` ("a location task, not
+  a judgement task," `claimlink.py`'s own words). Both now default to `haiku`, each
+  re-verified in full downstream exactly as before (a query is checked only by what it
+  retrieves; a claim-link pairing is refused outright on any citation, arithmetic or
+  chronology mismatch), so nothing about the ADMISSIBILITY of what either role produces
+  changed — only which tier reads the text first. `prompts.validation.DESIGN_ROLE_SPEC`
+  (naming the variable two arms differ in) moved to `haiku` on the same argument, made in
+  its own docstring before this pass and left unacted on until now. Every role that
+  decides something no deterministic check later re-derives — the four audit lenses, the
+  blinded grader, the whole-paper verdict, the literature COMPARISON reader (real
+  reading-comprehension judgement about novelty overlap, not term extraction), the
+  authors'-code auditor, and the reconstruction generator (writing code, not classifying
+  text, and the one candidate this pass treated with more caution than the others'
+  docstrings argued for) — is unchanged at `sonnet`. `SH_LITERATURE_MODEL` still overrides
+  only the reader; the query proposer and the validation designer have no override lever
+  of their own, by design, matching their own declared defaults rather than an operator's
+  ambient config.
+
+  **And two more roles were found to have the identical declared-vs-actual drift the
+  2026-09-18 fix above closed for `LENSES[lens]["model"]`.**
+  `prompts.claimlink.ROLE_SPEC["tools"]` declared `()` while `claimlink_driver.link_confinement`
+  actually granted `("Read",)` — both are now `("Read",)`, and the confinement builder
+  reads `tools` from the spec instead of hardcoding it, so the two cannot drift apart
+  again. `prompts.grade.ROLE_SPEC`, `prompts.verdict.ROLE_SPEC` and
+  `prompts.reimplement.ROLE_SPEC` all declared `tools`/`bare` fields their drivers never
+  read (each hardcoded `allowed_tools=()`/`bare=True` directly); all three confinement
+  builders now read from the spec too. Harmless today because the hardcoded values
+  happened to agree, but it was the same duplicated-source-of-truth shape that produced
+  the wrong "a panel of four models" claim once already.
 - **The grader and the assessor have now run on a real corpus, to 100% coverage.** All 38
   in-scope candidates across the eight papers were independently, blindly graded
   (`grade_coverage` is `N of N` on every paper, 0 pending anywhere), and all 8 papers

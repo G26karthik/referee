@@ -66,12 +66,23 @@ class LiteratureDriverError(RuntimeError):
     pass
 
 
-def role_model(cfg: Config) -> str:
+def role_model(cfg: Config, *, query: bool = False) -> str:
+    """The query proposer and the reader are two roles with two declared defaults
+    (`prompts.literature.QUERY_ROLE_SPEC` vs `REVIEW_ROLE_SPEC`) — proposing search terms
+    from a closed family list is a language task the module's own docstring says the
+    expensive tier buys nothing on, so it has no operator override of its own and always
+    runs at its declared default; the reader keeps `cfg.literature_model`'s override,
+    since comparing a claim against a retrieved abstract is real reading comprehension."""
+    if query:
+        return delegation.resolve_model("", LP.QUERY_ROLE_SPEC.get("model", ""))
     return delegation.resolve_model(cfg.literature_model, LP.REVIEW_ROLE_SPEC.get("model", ""))
 
 
-def review_confinement(cfg: Config, *, settings_sha256: str = "") -> Confinement:
-    """NO TOOLS. The reader is given two texts and asked to compare them.
+def review_confinement(cfg: Config, *, settings_sha256: str = "",
+                       query: bool = False) -> Confinement:
+    """NO TOOLS, for either role this builds a confinement for — the query proposer or the
+    reader that compares a claim against retrieved abstracts (`query=True` selects the
+    former, whose declared model tier is cheaper; see `role_model`).
 
     Zero rather than `Read`, and the zero is load-bearing. A reader with `WebFetch` would
     search the literature itself, and then the passage it quoted would be from a page this
@@ -80,11 +91,11 @@ def review_confinement(cfg: Config, *, settings_sha256: str = "") -> Confinement
     reach this harness's own artifacts, including the findings it must not see.
     """
     if cfg.literature_cmd.strip():
-        return operator_confinement("literature reviewer")
+        return operator_confinement("literature query proposer" if query else "literature reviewer")
     return Confinement(
         role="literature", allowed_tools=(), disallowed_tools=denied_tools(()),
-        add_dir=(), model=role_model(cfg), restricted=True, strict_mcp=True, bare=False,
-        settings_sha256=settings_sha256, output_format="json",
+        add_dir=(), model=role_model(cfg, query=query), restricted=True, strict_mcp=True,
+        bare=False, settings_sha256=settings_sha256, output_format="json",
     )
 
 
@@ -311,7 +322,7 @@ def call(cfg: Config, prompt_text: str, *, tag: str = "literature"
         prompt, out = Path(td) / "prompt.md", Path(td) / "out.txt"
         prompt.write_text(prompt_text, encoding="utf-8")
         policy_dir = Path(tempfile.mkdtemp(prefix="sh-lit-policy-"))
-        conf = review_confinement(cfg)
+        conf = review_confinement(cfg, query=tag.startswith("queries"))
         settings_path = ""
         try:
             if conf.enforced:

@@ -299,8 +299,8 @@ class ReportedQuantity(_Base):
 
     Deliberately willing to find NOTHING. Two numbers in a span with no relation stated
     between them is not a reported quantity, it is two numbers, and picking one would be
-    the same positional coincidence that `local_exec.json_metric` was criticised for.
-    See `harness.claims.parse_quantity` for the three rules that decide.
+    positional coincidence. See `harness.claims.parse_quantity` for the three rules that
+    decide.
     """
 
     value: float | None = Field(default=None, description="the quantity, or None if none is unambiguous")
@@ -1553,9 +1553,8 @@ class ArgSpec(_Base):
     """One CLI argument an entrypoint's own `argparse.add_argument` call declares.
 
     Written by `harness.alignment.argparse_surface`, which reads the SOURCE and never
-    runs it — `harness.alignment.trial` is the only place in that package that asks the
-    program itself, and it is optional and gated. Every field here is what the source
-    text says, not what a real invocation would show.
+    runs it. Every field here is what the source text says, not what a real invocation
+    would show.
     """
 
     flag: str = ""
@@ -1566,42 +1565,7 @@ class ArgSpec(_Base):
     is_flag: bool = Field(
         default=False, description="action='store_true': no value, presence only")
     source_ref: str = ""
-
-
-class TrialResult(_Base):
-    """The outcome of an OPTIONAL, GATED `--help` invocation confirming an argparse
-    surface against the real program.
-
-    Written by `harness.alignment.trial`, which never touches `backends.authorize()` or
-    `experiment_id.identities_established` — this is a separate, narrower permission
-    (`SH_ALLOW_ALIGNMENT_TRIAL`) for a cheaper action than running the experiment, gated
-    by the SAME isolation sufficiency repository execution requires, because a `--help`
-    invocation still executes the top of a file this harness did not write.
-
-    `attempted=False` means the gate was shut or isolation was insufficient — nothing
-    ran, and that is recorded as a fact about this review, never as a fact about the
-    repository. `attempted=True, ran=False` means a process was refused or crashed before
-    producing output. Only `ran=True` entitles `confirmed_flags` to mean anything.
-    """
-
-    attempted: bool = False
-    ran: bool = False
-    argv: list[str] = Field(default_factory=list)
     returncode: int | None = None
-    stdout_tail: str = Field(default="", description="the last portion of stdout, for a reader")
-    confirmed_flags: list[str] = Field(
-        default_factory=list,
-        description="flags the STATIC surface declared and this run's --help output "
-                    "actually printed")
-    unconfirmed_flags: list[str] = Field(
-        default_factory=list,
-        description="flags the static surface declared that --help did NOT print — a "
-                    "real disagreement between the source read and the program run, "
-                    "worth a reader's attention")
-    backend: str = ""
-    reason: str = Field(default="", description="why nothing ran, when `attempted` is False")
-
-
 class _Identity(_Base):
     state: str = Field(default="unmapped", description=" | ".join(IDENTITY_STATES))
     evidence: list[IdentityEvidence] = Field(default_factory=list)
@@ -3316,7 +3280,6 @@ class DiscoveredObject(_Base):
     evidence_requirements: list[str] = Field(
         default_factory=list, description="what would have to be true to check this")
     routes: list[str] = Field(default_factory=list, description="admissible routes, cheapest first")
-    discovery_confidence: str = Field(default="", description=" | ".join(CONFIDENCES))
     status: str = Field(default="PENDING", description=" | ".join(TARGET_DISPOSITIONS))
     proposed_by_lens: bool = Field(
         default=False, description="the lens's own `verifiable_by_experiment`, kept as METADATA")

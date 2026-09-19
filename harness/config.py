@@ -100,7 +100,6 @@ class Config:
         default_factory=lambda: pathlib.Path(os.environ["SH_PROJECTS_DIR"]).resolve()
         if os.environ.get("SH_PROJECTS_DIR") else PROJECTS_DIR)
     python: str = field(default_factory=lambda: os.environ.get("SH_PYTHON") or sys.executable)
-    device: str = field(default_factory=lambda: os.environ.get("SH_DEVICE", "auto"))
     seeds: int = field(default_factory=lambda: int(os.environ.get("SH_SEEDS", "5")))
     probe_timeout_s: int = field(default_factory=lambda: int(os.environ.get("SH_PROBE_TIMEOUT", "1800")))
     # How many targets one paper may pursue to execution. A budget, not a policy: which
@@ -167,6 +166,12 @@ class Config:
     # authorization refusal is deterministic, and re-running one would be an attempt to
     # get a different answer out of a gate that is doing its job.
     audit_retries: int = field(default_factory=lambda: int(os.environ.get("SH_AUDIT_RETRIES", "2")))
+    # How many lens/part units may be in flight at once. Each is an isolated subprocess —
+    # its own sandboxed cwd, its own pinned settings, its own prompt and output file — so
+    # running several at once is STRONGER isolation than one operator terminal running them
+    # one after another, not weaker. 4 covers a single-pass paper's four lenses in one
+    # round; a multi-part paper still bounds the burst.
+    audit_concurrency: int = field(default_factory=lambda: int(os.environ.get("SH_AUDIT_CONCURRENCY", "4")))
 
     # --- S2.5 independent grading --------------------------------------------------
     # OFF by default, same reasoning as `allow_auto_audit`: a second external process,
@@ -191,6 +196,10 @@ class Config:
     grade_model: str = field(default_factory=lambda: (os.environ.get("SH_GRADE_MODEL") or "").strip())
     grade_timeout_s: int = field(default_factory=lambda: int(os.environ.get("SH_GRADE_TIMEOUT", "600")))
     grade_retries: int = field(default_factory=lambda: int(os.environ.get("SH_GRADE_RETRIES", "2")))
+    # How many candidates may be graded at once. Graders are blinded from each other by
+    # design (zero tools, no shared context), so nothing about running several at once
+    # weakens the independence the stage exists to guarantee.
+    grade_concurrency: int = field(default_factory=lambda: int(os.environ.get("SH_GRADE_CONCURRENCY", "4")))
     # "serious": only FATAL/MAJOR candidates are graded — justified by threshold
     # reachability, not cost: a MINOR cannot cross any RED branch on its own, so grading
     # it can only ever move a verdict toward GREEN, the direction a false negative there
@@ -303,11 +312,6 @@ class Config:
         default_factory=lambda: (os.environ.get("SH_VALIDATION_MODEL") or "").strip())
     validation_timeout_s: int = field(
         default_factory=lambda: int(os.environ.get("SH_VALIDATION_TIMEOUT", "600")))
-    # How many focused validations one paper may design. A BUDGET, not a gate: which
-    # targets are worth it is `planner`'s decision and the order is `priority`'s.
-    validation_max_designs: int = field(
-        default_factory=lambda: int(os.environ.get("SH_VALIDATION_MAX_DESIGNS", "2")))
-
     # --- the substantive verdict -----------------------------------------------------
     # A single, best-effort, never-retried, whole-paper opinion — see
     # `harness/prompts/verdict.py`. OFF by default: a third external process an operator
@@ -394,16 +398,6 @@ class Config:
     allow_install: bool = field(default_factory=lambda: _flag("SH_ALLOW_INSTALL"))
     allow_repo_exec: bool = field(default_factory=lambda: _flag("SH_ALLOW_REPO_EXEC"))
     allow_synthesis: bool = field(default_factory=lambda: _flag("SH_ALLOW_SYNTHESIS", True))
-    # ALIGNMENT TRIAL — off by default, like every other gate that runs third-party code.
-    # `harness.alignment.trial` invokes a candidate command with `--help` to CONFIRM a
-    # statically-read argparse surface against the real program — no experiment runs, but
-    # a `--help` invocation still executes the top of a file this harness did not write,
-    # so it is gated exactly as repository execution is and requires the SAME isolation
-    # sufficiency (`harness.isolation.sufficient_for_repo_exec`). A separate gate from
-    # `allow_repo_exec` because confirming an argparse surface is a narrower, cheaper
-    # permission an operator may reasonably grant without granting the full experiment.
-    allow_alignment_trial: bool = field(
-        default_factory=lambda: _flag("SH_ALLOW_ALIGNMENT_TRIAL"))
 
     # --- PATH B, governed reconstruction (Step 8) --------------------------------------
     # TWO gates, because WRITING a reconstruction and RUNNING it are different acts with

@@ -80,10 +80,6 @@ class PhaseOutcome:
     detail: dict | None = None
     reproduction_class: str = ""
 
-    @property
-    def advances(self) -> bool:
-        return self.outcome in ("ok", "abstain")
-
 
 # --------------------------------------------------------------------------- #
 # Case lifecycle
@@ -128,6 +124,16 @@ def rewind(case: CaseState, phase: str) -> CaseState:
     return case
 
 
+def is_new_pdf_source(source: str) -> bool:
+    """Is `source` a not-yet-ingested PDF path, rather than an already-ingested case id?
+
+    A `.pdf` suffix decides it outright — no need for the file to exist yet — and
+    otherwise it is a real path on disk. Anything else is a bare case id.
+    """
+    src = Path(source).expanduser()
+    return src.suffix.lower() == ".pdf" or src.exists()
+
+
 def open_case(cfg: Config, source: str) -> CaseState:
     """The case for one input — a PDF path or an already-ingested id. Resumes if it exists.
 
@@ -135,13 +141,12 @@ def open_case(cfg: Config, source: str) -> CaseState:
     process ending, which is the normal way a run stops when it is waiting for lens
     evidence that has to arrive from somewhere else.
     """
-    src = Path(source).expanduser()
-    if not (src.suffix.lower() == ".pdf" or src.exists()):
+    if not is_new_pdf_source(source):
         existing = load_case(cfg, source)
         if existing:
             return existing
         return CaseState(paper_id=source, source=source, phase="ingest")
-    return CaseState(source=str(src), phase="ingest")
+    return CaseState(source=str(Path(source).expanduser()), phase="ingest")
 
 
 # --------------------------------------------------------------------------- #
@@ -149,7 +154,7 @@ def open_case(cfg: Config, source: str) -> CaseState:
 # --------------------------------------------------------------------------- #
 def _phase_ingest(cfg: Config, case: CaseState, **_) -> PhaseOutcome:
     src = Path(case.source).expanduser()
-    if not (src.suffix.lower() == ".pdf" or src.exists()):
+    if not is_new_pdf_source(case.source):
         # A bare case id: the paper was ingested by an earlier run.
         pid = case.paper_id or case.source
         if not (state.project_dir(cfg, pid) / "paper" / "doc.json").exists():

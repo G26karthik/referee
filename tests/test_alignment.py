@@ -22,10 +22,8 @@ from pathlib import Path
 import pytest
 
 from harness import experiment_id as eid
-from harness.alignment import argparse_surface, candidates, configs, configuration, evaluator, trial
-from harness.artifacts import (ArgSpec, CandidateCommand, PaperDoc, Table, TrialResult)
-from harness.backends import BackendResources, ExecCapability, ExecOutcome, ExecRequest, ExecutionBackend
-from harness.config import Config
+from harness.alignment import argparse_surface, candidates, configs, configuration, evaluator
+from harness.artifacts import CandidateCommand, PaperDoc, Table
 
 
 # --------------------------------------------------------------------------- #
@@ -343,72 +341,3 @@ def test_backends_authorize_is_untouched_by_this_package():
         "authorize() must not gain a dependency on this package — every alignment "
         "module feeds evidence INTO the existing identity decision, never a new gate "
         "inside authorize() itself")
-
-
-# --------------------------------------------------------------------------- #
-# trial — optional, gated, same isolation floor as repository execution
-# --------------------------------------------------------------------------- #
-class _StubBackend(ExecutionBackend):
-    name = "trial-test-stub"
-    isolation = "NONE"
-
-    def resources(self) -> BackendResources:
-        return BackendResources(name=self.name, platform="linux", python="/usr/bin/python3")
-
-    def capability(self, acq, interpreter, harness_python, flag="seed") -> ExecCapability:
-        return ExecCapability(established=False, reason_code="not_attempted")
-
-    def provision(self, cfg, root, pid, acq):
-        return acq
-
-    def execute(self, req: ExecRequest) -> ExecOutcome:
-        return ExecOutcome(launched=True, completed=True, returncode=0,
-                          stdout="usage: [-h] [--sparsity S]\n", argv=req.argv, backend=self.name)
-
-    def cleanup(self, root, pid) -> list[str]:
-        return []
-
-
-def _cfg(allow: bool) -> Config:
-    c = Config.load()
-    c.allow_alignment_trial = allow
-    return c
-
-
-def test_trial_requires_both_the_gate_and_sufficient_isolation():
-    confined = _StubBackend()
-    confined.isolation = "REMOTE_SESSION"
-    unconfined = _StubBackend()
-
-    assert trial.may_trial(_cfg(False), confined) == (False, trial.may_trial(_cfg(False), confined)[1])
-    assert not trial.may_trial(_cfg(False), confined)[0]
-    assert not trial.may_trial(_cfg(True), unconfined)[0]
-    assert trial.may_trial(_cfg(True), confined)[0]
-
-
-def test_trial_never_runs_without_both_conditions_even_when_asked():
-    unconfined = _StubBackend()
-    cmd = CandidateCommand(argv=["python", "eval.py"], source_ref="eval.py:1")
-    r = trial.run_trial(_cfg(True), unconfined, cwd=".", interpreter="python",
-                        cmd=cmd, declared=[ArgSpec(flag="--sparsity")])
-    assert isinstance(r, TrialResult) and not r.attempted
-
-
-def test_trial_confirms_and_distinguishes_declared_flags():
-    confined = _StubBackend()
-    confined.isolation = "REMOTE_SESSION"
-    cmd = CandidateCommand(argv=["python", "eval.py"], source_ref="eval.py:1")
-    declared = [ArgSpec(flag="--sparsity"), ArgSpec(flag="--seed")]
-    r = trial.run_trial(_cfg(True), confined, cwd=".", interpreter="python",
-                        cmd=cmd, declared=declared)
-    assert r.attempted and r.ran
-    assert r.confirmed_flags == ["--sparsity"]
-    assert r.unconfirmed_flags == ["--seed"]
-
-
-def test_trial_is_optional_identity_resolution_never_requires_it():
-    """The whole package's central promise: identity resolution never calls `trial`.
-    Static evidence alone must be able to resolve `ambiguous`, and it did in the test
-    above with the gate never even mentioned."""
-    src = inspect.getsource(eid.resolve_experiment) + inspect.getsource(eid._prose_experiment)
-    assert "trial" not in src

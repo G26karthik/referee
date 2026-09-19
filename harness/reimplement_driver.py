@@ -115,9 +115,11 @@ def reimplementation_confinement(cfg: Config, *, settings_sha256: str = "") -> C
     the paper text it needs is entirely inside the prompt, on disk, checkable by a human."""
     if cfg.reimplementation_cmd.strip():
         return operator_confinement("reimplementer")
+    allowed = RP.ROLE_SPEC.get("tools", ())
     return Confinement(
-        role="reimplementer", allowed_tools=(), disallowed_tools=denied_tools(()),
-        add_dir=(), model=role_model(cfg), restricted=True, strict_mcp=True, bare=True,
+        role="reimplementer", allowed_tools=allowed, disallowed_tools=denied_tools(allowed),
+        add_dir=(), model=role_model(cfg), restricted=True, strict_mcp=True,
+        bare=RP.ROLE_SPEC.get("bare", True),
         settings_sha256=settings_sha256, output_format="json",
     )
 

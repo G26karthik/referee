@@ -79,6 +79,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import delegation, failures, reviewer_cli, sealing, state
@@ -655,6 +656,32 @@ def run_lens(cfg: Config, pid: str, lens: str, prompt: Path, out: Path, *,
         shutil.rmtree(policy_dir, ignore_errors=True)
 
 
+def _fill_one(cfg: Config, pid: str, unit_id: str, lens: str, prompt: Path,
+              out_path: Path, pdf_dir: str) -> tuple[str, dict | None, "AuditDriverError | None"]:
+    try:
+        rec = run_lens(cfg, pid, lens, prompt, out_path, pdf_dir=pdf_dir, unit_id=unit_id)
+        detail = rec.get("tool_policy_detail") or {}
+        state.append_log(cfg, pid, artifact_type="audit_auto", phase="audit",
+                         headers={"lens": lens, "unit": unit_id,
+                                  "findings": rec["findings"],
+                                  "seconds": rec["seconds"],
+                                  # WHICH MODEL and WHETHER CONFINED, in the case
+                                  # history itself. The history line used to carry
+                                  # three numbers and nothing about how the reading
+                                  # was produced, so a run that silently collapsed
+                                  # onto one model left no trace to notice.
+                                  "model_requested": detail.get("model_requested", ""),
+                                  "model_reported": (rec.get("envelope") or {}).get(
+                                      "model_reported", ""),
+                                  "confinement_enforced": bool(detail.get("enforced")),
+                                  "harness_keys_stripped": rec.get(
+                                      "harness_keys_stripped", 0)},
+                         path=str(out_path))
+        return unit_id, rec, None
+    except AuditDriverError as e:
+        return unit_id, None, e
+
+
 def fill(cfg: Config, pid: str, awaiting: list[str], prompts: dict[str, str],
         pdf_dir: str = "", units: list[dict] | None = None) -> dict:
     """Attempt every pending lens. Partial success is success for the lenses that worked.
@@ -668,6 +695,13 @@ def fill(cfg: Config, pid: str, awaiting: list[str], prompts: dict[str, str],
 
     `kinds` carries the classification per lens so the reason survives into the case
     state and the report, rather than only into a log line.
+
+    Every unit runs as its own subprocess with its own sandboxed cwd, its own pinned
+    settings and its own prompt/output files (`run_lens`), so dispatching several at once
+    on a bounded thread pool (`cfg.audit_concurrency`) is stronger isolation than one
+    operator terminal running them one after another, not weaker — see CLAUDE.md's reading
+    design. `ThreadPoolExecutor.map` preserves `awaiting`'s order in the results regardless
+    of which subprocess actually finished first, so the buckets below are deterministic.
     """
     filled, failed, rate_limited, blocked, kinds = [], {}, {}, {}, {}
     audit_dir = state.project_dir(cfg, pid) / "audit"
@@ -677,35 +711,23 @@ def fill(cfg: Config, pid: str, awaiting: list[str], prompts: dict[str, str],
     # lens name and the output is `audit/<lens>.json`, which is the historical behaviour
     # and what every caller that does not read in parts still gets.
     by_unit = {u["unit_id"]: u for u in (units or [])}
-    for unit_id in awaiting:
+
+    def _dispatch(unit_id: str):
         spec = by_unit.get(unit_id, {})
         lens = spec.get("lens", unit_id)
         out_path = Path(spec["out"]) if spec.get("out") else audit_dir / f"{unit_id}.json"
-        prompt = Path(prompts[unit_id])
-        try:
-            rec = run_lens(cfg, pid, lens, prompt, out_path, pdf_dir=pdf_dir,
-                           unit_id=unit_id)
-            filled.append(unit_id)
-            detail = rec.get("tool_policy_detail") or {}
-            state.append_log(cfg, pid, artifact_type="audit_auto", phase="audit",
-                             headers={"lens": lens, "unit": unit_id,
-                                      "findings": rec["findings"],
-                                      "seconds": rec["seconds"],
-                                      # WHICH MODEL and WHETHER CONFINED, in the case
-                                      # history itself. The history line used to carry
-                                      # three numbers and nothing about how the reading
-                                      # was produced, so a run that silently collapsed
-                                      # onto one model left no trace to notice.
-                                      "model_requested": detail.get("model_requested", ""),
-                                      "model_reported": (rec.get("envelope") or {}).get(
-                                          "model_reported", ""),
-                                      "confinement_enforced": bool(detail.get("enforced")),
-                                      "harness_keys_stripped": rec.get(
-                                          "harness_keys_stripped", 0)},
-                             path=str(out_path))
-        except AuditDriverError as e:
-            kinds[unit_id] = {"kind": e.kind, "retry": e.retry, "reset_hint": e.reset_hint}
-            {"later": rate_limited, "never": blocked}.get(e.retry, failed)[unit_id] = str(e)
+        return _fill_one(cfg, pid, unit_id, lens, Path(prompts[unit_id]), out_path, pdf_dir)
+
+    workers = max(1, min(len(awaiting), cfg.audit_concurrency))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for unit_id, _rec, err in pool.map(_dispatch, awaiting):
+            if err is None:
+                filled.append(unit_id)
+            else:
+                kinds[unit_id] = {"kind": err.kind, "retry": err.retry,
+                                  "reset_hint": err.reset_hint}
+                {"later": rate_limited, "never": blocked}.get(
+                    err.retry, failed)[unit_id] = str(err)
     return {"filled": filled, "failed": failed, "rate_limited": rate_limited,
             "blocked": blocked, "kinds": kinds}
 

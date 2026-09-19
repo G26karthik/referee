@@ -207,6 +207,14 @@ def add_cost(cfg: Config, pid: str, cost_usd: float) -> None:
 
 
 
+# In-process only: several lens/grade calls now run concurrently on threads within one
+# controller invocation, and a plain `open(..., "a").write(...)` from two threads at once
+# can interleave two records into one unparseable line. A per-process lock is enough —
+# cross-process writers still serialize through `project_lock`'s OS-level lock, which every
+# writer of this file already holds for the duration of its phase.
+_log_lock = threading.Lock()
+
+
 def append_log(
     cfg: Config,
     pid: str,
@@ -226,8 +234,9 @@ def append_log(
         "path": path,
         "cost_usd": round(float(cost_usd or 0.0), 6),
     }
-    with (project_dir(cfg, pid) / "research_log.jsonl").open("a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    with _log_lock:
+        with (project_dir(cfg, pid) / "research_log.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     if cost_usd:
         add_cost(cfg, pid, cost_usd)
 

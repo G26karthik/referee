@@ -114,21 +114,27 @@ class Reviewer:
         self.dir = cfg.projects_dir.parent / "reviewer"
         self.dir.mkdir(parents=True, exist_ok=True)
         self.map_path = self.dir / "responses.json"
-        self.log_path = self.dir / "calls.jsonl"
+        self.calls_dir = self.dir / "calls"
+        self.calls_dir.mkdir(parents=True, exist_ok=True)
         self.map_path.write_text(json.dumps(responses), encoding="utf-8")
-        self.log_path.write_text("", encoding="utf-8")
         script = self.dir / "reviewer.py"
+        # One call record PER FILE, named for the unit that produced it, rather than one
+        # shared appended log: `fill()` now dispatches several of these as real, separate
+        # subprocesses at once (bounded concurrency), and concurrent processes appending
+        # to one shared file are not guaranteed atomic — exactly the isolation `fill()`'s
+        # own docstring says several real subprocesses at once is stronger than, not
+        # weaker, provided each writes somewhere only it owns.
         script.write_text(
             "import json, pathlib, re, sys\n"
             "prompt, out = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])\n"
             "body = prompt.read_text(encoding='utf-8')\n"
             "unit = re.search(r'# Audit lens: `([^`]+)`', body).group(1)\n"
             f"responses = json.loads(pathlib.Path({str(self.map_path)!r}).read_text('utf-8'))\n"
-            f"log = pathlib.Path({str(self.log_path)!r})\n"
-            "with log.open('a', encoding='utf-8') as fh:\n"
-            "    fh.write(json.dumps({'unit': unit, 'prompt': str(prompt),\n"
-            "                         'chars': len(body)}) + '\\n')\n"
-            f"(pathlib.Path({str(self.dir)!r}) / (unit.replace('/', '__') + '.prompt.md'))"
+            f"calls_dir = pathlib.Path({str(self.calls_dir)!r})\n"
+            "safe = unit.replace('/', '__')\n"
+            "(calls_dir / (safe + '.json')).write_text(json.dumps(\n"
+            "    {'unit': unit, 'prompt': str(prompt), 'chars': len(body)}), encoding='utf-8')\n"
+            f"(pathlib.Path({str(self.dir)!r}) / (safe + '.prompt.md'))"
             ".write_text(body, encoding='utf-8')\n"
             "payload = responses.get(unit)\n"
             "if payload is None:\n"
@@ -139,8 +145,13 @@ class Reviewer:
 
     @property
     def calls(self) -> list[dict]:
-        text = self.log_path.read_text(encoding="utf-8").strip()
-        return [json.loads(line) for line in text.splitlines()] if text else []
+        # By mtime, not by name: several calls within one `fill()` batch now run as
+        # concurrent subprocesses and finish in no guaranteed order, but `fill()` itself
+        # is still one phase at a time, so calls from an EARLIER batch reliably precede
+        # calls from a later one — which is the only ordering property any test here
+        # actually relies on (slicing "the calls made in this second batch").
+        files = sorted(self.calls_dir.glob("*.json"), key=lambda p: p.stat().st_mtime_ns)
+        return [json.loads(p.read_text(encoding="utf-8")) for p in files]
 
     def prompt_for(self, unit_id: str) -> str:
         return (self.dir / (unit_id.replace("/", "__") + ".prompt.md")).read_text("utf-8")

@@ -589,10 +589,9 @@ def test_the_grader_is_blinded_from_everything_that_would_anchor_it():
     assert "counted toward any verdict" in _flat(grade_prompts.INDEPENDENCE)
     # The driver records what it withheld, so a reader can check the claim.
     from harness import grade_driver
-    withheld = inspect.getsource(grade_driver.fill)
     for field in ("severity", "severity_rationale", "lens", "other_findings",
                   "verdict_thresholds", "derivation_table"):
-        assert f'"{field}"' in withheld, f"the driver does not record withholding {field!r}"
+        assert field in grade_driver._WITHHELD, f"the driver does not record withholding {field!r}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════

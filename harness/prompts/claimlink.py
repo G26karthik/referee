@@ -25,10 +25,14 @@ from __future__ import annotations
 
 from .audit import SECURITY
 
-# `sonnet` rather than `opus`: this is a location task, not a judgement task. What it
-# needs is care with quotations, which is the one thing the harness re-checks in full, so
-# the expensive model buys nothing here that the verification does not already guarantee.
-ROLE_SPEC = {"role": "claim-link reader", "model": "sonnet", "tools": ()}
+# `haiku`: this is a location task, not a judgement task. What it needs is care with
+# quotations, which is the one thing the harness re-checks in full, so the expensive model
+# buys nothing here that the verification does not already guarantee. `tools` names
+# `("Read",)` because that is what `claimlink_driver.link_confinement` actually grants —
+# extraction garbles tables, and a reader quoting a cell verbatim needs to be able to check
+# the printed page — kept equal to the runtime grant rather than merely documented, so this
+# spec cannot drift from the confinement the way `audit.LENSES`'s model field once did.
+ROLE_SPEC = {"role": "claim-link reader", "model": "haiku", "tools": ("Read",)}
 
 _RULES = """\
 === WHAT YOU ARE DOING ===
@@ -155,7 +159,7 @@ def _self_check() -> None:
                       "figures_text", "equations_text", "numbers_text", "pdf_path"}, params
     for banned in ("severity", "finding", "FATAL", "verdict", "grade"):
         assert banned not in " ".join(params)
-    assert ROLE_SPEC["tools"] == (), "a location task needs no tools"
+    assert ROLE_SPEC["tools"] == ("Read",), "must match link_confinement's actual grant"
     print("harness.prompts.claimlink self-check ok")
 
 

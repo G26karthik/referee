@@ -820,10 +820,9 @@ def test_the_grader_still_sees_none_of_what_it_is_blinded_to():
     for leak in ("counted_severity", "RED_FATAL", "MATERIAL_SEVERITY",
                  "severity_rationale", "prior_grades", "other_findings"):
         assert leak not in built, leak
-    withheld = inspect.getsource(grade_driver.fill)
     for name in ("severity", "lens", "other_findings", "prior_grades",
                  "verdict_thresholds", "derivation_table"):
-        assert name in withheld, name
+        assert name in grade_driver._WITHHELD, name
 
 
 def test_the_grader_path_runs_end_to_end_and_records_what_produced_the_grade(tmp_path: Path):

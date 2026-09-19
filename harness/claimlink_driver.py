@@ -61,7 +61,7 @@ def link_confinement(cfg: Config, *, settings_sha256: str = "",
     """
     if cfg.claimlink_cmd.strip():
         return operator_confinement("claim-link reader")
-    allowed = ("Read",)
+    allowed = CP.ROLE_SPEC.get("tools", ("Read",))
     return Confinement(
         role="claimlink", allowed_tools=allowed, disallowed_tools=denied_tools(allowed),
         add_dir=((pdf_dir,) if pdf_dir else ()), model=role_model(cfg),
@@ -322,7 +322,7 @@ if __name__ == "__main__":       # self-check: python -m harness.claimlink_drive
     assert set(conf.allowed_tools) == {"Read"}, conf.allowed_tools
     for net in ("WebSearch", "WebFetch", "Bash"):
         assert net in conf.disallowed_tools, net
-    assert conf.model == "sonnet" and conf.enforced is True
+    assert conf.model == CP.ROLE_SPEC["model"] and conf.enforced is True
     assert operator_confinement("claim-link reader").enforced is False
 
     # A reader's own verdict on its own pairing is stripped before anything is verified.

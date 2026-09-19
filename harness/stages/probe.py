@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import artifact as artifact_stage
@@ -1877,13 +1878,29 @@ def _review(cfg: Config, pid: str) -> dict:
         exhaustion.refresh(target_set, cfg)
         state.write_json(discover_stage.targets_path_in(root), target_set.model_dump())
 
-    # --- the artifact route ------------------------------------------------------------
-    # AFTER acquisition, because it needs the checkout, and structurally separate from the
-    # execution loop above because its targets are not executable ones: `planner` reaches
-    # ARTIFACT_INSPECTION_ONLY only where no executable route applies, so nothing here
-    # competes with, defers, or suppresses a run. It spends no process and no budget.
-    artifact_outcomes, inspection = artifact_stage.run_route(
-        cfg, pid, doc, target_set, acq.path, url=acq.url or (doc.repo_url or ""))
+    # --- the artifact route and the prior-art route, CONCURRENTLY ----------------------
+    # AFTER acquisition, because the artifact route needs the checkout, and structurally
+    # separate from the execution loop above because neither route's targets are
+    # executable ones: `planner` reaches ARTIFACT_INSPECTION_ONLY / LITERATURE_SEARCH_ONLY
+    # only where no executable route applies, so neither competes with, defers, or
+    # suppresses a run, and neither spends a process or execution budget.
+    #
+    # The two routes select on DISJOINT, already-decided `plan.action` values, read only
+    # `target_set` (never each other's output — `literature_stage.run_route` never reads
+    # `artifact/`, and vice versa), and write to disjoint files
+    # (`artifact/<pid>.route.json` vs `literature/<pid>.search.json`). So they run on a
+    # 2-worker pool and their outcome-merge blocks below apply sequentially afterward —
+    # both are idempotent per-target writes keyed by disjoint target ids, so the order
+    # between them does not matter. This removes the artifact route's one whole-paper
+    # reviewer call from the literature route's critical path.
+    with ThreadPoolExecutor(max_workers=2) as _route_pool:
+        _artifact_future = _route_pool.submit(
+            artifact_stage.run_route, cfg, pid, doc, target_set, acq.path,
+            url=acq.url or (doc.repo_url or ""))
+        _literature_future = _route_pool.submit(
+            literature_stage.run_route, cfg, pid, doc, target_set)
+        artifact_outcomes, inspection = _artifact_future.result()
+        literature_outcomes, search = _literature_future.result()
     if target_set is not None and artifact_outcomes:
         for out in artifact_outcomes:
             state.write_json(
@@ -1900,13 +1917,8 @@ def _review(cfg: Config, pid: str) -> dict:
         exhaustion.refresh(target_set, cfg)
         state.write_json(discover_stage.targets_path_in(root), target_set.model_dump())
 
-    # --- the prior-art route -----------------------------------------------------------
-    # NEEDS NO CHECKOUT, so it runs whether or not the authors published one, and it is
-    # here rather than in `discover` for the same reason the artifact route is: `discover`
-    # is pure with respect to the parsed paper and consults no external source at all.
-    # Like the artifact route it spends no process and no execution budget, and `planner`
-    # reaches LITERATURE_SEARCH_ONLY only where no executable route applies.
-    literature_outcomes, search = literature_stage.run_route(cfg, pid, doc, target_set)
+    # --- the prior-art route's own outcome merge (dispatched above, alongside the
+    # artifact route) ---------------------------------------------------------------
     if target_set is not None and literature_outcomes:
         for out in literature_outcomes:
             state.write_json(

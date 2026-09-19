@@ -20,9 +20,6 @@ ADDITIONALLY, never a replacement for the existing refusal ladder:
   `evaluator`         which candidate's code actually COMPUTES the cited quantity, from a
                       real metric call or a `compute_metrics`-shaped function, rather than
                       a bare quoted key that could be an argparse help string
-  `trial`             an OPTIONAL, GATED `--help` invocation that CONFIRMS a statically
-                      read argparse surface against the real program, under the same
-                      isolation boundary repository execution requires
 
 **What this package does not touch.** `backends.authorize()` and
 `experiment_id.identities_established` are unchanged — every module here feeds evidence

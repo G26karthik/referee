@@ -33,11 +33,11 @@ from __future__ import annotations
 from ..artifacts import NEVER_ASSUMED, PREDICTED_DIRECTIONS, SETTLEMENT_RULES
 from .audit import SECURITY
 
-# `sonnet`, and no tools. Naming the variable two arms differ in is a reading of two
+# `haiku`, and no tools. Naming the variable two arms differ in is a reading of two
 # passages that are both printed below; it is not the kind of judgement the expensive
 # model buys, and every part of the answer that could be got wrong silently — the
 # quotations, the addresses, the conformance — is re-checked by the harness.
-DESIGN_ROLE_SPEC = {"role": "focused validation designer", "model": "sonnet", "tools": ()}
+DESIGN_ROLE_SPEC = {"role": "focused validation designer", "model": "haiku", "tools": ()}
 
 _DISCIPLINE = """\
 === THE ONE RULE THAT SHAPES THIS TASK ===

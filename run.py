@@ -328,10 +328,8 @@ def cmd_stage(args: argparse.Namespace) -> int:
     """
     cfg = Config.load()
     pid = args.paper
-    if args.name == "ingest":
-        src = Path(args.paper).expanduser()
-        if src.suffix.lower() == ".pdf" or src.exists():
-            pid = ""  # not yet ingested — same lock key `step` uses pre-ingest
+    if args.name == "ingest" and controller.is_new_pdf_source(args.paper):
+        pid = ""  # not yet ingested — same lock key `step` uses pre-ingest
     with state.project_lock(cfg, pid):
         result = STAGES[args.name](cfg, args.paper)
     print(json.dumps(result, indent=2, default=str))

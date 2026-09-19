@@ -277,8 +277,6 @@ def deterministic_queries(doc: PaperDoc, claim: SearchClaim, *,
 # --------------------------------------------------------------------------------------
 # WHEN THE TARGET BECAME PUBLIC
 # --------------------------------------------------------------------------------------
-_YEAR = re.compile(r"\b(19[89]\d|20[0-4]\d)\b")
-
 # Strongest first, and the order IS the rule: the first arXiv submission is what "public"
 # means for a paper that had one, and a proceedings year is a last resort that cannot
 # order two papers inside it.
@@ -434,17 +432,6 @@ def title_matches(want: str, got: str, *, min_prefix: int = 40) -> bool:
         return True
     short, long = (a, b) if len(a) <= len(b) else (b, a)
     return len(short) >= min_prefix and long.startswith(short)
-
-
-def year_in_text(text: str) -> str:
-    """The latest year the paper's own front matter prints, as a last-resort cutoff offer.
-
-    Last resort and year-only: a copyright line or a proceedings folio dates a paper to a
-    year and never to a day, and this returns the LATEST year it sees rather than the
-    first, because a paper cites years before its own.
-    """
-    years = sorted(_YEAR.findall(text or ""))
-    return years[-1] if years else ""
 
 
 def _iso(raw: str) -> str:

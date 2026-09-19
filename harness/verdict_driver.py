@@ -71,9 +71,11 @@ def verdict_confinement(cfg: Config, *, settings_sha256: str = "") -> Confinemen
     """
     if cfg.verdict_cmd.strip():
         return operator_confinement("assessor")
+    allowed = VP.ROLE_SPEC.get("tools", ())
     return Confinement(
-        role="assessor", allowed_tools=(), disallowed_tools=denied_tools(()),
-        add_dir=(), model=role_model(cfg), restricted=True, strict_mcp=True, bare=True,
+        role="assessor", allowed_tools=allowed, disallowed_tools=denied_tools(allowed),
+        add_dir=(), model=role_model(cfg), restricted=True, strict_mcp=True,
+        bare=VP.ROLE_SPEC.get("bare", True),
         settings_sha256=settings_sha256, output_format="json",
     )
 

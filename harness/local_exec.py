@@ -84,11 +84,6 @@ _VALUE_WITH_UNCERTAINTY = re.compile(
     rf"(?:±|\+/-|\+-)\s*{_NUM}\s*%?"
     rf"|[\(\[]\s*{_NUM}(?:\s*(?:,|±|–|—|-|to)\s*{_NUM})?\s*[\)\]]\s*%?"
     rf")\s*$")
-# A repo that does not implement the SH_METRIC contract usually still prints a JSON
-# summary. These are the keys worth reading, in preference order.
-_JSON_METRIC_KEYS = ("value", "metric", "score", "result", "accuracy", "acc", "top1",
-                     "top_1", "f1", "map", "miou", "iou", "psnr", "bleu", "auc", "mean")
-
 # The default probe. With no intervention supplied both arms are identical, so it
 # measures this machine's SEED NOISE FLOOR — the denominator every "is this gain real?"
 # question divides by. Trains on the local GPU through torch when it is installed and
@@ -420,31 +415,6 @@ def parse_metric(stdout: str, key: str, experiment_hint: str = "") -> MetricPars
         return MetricParse(value=distinct[0], tier=tier, candidates=candidates,
                            detail=f"'{key}' identified at tier {tier}")
     return MetricParse(detail=f"no JSON object on stdout reported '{key}'")
-
-
-def json_metric(stdout: str, metric: str = "", strict: bool = False) -> float | None:
-    """Last JSON object on stdout that carries a usable metric, as a float.
-
-    **Diagnostic only.** Kept because a report is more useful when it can say what the run
-    printed, and because the generic key list is the only thing available when no metric
-    identity was established. What it must never do is establish a reconciliation: the
-    execution path calls `parse_metric` instead, which refuses a positional answer.
-
-    `strict` is what a bound `MetricIdentity.output_key` means: ONLY that key is
-    accepted, because the whole point of establishing which output corresponds to the
-    cited metric is to stop here from mining a generic "value"/"score"/"mean" out of
-    whichever number happens to parse when the bound key is not the one present.
-    """
-    if strict and not metric:
-        return None
-    keys = ([metric.lower()] if metric else []) + ([] if strict else list(_JSON_METRIC_KEYS))
-    for obj in reversed(_json_objects(stdout)):
-        lowered = {str(k).lower(): v for k, v in obj.items()}
-        for key in keys:
-            v = _number(lowered.get(key))
-            if v is not None:
-                return v
-    return None
 
 
 def _scale_ratio(a: float, b: float) -> float:
@@ -1523,8 +1493,6 @@ if __name__ == "__main__":  # self-check: python -m harness.local_exec
     assert parse_cell_number("12.196 ± 0.207") == 12.196, "the reported value leads the cell"
     assert parse_cell_number("80.5%(161)") == 80.5
     assert parse_cell_number("n/a") is None
-    assert json_metric('noise\n{"epochs": 90}\n{"accuracy": 0.91}\n') == 0.91
-    assert json_metric('{"lr": 0.1}') is None, "a hyperparameter blob is not a metric"
 
     # --- target-aware metric binding ---------------------------------------------------
     one = parse_metric('{"eval_accuracy": 0.87}', "eval_accuracy")

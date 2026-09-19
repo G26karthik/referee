@@ -22,7 +22,7 @@ from harness.artifacts import (ConfigurationIdentity, ExperimentIdentity, Metric
                                PaperDoc, ProbeSpec, Reconciliation, RepoAcquisition, Section,
                                Table)
 from harness.config import Config
-from harness.local_exec import StartupEvidence, json_metric, parse_cell_number, reconcile, resolve_command
+from harness.local_exec import StartupEvidence, parse_cell_number, reconcile, resolve_command
 from harness.stages.probe import cell_contents, plan_execution
 from harness.stages.report import overall_verdict
 from conftest import incidental_objects, material_objects
@@ -303,8 +303,6 @@ def test_cell_and_json_parsing_take_the_reported_value():
     assert parse_cell_number("12.196 ± 0.207") == 12.196
     assert parse_cell_number("80.5%(161)") == 80.5
     assert parse_cell_number("—") is None
-    assert json_metric('{"epoch": 3}\n{"accuracy": 0.91}') == 0.91
-    assert json_metric('{"batch_size": 64}') is None
 
 
 # --------------------------------------------------------------------------- #

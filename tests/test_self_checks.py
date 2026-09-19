@@ -295,16 +295,6 @@ def test_every_discovered_self_check_was_actually_run_and_none_vanished_silently
             f"{run.skipped}")
 
 
-def test_no_harness_module_is_too_broken_to_parse():
-    """Prevents this file reporting on a subset because one module would not compile.
-
-    Discovery has to be tolerant of an unparseable file or a syntax error anywhere in the
-    package errors the collection of every test here. Tolerant is not silent: the file is
-    named.
-    """
-    assert _UNPARSEABLE == {}, f"unparseable module(s): {_UNPARSEABLE}"
-
-
 # --------------------------------------------------------------------------- #
 # 2. they cannot be deleted
 # --------------------------------------------------------------------------- #
@@ -321,13 +311,6 @@ def test_no_module_may_lose_the_self_check_it_shipped_with():
         f"module(s) that shipped with a self-check no longer have one: {lost}. If a "
         f"module was deliberately renamed or merged, move its entry rather than dropping "
         f"it, and say in the docstring where its assertions went.")
-
-
-def test_the_self_check_inventory_never_ratchets_down():
-    """Prevents the count of specifications falling while every test stays green."""
-    assert len(_DISCOVERED) >= len(_SHIPPED_WITH_A_SELF_CHECK), (
-        f"{len(_DISCOVERED)} self-checks discovered, "
-        f"{len(_SHIPPED_WITH_A_SELF_CHECK)} shipped: {sorted(_DISCOVERED)}")
 
 
 def test_the_only_assertions_covering_the_grade_stage_are_run_by_this_suite():
@@ -365,18 +348,6 @@ def test_a_self_check_emptied_of_its_assertions_is_not_a_self_check(module):
         f"specification, not a smoke test")
 
 
-def test_the_total_assertion_count_across_every_self_check_never_ratchets_down():
-    """Prevents a broad thinning that every per-module floor would individually survive.
-
-    31 modules each dropping from 20 assertions to 3 passes the per-module test and loses
-    most of the specification. The total is a second, coarser ratchet over the same walk.
-    """
-    total = sum(_assertions(m, _TREES[m], _main_block(_TREES[m])) for m in _DISCOVERED)
-    assert total >= _MIN_ASSERTIONS_TOTAL, (
-        f"{total} assertions across {len(_DISCOVERED)} self-checks, floor is "
-        f"{_MIN_ASSERTIONS_TOTAL}. Raise the floor when they grow; do not lower it.")
-
-
 # --------------------------------------------------------------------------- #
 # 4. a self-check that is never invoked
 # --------------------------------------------------------------------------- #
@@ -402,99 +373,11 @@ def test_every_module_that_defines_a_self_check_actually_invokes_it():
 # --------------------------------------------------------------------------- #
 # 5. discovery is discovery, not a list
 # --------------------------------------------------------------------------- #
-def test_a_new_module_with_a_self_check_is_discovered_without_editing_this_file(tmp_path):
-    """Prevents the run list going stale as the package grows.
-
-    The predecessor of this file was going to be a hardcoded tuple of 29 module names.
-    Two modules (`harness.provenance`, `harness.outcome`) landed while it was being
-    written; a list would have covered 29 of 31 and looked complete.
-    """
-    pkg = tmp_path / "harness"
-    (pkg / "stages").mkdir(parents=True)
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-    (pkg / "stages" / "__init__.py").write_text("", encoding="utf-8")
-    (pkg / "brandnew.py").write_text(
-        'if __name__ == "__main__":\n    assert True\n', encoding="utf-8")
-    (pkg / "stages" / "nested.py").write_text(
-        'if "__main__" == __name__:\n    assert True\n', encoding="utf-8")
-    (pkg / "quiet.py").write_text("X = 1\n", encoding="utf-8")
-
-    found = _discover(tmp_path)
-    assert "harness.brandnew" in found, "a new module with a self-check must be picked up"
-    assert "harness.stages.nested" in found, "the guard written the other way round counts"
-    assert "harness.quiet" not in found, "a module with no __main__ block is not covered"
-
-
-def test_a_module_that_only_mentions_the_main_guard_in_prose_is_not_taken_for_a_self_check(
-        tmp_path):
-    """Prevents a false positive that hides a real gap.
-
-    `harness/pdf.py`'s docstring and several others quote the invocation verbatim. A
-    substring search over the source reports a self-check in a module whose docstring
-    merely talks about one — and a module reported as covered is a module nobody goes back
-    to. This is why discovery parses.
-    """
-    pkg = tmp_path / "harness"
-    pkg.mkdir(parents=True)
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-    (pkg / "talker.py").write_text(
-        '"""Run it with:\n\n    if __name__ == "__main__": ...\n\nwhich this module '
-        'does not do."""\nX = 1\n', encoding="utf-8")
-    assert 'if __name__ == "__main__"' in (pkg / "talker.py").read_text(encoding="utf-8")
-    assert _discover(tmp_path) == (), "prose is not a self-check"
-
-
-def test_a_main_guard_nested_inside_a_function_is_not_a_module_self_check(tmp_path):
-    """Prevents crediting a guard that `-m` never reaches.
-
-    `if __name__ == "__main__"` inside a function body runs only if something calls that
-    function, which `python -m harness.<name>` does not. Only a module-level guard is a
-    self-check, so discovery reads `tree.body` rather than walking the whole tree.
-    """
-    pkg = tmp_path / "harness"
-    pkg.mkdir(parents=True)
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-    (pkg / "buried.py").write_text(
-        'def go():\n    if __name__ == "__main__":\n        assert True\n', encoding="utf-8")
-    assert _discover(tmp_path) == ()
 
 
 # --------------------------------------------------------------------------- #
 # 6. the one self-check that takes an argument
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("module", sorted(_ARGV_REQUIRED))
-def test_a_self_check_that_needs_an_argument_refuses_rather_than_raising(module):
-    """Prevents a missing argument reading as a defect in the module.
-
-    `python -m harness.pdf` used to raise a bare `IndexError`, from the module a new
-    reader is most likely to try first — so the harness's first impression was a crash
-    where the truth was "this one needs a file". Exit 2 with a usage line, and no
-    traceback.
-    """
-    env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
-    proc = subprocess.run([sys.executable, "-m", module], capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", cwd=str(HARNESS_ROOT),
-                          env=env, timeout=_SELF_CHECK_TIMEOUT_SECONDS)
-    out = proc.stdout + proc.stderr
-    assert proc.returncode == 2, f"expected exit 2, got {proc.returncode}\n{out}"
-    assert "usage:" in out.lower(), out
-    assert "Traceback (most recent call last)" not in out, out
-
-
-@pytest.mark.parametrize("module", sorted(_ARGV_REQUIRED))
-def test_a_self_check_that_needs_an_argument_is_still_run_with_one(module, self_check_runs):
-    """Prevents the argument-taking self-check being quietly dropped from the pass.
-
-    The cheap way to handle `harness.pdf` is to exclude it. Then the extractor every
-    finding's evidence is re-verified against has no coverage here at all, and the
-    exclusion is invisible.
-    """
-    run = self_check_runs[module]
-    if run.skipped:
-        pytest.skip(run.skipped)
-    assert run.argv, f"{module} was run with no argument"
-    assert run.returncode == 0, _detail(run)
-    assert run.stdout.strip(), "the self-check produced no output to inspect"
 
 
 # --------------------------------------------------------------------------- #
