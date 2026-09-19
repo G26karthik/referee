@@ -523,20 +523,45 @@ def _check_provenance(report, outcomes) -> tuple[bool, str]:
 
 
 def _check_authorization(report, outcomes) -> tuple[bool, str]:
+    """Fold EVERY execution record for this paper, not only the paper-level probe.
+
+    A paper can execute more than one target — a secondary target, a reconstruction's own
+    run — and each carries its OWN `authorization` (`TargetOutcome.authorized`, copied in
+    `stages.probe.outcome_for` from that target's own `ProbeResult`). Reading only
+    `report.probe.authorization` checked whichever ONE execution happens to be attached
+    to the paper-level field and reported the guarantee held whenever that one was fine,
+    even if a different target's own execution ran with no authorization at all. Per-
+    target outcomes are checked when they exist; the paper-level field is the fallback
+    only for the legacy shape that never split targets — a single top-level `probe` and no
+    `outcomes` at all.
+    """
     launched = _launched(report, outcomes)
-    probe = getattr(report, "probe", None)
     if launched == 0:
         # Vacuous, and the evidence says so. A vacuous guarantee printed as though it had
         # been exercised is the second-worst thing this module can do.
         return True, "no process was started, so this held without being exercised"
-    auth = getattr(probe, "authorization", None) if probe is not None else None
-    if auth is None:
-        return False, f"{launched} process(es) started with no authorization record"
-    if not bool(getattr(auth, "allowed", False)):
-        return False, (f"{launched} process(es) started while authorization recorded "
-                       f"'{getattr(auth, 'decision', '?')}'")
-    return True, (f"{launched} process(es), authorized by decision "
-                  f"'{getattr(auth, 'decision', '?')}'")
+    checks: list[tuple[str, bool | None]] = []
+    if outcomes:
+        for o in outcomes:
+            if int(getattr(o, "launched", 0) or 0) > 0:
+                checks.append((getattr(o, "target_id", "") or "?",
+                               getattr(o, "authorized", None)))
+    else:
+        probe = getattr(report, "probe", None)
+        if probe is not None and int(getattr(probe, "executions", 0) or 0) > 0:
+            auth = getattr(probe, "authorization", None)
+            checks.append(("(paper-level)",
+                           bool(getattr(auth, "allowed", False)) if auth is not None else None))
+    if not checks:
+        # `launched` counted via `_launched`'s own `probe.executions` fallback but no
+        # per-target outcome and no paper-level probe carried a record to check — an
+        # accounting gap this guarantee must not read as authorized-by-default.
+        return False, f"{launched} process(es) started with no authorization record to check"
+    bad = [tid for tid, ok in checks if ok is not True]
+    if bad:
+        return False, (f"{len(bad)} of {len(checks)} execution record(s) started with no "
+                       f"authorization, or one that did not allow: {', '.join(bad[:4])}")
+    return True, f"{len(checks)} execution record(s), every one authorized"
 
 
 def _check_infrastructure(report, outcomes) -> tuple[bool, str]:
@@ -570,16 +595,36 @@ def _check_refusals(report, outcomes) -> tuple[bool, str]:
 def _check_accounting(report, outcomes, objects=None) -> tuple[bool, str]:
     ledger = (getattr(report, "ledger_path", "") or "").strip()
     efficiency = dict(getattr(report, "review_efficiency", None) or {})
-    launched = _launched(report, outcomes)
     probe = getattr(report, "probe", None)
-    log = (getattr(probe, "execution_log", "") or "").strip() if probe is not None else ""
+    # EVERY execution record this paper produced, not only the paper-level probe's. A
+    # secondary target or a reconstruction writes its OWN `execution.jsonl`
+    # (`stages.probe.outcome_for` carries it as `TargetOutcome.execution_ref`) that
+    # `report.probe.execution_log` never points to — reading only the latter reported
+    # "every count re-derivable" whenever the PRIMARY target happened to log one, even
+    # while a different target that launched processes left none.
+    logged = 0
+    unlogged: list[str] = []
+    if outcomes:
+        for o in outcomes:
+            if int(getattr(o, "launched", 0) or 0) <= 0:
+                continue
+            if (getattr(o, "execution_ref", "") or "").strip():
+                logged += 1
+            else:
+                unlogged.append(getattr(o, "target_id", "") or "?")
+    elif probe is not None and int(getattr(probe, "executions", 0) or 0) > 0:
+        if (getattr(probe, "execution_log", "") or "").strip():
+            logged = 1
+        else:
+            unlogged.append("(paper-level)")
     missing = []
     if not ledger:
         missing.append("no ledger path")
     if not efficiency:
         missing.append("no efficiency accounting")
-    if launched > 0 and not log:
-        missing.append(f"{launched} process(es) with no execution record")
+    if unlogged:
+        missing.append(f"{len(unlogged)} of {logged + len(unlogged)} execution record(s) "
+                       f"with no execution log: {', '.join(unlogged[:4])}")
     # A target that ESTABLISHED a defect and has no object in the set it is being folded
     # over. Materiality cannot be assessed for it, so it is not material (never material
     # by default) — and the disagreement between the outcomes and the objects is a state
@@ -593,7 +638,7 @@ def _check_accounting(report, outcomes, objects=None) -> tuple[bool, str]:
     if missing:
         return False, "; ".join(missing)
     return True, (f"ledger at {ledger}, {len(efficiency)} accounting term(s)"
-                  + (f", execution record at {log}" if log else ""))
+                  + (f", {logged} execution record(s) logged" if logged else ""))
 
 
 def _check_severity_caps(report) -> tuple[bool, str]:

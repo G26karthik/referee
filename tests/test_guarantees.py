@@ -82,7 +82,15 @@ def _red_report() -> tuple[EvalReport, TargetSet]:
                    outcomes=[TargetOutcome(
                        target_id="T1", disposition="FAILED_REPRODUCTION",
                        provenance="repo_exec", launched=3, reconciliation=rec,
-                       reason="0.71 measured against 0.83 printed", failure_class="none")])
+                       reason="0.71 measured against 0.83 printed", failure_class="none",
+                       # What `stages.probe.outcome_for` actually copies from THIS
+                       # target's own `ProbeResult` — matching the paper-level `probe`
+                       # below, since this fixture models the legacy shape where the one
+                       # executed target IS the paper-level probe. `guarantees._check_
+                       # authorization`/`_check_accounting` now fold over per-target
+                       # outcomes first; a launched-but-unmarked outcome is indistinguishable
+                       # from one this harness never recorded a decision for.
+                       authorized=True, execution_ref="runs/omega/execution.jsonl")])
     rep = EvalReport(
         paper_id="omega", verdict="RED", claim_status="VERIFIED_FAILURE",
         findings=[_finding(severity="FATAL")], ledger_path="reports/omega.ledger.json",
