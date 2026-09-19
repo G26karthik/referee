@@ -231,6 +231,74 @@ def _demote_when_a_central_target_is_being_pursued(
     return out
 
 
+# Dispositions that mean the question was actually SETTLED, not merely that a route
+# reached a terminal state. Kept in sync with the resolving branches `exhaustion._attempt_for`
+# recognises (`PAPER_ONLY_RESOLVED` and `PAPER_ARITHMETIC_CONTRADICTION` off the paper-only
+# route; `REPRODUCED`, `FAILED_REPRODUCTION`, `VALIDATION_DEFECT_ESTABLISHED` and
+# `VALIDATION_SUPPORTS_CLAIM` off an admissible, launched execution) — deliberately not the
+# same list as "reached a terminal state", which every disposition here is.
+_SETTLING_DISPOSITIONS = (
+    "PAPER_ONLY_RESOLVED", "PAPER_ARITHMETIC_CONTRADICTION",
+    "REPRODUCED", "FAILED_REPRODUCTION",
+    "VALIDATION_DEFECT_ESTABLISHED", "VALIDATION_SUPPORTS_CLAIM",
+)
+
+
+def _undefer_when_the_central_target_did_not_settle(
+        objects: list[DiscoveredObject], plans: list[PlanDecision],
+        prior_outcomes: dict[str, TargetOutcome] | None) -> list[PlanDecision]:
+    """Give a deferred SUPPORTING target its own turn once its CENTRAL sibling's prior
+    attempt is known to have settled nothing.
+
+    `_demote_when_a_central_target_is_being_pursued` is right on the first pass, where no
+    outcome for the central target exists yet and spending the budget there first is the
+    only defensible order. It stops being right once a prior run's own recorded outcome
+    shows every central sibling reached a terminal, NON-settling disposition (refused,
+    blocked, inconclusive -- never one that actually resolved the question): the budget
+    that outranked the supporting target has already been spent and produced nothing, and
+    holding the supporting target back forever turns a resource-ordering heuristic into a
+    standing refusal with no scientific content, the exact "open only because of this
+    harness's own configuration" gap Section 3 of a first-pass review must not leave
+    unexamined when the route itself remains affordable.
+
+    Absent a prior run (`prior_outcomes` empty or None, i.e. this paper's first discover
+    pass), nothing here changes and the original demotion stands untouched.
+    """
+    if not prior_outcomes:
+        return plans
+    by_question: dict[str, list[DiscoveredObject]] = {}
+    for obj in objects:
+        if obj.question_id:
+            by_question.setdefault(obj.question_id, []).append(obj)
+    out: list[PlanDecision] = []
+    for obj, plan in zip(objects, plans):
+        if plan.blocking_gate != "outranked_by_a_central_target":
+            out.append(plan)
+            continue
+        centrals = [o for o in by_question.get(obj.question_id, [])
+                    if o.centrality == "CENTRAL" and o.target_id != obj.target_id]
+        central_outcomes = [prior_outcomes[o.target_id] for o in centrals
+                            if o.target_id in prior_outcomes]
+        # Un-defer only once EVERY central sibling has a known prior outcome (nobody is
+        # still pending, so nothing is jumping the queue) and NONE of them settled.
+        all_known = bool(centrals) and len(central_outcomes) == len(centrals)
+        any_settled = any(o.disposition in _SETTLING_DISPOSITIONS for o in central_outcomes)
+        if all_known and not any_settled:
+            dispositions = ", ".join(sorted({o.disposition for o in central_outcomes}))
+            out.append(plan.model_copy(update=dict(
+                reason=("a supporting result, previously deferred while a central target "
+                        "for this question was pursued; that central target's own prior "
+                        f"attempt reached a terminal, non-settling disposition "
+                        f"({dispositions}), so this target is no longer outranked and "
+                        "gets its own attempt."),
+                gates=dict(plan.gates, outranked_by_a_central_target=False,
+                          central_target_did_not_settle=True),
+                blocking_gate="", requires_execution=True)))
+        else:
+            out.append(plan)
+    return out
+
+
 def _question_for_every_executable_target(
         objects: list[DiscoveredObject], plans: list[PlanDecision],
         qs: list) -> list:
@@ -407,13 +475,21 @@ def _conclusion(out: TargetOutcome) -> str:
 
 
 def build(cfg: Config, pid: str, doc: PaperDoc, *,
-          investigation_open: bool = True) -> TargetSet:
+          investigation_open: bool = True,
+          prior_outcomes: dict[str, TargetOutcome] | None = None) -> TargetSet:
     """The whole target set for one paper. Pure with respect to what is on disk.
 
     `investigation_open` comes from the ASSESS phase and is ONE BIT. When it is False the
     paper's own evidence has already established a material failure, and no execution can
     change what the review concluded — so the planner refuses every executable route with
     `SUPERSEDED_BY_ESTABLISHED_FAILURE`.
+
+    `prior_outcomes` is this paper's OWN previous discover pass, keyed by target_id, and is
+    the one piece of history this otherwise-pure rebuild is allowed to consult: it lets
+    `_undefer_when_the_central_target_did_not_settle` tell "nobody has tried the central
+    target yet" apart from "the central target was tried and settled nothing", which a
+    from-scratch rebuild cannot otherwise know. Passing None (the default) reproduces the
+    prior, purely-current-pass behaviour exactly.
 
     Everything else here still runs, deliberately and in full: questions, addresses,
     routes, centrality, the coverage denominators. The referee record has to be complete
@@ -457,6 +533,7 @@ def build(cfg: Config, pid: str, doc: PaperDoc, *,
                              investigation_open=investigation_open)
                 for obj in ordered]
     proposed = _demote_when_a_central_target_is_being_pursued(ordered, proposed)
+    proposed = _undefer_when_the_central_target_did_not_settle(ordered, proposed, prior_outcomes)
     proposed = _one_per_experiment(ordered, proposed)
     # AFTER the two set-level demotions, so a target that will not run does not acquire a
     # question purely to be reported as unanswered.
@@ -537,8 +614,11 @@ def run(cfg: Config, pid: str, *, investigation_open: bool = True) -> dict:
     doc = PaperDoc(**state.read_json(doc_path))
     state.set_phase(cfg, pid, "discover")
 
+    prior = load(cfg, pid)
+    prior_outcomes = {o.target_id: o for o in prior.outcomes} if prior else None
     ts = exhaustion.refresh(
-        build(cfg, pid, doc, investigation_open=investigation_open), cfg)
+        build(cfg, pid, doc, investigation_open=investigation_open,
+              prior_outcomes=prior_outcomes), cfg)
     path = targets_path(cfg, pid)
     state.write_json(path, ts.model_dump())
 

@@ -30,7 +30,8 @@ import pytest
 from harness import comparison, discovery, planner, questions
 from harness.artifacts import (COMPARISON_KINDS, COMPARISON_STATES, QUESTION_KINDS,
                                VERIFICATION_ROUTES, DiscoveredObject, Finding, PaperDoc,
-                               PlanDecision, ProbeSpec, QuantFinding, Section, Table)
+                               PlanDecision, ProbeSpec, QuantFinding, Section, Table,
+                               TargetOutcome)
 from harness.stages import discover as discover_stage
 from harness.stages import probe as probe_stage
 
@@ -487,3 +488,63 @@ def test_a_central_target_that_does_not_run_does_not_outrank_anything():
     out = discover_stage._demote_when_a_central_target_is_being_pursued(objects, plans)
 
     assert {p.target_id: p.requires_execution for p in out} == {"CEN": False, "SUP": True}
+
+
+# --------------------------------------------------------------------------- #
+# A deferred SUPPORTING target gets its own turn once the CENTRAL target it was
+# deferred behind is KNOWN, from a prior pass, to have settled nothing. Section 3 of the
+# 2026-09 closure pass: "open only because of this harness's own scheduling" must not be
+# a standing refusal once the route it deferred to has already produced its answer.
+# --------------------------------------------------------------------------- #
+def _q_obj(target_id: str, centrality: str, question_id: str) -> DiscoveredObject:
+    return DiscoveredObject(target_id=target_id, centrality=centrality, question_id=question_id,
+                            harness_addressable=True, materiality_basis="NONE")
+
+
+def test_a_deferred_supporting_target_is_undeferred_once_its_central_sibling_settled_nothing():
+    objects = [_q_obj("CEN", "CENTRAL", "Q1"), _q_obj("SUP", "SUPPORTING", "Q1")]
+    plans = discover_stage._demote_when_a_central_target_is_being_pursued(
+        objects, [_executable_plan(o.target_id) for o in objects])
+    assert {p.target_id: p.requires_execution for p in plans} == {"CEN": True, "SUP": False}
+
+    # The central target's prior attempt is now known, and it did not settle anything.
+    prior = {"CEN": TargetOutcome(target_id="CEN", disposition="AUTHORIZATION_BLOCKED",
+                                  action="INDEPENDENT_RECONSTRUCTION",
+                                  route="INDEPENDENT_RECONSTRUCTION", reason="fixture")}
+    out = discover_stage._undefer_when_the_central_target_did_not_settle(objects, plans, prior)
+
+    by_id = {p.target_id: p for p in out}
+    assert by_id["SUP"].requires_execution is True, "no longer outranked by a spent central"
+    assert by_id["SUP"].blocking_gate == ""
+    assert by_id["SUP"].gates.get("outranked_by_a_central_target") is False
+    assert by_id["SUP"].gates.get("central_target_did_not_settle") is True
+    assert "AUTHORIZATION_BLOCKED" in by_id["SUP"].reason
+    assert by_id["CEN"].requires_execution is True, "the central plan itself is untouched"
+
+
+def test_a_deferred_supporting_target_stays_deferred_when_the_central_sibling_settled():
+    objects = [_q_obj("CEN", "CENTRAL", "Q1"), _q_obj("SUP", "SUPPORTING", "Q1")]
+    plans = discover_stage._demote_when_a_central_target_is_being_pursued(
+        objects, [_executable_plan(o.target_id) for o in objects])
+
+    prior = {"CEN": TargetOutcome(target_id="CEN", disposition="FAILED_REPRODUCTION",
+                                  action="AUTHOR_CODE_REPRODUCTION",
+                                  route="AUTHOR_CODE_EXECUTION", reason="fixture")}
+    out = discover_stage._undefer_when_the_central_target_did_not_settle(objects, plans, prior)
+
+    assert {p.target_id: p.requires_execution for p in out} == {"CEN": True, "SUP": False}, (
+        "a central target that actually settled the question must not un-defer anything")
+
+
+def test_a_deferred_supporting_target_stays_deferred_when_the_central_sibling_is_still_pending():
+    objects = [_q_obj("CEN", "CENTRAL", "Q1"), _q_obj("SUP", "SUPPORTING", "Q1")]
+    plans = discover_stage._demote_when_a_central_target_is_being_pursued(
+        objects, [_executable_plan(o.target_id) for o in objects])
+
+    # No prior outcome at all -- this is the first pass, or the central target is still
+    # queued. Nothing may jump ahead of a central target that has not been tried yet.
+    out = discover_stage._undefer_when_the_central_target_did_not_settle(objects, plans, {})
+    assert {p.target_id: p.requires_execution for p in out} == {"CEN": True, "SUP": False}
+
+    out_none = discover_stage._undefer_when_the_central_target_did_not_settle(objects, plans, None)
+    assert {p.target_id: p.requires_execution for p in out_none} == {"CEN": True, "SUP": False}
