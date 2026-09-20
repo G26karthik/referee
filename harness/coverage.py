@@ -275,18 +275,6 @@ def surface(doc: PaperDoc) -> ReviewSurface:
     )
 
 
-def truncated_sections(doc: PaperDoc) -> int:
-    """How many sections the OLD truncating renderer would cut at the current budget.
-
-    A measurement of the alternative, not of this run: nothing is truncated under the
-    reading plan. Kept because it is the other half of the comparison — "38% of the prose,
-    and 24 of 56 sections cut" says whether the loss was spread or local, and that is what
-    a reader needs to judge how much the replacement was worth. It is deliberately not
-    printed in a review, where it would read as a property of the review that produced it.
-    """
-    return prose_presented(list(doc.sections), budget_chars())[2]
-
-
 # --------------------------------------------------------------------------- #
 # The numerators
 # --------------------------------------------------------------------------- #

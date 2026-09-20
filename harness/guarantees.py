@@ -244,9 +244,8 @@ NOT_HELD: dict[str, str] = {
         "nothing here says the paper is correct; the absence of an established failure is "
         "not support",
     "NOVELTY_ASSESSED":
-        "a bounded prior-art search runs and may raise a concern a referee must "
-        "adjudicate; novelty itself is never established, because a search that completed "
-        "and matched nothing is a fact about the search",
+        "this system has no prior-art search route; novelty and its relation to earlier "
+        "work are not assessed at all",
     "EVERY_IMPORTANT_EXPERIMENT_EXECUTABLE":
         "not every experiment that would matter is executable from what a paper "
         "publishes, and the set that ran is not the set that matters",
@@ -283,7 +282,7 @@ SHORT: dict[str, str] = {
     "COMPLETE_ISSUE_RECALL": "issue recall neither claimed nor measurable",
     "REFEREE_ACCURACY_MEASURED": "accuracy unmeasured: no adjudicated ground truth",
     "PAPER_CORRECTNESS": "nothing here says the paper is correct",
-    "NOVELTY_ASSESSED": "prior art searched within declared bounds; novelty not established",
+    "NOVELTY_ASSESSED": "no prior-art search route; novelty not assessed",
     "EVERY_IMPORTANT_EXPERIMENT_EXECUTABLE": "not every important experiment is executable",
     "HUMAN_REFEREE_SUBSTITUTE": "a first pass, not a substitute for a referee",
 }
@@ -326,15 +325,13 @@ ESTABLISHED_BY: dict[str, str] = {
         "no artifact: no adjudicated ground truth exists for this corpus",
     "PAPER_CORRECTNESS":
         "no artifact: GREEN is the absence of an established failure, not support",
-    # THE ROUTE NOW EXISTS AND THIS IS STILL A NON-GUARANTEE, which is the point of
-    # keeping the two apart. `stages/literature.py` carries out a bounded prior-art
-    # search and can raise a concern a referee must adjudicate. It cannot establish that
-    # a contribution is new: a search that completes and matches nothing has established
-    # a fact about the search, and `artifacts.NOVELTY_ESTABLISHING_AUTHORITIES` is empty
-    # so that no accumulation of clean searches can ever add up to one.
+    # The prior-art search route was deleted (2026-09-20 simplification pass) after
+    # producing zero structurally-bound results across the whole corpus it ever ran
+    # against. Novelty is now simply not assessed, which is a plainer sentence than the
+    # route it replaces, not a weaker one: even a bounded search that ran and matched
+    # nothing was never entitled to establish novelty either.
     "NOVELTY_ASSESSED":
-        "no artifact: the prior-art route may raise a concern and may never establish "
-        "novelty; a completed search with no match is a fact about the search",
+        "no artifact: this system has no route to prior-art search",
     "EVERY_IMPORTANT_EXPERIMENT_EXECUTABLE":
         "no artifact: 'important' is not a property this system may assign",
     "HUMAN_REFEREE_SUBSTITUTE":
@@ -1062,7 +1059,7 @@ def _self_check() -> None:
     assert len(text) <= _MAX_SECTION_CHARS, len(text)
     assert "Machine-enforced here:" in text and "Not established here:" in text
     # the four things a 2026 referee would otherwise assume
-    for clause in ("accuracy unmeasured", "novelty not established",
+    for clause in ("accuracy unmeasured", "novelty not assessed",
                    "nothing here says the paper is correct",
                    "not a substitute for a referee"):
         assert clause in text, clause

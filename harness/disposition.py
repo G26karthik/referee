@@ -170,53 +170,6 @@ DELIBERATELY_UNCLASSIFIED: dict[str, str] = {
         "correspondence between them is the auditor's reading. The question stays open "
         "and is counted as open; calling it a blocker would say no route was available "
         "when one was taken.",
-    # --- THE FOUR FOCUSED-VALIDATION OUTCOMES. None is a blocker; three settled --------
-    "VALIDATION_DEFECT_ESTABLISHED":
-        "a controlled experiment derived from the paper, run on an admissible provenance "
-        "and answering the question it was designed for, produced the opposite of what "
-        "the claim predicts. SETTLED, not blocked. Whether it also STOPS the paper is "
-        "`harness.materiality`'s to decide from where the claim sits — established is not "
-        "material, exactly as PAPER_ARITHMETIC_CONTRADICTION is not.",
-    "VALIDATION_SUPPORTS_CLAIM":
-        "the same experiment, firing the other way. A settled question in the paper's "
-        "favour is a result and not a blocker, and it is not a certificate either: it "
-        "settles the bounded contrast that ran and nothing wider.",
-    "VALIDATION_OBSERVATION_ONLY":
-        "two arms ran and were compared, and the conformance that would let the "
-        "comparison say something about the PAPER was not established — a scientific "
-        "choice in the experiment was this review's. NOT a blocker, because a route ran "
-        "and produced a real measurement; NOT a resolution, because the measurement is "
-        "about our experiment. This is the expected commonest outcome of the route.",
-    "VALIDATION_INCONCLUSIVE":
-        "the controlled comparison ran and the rule declared for it before the run fired "
-        "in neither direction. As INCONCLUSIVE: pursued, and it settled nothing. Kept "
-        "apart from COMPARISON_BLOCKED because the arms WERE held against each other.",
-    # --- THE FIVE LITERATURE OUTCOMES. None is a blocker, and the reasons differ. -------
-    "PRIOR_ART_RELATION_STRUCTURALLY_BOUND":
-        "an earlier work and this paper's own priority claim were bound from the two "
-        "documents. Settled, not blocked — and not a material failure either: whether "
-        "two contributions are the same contribution is a scholarly judgement in the "
-        "authors' field, which is why `establishes_failure` excludes this.",
-    "LITERATURE_MATCH_VERIFIED_ENDPOINTS":
-        "an earlier work, a resolved passage and a verified chronology, with the OVERLAP "
-        "the reviewer's reading. The question stays open and is counted as open; calling "
-        "it a blocker would say no route was available when one was taken.",
-    "SEARCH_COMPLETED_NO_MATCH_FOUND":
-        "the declared bounded protocol completed and nothing qualified. NOT a blocker — a "
-        "route ran — and emphatically not a resolution: the literature a bounded search "
-        "did not reach is not enumerable, so the question stays open in the scope "
-        "section. This is the disposition that must never read as novelty, and it is kept "
-        "out of both tables for that reason rather than by an exception somewhere else.",
-    "SEARCH_INCONCLUSIVE":
-        "candidates were retrieved and the evidence did not reach them — no abstract, a "
-        "quotation that did not resolve, a date no index knew. As INCONCLUSIVE: pursued, "
-        "and it settled nothing.",
-    "LITERATURE_BLOCKED":
-        "no index could be reached, or one required a credential this host does not hold. "
-        "A fact about THIS RUN's configuration exactly as AUTHORIZATION_BLOCKED is, and "
-        "invariant 17 is why it may not colour a paper: a missing API key is not a "
-        "property of anybody's contribution.",
-
     "ARTIFACT_INSPECTION_INCONCLUSIVE":
         "the artifact route completed and settled no question. Handled as a METHOD limit "
         "would be only if it were a blocker, and it is not one: reading the code is a "

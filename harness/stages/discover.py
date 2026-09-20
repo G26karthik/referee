@@ -234,13 +234,12 @@ def _demote_when_a_central_target_is_being_pursued(
 # Dispositions that mean the question was actually SETTLED, not merely that a route
 # reached a terminal state. Kept in sync with the resolving branches `exhaustion._attempt_for`
 # recognises (`PAPER_ONLY_RESOLVED` and `PAPER_ARITHMETIC_CONTRADICTION` off the paper-only
-# route; `REPRODUCED`, `FAILED_REPRODUCTION`, `VALIDATION_DEFECT_ESTABLISHED` and
-# `VALIDATION_SUPPORTS_CLAIM` off an admissible, launched execution) — deliberately not the
-# same list as "reached a terminal state", which every disposition here is.
+# route; `REPRODUCED` and `FAILED_REPRODUCTION` off an admissible, launched execution) —
+# deliberately not the same list as "reached a terminal state", which every disposition
+# here is.
 _SETTLING_DISPOSITIONS = (
     "PAPER_ONLY_RESOLVED", "PAPER_ARITHMETIC_CONTRADICTION",
     "REPRODUCED", "FAILED_REPRODUCTION",
-    "VALIDATION_DEFECT_ESTABLISHED", "VALIDATION_SUPPORTS_CLAIM",
 )
 
 

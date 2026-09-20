@@ -39,18 +39,16 @@ _DECISIVENESS = {
     "PAPER_INTERNAL_CHECK": 3,           # can establish a contradiction outright
     "ARITHMETIC_RECHECK": 3,             # ditto, and costs nothing
     "AUTHOR_CODE_EXECUTION": 3,          # the only route that can convict on the authors' code
-    "FOCUSED_VALIDATION_EXPERIMENT": 2,  # can discriminate explanations, cannot convict alone
     "INDEPENDENT_RECONSTRUCTION": 2,     # bounded by invariant 15
     "ARTIFACT_INSPECTION": 1,            # can raise a concern, cannot settle a printed number
-    "LITERATURE_SEARCH": 1,
     "NONE": 0,
 }
 
 # Relative cost of the cheapest admissible route, inverted so higher is cheaper.
 _CHEAPNESS = {
     "PAPER_INTERNAL_CHECK": 3, "ARITHMETIC_RECHECK": 3,
-    "ARTIFACT_INSPECTION": 2, "LITERATURE_SEARCH": 2,
-    "AUTHOR_CODE_EXECUTION": 1, "FOCUSED_VALIDATION_EXPERIMENT": 0,
+    "ARTIFACT_INSPECTION": 2,
+    "AUTHOR_CODE_EXECUTION": 1,
     "INDEPENDENT_RECONSTRUCTION": 0, "NONE": 0,
 }
 

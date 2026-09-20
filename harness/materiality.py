@@ -58,8 +58,11 @@ than on the argument that the corrected one is obviously better:
 No object's centrality moves either way, so nothing the v2 run reported is restated. The
 reason it fires on nothing is structural — discovered objects come from table cells and
 parsed quantities, and an abstract carries prose — and that null result is the strongest
-evidence available that object-level centrality does not represent claim importance. The
-answer to it is `harness/claimgraph.py`, not a fifth boolean here.
+evidence available that object-level centrality does not represent claim importance. A
+claim-to-evidence linking module (`harness/claimgraph.py`) was built as an answer to this
+and was deleted in the 2026-09-20 destructive simplification pass after it never once
+produced a structurally-bound link across the measured corpus (see CLAUDE.md's Known
+Limitations) — this basis-string vocabulary remains the only materiality signal.
 """
 from __future__ import annotations
 

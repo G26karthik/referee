@@ -82,24 +82,14 @@ NON_DISCHARGING_BLOCKERS = ("AUTHORIZATION_BLOCKED", "BUDGET_DEFERRED",
 
 # Routes with no executor. Named rather than silently dropped: the exclusion IS the
 # limitation, and a reader who cannot see it cannot judge the rate.
+#
+# The focused-validation and literature-search routes (and the claim-link channel,
+# assessed separately from this vocabulary) were removed entirely in the 2026-09-20
+# destructive simplification pass — see CLAUDE.md's Known Limitations — after each was
+# measured to have never once discharged past its design/search stage on any paper this
+# harness reviewed. They are gone from `VERIFICATION_ROUTES` rather than listed here.
 UNIMPLEMENTED_ROUTES = (
     "ARTIFACT_INSPECTION",
-    # FOCUSED_VALIDATION_EXPERIMENT used to be here and no longer is. It was listed
-    # because the only executor authored a ``synthesized`` probe whose result the
-    # provenance ceiling cannot admit — a route that could not possibly discharge, so
-    # advertised rather than implemented. It has an executor now (`stages/validation.py`,
-    # over `validation.design` and `between_arms.compare`), and what it discharges is
-    # bounded in the same way the literature route's is: `validation.discharge` requires a
-    # comparison that reached CONFORMANT_CONTROLLED_RESULT and answers the question it was
-    # designed for, so a blocked design, a refused comparison and a controlled observation
-    # whose conformance was never established all leave it undischarged.
-    # LITERATURE_SEARCH used to be here and no longer is: it has a `PLAN_ACTIONS` member
-    # (`LITERATURE_SEARCH_ONLY`) and an executor (`stages/literature.py`), so it can
-    # discharge. What it discharges is bounded — a verified prior-art concern or a bound
-    # relation — and a search that completed with no match does NOT discharge, which is
-    # `literature.discharge`'s whole job. A route that could be discharged by finding
-    # nothing would be an exhaustion number that rises fastest on the papers nobody
-    # searched properly.
     "NONE",
 )
 
@@ -247,16 +237,6 @@ def _gate_closed(cfg, route: str) -> bool:
     if route == "INDEPENDENT_RECONSTRUCTION":
         return (not bool(getattr(cfg, "allow_reimplementation_driver", False))
                 or not bool(getattr(cfg, "allow_reimplementation_exec", False)))
-    if route == "FOCUSED_VALIDATION_EXPERIMENT":
-        # BOTH gates, because either one alone stops the route completing for a reason
-        # that is ours. With the design gate shut, every design is SPECIFICATION_BLOCKED —
-        # which without this branch scores DISCHARGED_BLOCKED, i.e. "the paper does not
-        # say enough", when the truth is that nothing asked. With the execution gate shut,
-        # a bound design cannot run. This is the defect the module's own docstring warns
-        # about — exhaustion reading 1.0 while measuring the operator's environment —
-        # arriving on a new route.
-        return (not bool(getattr(cfg, "allow_validation_design", False))
-                or not bool(getattr(cfg, "allow_repo_exec", False)))
     return False
 
 

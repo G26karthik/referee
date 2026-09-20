@@ -346,7 +346,7 @@ def load(cfg: Config, pid: str, *, commit: str = "",
     side and this one enforces.
 
     `prompt_sha256`, when given, must match what the sidecar recorded — the same shape
-    `claimlink_driver.load`/`verdict_driver.load_accepted` already use: an absent value on
+    `verdict_driver.load_accepted` already uses: an absent value on
     EITHER side is never treated as a mismatch, so a sidecar sealed before this parameter
     existed (or a caller not yet passing one) is not refused over a field that did not
     exist then. `run()`'s prompt is a function of the paper's title, its method text, the
@@ -615,8 +615,7 @@ if __name__ == "__main__":       # self-check: python -m harness.artifact_review
         # `prompt_sha256`: an ABSENT value on either side is never a mismatch. This
         # fixture was sealed through `accept()`, whose sidecar never records one (only
         # `run()`'s own live-subprocess path does) — so a caller supplying one here must
-        # still get the inspection back, exactly like `claimlink_driver.load`/
-        # `verdict_driver.load_accepted`.
+        # still get the inspection back, exactly like `verdict_driver.load_accepted` does.
         assert load(cfg, "p", prompt_sha256="c" * 64) is not None
 
         # A REAL prompt-hash mismatch — the sidecar recorded one, the caller asks for a

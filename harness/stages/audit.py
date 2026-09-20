@@ -55,7 +55,6 @@ from ..artifacts import (BASELINE_CLASSES, CANDIDATE_CLASSES, CONFIDENCES, DISCR
                          EvidencePointer, Figure, Finding, LensReport, PaperDoc)
 from ..config import Config
 from ..prompts import audit as P
-from ..prompts import claimlink as CLP
 
 LENSES = tuple(P.LENSES)
 # THE DEFAULT, not the live value. `SH_AUDIT_BUDGET_CHARS` is read by `budget_chars()`
@@ -406,10 +405,6 @@ def unit_is_accepted(unit: AuditUnit) -> tuple[bool, str]:
     return True, ""
 
 
-def lens_units(units: list[AuditUnit], lens: str) -> list[AuditUnit]:
-    return [u for u in units if u.lens == lens]
-
-
 def lens_is_accepted(root: Path, lens: str) -> tuple[bool, str]:
     """A lens result counts only if the HARNESS recorded writing it.
 
@@ -481,30 +476,6 @@ def accept_lens(cfg: Config, pid: str, lens: str, raw: str, *,
                         tool_policy=tool_policy,
                         extra={"lens": lens, "paper_id": pid,
                                "findings": len(report.findings)})
-
-
-def claimlink_prompt(doc: PaperDoc) -> str:
-    """The claim-link reading's prompt, rendered here beside the lens prompts.
-
-    Rendered unconditionally, gate open or shut, exactly as `audit/prompts/<lens>.md` is:
-    a prompt on disk is what makes the manual channel possible on a host where no CLI is
-    reachable, and `claimlink_driver.accept` is the door it goes back in through.
-
-    Shown the Abstract and the Conclusion in full and the paper's addressable evidence,
-    and NOT the body prose — see `prompts.claimlink.build` for why that is a bound on the
-    task rather than a saving.
-    """
-    ctx = context(doc)
-    by_idx = {sec.section_idx: sec for sec in doc.sections}
-    abstract_idx = materiality.abstract_section_idx(doc)
-    conclusion_idx = materiality.conclusion_section_idx(doc)
-    return CLP.build(
-        title=doc.title,
-        abstract_text=(by_idx[abstract_idx].text if abstract_idx in by_idx else ""),
-        conclusion_text=(by_idx[conclusion_idx].text if conclusion_idx in by_idx else ""),
-        tables_text=ctx["tables_text"], figures_text=ctx["figures_text"],
-        equations_text=ctx["equations_text"], numbers_text=ctx["numbers_text"],
-        pdf_path=ctx["pdf_path"])
 
 
 def _locate(quote: str, corpus) -> int | None:
@@ -831,13 +802,6 @@ def run_audit(cfg: Config, pid: str, lenses: tuple[str, ...] = LENSES) -> dict:
         _write_manifest(unit, pid=pid, part=part, anchor=plan.anchor, prompt_text=body,
                         budget=budget_chars(), inputs=inputs)
 
-    # The claim-link prompt, beside the lens prompts and on the same terms: written every
-    # run, never edited by hand, and the only way a host with no reachable CLI can supply
-    # the one correspondence the paper does not print.
-    link_prompt = root / "links" / "prompt.md"
-    link_prompt.parent.mkdir(parents=True, exist_ok=True)
-    link_prompt.write_text(pdf.sanitise_controls(claimlink_prompt(doc)), encoding="utf-8")
-
     done = [u.unit_id for u in units if unit_is_accepted(u)[0]]
     todo = [u.unit_id for u in units if u.unit_id not in done and u.unit_id in written]
 
@@ -871,7 +835,6 @@ def run_audit(cfg: Config, pid: str, lenses: tuple[str, ...] = LENSES) -> dict:
                    "out": str(u.out_path)} for u in units],
         "awaiting": todo, "deferred": deferred, "complete": done,
         "lenses_complete": [ln for ln in lenses if lens_is_accepted(root, ln)[0]],
-        "claimlink_prompt": str(link_prompt),
         "composed": composed, "parts": cov.parts,
         "reader_visible_fraction": cov.part_local_fraction,
         "next": (f"Read each prompt in audit/prompts/, perform that reading, and return "

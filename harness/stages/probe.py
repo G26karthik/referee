@@ -45,17 +45,14 @@ from __future__ import annotations
 
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import artifact as artifact_stage
-from . import literature as literature_stage
-from . import validation as validation_stage
-from .. import (backends, claimgraph, claims, code_audit, comparison as comparison_mod,
+from .. import (backends, claims, code_audit, comparison as comparison_mod,
                 delegation, exhaustion, experiment_id, materiality, planner, probe_synth,
                 provenance as provenance_mod, reimplement, reimplement_driver,
                 repo as repo_mod, resources as resources_mod, sealing, state)
-from ..artifacts import (CodeAudit, DiscoveredObject, Finding, FocusedValidation,
+from ..artifacts import (CodeAudit, DiscoveredObject, Finding,
                          PaperDoc, PlanDecision, ProbeResult, ProbeSpec,
                          ReimplementationReadiness, RepoAcquisition, TargetOutcome)
 from ..config import Config
@@ -1057,51 +1054,19 @@ def _superseded_by_established_failure(obj, plan, stopper) -> TargetOutcome:
                 f"and was not attempted"))
 
 
-def _graph_for(doc: PaperDoc, pairs: list) -> object | None:
-    """The claim graph, built ONCE and only when a focused validation needs it.
-
-    `claimgraph.build` parses the whole document; a paper with no target on this route
-    must not pay for it. Reused rather than rebuilt inside the design layer, so the
-    COMPARISON nodes a focused validation acts on are the same ones the claim-link channel
-    and `dependency()` read — a second inventory of the paper's own contrasts would be
-    free to disagree with the first.
-    """
-    if not any(plan.action == validation_stage.ACTION for _obj, plan in pairs):
-        return None
-    try:
-        return claimgraph.build(doc)
-    except Exception:                             # noqa: BLE001 — a graph is an optimisation
-        return None
-
-
-def establish_comparison(spec: ProbeSpec, route: str, *,
-                         settlement_declared: bool = False) -> ProbeSpec:
+def establish_comparison(spec: ProbeSpec, route: str) -> ProbeSpec:
     """Record what this spec's result would be held against, from the ROUTE it took.
 
     Derived rather than assumed, which is the whole of the correction: every execution in
     this system ended at `local_exec.reconcile`, and `reconcile` performs exactly one
-    comparison — a measured number against a quantity the paper printed. For an
-    AUTHOR_CODE_EXECUTION that is the right comparison. For a FOCUSED_VALIDATION_EXPERIMENT
-    it is not a comparison at all: an attribution experiment holds one arm against another
-    and the paper printed neither, so reconciling either against a cell answers a question
-    nobody asked.
-
-    `settlement_declared` is the second half of what a between-arms comparison needs and
-    is written by `stages.validation.prepare`, never by this function: two arms with no
-    rule declared for them BEFORE the run is a comparison with nothing to settle it
-    against, and a rule chosen once both numbers are in settles whatever its author
-    wanted. A caller that does not pass it gets the pre-focused-validation behaviour,
-    which is what keeps every other route and every fixture unchanged.
+    comparison — a measured number against a quantity the paper printed.
 
     Attached to the spec whether or not it is established, for the same reason capability
     and identity are: "we could not have compared it either" is more useful to a reader
     than leaving the question unanswered.
     """
     spec.comparison = comparison_mod.derive(
-        route,
-        printed_value_available=bool((spec.claimed_cell_value or "").strip()),
-        arms_specified=len(spec.arms or []),
-        settlement_declared=bool(settlement_declared))
+        route, printed_value_available=bool((spec.claimed_cell_value or "").strip()))
     return spec
 
 
@@ -1215,43 +1180,6 @@ def replan_after_author_code_exhausted(
     fallback = planner.plan(
         obj, artifact_available=True, specification_complete=True,
         investigation_open=True, author_code_exhausted=True, attempt=plan.attempt + 1)
-    plan.superseded_by = fallback.route
-    return fallback
-
-
-def replan_after_validation_blocked(
-        obj: DiscoveredObject, plan: PlanDecision,
-        fv: "FocusedValidation | None") -> PlanDecision | None:
-    """The SAME re-plan primitive as `replan_after_author_code_exhausted`, for the other
-    route that can precede a reconstruction.
-
-    A material question left NOT_TRIED because nothing carried a FOCUSED_VALIDATION_
-    EXPERIMENT design's own specification-block onward is the identical defect on a
-    second route: `validation_stage.prepare` can determine that the paper's method
-    section does not support a controlled contrast (a `SPECIFICATION_BLOCKED` design),
-    and until this function existed that fact went no further — `obj.routes` could still
-    OFFER `INDEPENDENT_RECONSTRUCTION` alongside `FOCUSED_VALIDATION_EXPERIMENT`, exactly
-    as it offers it alongside `AUTHOR_CODE_EXECUTION`, and nothing ever asked whether it
-    applied.
-
-    Two conditions, both required: the target's ORIGINAL plan chose
-    `FOCUSED_VALIDATION_EXPERIMENT` (a re-plan of anything else is not this fallback),
-    and the design GENUINELY failed to bind (`fv.design` absent or `not established`) —
-    a design this review never reached (`fv is None`) is not grounds for a fallback, the
-    same distinction `identity_failed` draws for identity never having been assessed.
-    `obj.routes` must still offer `INDEPENDENT_RECONSTRUCTION` — see `discovery._routes`:
-    that only happens when the paper's specification is otherwise complete enough to
-    attempt a reconstruction, so this function cannot invent a route discovery refused.
-    """
-    if plan.route != "FOCUSED_VALIDATION_EXPERIMENT":
-        return None
-    if "INDEPENDENT_RECONSTRUCTION" not in obj.routes:
-        return None
-    if fv is None or (fv.design is not None and fv.design.established):
-        return None
-    fallback = planner.plan(
-        obj, artifact_available=True, specification_complete=True,
-        investigation_open=True, focused_validation_exhausted=True, attempt=plan.attempt + 1)
     plan.superseded_by = fallback.route
     return fallback
 
@@ -1491,25 +1419,10 @@ def _review(cfg: Config, pid: str) -> dict:
     # execution planning so the authors' own entrypoint still wins when it is available.
     spec = synthesize_probe(cfg, doc, spec, acq)
     spec = plan_execution(cfg, spec, acq, doc, audit, root=root)
-    # THE FOCUSED-VALIDATION DESIGN, for a target on that route and for no other. It runs
-    # HERE — after identity has bound against a real checkout and before the comparison is
-    # derived — because a design that binds is what names the two arms, and the arms are
-    # what `establish_comparison` counts. A design that does not bind leaves `spec.arms`
-    # alone and nothing starts.
-    fv_graph = _graph_for(doc, pairs) if pairs else None
-    validations: list[FocusedValidation] = []
-    fv = None
-    if pairs and pairs[0][1].action == validation_stage.ACTION:
-        spec, fv, fv_record = validation_stage.prepare(
-            cfg, doc, pairs[0][0], pairs[0][1], spec, fv_graph)
-        state.write_json(state.control_dir(root) / "validation.driver.json", fv_record)
     # WHAT ITS RESULT WOULD BE HELD AGAINST, from the route the planner chose. Attached
     # whether or not it is established; only the gate below reads it.
     if pairs:
-        spec = establish_comparison(
-            spec, pairs[0][1].route,
-            settlement_declared=bool(fv is not None and fv.design is not None
-                                     and fv.design.established))
+        spec = establish_comparison(spec, pairs[0][1].route)
 
     # Only the harness's OWN generated spec is re-persisted here. A sealed `driver_accept`
     # spec (`spec.written_by == "driver_accept"`, set in `build_spec` above) must never be
@@ -1587,14 +1500,13 @@ def _review(cfg: Config, pid: str) -> dict:
     # a torso the report has to reassemble.
     #
     # THE GUARD IS NOT TIDINESS. This stage is now entered even when nothing is
-    # executable, so the three routes that do not execute — artifact inspection, the
-    # prior-art search, the focused-validation design — can reach a paper at all; before,
-    # the controller returned before calling it and they were skipped for most papers.
-    # Writing a ProbeResult on that path made `stages/report` print a "Measured
-    # reproduction" section for a probe that started nothing, which is the precise
-    # overclaim `tests/test_review` exists to catch. The reading routes seal their own
-    # records under `literature/`, `artifact/` and `validation/`; none of them is an
-    # execution and none belongs in this file.
+    # executable, so the artifact-inspection route that does not execute can still reach
+    # a paper at all; before, the controller returned before calling it and it was
+    # skipped for most papers. Writing a ProbeResult on that path made `stages/report`
+    # print a "Measured reproduction" section for a probe that started nothing, which is
+    # the precise overclaim `tests/test_review` exists to catch. The reading route seals
+    # its own records under `artifact/`; that is not an execution and does not belong in
+    # this file.
     if pairs:
         state.write_json(state.control_dir(root) / "probe_results.json", result.model_dump())
 
@@ -1606,49 +1518,7 @@ def _review(cfg: Config, pid: str) -> dict:
     # explain both rather than whichever happened to be first.
     outcomes: list[TargetOutcome] = []
     if target_set is not None and pairs:
-        if fv is not None and not (fv.design is not None and fv.design.established):
-            # THE DESIGN DID NOT BIND, so nothing was started and the reason is the
-            # paper's method section rather than any gate of ours. Reported as
-            # SPECIFICATION_BLOCKED naming the ingredient, not as COMPARISON_BLOCKED,
-            # which would report a limit of our arithmetic for a limit of their reporting.
-            outcomes.append(validation_stage.outcome_for(fv, pairs[0][1]))
-            validations.append(fv)
-            # THE SAME FALLBACK AUTHOR_CODE_EXECUTION GETS, on the route the design's own
-            # refusal opens rather than the identity layer's. A blocked design that never
-            # tries the reconstruction the object's own routes already offer is the exact
-            # "material question left NOT_TRIED" defect on a second originating route.
-            validation_fallback = replan_after_validation_blocked(pairs[0][0], pairs[0][1], fv)
-            if validation_fallback is not None:
-                target_set.plans.append(validation_fallback)
-                validation_reconstruction_result = attempt_reimplementation_fallback(
-                    cfg, root, pid, doc, spec, validation_fallback, acq=acq)
-                if validation_reconstruction_result is not None:
-                    outcomes.append(outcome_for(
-                        pairs[0][0].target_id, validation_reconstruction_result,
-                        validation_fallback.action, validation_fallback.route))
-                else:
-                    note = _fallback_note(cfg, validation_fallback, reconstruction_readiness)
-                    outcomes.append(TargetOutcome(
-                        target_id=pairs[0][0].target_id,
-                        disposition=("SPECIFICATION_BLOCKED"
-                                    if reconstruction_specification_blocked(
-                                        reconstruction_readiness)
-                                    else "AUTHORIZATION_BLOCKED"),
-                        action=validation_fallback.action, route=validation_fallback.route,
-                        launched=0,
-                        reason=(note.strip()
-                               or "a fallback to this route was considered and did not run"),
-                        failure_class=("none"
-                                      if reconstruction_specification_blocked(
-                                          reconstruction_readiness)
-                                      else "execution_unauthorized")))
-        elif fv is not None and may_run and not direct_reconstruction:
-            fv = validation_stage.adjudicate(fv, spec, result)
-            outcomes.append(validation_stage.outcome_for(
-                fv, pairs[0][1], provenance=result.provenance,
-                execution_ref=result.execution_log))
-            validations.append(fv)
-        elif reconstruction_result is not None and reconstruction_plan is not None:
+        if reconstruction_result is not None and reconstruction_plan is not None:
             outcomes.append(outcome_for(pairs[0][0].target_id, reconstruction_result,
                                         reconstruction_plan.action,
                                         reconstruction_plan.route))
@@ -1713,58 +1583,7 @@ def _review(cfg: Config, pid: str) -> dict:
                 other.written_by = "harness"
                 other = synthesize_probe(cfg, doc, other, acq)
                 other = plan_execution(cfg, other, acq, doc, audit, root=root)
-                other_fv = None
-                if plan.action == validation_stage.ACTION:
-                    other, other_fv, other_record = validation_stage.prepare(
-                        cfg, doc, obj, plan, other, fv_graph)
-                    state.write_json(
-                        state.control_dir(root) / "targets" / obj.target_id /
-                        "validation.driver.json", other_record)
-                    if not (other_fv.design is not None
-                            and other_fv.design.established):
-                        outcomes.append(validation_stage.outcome_for(other_fv, plan))
-                        validations.append(other_fv)
-                        # Same fallback as the primary target's: a blocked design that
-                        # never tries the reconstruction the object's own routes already
-                        # offer leaves that route NOT_TRIED rather than genuinely refused.
-                        other_validation_fallback = replan_after_validation_blocked(
-                            obj, plan, other_fv)
-                        if other_validation_fallback is not None:
-                            target_set.plans.append(other_validation_fallback)
-                            vtdir = root / "runs" / pid / "targets" / obj.target_id
-                            other_validation_result = attempt_reimplementation_fallback(
-                                cfg, root, pid, doc, other, other_validation_fallback,
-                                out_dir=vtdir / "reimplementation", acq=acq)
-                            if other_validation_result is not None:
-                                state.write_json(
-                                    state.control_dir(root) / "targets" / obj.target_id /
-                                    "probe_results.json",
-                                    other_validation_result.model_dump())
-                                outcomes.append(outcome_for(
-                                    obj.target_id, other_validation_result,
-                                    other_validation_fallback.action,
-                                    other_validation_fallback.route))
-                            else:
-                                vnote = _fallback_note(cfg, other_validation_fallback,
-                                                       reconstruction_readiness)
-                                v_spec_blocked = reconstruction_specification_blocked(
-                                    reconstruction_readiness)
-                                outcomes.append(TargetOutcome(
-                                    target_id=obj.target_id,
-                                    disposition=("SPECIFICATION_BLOCKED" if v_spec_blocked
-                                                else "AUTHORIZATION_BLOCKED"),
-                                    action=other_validation_fallback.action,
-                                    route=other_validation_fallback.route, launched=0,
-                                    reason=(vnote.strip() or "a fallback to this route "
-                                           "was considered and did not run"),
-                                    failure_class=("none" if v_spec_blocked
-                                                  else "execution_unauthorized")))
-                        continue
-                other = establish_comparison(
-                    other, plan.route,
-                    settlement_declared=bool(other_fv is not None
-                                             and other_fv.design is not None
-                                             and other_fv.design.established))
+                other = establish_comparison(other, plan.route)
                 tdir = root / "runs" / pid / "targets" / obj.target_id
                 ctdir = state.control_dir(root) / "targets" / obj.target_id
                 state.write_json(ctdir / "spec.json", other.model_dump())
@@ -1830,15 +1649,7 @@ def _review(cfg: Config, pid: str) -> dict:
                     continue
                 tres = _run(cfg, root, other, out_dir=tdir, results_dir=ctdir)
                 state.write_json(ctdir / "probe_results.json", tres.model_dump())
-                if other_fv is not None:
-                    other_fv = validation_stage.adjudicate(other_fv, other, tres)
-                    outcomes.append(validation_stage.outcome_for(
-                        other_fv, plan, provenance=tres.provenance,
-                        execution_ref=tres.execution_log))
-                    validations.append(other_fv)
-                else:
-                    outcomes.append(outcome_for(obj.target_id, tres, plan.action,
-                                                plan.route))
+                outcomes.append(outcome_for(obj.target_id, tres, plan.action, plan.route))
             except Exception as e:                # noqa: BLE001
                 # A fault pursuing one target is not evidence about the paper and must not
                 # cost the paper its other targets — the same rule `_phase_probe` applies
@@ -1878,29 +1689,14 @@ def _review(cfg: Config, pid: str) -> dict:
         exhaustion.refresh(target_set, cfg)
         state.write_json(discover_stage.targets_path_in(root), target_set.model_dump())
 
-    # --- the artifact route and the prior-art route, CONCURRENTLY ----------------------
+    # --- the artifact route -------------------------------------------------------------
     # AFTER acquisition, because the artifact route needs the checkout, and structurally
-    # separate from the execution loop above because neither route's targets are
-    # executable ones: `planner` reaches ARTIFACT_INSPECTION_ONLY / LITERATURE_SEARCH_ONLY
-    # only where no executable route applies, so neither competes with, defers, or
-    # suppresses a run, and neither spends a process or execution budget.
-    #
-    # The two routes select on DISJOINT, already-decided `plan.action` values, read only
-    # `target_set` (never each other's output — `literature_stage.run_route` never reads
-    # `artifact/`, and vice versa), and write to disjoint files
-    # (`artifact/<pid>.route.json` vs `literature/<pid>.search.json`). So they run on a
-    # 2-worker pool and their outcome-merge blocks below apply sequentially afterward —
-    # both are idempotent per-target writes keyed by disjoint target ids, so the order
-    # between them does not matter. This removes the artifact route's one whole-paper
-    # reviewer call from the literature route's critical path.
-    with ThreadPoolExecutor(max_workers=2) as _route_pool:
-        _artifact_future = _route_pool.submit(
-            artifact_stage.run_route, cfg, pid, doc, target_set, acq.path,
-            url=acq.url or (doc.repo_url or ""))
-        _literature_future = _route_pool.submit(
-            literature_stage.run_route, cfg, pid, doc, target_set)
-        artifact_outcomes, inspection = _artifact_future.result()
-        literature_outcomes, search = _literature_future.result()
+    # separate from the execution loop above because its targets are not executable ones:
+    # `planner` reaches ARTIFACT_INSPECTION_ONLY only where no executable route applies,
+    # so it never competes with, defers, or suppresses a run, and never spends a process
+    # or execution budget.
+    artifact_outcomes, inspection = artifact_stage.run_route(
+        cfg, pid, doc, target_set, acq.path, url=acq.url or (doc.repo_url or ""))
     if target_set is not None and artifact_outcomes:
         for out in artifact_outcomes:
             state.write_json(
@@ -1913,24 +1709,6 @@ def _review(cfg: Config, pid: str) -> dict:
         for obj in target_set.objects:
             if obj.target_id in by_artifact:
                 obj.status = by_artifact[obj.target_id]
-        discover_stage.sync_questions(target_set)
-        exhaustion.refresh(target_set, cfg)
-        state.write_json(discover_stage.targets_path_in(root), target_set.model_dump())
-
-    # --- the prior-art route's own outcome merge (dispatched above, alongside the
-    # artifact route) ---------------------------------------------------------------
-    if target_set is not None and literature_outcomes:
-        for out in literature_outcomes:
-            state.write_json(
-                state.control_dir(root) / "targets" / out.target_id / "outcome.json",
-                out.model_dump())
-        replaced = {o.target_id for o in literature_outcomes}
-        target_set.outcomes = [o for o in target_set.outcomes
-                               if o.target_id not in replaced] + literature_outcomes
-        by_literature = {o.target_id: o.disposition for o in literature_outcomes}
-        for obj in target_set.objects:
-            if obj.target_id in by_literature:
-                obj.status = by_literature[obj.target_id]
         discover_stage.sync_questions(target_set)
         exhaustion.refresh(target_set, cfg)
         state.write_json(discover_stage.targets_path_in(root), target_set.model_dump())
@@ -1961,18 +1739,6 @@ def _review(cfg: Config, pid: str) -> dict:
             "code_audit_skipped": audit.skipped or None,
             "artifact_targets": len(artifact_outcomes),
             "artifact_facts": len(inspection.facts) if inspection else 0,
-            # THREE COUNTS, NEVER SUMMED. Works retrieved is what the search saw;
-            # concerns is what survived every endpoint check; and a concern is a question
-            # for a referee, not a novelty finding.
-            # FOUR COUNTS, NEVER SUMMED, for the same reason the literature route's three
-        # are not: a design attempted, a design that bound, a contrast actually measured
-        # and a question actually settled are four different facts, and adding any two of
-        # them produces a number that means nothing.
-        **{f"validation_{k}": v for k, v in
-           validation_stage.summarise(validations).items()},
-        "literature_targets": len(literature_outcomes),
-            "literature_works": len(search.works) if search else 0,
-            "literature_concerns": len(search.concerns()) if search else 0,
             "reconciliation": rec.status if rec else None,
             "seconds": result.seconds, "reason": result.reason,
             "script": result.script_path, "results": "control/probe_results.json"}

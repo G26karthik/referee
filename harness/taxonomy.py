@@ -69,11 +69,6 @@ SCIENTIFIC_CLASSES = (
 RESOLUTION_STATES = (
     "RESOLVED_FROM_PAPER",      # the paper's own printed content settled it
     "RESOLVED_FROM_ARTIFACT",   # static inspection of the released code settled it
-    # A BOUNDED PRIOR-ART QUESTION SETTLED FROM THE PUBLISHED LITERATURE. Reachable only
-    # from `PRIOR_ART_EVIDENCE`, which needs a bound relation and not a silence: a search
-    # that completed and matched nothing resolves NOTHING, and lands on UNRESOLVED like
-    # every other state that looked without settling.
-    "RESOLVED_FROM_LITERATURE",
     "RESOLVED_BY_EXECUTION",    # something ran, admissibly, and settled it
     "UNRESOLVED",               # still open
     "NOT_INVESTIGATED",         # no route was pursued; see the evidence state for why
@@ -100,40 +95,6 @@ EVIDENCE_STATES = (
     # ARTIFACT_EVIDENCE would say the paper had been checked; NOT_INVESTIGATED would say
     # nobody looked.
     "ARTIFACT_ENDPOINTS_VERIFIED",
-    # A PRIOR-ART RELATION THE BOUNDED EVIDENCE ITSELF BINDS. About the paper, because a
-    # target claiming to be first at X and an earlier work stating that same narrow X is a
-    # statement about this document. Deliberately absent from `establishes_failure` all
-    # the same: novelty is a scholarly judgement, and a strong prior-art match is a
-    # serious question for a referee rather than a verdict this system may reach.
-    "PRIOR_ART_EVIDENCE",
-    # BOTH WORKS REAL, THE OVERLAP A READING. The third channel to need this state, after
-    # CITATION_VERIFIED and ARTIFACT_ENDPOINTS_VERIFIED, and it resolves to UNRESOLVED for
-    # the same reason they do.
-    "LITERATURE_ENDPOINTS_VERIFIED",
-    # THE ASYMMETRY, ON THE EVIDENCE AXIS. A bounded search that completed and matched
-    # nothing is a fact about the SEARCH — the declared protocol ran to its declared
-    # bounds — and it is not in `EVIDENCE_ABOUT_THE_PAPER`, so no amount of it can resolve
-    # anything about the document. There is no evidence state meaning "novel", and this is
-    # the one a completed empty search gets instead: the encoding of
-    # "failing to find prior art does not establish novelty".
-    "BOUNDED_SEARCH_NO_MATCH",
-    # No index answered, or none could be reached from here. A fact about this host's
-    # configuration in exactly the way ENVIRONMENT_LIMITATION is.
-    "LITERATURE_LIMITATION",
-    # A CONTROLLED EXPERIMENT THIS REVIEW DESIGNED, RUN AND READ. About the paper, and
-    # separate from REPRODUCTION_* on purpose: a reproduction re-runs an experiment the
-    # authors published, and a focused validation runs one they did not. Folding the two
-    # would let an experiment nobody published convict a paper through a state whose name
-    # says "reproduction" — and a referee reading the review could not tell which had
-    # happened. Reached only from a CONFORMANT design on an admissible provenance.
-    "CONTROLLED_EXPERIMENT_EVIDENCE",
-    # THE SAME ARITHMETIC, SAYING NOTHING ABOUT THE PAPER. Two arms really ran and really
-    # were compared, and the experiment is not established to be the paper's — a scientific
-    # choice in it is this review's. The fourth channel to need an endpoints-verified
-    # state, after CITATION_VERIFIED, ARTIFACT_ENDPOINTS_VERIFIED and
-    # LITERATURE_ENDPOINTS_VERIFIED, and it resolves to UNRESOLVED exactly as they do.
-    # This is expected to be the commonest outcome of the route and it is not a shortfall.
-    "CONTROLLED_OBSERVATION",
     # The design could not be built from what the paper states. Mapped to
     # SPECIFICATION_LIMITATION below rather than given its own state, because it is the
     # same fact `INFEASIBLE_SPECIFICATION` already reports: the paper's method section,
@@ -215,29 +176,6 @@ _EVIDENCE_FOR_DISPOSITION = {
     # The route ran and settled nothing. A limit of what reading can establish, reported
     # as such rather than as a missing artifact.
     "ARTIFACT_INSPECTION_INCONCLUSIVE": "COMPARISON_LIMITATION",
-    # THE FIVE LITERATURE OUTCOMES, and the one that matters is the third.
-    "PRIOR_ART_RELATION_STRUCTURALLY_BOUND": "PRIOR_ART_EVIDENCE",
-    "LITERATURE_MATCH_VERIFIED_ENDPOINTS": "LITERATURE_ENDPOINTS_VERIFIED",
-    # A COMPLETED SEARCH THAT MATCHED NOTHING RESOLVES NOTHING. Mapping this to anything
-    # in `EVIDENCE_ABOUT_THE_PAPER` would make a search budget into a novelty finding,
-    # which is the single rule this route is built around; mapping it to NOT_INVESTIGATED
-    # would say nobody looked, which is the CITATION_VERIFIED defect in a new costume.
-    "SEARCH_COMPLETED_NO_MATCH_FOUND": "BOUNDED_SEARCH_NO_MATCH",
-    # Candidates were found and the evidence did not reach them — no retrievable abstract,
-    # a quotation that did not resolve, a date no index knew. A limit of the retrieval,
-    # reported as one.
-    "SEARCH_INCONCLUSIVE": "LITERATURE_LIMITATION",
-    "LITERATURE_BLOCKED": "LITERATURE_LIMITATION",
-    # THE FOUR FOCUSED-VALIDATION OUTCOMES. The first two are about the paper and the
-    # last two are not, and the difference is conformance rather than arithmetic: the
-    # same measured contrast lands on the third row when a scientific choice in the
-    # experiment was this review's. `VALIDATION_INCONCLUSIVE` is its own row rather than
-    # folded into INCONCLUSIVE, because "it ran and the declared rule fired neither way"
-    # is a result of a predeclared condition and "it ran and settled nothing" is not.
-    "VALIDATION_DEFECT_ESTABLISHED": "CONTROLLED_EXPERIMENT_EVIDENCE",
-    "VALIDATION_SUPPORTS_CLAIM": "CONTROLLED_EXPERIMENT_EVIDENCE",
-    "VALIDATION_OBSERVATION_ONLY": "CONTROLLED_OBSERVATION",
-    "VALIDATION_INCONCLUSIVE": "INCONCLUSIVE_EXECUTION",
     "SPECIFICATION_BLOCKED": "SPECIFICATION_LIMITATION",
     "ARTIFACT_BLOCKED": "ARTIFACT_LIMITATION",
     # NOT ARTIFACT_LIMITATION. "We could not build an address for this claim" is a limit
@@ -271,32 +209,24 @@ _EVIDENCE_FOR_DISPOSITION = {
     "PENDING": "NOT_INVESTIGATED",
 }
 
-# Only these two evidence states are statements ABOUT THE PAPER. Everything else in
+# Only these four evidence states are statements ABOUT THE PAPER. Everything else in
 # `EVIDENCE_STATES` describes an artifact, a host, or a gate — invariants 4 to 7.
-# PRIOR_ART_EVIDENCE is the fifth and the newest. A target claiming to be first at X
-# and an earlier work stating that same narrow X is a statement about THIS document, so it
-# belongs here — and it still reaches no stop, because `TargetOutcome.establishes_failure`
-# names two dispositions and this is neither. Membership here decides what a review may
-# say it examined, never what it may conclude.
+# Membership here decides what a review may say it examined, never what it may conclude.
 EVIDENCE_ABOUT_THE_PAPER = ("REPRODUCTION_SUCCESS", "REPRODUCTION_FAILURE",
-                            "PAPER_INTERNAL_EVIDENCE", "ARTIFACT_EVIDENCE",
-                            "PRIOR_ART_EVIDENCE", "CONTROLLED_EXPERIMENT_EVIDENCE")
+                            "PAPER_INTERNAL_EVIDENCE", "ARTIFACT_EVIDENCE")
 
 # WAS THIS TARGET'S CLAIM CHECKED AT ALL? The question `stages/report.unchecked_central`
 # actually asks, derived here rather than kept there as a hand-written set of dispositions
-# — a set like that drifts every time a route is added, and by the time three had been
-# (artifact, literature, focused validation) an ESTABLISHED paper/artifact mismatch on a
-# CENTRAL target was printed under "Central claims this review did not check", three lines
-# below the section reporting what it had established.
+# — a set like that drifts every time a route is added, and an ESTABLISHED paper/artifact
+# mismatch on a CENTRAL target was once printed under "Central claims this review did not
+# check", three lines below the section reporting what it had established.
 #
 # THE PREDICATE IS `EVIDENCE_ABOUT_THE_PAPER`, PLUS ONE. Producing evidence is not the
 # test, and a first attempt at this used it and was wrong: a citation re-verification
 # produces real evidence about a CONCERN'S QUOTATION and says nothing whatever about the
 # paper, so a central claim carrying one is unchecked and `tests/test_scientific_taxonomy`
 # has said so deliberately since `CITATION_VERIFIED` was split out. The same goes for a
-# completed prior-art search that matched nothing, for a bounded fact about the released
-# code, and for a controlled observation whose conformance was never established — every
-# one of them is a real result, and not one of them is the paper's claim checked.
+# bounded fact about the released code — a real result, and not the paper's claim checked.
 #
 # The "plus one" is `INCONCLUSIVE_EXECUTION`: a route that tried to settle a question
 # ABOUT THE PAPER and failed. That target was checked and the check did not conclude,
@@ -364,12 +294,6 @@ def evidence_state(disposition: str = "", provenance: str = "") -> str:
     if state in ("REPRODUCTION_SUCCESS", "REPRODUCTION_FAILURE") \
             and not _admits(provenance or ""):
         return "INCONCLUSIVE_EXECUTION"
-    # THE SAME CEILING, ON THE FOCUSED-VALIDATION CHANNEL. `between_arms.authority_for`
-    # already refuses the top rung for an inadmissible provenance, so a disposition
-    # arriving here with one is a disagreement between two layers rather than a verdict —
-    # and it falls to the observation state, which says something true about what ran.
-    if state == "CONTROLLED_EXPERIMENT_EVIDENCE" and not _admits(provenance or ""):
-        return "CONTROLLED_OBSERVATION"
     return state
 
 
@@ -380,17 +304,10 @@ def resolution_state(evidence: str = "") -> str:
     of the evidence behind it is a resolution nobody checked.
     """
     e = (evidence or "").strip().upper()
-    if e in ("REPRODUCTION_SUCCESS", "REPRODUCTION_FAILURE",
-             "CONTROLLED_EXPERIMENT_EVIDENCE"):
-        # A focused validation IS an execution — the one axis on which it is exactly like
-        # a reproduction — so it resolves here rather than earning a sixth RESOLUTION_STATES
-        # member. What it is NOT like a reproduction in is which evidence state it carries,
-        # and that distinction is one line above, where a reader can see it.
+    if e in ("REPRODUCTION_SUCCESS", "REPRODUCTION_FAILURE"):
         return "RESOLVED_BY_EXECUTION"
     if e == "PAPER_INTERNAL_EVIDENCE":
         return "RESOLVED_FROM_PAPER"
-    if e == "PRIOR_ART_EVIDENCE":
-        return "RESOLVED_FROM_LITERATURE"
     if e in ("ARTIFACT_EVIDENCE", "ARTIFACT_PROPERTY_ESTABLISHED"):
         # BOTH are resolutions — the narrow artifact question really is closed — and they
         # differ on the OTHER axis: only ARTIFACT_EVIDENCE is in EVIDENCE_ABOUT_THE_PAPER.

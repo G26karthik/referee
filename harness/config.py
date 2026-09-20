@@ -1,15 +1,14 @@
-"""Paths, execution settings, and where a remote sandbox is asked for.
+"""Paths and execution settings.
 
 No credentials are REQUIRED. Nothing in the review pipeline calls a hosted model: the
 deterministic stages are plain Python, and the judgement stages are driven by whatever
 reviewer the operator configures (see `stages/audit.py`).
 
 `Config.load()` therefore cannot fail for want of a token — the only thing it does is
-make sure the cases directory exists. Two subsystems can *use* credentials when the
-operator supplies them, and both are off by default: the audit/grade/verdict drivers,
-and the remote sandbox backend (`SH_ALLOW_SANDBOX`, read from the environment or from a
-`.env.sandbox` file beside the repo). A missing token is never an error here; it makes a
-capability unavailable and is reported as such.
+make sure the cases directory exists. Only one subsystem can *use* credentials when the
+operator supplies them, and it is off by default: the audit/grade/verdict drivers. A
+missing token is never an error here; it makes a capability unavailable and is reported
+as such.
 """
 from __future__ import annotations
 
@@ -23,68 +22,10 @@ BASE_DIR = pathlib.Path(__file__).resolve().parent.parent      # single-harness/
 REPO_ROOT = BASE_DIR.parent
 PROJECTS_DIR = BASE_DIR / "projects"
 
-# Credentials for the remote sandbox are read from the environment, or from this file if
-# it exists, so an operator can keep a provider token out of their shell history. Loaded
-# with `setdefault` semantics: a variable already exported always wins, and nothing here
-# is ever written back to disk.
-#
-# The file is deliberately NOT in the repo and is git-ignored. It is read at
-# `Config.load()` time rather than at import time so a test that manipulates the
-# environment is not racing a module-level side effect.
-ENV_FILES = (BASE_DIR / ".env.sandbox", REPO_ROOT / ".env.sandbox")
-
 
 def _flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     return default if raw is None else raw.strip().lower() in ("1", "true", "yes", "on")
-
-
-def _int(name: str, default: int) -> int:
-    """An unparseable value falls back to the default rather than crashing the run.
-
-    A malformed `SH_SANDBOX_CPU=four` should not take a review down at import time; the
-    declared default is a safe answer and `sandbox.spec_from_config` reports what it used.
-    """
-    raw = (os.environ.get(name) or "").strip()
-    try:
-        return int(float(raw)) if raw else default
-    except ValueError:
-        return default
-
-
-def _float(name: str, default: float) -> float:
-    raw = (os.environ.get(name) or "").strip()
-    try:
-        return float(raw) if raw else default
-    except ValueError:
-        return default
-
-
-def load_env_files(paths: "tuple[pathlib.Path, ...] | None" = None) -> list[str]:
-    """Populate the environment from `.env.sandbox`, without overriding what is set.
-
-    Returns the files that were read, so a caller can say where a credential came from.
-    Quoted values are kept verbatim; an unquoted trailing ` # comment` is stripped.
-    """
-    read: list[str] = []
-    for path in (paths if paths is not None else ENV_FILES):
-        if not path.is_file():
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            value = value.strip()
-            if not (value[:1] in "\"'" and value[-1:] == value[:1]):
-                value = value.split(" #", 1)[0].rstrip()
-            os.environ.setdefault(key.strip(), value.strip("\"'"))
-        read.append(str(path))
-    return read
 
 
 @dataclass
@@ -214,24 +155,6 @@ class Config:
     # this run could not cover everything, exactly as the audit lenses already work.
     require_grades: bool = field(default_factory=lambda: _flag("SH_REQUIRE_GRADES"))
 
-    # --- claim links ------------------------------------------------------------------
-    # The one correspondence a paper does not print: which number a headline claim rests
-    # on. OFF by default, and the default is load-bearing rather than cautious. With the
-    # gate closed no link is ever established, `claimgraph` has no SUPPORTED_BY edges, and
-    # `materiality` falls back to its own structural rule — which is exactly the state the
-    # harness was in before this channel existed. So turning it off reproduces the
-    # pre-claim-link decision bit for bit, the same property `allow_grading` has and for
-    # the same reason: a model channel that could only be assessed by running it is a
-    # channel nobody can turn off to see what it did.
-    allow_claim_links: bool = field(default_factory=lambda: _flag("SH_ALLOW_CLAIM_LINKS"))
-    claimlink_cmd: str = field(default_factory=lambda: os.environ.get("SH_CLAIMLINK_CMD", ""))
-    # Same reasoning as `grade_model` and `verdict_model`: empty means the role's declared
-    # default in `harness.prompts.claimlink.ROLE_SPEC`, never the CLI's ambient default.
-    claimlink_model: str = field(
-        default_factory=lambda: (os.environ.get("SH_CLAIMLINK_MODEL") or "").strip())
-    claimlink_timeout_s: int = field(
-        default_factory=lambda: int(os.environ.get("SH_CLAIMLINK_TIMEOUT", "600")))
-
     # --- the authors'-code auditor ---------------------------------------------------
     # "Did the authors actually implement the code correctly?" — one read-only pass over
     # the PINNED checkout, proposing code-level scientific concerns. OFF by default and
@@ -252,66 +175,6 @@ class Config:
     artifact_review_timeout_s: int = field(
         default_factory=lambda: int(os.environ.get("SH_ARTIFACT_REVIEW_TIMEOUT", "900")))
 
-    # --- the prior-art route ----------------------------------------------------------
-    # Two separate gates, because they buy two different things and fail in two different
-    # ways. `allow_literature_search` permits QUERYING public scholarly indexes — network
-    # egress to OpenAlex, Crossref, arXiv and Semantic Scholar — and
-    # `allow_literature_review` permits a model to read what came back. Off by default,
-    # both: with the first closed nothing is searched and the route reports LITERATURE_
-    # BLOCKED, which is a fact about this host; with only the second closed the route
-    # searches on deterministic queries and adjudicates nothing semantically.
-    #
-    # NEITHER GATE CAN PRODUCE A NOVELTY CONCLUSION, and that is not enforced by these
-    # flags — `artifacts.NOVELTY_ESTABLISHING_AUTHORITIES` is the empty tuple, so a
-    # completed search with no match establishes nothing whatever either gate is set to.
-    allow_literature_search: bool = field(
-        default_factory=lambda: _flag("SH_ALLOW_LITERATURE_SEARCH"))
-    allow_literature_review: bool = field(
-        default_factory=lambda: _flag("SH_ALLOW_LITERATURE_REVIEW"))
-    literature_cmd: str = field(default_factory=lambda: os.environ.get("SH_LITERATURE_CMD", ""))
-    literature_model: str = field(
-        default_factory=lambda: (os.environ.get("SH_LITERATURE_MODEL") or "").strip())
-    literature_timeout_s: int = field(
-        default_factory=lambda: int(os.environ.get("SH_LITERATURE_TIMEOUT", "600")))
-    # The indexes to ask, in order. An operator may narrow this; narrowing it narrows the
-    # PUBLISHED protocol too, because `LiteratureSearch.protocol` records what was
-    # required and `protocol_completed` is false when a required index did not answer.
-    literature_providers: str = field(
-        default_factory=lambda: os.environ.get("SH_LITERATURE_PROVIDERS",
-                                               "openalex,crossref,arxiv"))
-    # How deep each query goes. A BOUND, published in the record: "no match in the top 20"
-    # means exactly that and says nothing about rank 21.
-    literature_top_k: int = field(
-        default_factory=lambda: int(os.environ.get("SH_LITERATURE_TOP_K", "20")))
-    literature_max_claims: int = field(
-        default_factory=lambda: int(os.environ.get("SH_LITERATURE_MAX_CLAIMS", "6")))
-    # How many retrieved candidates a reader is shown per claim. A reader given 160
-    # abstracts for one sentence has not read 160 abstracts.
-    literature_max_candidates: int = field(
-        default_factory=lambda: int(os.environ.get("SH_LITERATURE_MAX_CANDIDATES", "12")))
-    # Identifies this harness to the indexes, which ask politely to be told who is asking.
-    # Not a credential: none of the three default providers requires one, which is why
-    # they are the default and Semantic Scholar is not.
-    literature_mailto: str = field(
-        default_factory=lambda: os.environ.get("SH_LITERATURE_MAILTO", ""))
-
-    # --- the focused-validation route -------------------------------------------------
-    # ONE gate, and it buys the DESIGN rather than the run. With it closed the route still
-    # runs: the arms, the metric, the benchmark, the split and the addressed question are
-    # all read off the document, and every design reports SPECIFICATION_BLOCKED naming the
-    # ingredients the paper does not bind — which is the honest answer for a paper that
-    # does not state enough, and is what a reader sees without any model in the loop.
-    #
-    # EXECUTION IS NOT GATED HERE. A focused validation runs the authors' own checkout, so
-    # it passes through `backends.authorize` and `SH_ALLOW_REPO_EXEC` exactly as a
-    # reproduction does. Nothing in this flag can start a process.
-    allow_validation_design: bool = field(
-        default_factory=lambda: _flag("SH_ALLOW_VALIDATION_DESIGN"))
-    validation_cmd: str = field(default_factory=lambda: os.environ.get("SH_VALIDATION_CMD", ""))
-    validation_model: str = field(
-        default_factory=lambda: (os.environ.get("SH_VALIDATION_MODEL") or "").strip())
-    validation_timeout_s: int = field(
-        default_factory=lambda: int(os.environ.get("SH_VALIDATION_TIMEOUT", "600")))
     # --- the substantive verdict -----------------------------------------------------
     # A single, best-effort, never-retried, whole-paper opinion — see
     # `harness/prompts/verdict.py`. OFF by default: a third external process an operator
@@ -333,66 +196,14 @@ class Config:
     # thing that may say yes. An unknown name is refused rather than substituted (see
     # backends.select_backend).
     #
-    #   local   this machine, subprocesses. The default, and the only backend that runs
-    #           code THIS harness authored (see backends.local_backend).
-    #   modal   a remote Linux sandbox, leased per paper (harness/sandbox.py). Needs
-    #           `allow_sandbox` AND provider credentials; without either it reports
-    #           itself unavailable and nothing runs there.
+    #   local     this machine, subprocesses. The default, and the only backend that runs
+    #             code THIS harness authored (see backends.local_backend).
+    #   container a local container with its own filesystem namespace — the only
+    #             registered backend whose isolation is sufficient to run a paper's own
+    #             repository (see backends.ContainerBackend, harness.isolation).
     #   kaggle
-    #   colab   declarations of published hardware. Never runners.
+    #   colab     declarations of published hardware. Never runners.
     exec_backend: str = field(default_factory=lambda: os.environ.get("SH_EXEC_BACKEND", "local"))
-
-    # --- the remote sandbox ------------------------------------------------------------
-    # A fifth gate, and the only one that spends money rather than merely risk. It permits
-    # LEASING remote compute: creating a sandbox, staging the audited checkout into it and
-    # building the repository's environment there. It does not permit running third-party
-    # code — `allow_repo_exec` still decides that, and both are required for a remote
-    # reproduction. Off by default for the same reason `allow_install` is: an operator has
-    # to ask for it once per invocation.
-    #
-    # A sandbox is leased PER PAPER, not per command: the checkout is staged once, the
-    # environment is built once, and every (seed, arm) of every target runs in that same
-    # session. `stages/probe.run` releases it in a `finally`, and `run.py sandbox` lists
-    # and releases any that outlived their run.
-    allow_sandbox: bool = field(default_factory=lambda: _flag("SH_ALLOW_SANDBOX"))
-    # What to RESERVE. These are a request, and `sandbox.open_session` verifies the
-    # sandbox it got is not smaller than what was asked for — a declared profile that is
-    # never checked against the machine is the kind of unverified assumption every other
-    # preflight in this harness exists to refuse.
-    #
-    # `SH_SANDBOX_GPU` is empty by default: a review whose experiments are CPU-bound must
-    # not silently bill for an accelerator, and an unstated GPU demand is reported as
-    # unknown by `select_for` rather than matched against a card nobody asked for.
-    sandbox_gpu: str = field(default_factory=lambda: (os.environ.get("SH_SANDBOX_GPU") or "").strip())
-    sandbox_cpu: float = field(default_factory=lambda: _float("SH_SANDBOX_CPU", 4.0))
-    sandbox_memory_mib: int = field(default_factory=lambda: _int("SH_SANDBOX_MEMORY_MIB", 16384))
-    # Declared only. A sandbox's ephemeral disk is not a reservable quantity, so this is
-    # what we claim to offer for requirement matching and is verified after the fact
-    # against what the session actually reports free.
-    sandbox_disk_gib: int = field(default_factory=lambda: _int("SH_SANDBOX_DISK_GIB", 50))
-    # The sandbox's own lifetime ceiling. It has to exceed provisioning plus every run the
-    # paper will make, or the session dies mid-experiment and the result is a timeout that
-    # says nothing about the paper.
-    sandbox_timeout_s: int = field(default_factory=lambda: _int("SH_SANDBOX_TIMEOUT", 3600))
-    # A backstop UNDER the `finally` that releases a lease. If this process is killed
-    # between commands, nothing here runs the teardown, and the machine would bill until
-    # `sandbox_timeout_s`. An idle ceiling makes it terminate itself instead.
-    #
-    # The tradeoff is real and fails in the safe direction: set too low, the session dies
-    # while the harness is doing local work between targets, and the next command reports
-    # `launched=False` — a setup failure, INCONCLUSIVE, never a verdict about the paper.
-    # Set to 0 to disable it and rely on the lease ceiling alone.
-    sandbox_idle_timeout_s: int = field(
-        default_factory=lambda: _int("SH_SANDBOX_IDLE_TIMEOUT", 900))
-    sandbox_python: str = field(
-        default_factory=lambda: (os.environ.get("SH_SANDBOX_PYTHON") or "3.12").strip())
-    sandbox_app: str = field(
-        default_factory=lambda: (os.environ.get("SH_SANDBOX_APP") or "single-harness-review").strip())
-    # How long the staging step may take: a shallow fetch of one commit plus a pip install
-    # of the repository's declared stack. Separate from `install_timeout_s` because the
-    # remote leg also pays for image pull and sandbox startup.
-    sandbox_setup_timeout_s: int = field(
-        default_factory=lambda: _int("SH_SANDBOX_SETUP_TIMEOUT", 2400))
 
     allow_network: bool = field(default_factory=lambda: _flag("SH_ALLOW_NETWORK", True))
     allow_install: bool = field(default_factory=lambda: _flag("SH_ALLOW_INSTALL"))
@@ -401,8 +212,8 @@ class Config:
 
     # --- PATH B, governed reconstruction (Step 8) --------------------------------------
     # TWO gates, because WRITING a reconstruction and RUNNING it are different acts with
-    # different risk, the same separation `allow_sandbox` (lease) and `allow_repo_exec`
-    # (run) already make for a real repository.
+    # different risk — the same separation `allow_install` (build the environment) and
+    # `allow_repo_exec` (run) already make for a real repository.
     #
     #   driver  OFF by default. Delegates to an external reviewer to WRITE a
     #           reconstruction script from the paper's own specification — a fourth
@@ -450,10 +261,6 @@ class Config:
 
     @classmethod
     def load(cls) -> "Config":
-        # Read `.env.sandbox` BEFORE the field defaults are evaluated, so a token or a
-        # gate written there is seen by the `default_factory` lambdas above. Nothing is
-        # overridden: an exported variable always wins.
-        load_env_files()
         PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
         return cls()
 

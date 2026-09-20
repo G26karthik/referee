@@ -45,41 +45,21 @@ COMPARISON_FOR_ROUTE = {
     "AUTHOR_CODE_EXECUTION": "AGAINST_PRINTED_VALUE",
     "INDEPENDENT_RECONSTRUCTION": "AGAINST_PRINTED_VALUE",
     "ARITHMETIC_RECHECK": "AGAINST_PRINTED_VALUE",
-    # The one that was being forced through AGAINST_PRINTED_VALUE. A focused validation
-    # experiment varies ONE thing and compares the two runs; the paper printed neither of
-    # them, so reconciling either against a cell answers a question nobody asked.
-    "FOCUSED_VALIDATION_EXPERIMENT": "BETWEEN_ARMS",
     "ARTIFACT_INSPECTION": "AGAINST_EXISTENCE",
-    "LITERATURE_SEARCH": "AGAINST_EXISTENCE",
     "PAPER_INTERNAL_CHECK": "AGAINST_SPECIFICATION",
     "NONE": "",
 }
 
-# The comparison kinds this system has arithmetic for. TWO, since `harness.between_arms`
-# shipped: AGAINST_PRINTED_VALUE is `local_exec.reconcile`'s, and BETWEEN_ARMS is
-# `between_arms.compare`'s. The remaining two are still routed to and then refused, rather
-# than being quietly performed as though they were one of these.
+# The comparison kind this system has arithmetic for. ONE: AGAINST_PRINTED_VALUE is
+# `local_exec.reconcile`'s. The remaining two are still routed to and then refused, rather
+# than being quietly performed as though they were this one.
 #
-# The two arithmetics are deliberately in different modules and share no code. A
-# reconciliation reads a quantity the paper printed; a between-arms comparison must never
-# read one, and `between_arms._self_check` asserts over its own source that it does not.
-RECONCILABLE = ("AGAINST_PRINTED_VALUE", "BETWEEN_ARMS")
-
-# A BETWEEN_ARMS comparison needs at least this many arms to exist at all. One arm is a
-# measurement; two is a comparison.
-_MIN_ARMS = 2
-
-_ARMS_UNSPECIFIED_DETAIL = (
-    "this comparison needs two arms that differ in exactly one thing, and only one was "
-    "built: nothing in what the paper specifies says what the second would be. The "
-    "question is reported open rather than answered by a single arm.")
-
-_NO_SETTLEMENT_DETAIL = (
-    "the arms are specified and no settlement condition was declared for them. A "
-    "between-arms comparison is settled against a rule the design carries BEFORE "
-    "anything runs; a rule chosen once the two numbers are in settles whatever the "
-    "author of the rule wanted. The question is reported open rather than adjudicated "
-    "against a threshold nobody declared.")
+# A between-arms comparison kind (BETWEEN_ARMS, `harness.between_arms`'s) existed here
+# once, for the FOCUSED_VALIDATION_EXPERIMENT route; both were removed in the 2026-09-20
+# destructive simplification pass after the route never once reached execution across the
+# whole measured corpus (every attempt blocked at `no_arms` before a design could even be
+# built) — see CLAUDE.md's Known Limitations for the measurement.
+RECONCILABLE = ("AGAINST_PRINTED_VALUE",)
 
 _UNSUPPORTED_DETAIL = {
     "AGAINST_EXISTENCE":
@@ -120,19 +100,15 @@ def needs_printed_value(route: str = "") -> bool:
     return kind_for_route(route) == "AGAINST_PRINTED_VALUE"
 
 
-def derive(route: str = "", *, printed_value_available: bool = False,
-           arms_specified: int = 0, settlement_declared: bool = False) -> Comparison:
+def derive(route: str = "", *, printed_value_available: bool = False) -> Comparison:
     """The comparison for one route, and whether this run could carry it out.
 
-    Vocabulary strings, a boolean and a count only. The count is `len(spec.arms)`, which
-    is a structural fact about the spec rather than anything measured, so no number from
-    the paper and no number from a run reaches this function.
+    Vocabulary strings and a boolean only.
 
-    The four states are four different facts and none of them is a finding about the
-    paper: `established` (the comparison can be performed), `no_reference` (the paper
-    printed nothing at this address to compare against), `arms_unspecified` (a second arm
-    would be needed and none was built) and `unsupported` (this system has no arithmetic
-    for this kind of comparison at all).
+    Three states, and none of them is a finding about the paper: `established` (the
+    comparison can be performed), `no_reference` (the paper printed nothing at this
+    address to compare against), `unsupported` (this system has no arithmetic for this
+    kind of comparison at all).
     """
     kind = kind_for_route(route)
     if not kind:
@@ -151,27 +127,6 @@ def derive(route: str = "", *, printed_value_available: bool = False,
             reason=("the paper prints no single unambiguous quantity at the cited address, "
                     "so a run of this route would produce a number with nothing to "
                     "reconcile it against."))
-    if kind == "BETWEEN_ARMS":
-        # THREE DIFFERENT MISSING THINGS, most specific first. `arms_unspecified` says the
-        # experiment could not be BUILT; `no_reference` says it could and nothing was
-        # declared to settle it against; `established` says both halves are there. None is
-        # a statement about the paper, and a referee tracing a refusal needs them apart.
-        if arms_specified < _MIN_ARMS:
-            return Comparison(
-                kind=kind, state="arms_unspecified",
-                measured="the arm that varies the credited mechanism",
-                reference="the arm that holds it fixed",
-                reason=_ARMS_UNSPECIFIED_DETAIL)
-        if not settlement_declared:
-            return Comparison(
-                kind=kind, state="no_reference",
-                measured="the arm that varies the credited mechanism",
-                reference="the settlement condition the design declared before the run",
-                reason=_NO_SETTLEMENT_DETAIL)
-        return Comparison(kind=kind, state="established",
-                          measured="the arm that varies the credited mechanism",
-                          reference="the arm that holds it fixed",
-                          reason="")
     return Comparison(kind=kind, state="unsupported",
                       measured="what this route would observe",
                       reference="what the claim requires to be there",
@@ -200,17 +155,6 @@ def _self_check() -> None:
     for name, p in inspect.signature(derive).parameters.items():
         assert str(p.annotation) in ("str", "bool", "int"), f"{name}: {p.annotation}"
 
-    # A BETWEEN_ARMS COMPARISON MAY NOT BE SETTLED BY A PRINTED VALUE, and the signature
-    # is not enough to say so — `printed_value_available` is in it. This asserts the
-    # behaviour: whether the paper printed a number changes nothing on this route.
-    for arms in (0, 1, 2):
-        for declared in (True, False):
-            a = derive("FOCUSED_VALIDATION_EXPERIMENT", printed_value_available=True,
-                       arms_specified=arms, settlement_declared=declared)
-            b = derive("FOCUSED_VALIDATION_EXPERIMENT", printed_value_available=False,
-                       arms_specified=arms, settlement_declared=declared)
-            assert a.model_dump() == b.model_dump(), (arms, declared)
-
     # --- the tables are closed --------------------------------------------------------
     assert set(COMPARISON_FOR_ROUTE.values()) <= set(COMPARISON_KINDS) | {""}
     assert set(RECONCILABLE) <= set(COMPARISON_KINDS)
@@ -220,15 +164,13 @@ def _self_check() -> None:
         "every route must say what its result is compared against, including NONE")
 
     # --- exactly one kind reaches an arithmetic ---------------------------------------
-    assert reconcilable("AGAINST_PRINTED_VALUE") and reconcilable("BETWEEN_ARMS")
+    assert reconcilable("AGAINST_PRINTED_VALUE")
     for k in ("AGAINST_EXISTENCE", "AGAINST_SPECIFICATION", "", "x"):
         assert not reconcilable(k), k
 
     # --- the printed-value requirement is a property of the ROUTE ---------------------
     assert needs_printed_value("AUTHOR_CODE_EXECUTION")
     assert needs_printed_value("INDEPENDENT_RECONSTRUCTION")
-    assert not needs_printed_value("FOCUSED_VALIDATION_EXPERIMENT"), (
-        "an attribution experiment compares two arms; the paper printed neither")
     assert not needs_printed_value("ARTIFACT_INSPECTION")
 
     # --- derivation -------------------------------------------------------------------
@@ -239,43 +181,17 @@ def _self_check() -> None:
     assert none_printed.state == "no_reference" and not admits_verdict(none_printed)
     assert "nothing to reconcile it against" in none_printed.reason
 
-    one_arm = derive("FOCUSED_VALIDATION_EXPERIMENT", arms_specified=1)
-    assert one_arm.kind == "BETWEEN_ARMS" and one_arm.state == "arms_unspecified"
-    assert not admits_verdict(one_arm), "one arm is a measurement, not a comparison"
-
-    undeclared = derive("FOCUSED_VALIDATION_EXPERIMENT", arms_specified=2)
-    assert undeclared.state == "no_reference", (
-        "two arms and no declared settlement rule is a comparison with nothing to settle "
-        "it against, which is not the same fact as not having built the second arm")
-    assert not admits_verdict(undeclared)
-    assert undeclared.reason != one_arm.reason, (
-        "and the two refusals must not share a sentence — one is about what could be "
-        "built, the other about what could be concluded")
-
-    # AND THE ONE THAT NOW WORKS. Two arms and a rule declared before either of them ran
-    # is a comparison `harness.between_arms` performs, so the route may start a process.
-    # It was `unsupported` until that module existed, and the sentence it carried then —
-    # "a run would produce two numbers and no verdict" — was true and is no longer.
-    both = derive("FOCUSED_VALIDATION_EXPERIMENT", arms_specified=2,
-                  settlement_declared=True)
-    assert both.state == "established" and admits_verdict(both), both.state
-    assert not both.reason, "an established comparison has nothing to explain"
-
     # NO STATE IS BOTH ESTABLISHED AND UNREADABLE. `established` means the comparison can
-    # be performed, so while AGAINST_PRINTED_VALUE is the only reconcilable kind it is the
+    # be performed, so AGAINST_PRINTED_VALUE being the only reconcilable kind makes it the
     # only kind that can reach it. A comparison reported established and then refused
     # produces exactly the empty explanation this split was written to remove.
     for route in COMPARISON_FOR_ROUTE:
         for printed in (True, False):
-            for arms in (0, 1, 2, 5):
-                for declared in (True, False):
-                    c = derive(route, printed_value_available=printed,
-                               arms_specified=arms, settlement_declared=declared)
-                    assert c.established == admits_verdict(c), (route, printed, arms,
-                                                                declared, c.state)
-                    assert c.established or c.reason, (route, printed, arms, declared)
+            c = derive(route, printed_value_available=printed)
+            assert c.established == admits_verdict(c), (route, printed, c.state)
+            assert c.established or c.reason, (route, printed)
 
-    for route in ("ARTIFACT_INSPECTION", "PAPER_INTERNAL_CHECK", "LITERATURE_SEARCH"):
+    for route in ("ARTIFACT_INSPECTION", "PAPER_INTERNAL_CHECK"):
         c = derive(route)
         assert c.state == "unsupported" and not admits_verdict(c), route
         assert c.reason, route
@@ -283,7 +199,7 @@ def _self_check() -> None:
     assert derive("NONE").state == "unmapped"
     assert derive("not-a-route").state == "unmapped"
     assert set(c.state for c in
-               (ok, none_printed, one_arm, undeclared, both, derive("NONE"))) <= set(COMPARISON_STATES)
+               (ok, none_printed, derive("NONE"))) <= set(COMPARISON_STATES)
 
     # --- an absent comparison changes nothing -----------------------------------------
     assert admits_verdict(None), "a spec built before this layer must behave as it did"

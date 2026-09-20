@@ -71,14 +71,12 @@ _CITATION_ONLY = ("PAPER_INTERNAL_CHECK",)
 _ACTION_FOR_ROUTE = {
     "AUTHOR_CODE_EXECUTION": "AUTHOR_CODE_REPRODUCTION",
     "INDEPENDENT_RECONSTRUCTION": "INDEPENDENT_RECONSTRUCTION",
-    "FOCUSED_VALIDATION_EXPERIMENT": "FOCUSED_VALIDATION_EXPERIMENT",
 }
 
 # Executable routes, most decisive first. The planner escalates in this order, so the
 # authors' own code is always preferred over a reconstruction — invariant 15 exists
 # because a reconstruction that differs is not evidence that the paper is wrong.
-_EXECUTABLE_ORDER = ("AUTHOR_CODE_EXECUTION", "FOCUSED_VALIDATION_EXPERIMENT",
-                     "INDEPENDENT_RECONSTRUCTION")
+_EXECUTABLE_ORDER = ("AUTHOR_CODE_EXECUTION", "INDEPENDENT_RECONSTRUCTION")
 
 _WORTH_PURSUING = ("CENTRAL", "SUPPORTING")
 
@@ -212,8 +210,7 @@ def classify(*, centrality: str, addressable: bool, route: str,
                 "the authors' code is the only admissible route to this printed quantity and "
                 "no repository was found. Nothing about the paper follows from that.",
                 gates, "artifact_available")
-    if route in ("INDEPENDENT_RECONSTRUCTION", "FOCUSED_VALIDATION_EXPERIMENT") \
-            and not gates["specification_complete"]:
+    if route == "INDEPENDENT_RECONSTRUCTION" and not gates["specification_complete"]:
         return ("INFEASIBLE_SPECIFICATION",
                 "the paper does not specify enough to build the experiment that would answer "
                 "this, and inventing the missing half would produce a result about our "
@@ -290,7 +287,6 @@ def plan(obj: DiscoveredObject, *, artifact_available: bool = False,
          environment_state: str = "unassessed",
          investigation_open: bool = True,
          author_code_exhausted: bool = False,
-         focused_validation_exhausted: bool = False,
          attempt: int = 1) -> PlanDecision:
     """The decision for one discovered object: resolve it cheaply, escalate, or refuse.
 
@@ -317,14 +313,6 @@ def plan(obj: DiscoveredObject, *, artifact_available: bool = False,
     is a per-call filter, not a mutation: `obj.routes` is never changed, and a fresh
     `plan()` call without the flag reproduces the original decision exactly.
 
-    `focused_validation_exhausted` is the same re-plan primitive for the OTHER route that
-    can precede a reconstruction: a design `stages.validation.prepare` could not bind is
-    also a fact only a real attempt establishes, never known at first `plan()` time. A
-    caller that re-invokes with this set gets the same treatment - FOCUSED_VALIDATION_
-    EXPERIMENT removed for THIS call only, so a comparison the paper's own method section
-    could not support falls through to INDEPENDENT_RECONSTRUCTION exactly where the
-    object's own `routes` already offer it, and to nothing otherwise.
-
     `attempt` is carried straight onto `PlanDecision.attempt` and decided by nothing here;
     the caller numbers its own attempts, and `plan()` stays a pure function of what it is
     told.
@@ -333,8 +321,7 @@ def plan(obj: DiscoveredObject, *, artifact_available: bool = False,
     paper_only_no, inspection_no = _cheaper_routes_ruled_out(obj)
     executable_order = tuple(
         r for r in _EXECUTABLE_ORDER
-        if not (author_code_exhausted and r == "AUTHOR_CODE_EXECUTION")
-        and not (focused_validation_exhausted and r == "FOCUSED_VALIDATION_EXPERIMENT"))
+        if not (author_code_exhausted and r == "AUTHOR_CODE_EXECUTION"))
 
     # THE EARLY STOP, ahead of the route ladder. A cheap route that SETTLES something is
     # still worth taking when the paper has already been disproved -- it costs nothing and
@@ -425,38 +412,6 @@ def plan(obj: DiscoveredObject, *, artifact_available: bool = False,
                 paper_only_insufficient_because=paper_only_no,
                 competing_explanations=competing, attempt=attempt)
 
-        # A BOUNDED PRIOR-ART SEARCH, and only here. The same three conditions, one of
-        # them differently: this arm is reached only when no executable route applies, so
-        # a search can never be why an experiment did not happen; the route must be the
-        # one the question's own kind selected; and there is no artifact requirement,
-        # because the literature is not the authors' to publish.
-        #
-        # What it can settle is a prior-art question. What it can NEVER settle — by
-        # construction rather than by policy — is that a contribution is new: a search
-        # that completes and matches nothing produces SEARCH_COMPLETED_NO_MATCH_FOUND,
-        # which resolves nothing, and no authority in that route's vocabulary means novel.
-        if "LITERATURE_SEARCH" in obj.routes:
-            _, _, gates, _ = classify(
-                centrality=obj.centrality, addressable=bool(obj.harness_addressable),
-                route="LITERATURE_SEARCH", artifact_available=artifact_available,
-                specification_complete=specification_complete,
-                environment_state=environment_state,
-                addressing_blocker=obj.addressing_blocker,
-                investigation_open=investigation_open)
-            gates["resolvable_without_execution"] = False
-            return PlanDecision(
-                target_id=obj.target_id, action="LITERATURE_SEARCH_ONLY",
-                route="LITERATURE_SEARCH",
-                reason="no executable route applies and this is a question about earlier "
-                       "published work, so a bounded prior-art search is carried out. "
-                       "Finding earlier work may raise a concern for a referee; finding "
-                       "none establishes nothing, because the literature a bounded search "
-                       "does not reach is not enumerable.",
-                gates=gates, requires_execution=False,
-                necessity="NO_EXPERIMENT_NEEDED", why_material=why_material,
-                paper_only_insufficient_because=paper_only_no,
-                competing_explanations=competing, attempt=attempt)
-
         cite = next((r for r in obj.routes if r in _CITATION_ONLY), "")
         if cite:
             _, _, gates, _ = classify(
@@ -502,7 +457,7 @@ def plan(obj: DiscoveredObject, *, artifact_available: bool = False,
         target_id=obj.target_id, action=action, route=route, reason=reason, gates=gates,
         blocking_gate=blocking,
         requires_execution=action in ("AUTHOR_CODE_REPRODUCTION", "INDEPENDENT_RECONSTRUCTION",
-                                      "FOCUSED_VALIDATION_EXPERIMENT", "MECHANISM_TEST_ONLY"),
+                                      "MECHANISM_TEST_ONLY"),
         attempt=attempt,
         necessity=_necessity(action), why_material=why_material,
         paper_only_insufficient_because=paper_only_no,
@@ -538,12 +493,12 @@ def _self_check() -> None:
     assert plan(peripheral, artifact_available=True).action == "NO_EXPERIMENT_NEEDED"
 
     vague = DiscoveredObject(target_id="T4", centrality="CENTRAL", harness_addressable=True,
-                             routes=["FOCUSED_VALIDATION_EXPERIMENT"])
+                             routes=["INDEPENDENT_RECONSTRUCTION"])
     d = plan(vague, artifact_available=True, specification_complete=False)
     assert d.action == "INFEASIBLE_SPECIFICATION" and not d.requires_execution
     assert "inventing the missing half" in d.reason
     d = plan(vague, artifact_available=True, specification_complete=True, environment_state="ok")
-    assert d.action == "FOCUSED_VALIDATION_EXPERIMENT" and d.requires_execution
+    assert d.action == "INDEPENDENT_RECONSTRUCTION" and d.requires_execution
 
     blocked = plan(central, artifact_available=True, environment_state="blocked")
     assert blocked.action == "INFEASIBLE_ENVIRONMENT" and not blocked.requires_execution

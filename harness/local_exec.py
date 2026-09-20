@@ -743,28 +743,6 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
                 f"has measured something; there is nothing here to hold it against, so no "
                 f"verdict is drawn about {_addressed(spec)}.")
             return rec
-        if spec.comparison.kind == "BETWEEN_ARMS":
-            # AND THE ONE COMPARISON THIS FUNCTION MUST NOT PERFORM, even though it is now
-            # established and admissible. Everything below holds a measured quantity
-            # against one the PAPER PRINTED; a focused validation holds one arm against
-            # another and the paper printed neither, so running the arithmetic below on it
-            # would reconcile an arm against a cell that describes a different experiment
-            # — the exact defect `harness.comparison` was written to name, arriving one
-            # layer lower and wearing a verdict.
-            #
-            # The comparison IS performed, by `between_arms.compare`, from
-            # `stages.validation.adjudicate`, over the per-arm statistics `run_probe`
-            # produced. This is NOT_ATTEMPTED rather than INCONCLUSIVE because nothing
-            # here failed: the right arithmetic ran somewhere else, and saying "it settled
-            # nothing" would report a completed comparison as a dead end.
-            rec.status = "NOT_ATTEMPTED"
-            rec.failure_class = "none"
-            rec.reason = (
-                "this target is a focused validation: its result is one arm held against "
-                "another, which `harness.between_arms` performs against the settlement "
-                "condition the design declared before the run. No quantity the paper "
-                "printed is reconciled here, because the paper printed neither arm.")
-            return rec
     elif spec.provenance:
         # A spec built before this layer existed, or by hand. The comparison it gets is the
         # one this function has always performed, recorded so the trace says which.

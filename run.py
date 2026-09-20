@@ -6,7 +6,6 @@
     python run.py stage <ingest|audit|grade|probe|report> --paper <pdf-or-id>
     python run.py list
     python run.py status <paper-id>
-    python run.py sandbox [--release]      # leased remote machines
 
 `review` is the entrypoint. Everything else is a way to look at what it did, or to
 re-run one stage by hand while debugging.
@@ -336,47 +335,6 @@ def cmd_stage(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_sandbox(args: argparse.Namespace) -> int:
-    """Show or release leased remote machines. The one command that is about money.
-
-    `stages/probe.run` releases a paper's sandbox in a `finally`, so under normal
-    operation there is nothing here to do. This exists for the case that `finally` cannot
-    cover — the process was killed, the host lost power, the provider was unreachable at
-    teardown — because a sandbox nobody released keeps billing until its own timeout and
-    nothing else in this harness would ever mention it again.
-
-    `status` contacts no provider: an operator asking what might still be running needs
-    the answer when the network is down too, and `release` is what actually checks.
-    """
-    from harness import sandbox as sandbox_mod
-
-    cfg = Config.load()
-    ok, why = sandbox_mod.driver_status(cfg)
-    print(f"driver  : {'usable' if ok else 'unusable — ' + why}")
-    print(f"reserve : {sandbox_mod.spec_from_config(cfg).describe()}")
-    print(f"backend : SH_EXEC_BACKEND={cfg.exec_backend}  "
-          f"sandbox gate {'OPEN' if cfg.allow_sandbox else 'closed'}  "
-          f"repo-exec gate {'OPEN' if cfg.allow_repo_exec else 'closed'}")
-
-    sessions = sandbox_mod.list_sessions(cfg.projects_dir)
-    if not sessions:
-        print("\nno sandbox sessions are recorded")
-        return 0
-    print(f"\n{len(sessions)} recorded session(s):")
-    for s in sessions:
-        cost = sandbox_mod.lease_cost_usd(s.spec, s.age_seconds)
-        print(f"  {s.sandbox_id:<26} {s.paper_id[:30]:<30} {s.commit[:12]:<13} "
-              f"{s.spec.gpu_kind or 'no GPU':<10} {s.age_seconds:>9.0f}s  ~${cost:.4f}")
-    if not args.release:
-        print("\n(pass --release to terminate them)")
-        return 0
-    failures = 0
-    for sandbox_id, released, detail in sandbox_mod.release_all(cfg.projects_dir):
-        print(f"  {'released' if released else 'FAILED  '} {sandbox_id:<26} {detail}")
-        failures += 0 if released else 1
-    return 1 if failures else 0
-
-
 def cmd_list(args: argparse.Namespace) -> int:
     cfg = Config.load()
     pids = reviewed_papers(cfg)
@@ -490,11 +448,6 @@ def main() -> int:
     st.set_defaults(func=cmd_stage)
 
     sub.add_parser("list", help="list reviewed papers").set_defaults(func=cmd_list)
-
-    sb = sub.add_parser("sandbox", help="show or release leased remote machines")
-    sb.add_argument("--release", action="store_true",
-                    help="terminate every recorded session (safe to run twice)")
-    sb.set_defaults(func=cmd_sandbox)
 
     sp = sub.add_parser("status", help="one paper's controller state and history")
     sp.add_argument("paper_id")

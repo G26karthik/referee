@@ -65,15 +65,6 @@ QUESTION_STATES = (
 EXECUTION_STATES = (
     "EXECUTION_CONTRADICTED_A_PRINTED_QUANTITY",
     "EXECUTION_REPRODUCED_A_PRINTED_QUANTITY",
-    # TWO MORE, AND THEY ARE NOT THE TWO ABOVE. `establishes_failure` admits
-    # VALIDATION_DEFECT_ESTABLISHED, whose experiment THIS REVIEW designed — so reaching
-    # the first row printed "the authors' own code ran and did not produce a quantity the
-    # paper prints" for a contrast the authors never published and a quantity they never
-    # printed. That is the same accidental attribution `EXECUTION_ACTOR` was added to
-    # prevent for `reimpl_exec`, one route further along, and the fix is the same shape:
-    # a state of its own with a sentence that names what actually ran.
-    "EXECUTION_CONTRADICTED_A_PREDICTED_CONTRAST",
-    "EXECUTION_CONFIRMED_A_PREDICTED_CONTRAST",
     "EXECUTION_PRODUCED_NO_ADMISSIBLE_EVIDENCE",  # it ran; nothing admissible came out
     "EXECUTION_BLOCKED_BEFORE_IT_STARTED",        # warranted, refused before a process began
     "EXECUTION_WARRANTED_AND_NOT_ATTEMPTED",      # warranted, nothing started, nothing refused
@@ -81,9 +72,7 @@ EXECUTION_STATES = (
 )
 
 EXECUTION_ABOUT_THE_PAPER = ("EXECUTION_CONTRADICTED_A_PRINTED_QUANTITY",
-                             "EXECUTION_REPRODUCED_A_PRINTED_QUANTITY",
-                             "EXECUTION_CONTRADICTED_A_PREDICTED_CONTRAST",
-                             "EXECUTION_CONFIRMED_A_PREDICTED_CONTRAST")
+                             "EXECUTION_REPRODUCED_A_PRINTED_QUANTITY")
 
 # --- tier 4: how much of the paper this is an assessment of ----------------------------
 SCOPE_STATES = (
@@ -138,16 +127,6 @@ EXECUTION_GLOSS = {
         "{actor} ran and did not produce a quantity the paper prints",
     "EXECUTION_REPRODUCED_A_PRINTED_QUANTITY":
         "{actor} ran and re-derived a quantity the paper prints",
-    # NEITHER SENTENCE SAYS "reproduce", and neither says the paper printed anything: a
-    # focused validation compares two arms and the paper printed neither of them. What
-    # each says is bounded to the one contrast that ran, because that is all a single
-    # controlled comparison establishes.
-    "EXECUTION_CONTRADICTED_A_PREDICTED_CONTRAST":
-        "{actor} ran a controlled contrast this review designed, and it came out the "
-        "opposite way to what the claim predicts",
-    "EXECUTION_CONFIRMED_A_PREDICTED_CONTRAST":
-        "{actor} ran a controlled contrast this review designed, and it came out the way "
-        "the claim predicts",
     "EXECUTION_PRODUCED_NO_ADMISSIBLE_EVIDENCE":
         "execution was attempted and did not produce admissible evidence, so nothing "
         "about the paper follows from it",
@@ -274,22 +253,9 @@ def execution_state(outcomes: list | None = None, plans: list | None = None) -> 
     from .provenance import admits
     executed = [o for o in outs if admits(getattr(o, "provenance", ""))]
 
-    # THE VALIDATION ROUTE FIRST, and keyed on its own dispositions rather than on
-    # `establishes_failure`, which is broader than this row. A contrast this review
-    # designed is not a reproduction in either direction, so both of its settled outcomes
-    # get their own state and neither borrows the reproduction sentence.
-    contradicted = [o for o in executed
-                    if getattr(o, "disposition", "") == "VALIDATION_DEFECT_ESTABLISHED"]
-    confirmed = [o for o in executed
-                 if getattr(o, "disposition", "") == "VALIDATION_SUPPORTS_CLAIM"]
-    failed = [o for o in executed if getattr(o, "establishes_failure", False)
-              and getattr(o, "disposition", "") != "VALIDATION_DEFECT_ESTABLISHED"]
+    failed = [o for o in executed if getattr(o, "establishes_failure", False)]
     reproduced = [o for o in executed
                   if getattr(o, "evidence_state", "") == "REPRODUCTION_SUCCESS"]
-    if contradicted:
-        return "EXECUTION_CONTRADICTED_A_PREDICTED_CONTRAST", (
-            f"target {getattr(contradicted[0], 'target_id', '?')}: "
-            f"{getattr(contradicted[0], 'reason', '') or 'no reason recorded'}")
     if failed:
         detail = (f"target {getattr(failed[0], 'target_id', '?')}: "
                   f"{getattr(failed[0], 'reason', '') or 'no reason recorded'}")
@@ -301,13 +267,6 @@ def execution_state(outcomes: list | None = None, plans: list | None = None) -> 
         return "EXECUTION_REPRODUCED_A_PRINTED_QUANTITY", (
             f"target {getattr(reproduced[0], 'target_id', '?')}: "
             f"{getattr(reproduced[0], 'reason', '') or 'no reason recorded'}")
-    if confirmed:
-        # AFTER the reproduction row, deliberately. Re-deriving a quantity the paper
-        # actually printed is the stronger statement of the two, and a review that did
-        # both should lead with it.
-        return "EXECUTION_CONFIRMED_A_PREDICTED_CONTRAST", (
-            f"target {getattr(confirmed[0], 'target_id', '?')}: "
-            f"{getattr(confirmed[0], 'reason', '') or 'no reason recorded'}")
 
     ran = [o for o in outs if int(getattr(o, "launched", 0) or 0) > 0]
     if ran:
@@ -547,51 +506,14 @@ def _self_check() -> None:
                        provenance="repo_exec", launched=1, reason="0.71 vs 0.83")], warrant)
     assert st == "EXECUTION_CONTRADICTED_A_PRINTED_QUANTITY"
     assert "other target(s) reproduced" in why
-    # FOUR execution states say something about the paper, and they are exactly the ones
-    # naming what was HELD AGAINST WHAT: a quantity the paper printed, or a contrast the
-    # claim predicts. Every other state names a fact about an attempt — it produced nothing
-    # admissible, it was refused, it was never started, none was warranted — and those are
-    # facts about an artifact, this host, or a gate.
+    # TWO execution states say something about the paper, and they are exactly the ones
+    # naming what was HELD AGAINST WHAT: a quantity the paper printed. Every other state
+    # names a fact about an attempt — it produced nothing admissible, it was refused, it
+    # was never started, none was warranted — and those are facts about an artifact, this
+    # host, or a gate.
     for st in EXECUTION_STATES:
         about = st in EXECUTION_ABOUT_THE_PAPER
-        assert about == ("PRINTED_QUANTITY" in st or "PREDICTED_CONTRAST" in st), st
-
-    # A CONTRAST THIS REVIEW DESIGNED IS NOT A REPRODUCTION, in either direction, and
-    # neither of its sentences may borrow the reproduction wording. This is the same
-    # correction `EXECUTION_ACTOR` made for `reimpl_exec`, one route further along.
-    st, why = execution_state(
-        [TargetOutcome(target_id="V", disposition="VALIDATION_DEFECT_ESTABLISHED",
-                       provenance="repo_exec", launched=2,
-                       reason="the regulariser arm did not move the metric.")], warrant)
-    assert st == "EXECUTION_CONTRADICTED_A_PREDICTED_CONTRAST", st
-    assert "V" in why
-    sentence = EXECUTION_GLOSS[st].format(actor=execution_actor(
-        [TargetOutcome(target_id="V", disposition="VALIDATION_DEFECT_ESTABLISHED",
-                       provenance="repo_exec", launched=2)]))
-    for forbidden in ("reproduce", "re-derived", "a quantity the paper prints"):
-        assert forbidden not in sentence, (forbidden, sentence)
-    assert "this review designed" in sentence
-
-    st, _ = execution_state(
-        [TargetOutcome(target_id="V", disposition="VALIDATION_SUPPORTS_CLAIM",
-                       provenance="repo_exec", launched=2)], warrant)
-    assert st == "EXECUTION_CONFIRMED_A_PREDICTED_CONTRAST", st
-
-    # AND A REPRODUCTION STILL LEADS. Re-deriving a quantity the paper actually printed is
-    # the stronger of the two statements, so a review that did both says that first.
-    st, _ = execution_state(
-        [TargetOutcome(target_id="V", disposition="VALIDATION_SUPPORTS_CLAIM",
-                       provenance="repo_exec", launched=2),
-         TargetOutcome(target_id="A", disposition="REPRODUCED", provenance="repo_exec",
-                       launched=1)], warrant)
-    assert st == "EXECUTION_REPRODUCED_A_PRINTED_QUANTITY", st
-
-    # An inadmissible provenance reaches NEITHER new state: `executed` is filtered by the
-    # reproduction ceiling before any of this.
-    st, _ = execution_state(
-        [TargetOutcome(target_id="V", disposition="VALIDATION_DEFECT_ESTABLISHED",
-                       provenance="synthesized", launched=2)], warrant)
-    assert st != "EXECUTION_CONTRADICTED_A_PREDICTED_CONTRAST", st
+        assert about == ("PRINTED_QUANTITY" in st), st
 
     # --- tier 4 ------------------------------------------------------------------------
     assert scope_state() == "NO_TARGET_PURSUED"
