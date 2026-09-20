@@ -16,18 +16,15 @@ Two hard rules carried over unchanged:
   2. THE RENDERER COPIES, IT DOES NOT WRITE. Every render function here is pure over
      artifacts some earlier stage already produced.
 
-**Scope, deliberately narrower than the old `run_report`.** The old function also read
-`paper/doc.json` / `probe_results.json` off disk and called `stages.audit.load_reports`
-(collect-phase quote verification), `stages.grade.attach` (grade-phase dispatch),
-`stages.discover.load` (the pre-consolidation target-set store) and `verdict_driver`
-(whole-paper subprocess dispatch) — none of which have migrated to `schema.py` yet; they
-still construct `.artifacts` model instances, and passing one of those into a field
-`schema.py` types as `list[schema.Finding]` is an untested cross-model hazard. So
-`assemble_report` below takes already-produced, already-verified, already-graded artifacts
-(a `PaperDoc`, a list of `LensReport`, a `ProbeResult | None`, a `TargetSet | None`) and
-does everything from `findings = rank(...)` onward — the part that is this stage's own job
-per CLAUDE.md's phase table, and the part that is entirely pure. File I/O, subprocess
-dispatch and wiring into `paper.py`/`controller.py` are a future integration pass.
+**Scope, deliberately narrower than the old `run_report`.** `assemble_report` below takes
+already-produced, already-verified, already-graded artifacts (a `PaperDoc`, a list of
+`LensReport`, a `ProbeResult | None`, a `TargetSet | None`) and does everything from
+`findings = rank(...)` onward — the part that is this stage's own job per CLAUDE.md's phase
+table, and the part that is entirely pure. All file I/O and subprocess dispatch (reading
+`paper/doc.json`, writing the four report files, calling `agent.run_verdict`) is
+`pipeline.run_report_stage`'s job, not this module's — kept apart so this file stays a pure
+function of artifacts a caller already produced, never a place a network or filesystem
+call can smuggle a decision in unverified.
 
 `python -m harness.report` runs the self-check.
 """
@@ -73,14 +70,10 @@ _SEVERITY_RANK = {"FATAL": 2, "MAJOR": 1, "MINOR": 0, "NOTE": -1}
 # first kind in seconds.
 _LENS_RANK = {"overclaim": 3, "contradiction": 2, "confound": 1, "protocol": 0}
 
-# THE MATERIALITY TABLE, stated as data. RED iff a scientifically material failure has been
-# ESTABLISHED by evidence strong enough to REJECT the claim it addresses — never by
-# accumulating model concerns. The old table reached RED by ACCUMULATION (three MAJORs from
-# one lens, or ten across all four), which made the paper-level decision a property of how
-# many things a panel chose to write down. Only two things clear the bar and neither is a
-# count: a failed reproduction from an admissible provenance, or the paper's own printed
-# arithmetic failing to evaluate. `MATERIAL_SEVERITY = ()` — the EMPTY TUPLE — is invariant
-# 8 held by the type system: no severity, however many times asserted, may reach RED.
+# THE MATERIALITY TABLE, stated as data (invariant 8, CLAUDE.md). RED iff a material
+# failure was ESTABLISHED — a failed reproduction from an admissible provenance, or the
+# paper's own arithmetic failing — never by accumulating model concerns. The EMPTY TUPLE
+# is the invariant held by the type system: no severity, however asserted, may reach RED.
 MATERIAL_SEVERITY: tuple[str, ...] = ()
 CONCERN_SEVERITY = ("FATAL", "MAJOR")
 
@@ -394,11 +387,8 @@ def overall_verdict(findings: list[Finding], reconciliation: Reconciliation | No
 
 
 # A central target that was ATTEMPTED and settled nothing — the ONLY non-finding state that
-# colours a paper (invariant 17). Flagging every unsettled central target made all seven
-# corpus papers YELLOW, because the execution gates are shut by default; restricting it to
-# INCONCLUSIVE alone made them YELLOW again once opened, because most of what ran was a
-# synthesized diagnostic the provenance ceiling never entitled to settle anything. Both
-# versions measured the harness's own configuration rather than the paper.
+# colours a paper (invariant 17, CLAUDE.md). Anything less specific measures this harness's
+# own configuration rather than the paper.
 _ATTEMPTED_AND_UNSETTLED = ("INCONCLUSIVE",)
 
 
@@ -759,9 +749,14 @@ _RECONCILE_HEAD = {
 MAX_CODE_ROWS = 12
 
 
+def _head(table: dict[str, str], status: str) -> str:
+    """A status-keyed headline, falling back to the bare token bolded rather than KeyError."""
+    return table.get(status, f"**{status}**")
+
+
 def _repo_block(a: RepoAcquisition) -> list[str]:
     """Where the code came from. States plainly when the answer is 'we did not look'."""
-    out = [_REPO_HEAD.get(a.status, f"**{a.status}**"), ""]
+    out = [_head(_REPO_HEAD, a.status), ""]
     rows = [("source", f"`{a.url}`" if a.url else "— none found in the paper"),
             ("status", a.status)]
     if a.commit:
@@ -866,7 +861,7 @@ def _code_audit_block(c: CodeAudit) -> list[str]:
 
 def _reconciliation_block(r: Reconciliation) -> list[str]:
     """Executed number against the printed cell, with the arithmetic shown."""
-    out = [_RECONCILE_HEAD.get(r.status, f"**{r.status}**"), "", "| quantity | value |", "|---|---|"]
+    out = [_head(_RECONCILE_HEAD, r.status), "", "| quantity | value |", "|---|---|"]
     out.append(f"| cited cell | `{r.table_ref or '—'}` |")
     out.append(f"| cell contents (verbatim) | `{r.claimed_raw or '—'}` |")
     out.append(f"| claimed value | "
@@ -1723,14 +1718,8 @@ def render_reviewer_report(report: EvalReport, target_set: TargetSet | None = No
 #   (from outcome.py; `derive`/`render` renamed `derive_outcome`/`render_outcome` to avoid
 #   colliding with `guarantees.py`'s identically-named functions in this merged module)
 # =============================================================================
-# The defect this exists to fix: a review used to hand a reader a colour, a category
-# table, and — eight sections later — a bold `**NOT_VERIFIED**` under `## Reproduction
-# status`, beside `Targets: 5 addressing blocked, 1 inconclusive, 25 not attempted`.
-# `NOT_VERIFIED` reads as a verdict, `inconclusive` reads as a property of the paper, and a
-# colour reads as all three at once — but the paper is not inconclusive, our attempt to
-# check it was.
-#
-# The fix is four independent folds over DISJOINT inputs:
+# Four independent folds over DISJOINT inputs (invariant 24, CLAUDE.md — replaces a single
+# colour plus a `## Reproduction status` section that read a verdict where none was meant):
 #
 #     tier 1  FINDING STATE     what this review established — reads claim_status + kept
 #                               findings, NOTHING from tier 3
@@ -1738,9 +1727,8 @@ def render_reviewer_report(report: EvalReport, target_set: TargetSet | None = No
 #     tier 3  EXECUTION STATE   what execution was attempted and what it produced
 #     tier 4  SCOPE STATE       how much of the paper this is an assessment of
 #
-# `finding_state`'s signature is the guarantee: no execution outcome — blocked,
-# inconclusive, refused by a gate, or run on an inadmissible provenance — can move it,
-# because the parameter to move it with does not exist. `_self_check_outcome` sweeps every
+# `finding_state`'s signature is the guarantee: no execution outcome can move it, because
+# the parameter to move it with does not exist. `_self_check_outcome` sweeps every
 # execution state against every finding state to prove it.
 
 EXECUTION_ABOUT_THE_PAPER = ("EXECUTION_CONTRADICTED_A_PRINTED_QUANTITY",
@@ -1982,21 +1970,14 @@ def render_outcome(o: ReviewOutcome) -> list[str]:
 # PART 4 — GUARANTEES: what a machine enforced in THIS review, and what it never promises
 #   (from guarantees.py; `derive`/`render` renamed `derive_guarantees`/`render_guarantees`)
 # =============================================================================
-# Three groups, because one list teaches a reader to ignore all of it:
-#
-#   PROCESS_GUARANTEES         enforced unconditionally, by deterministic code.
-#                              `holds=False` here is a HARNESS DEFECT — the only thing
-#                              that reaches `unmet`.
-#   CONDITIONAL_PROPERTIES     true only when a gate was open or a surface was reachable.
-#                              Grading being off is a configuration, never a defect, so
-#                              these never reach `unmet`.
-#   SCIENTIFIC_NON_GUARANTEES  properties this system does not have and cannot acquire by
-#                              running better. `holds` is False on EVERY input, by an
-#                              EMPTY membership tuple rather than a comment.
-#
-# Every entry carries `holds`, established from a harness-written field on an artifact a
-# reader can open, plus `evidence` naming that field — a guarantee nobody checks per
-# review is a marketing claim with a citation.
+# Three groups, because one list teaches a reader to ignore all of it (invariant 28,
+# CLAUDE.md): PROCESS_GUARANTEES (enforced unconditionally; `holds=False` is a HARNESS
+# DEFECT, the only thing reaching `unmet`), CONDITIONAL_PROPERTIES (true only when a gate
+# was open or a surface reachable — off is a configuration, never a defect), and
+# SCIENTIFIC_NON_GUARANTEES (properties this system cannot acquire by running better;
+# `holds` is False on every input, by an EMPTY membership tuple rather than a comment).
+# Every entry carries `holds` established from a harness-written field plus `evidence`
+# naming it — a guarantee nobody checks per review is a marketing claim with a citation.
 
 PROCESS_GUARANTEES: tuple[str, ...] = (
     "EVERY_EVIDENCE_POINTER_RE_VERIFIED", "PROVENANCE_CEILING_HELD",
@@ -2674,15 +2655,13 @@ def render_guarantees(g: ReviewGuarantees) -> list[str]:
 # PART 5 — COVERAGE: how much of THE PAPER this review could address and examined
 #   (from coverage.py; `claims.*` repointed at `locate.*`, the v4 replacement)
 # =============================================================================
-# The defect this replaces: `targets_addressable / targets_discovered` divides the
-# harness's own object list by itself — an unresolvable reference never becomes an object,
-# so the rate RISES when extraction fails. It read 0.93 corpus-wide and was published.
-#
-# The denominator is the paper's own addressable surface, enumerated from a `PaperDoc` and
-# NOTHING the review produced — `surface(doc)` takes a `PaperDoc` and nothing else, and
-# `measure(...)` takes its numerators as plain address STRINGS, so a numerator cannot reach
-# the denominator's construction. Two numerators, never one: `addressed` (an address was
-# minted) and `examined` (a route was pursued) are different claims.
+# Replaces `targets_addressable / targets_discovered` (invariant 27, CLAUDE.md — that rate
+# divides the harness's own object list by itself and RISES when extraction fails; it read
+# 0.93 corpus-wide). The denominator is the paper's own addressable surface, enumerated from
+# a `PaperDoc` and NOTHING the review produced: `surface(doc)` takes a `PaperDoc` and
+# nothing else, `measure(...)` takes its numerators as plain address STRINGS so a numerator
+# cannot reach the denominator's construction. Two numerators, never one: `addressed` (an
+# address was minted) and `examined` (a route was pursued) are different claims.
 
 _BUDGET_ENV = "SH_AUDIT_BUDGET_CHARS"
 _BUDGET_DEFAULT = 70000
@@ -2897,18 +2876,15 @@ def measure(surf: ReviewSurface, *, addressed: tuple[str, ...] = (),
 # PART 6 — DOCUMENT INTEGRITY: OBSERVATIONS about a parsed paper, never conclusions
 #   (from docintegrity.py; `claims.*` repointed at `locate.*`)
 # =============================================================================
-# The defect this exists to prevent: a naive "referenced but missing" check over the
-# eleven parsed papers shipped in `projects/*/paper/doc.json` produces TWELVE claims that a
-# table or equation is absent, and NOT ONE of them is true — every object is in the paper
-# and absent only from what extraction recovered. So `DocumentObservation.about` is a
-# REQUIRED field with no default: of the ten declared checks, eight can only ever fill it
-# with EXTRACTION, one may fill it with PAPER, and one (`PROSE_CELL_MISMATCH`) is not
-# computed at all. `TABLE_ARITHMETIC` is the ONE check that may speak about the paper: its
-# operands and result are all verbatim cells of one recovered row, re-derived operand by
-# operand, and it refuses unless another row of the SAME table establishes what the column
-# means. This layer is report-only, on the model of `code_audit.py`: `observe` takes a
-# `PaperDoc` and nothing else, and no decision function anywhere has a parameter that could
-# receive a severity, confidence or scientific class from it.
+# Prevents the defect in invariant 26 (CLAUDE.md): a naive "referenced but missing" check
+# produced TWELVE false "missing table/equation" claims over the shipped corpus. So `about`
+# is REQUIRED with no default: of the ten checks, eight can only fill it with EXTRACTION,
+# one with PAPER, one (`PROSE_CELL_MISMATCH`) is not computed at all. `TABLE_ARITHMETIC` is
+# the ONE check that may speak about the paper: operands and result are verbatim cells of
+# one recovered row, re-derived operand by operand, refusing unless another row of the SAME
+# table establishes what the column means. Report-only, on the model of `code_audit.py`:
+# `observe` takes a `PaperDoc` and nothing else, and no decision function has a parameter
+# that could receive a severity, confidence or scientific class from it.
 
 INTEGRITY_NOT_ATTEMPTED: tuple[tuple[str, str], ...] = (
     ("figure content",
@@ -3417,11 +3393,9 @@ def scope_lines(observations: tuple[DocumentObservation, ...]) -> tuple[str, ...
 # =============================================================================
 # PART 7 — SELF-AUDIT: did the review do the work it claims? (from selfaudit.py)
 # =============================================================================
-# Pure: artifacts in, verdict per item out — no model, no I/O. A prompt cannot honestly ask
-# a model to grade its own diligence, so every item here is checked against a
-# HARNESS-WRITTEN field or the mere PRESENCE of a lens-written one, never against a model's
-# assessment of itself. A failed item does NOT move the verdict; it refuses to let the
-# review present itself as complete.
+# Pure: artifacts in, verdict per item out — no model, no I/O. Every item is checked
+# against a HARNESS-WRITTEN field, never a model's assessment of its own diligence. A
+# failed item does NOT move the verdict; it refuses to let the review call itself complete.
 
 # Numeric discrepancy types whose whole content IS an arithmetic claim.
 _NUMERIC = ("ARITHMETIC_ERROR", "DIFFERENT_DENOMINATOR", "GENUINE_CONTRADICTION")
@@ -3548,9 +3522,8 @@ def self_audit(report: EvalReport, counted_fn) -> ReviewSelfAudit:
 #   (from the ledger-assembly half of ledger.py; `exhaustion`/`planner` repointed at
 #   `decide.route_coverage` / `decide.current_plans`)
 # =============================================================================
-# A reviewer-facing report is one to two pages; an audit trace is however long it needs to
-# be so any line of the report can be traced to an artifact. Every field below is copied
-# from an artifact that already exists — nothing here is re-reasoned.
+# A reviewer-facing report is one to two pages; the trace below is however long it needs to
+# be so any line can be traced to an artifact. Every field is copied — nothing re-reasoned.
 
 _LEDGER_ADMISSIBILITY = {
     "repo_exec": "the authors' own checkout at a verified commit — admissible in both "
