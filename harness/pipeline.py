@@ -467,7 +467,7 @@ def _phase_probe(cfg: Config, case: CaseState, *, force_probe: bool = False,
                         _reproduction_class(result))
 
 
-def _run_report(cfg: Config, pid: str) -> dict:
+def run_report_stage(cfg: Config, pid: str) -> dict:
     """Everything `report.assemble_report` needs is an already-produced artifact; this
     function is the I/O half `assemble_report`'s own docstring says a caller owns —
     reading those artifacts, dispatching the whole-paper verdict, and writing the four
@@ -594,7 +594,7 @@ def _run_report(cfg: Config, pid: str) -> dict:
 
 
 def _phase_report(cfg: Config, case: CaseState, **_) -> PhaseOutcome:
-    res = _run_report(cfg, case.paper_id)
+    res = run_report_stage(cfg, case.paper_id)
     if "error" in res:
         return PhaseOutcome("error", res["error"])
     case.verdict = res.get("triage") or res["verdict"]

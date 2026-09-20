@@ -16,9 +16,10 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from .. import pdf, repo, state
-from ..artifacts import PaperDoc
+from .. import repo, state
+from .. import paper as pdf
 from ..config import Config
+from ..schema import PaperDoc
 
 
 def content_sha(path: str | Path) -> str:

@@ -53,7 +53,8 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import claims, repo as repo_mod
+from . import repo as repo_mod
+from . import locate as claims
 from .schema import (ARTIFACT_QUESTION_SCOPES, SETTLEABLE_BY_ARTIFACT_FACT,
                      ArtifactFact, ArtifactInspection, ArtifactSnapshot, PaperDoc,
                      SourceSpan)

@@ -34,9 +34,9 @@ import time
 from pathlib import Path
 
 from . import artifact_evidence, delegation, reviewer_cli, sealing, state
-from .artifacts import (ARTIFACT_IDENTITY_BASES, ARTIFACT_IDENTITY_STATES,
-                        ArtifactFact,
-                        ArtifactInspection, ArtifactSnapshot, PaperDoc)
+from .schema import (ARTIFACT_IDENTITY_BASES, ARTIFACT_IDENTITY_STATES,
+                     ArtifactFact,
+                     ArtifactInspection, ArtifactSnapshot, PaperDoc)
 from .config import Config
 from .prompts import artifact_review as AP
 from .reviewer_cli import (Confinement, denied_tools, envelope_provenance,
@@ -480,7 +480,7 @@ def run(cfg: Config, pid: str, doc: PaperDoc, root: str | Path, prompt_text: str
 
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":       # self-check: python -m harness.artifact_review_driver
-    from .artifacts import Section
+    from .schema import Section
 
     assert available(Config(allow_artifact_review=False))[0] is False
     assert "SH_ALLOW_ARTIFACT_REVIEW" in available(Config(allow_artifact_review=False))[1]

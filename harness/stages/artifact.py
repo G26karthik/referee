@@ -49,7 +49,8 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from .. import artifact_evidence, artifact_review_driver, claims, state
+from .. import artifact_evidence, artifact_review_driver, state
+from .. import locate as claims
 from ..schema import (ArtifactFact, ArtifactInspection, DiscoveredObject, PaperDoc,
                       PlanDecision, TargetOutcome, TargetSet)
 from ..config import Config
