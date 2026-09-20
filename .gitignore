@@ -42,3 +42,11 @@ runs_*/projects/*/runs/*/repo/
 *.out
 *.toc
 *.bak
+
+manuscript/journal.fdb_latexmk
+manuscript/journal.fls
+manuscript/*.aux
+manuscript/*.log
+manuscript/*.out
+manuscript/*.bbl
+manuscript/*.blg
