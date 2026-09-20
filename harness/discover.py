@@ -830,6 +830,72 @@ def sync_questions(ts: TargetSet) -> TargetSet:
     return ts
 
 
+def targets_path_in(root):
+    """Where the target set lives inside a project directory. The ONE spelling —
+    `routes.py` and `discover.py` used to spell this three-component path independently."""
+    return root / "discovery" / "targets.json"
+
+
+def targets_path(cfg, pid: str):
+    from . import state
+    return targets_path_in(state.project_dir(cfg, pid))
+
+
+def load(cfg, pid: str) -> TargetSet | None:
+    from . import state
+    p = targets_path(cfg, pid)
+    if not p.exists():
+        return None
+    try:
+        return TargetSet(**state.read_json(p))
+    except (OSError, ValueError):
+        return None
+
+
+def run(cfg, pid: str, *, investigation_open: bool = True) -> dict:
+    """The DISCOVER-phase pipeline entry point: read the ingested paper and the composed
+    lens findings, build the whole target set, and persist it."""
+    from . import audit as audit_stage
+    from . import state
+
+    root = state.project_dir(cfg, pid)
+    doc_path = root / "paper" / "doc.json"
+    if not doc_path.exists():
+        return {"error": f"no ingested paper for '{pid}' — run ingest_paper first"}
+    doc = PaperDoc(**state.read_json(doc_path))
+    state.set_phase(cfg, pid, "discover")
+
+    reports = audit_stage.load_reports(cfg, pid, doc)
+    findings = [f for r in reports for f in r.findings]
+
+    prior = load(cfg, pid)
+    prior_outcomes = {o.target_id: o for o in prior.outcomes} if prior else None
+    ts = build(pid, doc, findings, investigation_open=investigation_open,
+              prior_outcomes=prior_outcomes)
+    path = targets_path(cfg, pid)
+    state.write_json(path, ts.model_dump())
+
+    executable = [p for p in ts.plans if p.requires_execution]
+    state.append_log(
+        cfg, pid, artifact_type="target_set", phase="discover",
+        headers={"objects": len(ts.objects), "questions": len(ts.questions),
+                "addressable": sum(1 for o in ts.objects if o.harness_addressable),
+                "requires_execution": len(executable),
+                "resolved_without_execution":
+                    ts.extraction_coverage.get("targets_resolved_without_execution", 0)},
+        path=str(path))
+
+    return {"paper_id": pid, "objects": len(ts.objects), "questions": len(ts.questions),
+           "addressable": sum(1 for o in ts.objects if o.harness_addressable),
+           "requires_execution": len(executable),
+           "resolved_without_execution":
+               ts.extraction_coverage.get("targets_resolved_without_execution", 0),
+           "blocked_before_execution":
+               ts.extraction_coverage.get("targets_blocked_before_execution", 0),
+           "top_target": ts.objects[0].target_id if ts.objects else None,
+           "targets": "discovery/targets.json"}
+
+
 def build(pid: str, doc: PaperDoc, findings: list[Finding], *,
          investigation_open: bool = True,
          prior_outcomes: dict[str, TargetOutcome] | None = None) -> TargetSet:
