@@ -235,8 +235,11 @@ def test_each_blocker_is_named_and_none_of_them_is_about_the_paper(kw, expected)
 
 
 def test_an_underspecified_experiment_is_refused_rather_than_invented():
+    # FOCUSED_VALIDATION_EXPERIMENT was deleted 2026-09-20 (0/7 targets ever reached an
+    # executable design over the eight-paper corpus); INDEPENDENT_RECONSTRUCTION is the
+    # surviving route this same refusal still guards.
     obj = DiscoveredObject(target_id="T", centrality="CENTRAL", harness_addressable=True,
-                           routes=["FOCUSED_VALIDATION_EXPERIMENT"])
+                           routes=["INDEPENDENT_RECONSTRUCTION"])
     d = planner.plan(obj, artifact_available=True, specification_complete=False)
     assert d.action == "INFEASIBLE_SPECIFICATION"
     assert d.necessity == "EXPERIMENT_UNDERSPECIFIED"

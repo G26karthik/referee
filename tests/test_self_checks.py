@@ -176,7 +176,7 @@ _SHIPPED_WITH_A_SELF_CHECK = frozenset({
     "harness.ledger", "harness.local_exec", "harness.outcome", "harness.pdf",
     "harness.planner", "harness.priority", "harness.probe_synth", "harness.provenance",
     "harness.questions", "harness.reimplement", "harness.repo", "harness.resources",
-    "harness.sandbox", "harness.selfaudit", "harness.taxonomy", "harness.verdict_driver",
+    "harness.selfaudit", "harness.taxonomy", "harness.verdict_driver",
     "harness.stages.discover", "harness.stages.grade", "harness.stages.report",
 })
 

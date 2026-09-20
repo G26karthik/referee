@@ -479,29 +479,28 @@ def test_no_execution_state_can_move_the_finding_state():
 
 
 def test_execution_about_the_paper_names_what_was_held_against_what_and_nothing_about_an_attempt():
-    """`EXECUTION_ABOUT_THE_PAPER` grew from two states to four: a contrast this review
-    itself designed and ran (`EXECUTION_CONTRADICTED_A_PREDICTED_CONTRAST` /
-    `EXECUTION_CONFIRMED_A_PREDICTED_CONTRAST`) is not a reproduction in either direction
-    — it holds a measured arm against a PREDICTION the claim committed to, not against a
-    QUANTITY the paper printed — and must not borrow the reproduction wording. So a bare
-    count of two no longer pins the rule; what the rule actually says is that this set
-    contains exactly the states that name what was held against what (a printed quantity,
-    or a predicted contrast) and none that merely names a fact about an attempt (that it
-    ran, that it was blocked, that it was warranted, that nothing came out of it)."""
+    """`EXECUTION_ABOUT_THE_PAPER` names exactly the states that hold a measured quantity
+    against a quantity the PAPER printed. It once also carried two states for a contrast
+    this review designed and ran itself against a PREDICTION the claim committed to,
+    rather than against the paper's own printed number -- that pair belonged to the
+    focused-validation/between-arms route, which this codebase deleted (zero executions
+    were ever reached through it; see CLAUDE.md's Known Limitations). What survives is the
+    original two-state rule: this set contains exactly the states that name a printed
+    quantity held against a measurement, and none that merely names a fact about an
+    attempt (that it ran, that it was blocked, that it was warranted, that nothing came
+    out of it)."""
     about = [s for s in outcome.EXECUTION_STATES if s in outcome.EXECUTION_ABOUT_THE_PAPER]
     assert set(about) == {
         "EXECUTION_CONTRADICTED_A_PRINTED_QUANTITY",
         "EXECUTION_REPRODUCED_A_PRINTED_QUANTITY",
-        "EXECUTION_CONTRADICTED_A_PREDICTED_CONTRAST",
-        "EXECUTION_CONFIRMED_A_PREDICTED_CONTRAST",
     }
-    assert all("PRINTED_QUANTITY" in s or "PREDICTED_CONTRAST" in s for s in about)
+    assert all("PRINTED_QUANTITY" in s for s in about)
 
     not_about = [s for s in outcome.EXECUTION_STATES if s not in outcome.EXECUTION_ABOUT_THE_PAPER]
     assert not_about, "there must be states that say nothing about the paper too"
     attempt_words = ("ADMISSIBLE_EVIDENCE", "BLOCKED", "WARRANTED", "NOT_ATTEMPTED")
     for s in not_about:
-        assert "PRINTED_QUANTITY" not in s and "PREDICTED_CONTRAST" not in s
+        assert "PRINTED_QUANTITY" not in s
         assert any(w in s for w in attempt_words), s
 
 
@@ -531,3 +530,34 @@ def test_no_new_mechanism_can_raise_a_severity():
                             candidate_class=cand, evidence_class=ev, evidence_quote="q")
                 counted = report_stage.counted(f)
                 assert rank[counted] <= rank[lens_sev], (lens_sev, cand, ev, counted)
+
+
+# --------------------------------------------------------------------------- #
+# (h) GREEN may not borrow the words of evidence it does not have
+# --------------------------------------------------------------------------- #
+def test_unverified_decision_prose_may_not_use_support_language():
+    """`report_stage.unearned_support_language` is this system's only guard against a
+    NOT_VERIFIED/VERIFIED_FAILURE report reading as though something were checked and
+    held. This is the guard's sole remaining test after an unrelated pass thinned the
+    suite that used to exercise it -- confirmed via a whole-codebase reachability sweep,
+    which is why this single function gets a dedicated test rather than being folded
+    into a larger file."""
+    # NOT_VERIFIED prose that smuggles in a support word must be flagged.
+    bad = report_stage.unearned_support_language(
+        "The paper's claim is confirmed by our reading.", "NOT_VERIFIED")
+    assert "confirmed" in bad
+
+    # The harness's own disclaiming vocabulary is not itself a violation.
+    clean = report_stage.unearned_support_language(
+        "NOT_VERIFIED: reproduction was not verified.", "NOT_VERIFIED")
+    assert clean == []
+
+    # VERIFIED_SUPPORT is the only status that has earned this language.
+    assert report_stage.unearned_support_language(
+        "The result is confirmed and supported.", "VERIFIED_SUPPORT") == []
+
+    # VERIFIED_FAILURE has not earned SUPPORT language either -- a failure is not a
+    # confirmation of anything.
+    failure_bad = report_stage.unearned_support_language(
+        "The reported number is confirmed wrong.", "VERIFIED_FAILURE")
+    assert "confirmed" in failure_bad

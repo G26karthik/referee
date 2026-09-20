@@ -436,18 +436,6 @@ def test_static_inspection_never_suppresses_an_execution():
         != "ARTIFACT_INSPECTION_ONLY"
 
 
-def test_an_artifact_finding_may_trigger_execution_and_focused_validation():
-    obj = _target("t1", "ATTRIBUTION")
-    obj.routes = ["ARTIFACT_INSPECTION", "FOCUSED_VALIDATION_EXPERIMENT"]
-    decided = planner.plan(obj, artifact_available=True, specification_complete=True)
-    assert decided.route == "FOCUSED_VALIDATION_EXPERIMENT"
-    assert decided.requires_execution
-
-    obj2 = _target("t2", "PRINTED_QUANTITY")
-    obj2.routes = ["ARTIFACT_INSPECTION", "AUTHOR_CODE_EXECUTION"]
-    assert planner.plan(obj2, artifact_available=True).requires_execution
-
-
 def test_an_inspection_records_what_it_buys_a_later_route(checkout, tmp_path):
     """Recorded, and acted on by nothing here: narrowing a command is `experiment_id`'s."""
     _outcomes, whole = _route(
@@ -933,3 +921,41 @@ def test_a_verified_concern_never_touches_a_target_this_route_does_not_own(
     # The executing target has no outcome here AT ALL — this route does not own it and
     # cannot suppress, defer, or overwrite it.
     assert all(o.target_id != "t2" for o in outcomes)
+
+
+# --------------------------------------------------------------------------- #
+# 40. `run()`'s own except clause must survive `out.read_text()` itself raising, not
+# only `parse_concerns` raising on text that WAS read.
+# --------------------------------------------------------------------------- #
+def _dir_writer_cmd(tmp_path: Path, name: str = "dir_writer") -> str:
+    """A REAL subprocess that creates a DIRECTORY at `{out}`, not a file.
+
+    `out.exists()` is then True, but `out.read_text()` raises OSError from the read
+    itself (`IsADirectoryError`/`PermissionError`), before `parse_concerns` ever runs —
+    the one case that reaches `run()`'s except clause with `raw` never assigned.
+    """
+    script = tmp_path / f"{name}.py"
+    script.write_text(
+        "import os, sys\n"
+        "os.makedirs(sys.argv[2], exist_ok=True)\n",
+        encoding="utf-8")
+    return f'"{sys.executable}" "{script}" "{{prompt}}" "{{out}}"'
+
+
+def test_an_unreadable_reader_output_is_a_recorded_failure_not_a_crash(checkout, tmp_path):
+    """`out.read_text()` raising OSError before `raw` is ever assigned must still be a
+    recorded failure and a `None` return — not an `UnboundLocalError` on `raw` inside the
+    except clause that was written to handle exactly this failure."""
+    from harness import state
+
+    cfg = Config(projects_dir=tmp_path / "projects", allow_artifact_review=True,
+                artifact_review_cmd=_dir_writer_cmd(tmp_path))
+    state.create_project(cfg, "", "T", pid="p")
+
+    result = artifact_review_driver.run(cfg, "p", _doc(), checkout, "prompt text")
+
+    assert result is None
+    _out, sidecar = artifact_review_driver._paths(cfg, "p")
+    record = state.read_json(sidecar)
+    assert record["ran"] is False
+    assert "output was unusable" in record["failure"]

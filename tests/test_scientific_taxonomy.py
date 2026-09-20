@@ -158,7 +158,7 @@ def test_an_unaddressable_target_is_not_an_underspecified_experiment():
                                      harness_addressable=False,
                                      routes=["AUTHOR_CODE_EXECUTION"])
     vague = DiscoveredObject(target_id="B", centrality="CENTRAL", harness_addressable=True,
-                             routes=["FOCUSED_VALIDATION_EXPERIMENT"])
+                             routes=["INDEPENDENT_RECONSTRUCTION"])
     a = planner.plan(unaddressable, artifact_available=True)
     b = planner.plan(vague, artifact_available=True, specification_complete=False)
     assert a.action == "INFEASIBLE_ADDRESSING" and a.necessity == "EXPERIMENT_NOT_EXECUTABLE"

@@ -15,7 +15,7 @@ but it only manipulates env vars (no DB connection), so it is harmless here.
 
 Every test here is a pure-function or local-subprocess test: no credentials, no
 network. `harness.config.Config.load()` is safe to call — it only ensures the cases
-directory exists — and `tests/test_local_exec.py` uses it to drive real probe
+directory exists — and `tests/test_local_execution.py` uses it to drive real probe
 subprocesses against `tmp_path`.
 """
 from __future__ import annotations

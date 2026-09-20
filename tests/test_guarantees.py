@@ -539,7 +539,7 @@ def test_the_section_states_the_four_things_a_referee_would_otherwise_assume():
     appear in the rendered section of every review, not only in the ledger."""
     for rep, ts in ((_clean_report(), _target_set()), _red_report()):
         text = "\n".join(guarantees.render(guarantees.derive(rep, ts)))
-        for clause in ("accuracy unmeasured", "novelty not established",
+        for clause in ("accuracy unmeasured", "novelty not assessed",
                        "nothing here says the paper is correct",
                        "not a substitute for a referee"):
             assert clause in text, clause
