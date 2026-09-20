@@ -581,7 +581,7 @@ _CITATION_WORD = {"table": r"(?:tables?|tabs?\.)", "figure": r"(?:figures?|figs?
 _RESULT_AT_SENTENCE_START = re.compile(
     r"(?:^|(?<=[.!?])\s+)result\s+(\d+(?:\.\d+)*)\b", re.I)
 
-_BASIS_GLOSS: dict[str, str] = {
+BASIS_GLOSS: dict[str, str] = {
     "ABSTRACT_CLAIM": "the claim resolves inside the paper's own Abstract",
     "CONCLUSION_CLAIM": "the claim resolves inside the paper's own Conclusion",
     "ABSTRACT_TABLE_REFERENCE": "the paper's Abstract explicitly cites this uniquely labelled table",
