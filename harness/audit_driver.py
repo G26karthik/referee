@@ -75,7 +75,6 @@ import dataclasses
 import hashlib
 import json
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -87,10 +86,10 @@ from .artifacts import Finding, LensReport
 from .config import Config
 from .prompts import audit as P
 from .reviewer_cli import (CODE_RUNNING_TOOLS, KNOWN_TOOLS, READING_TOOLS, Confinement,
-                           NonRetryable, RateLimited, _kill_tree, classify_delegated_failure,
+                           NonRetryable, RateLimited, classify_delegated_failure,
                            denied_tools, driver_error, envelope_provenance, keep_prompt_copy,
                            operator_confinement, pinned_settings_json, prompt_fingerprint,
-                           prompt_is_unchanged, unwrap_envelope, write_pinned_settings)
+                           prompt_is_unchanged, unwrap_envelope)
 
 # Back-compat re-export: `AuditDriverError` used to be DEFINED here. It now lives in
 # `harness/reviewer_cli.py` (as `ReviewerCLIError`, with `AuditDriverError` kept as a
@@ -537,12 +536,8 @@ def run_lens(cfg: Config, pid: str, lens: str, prompt: Path, out: Path, *,
     # The pinned settings live OUTSIDE the reviewer's cwd — see `write_pinned_settings`.
     policy_dir = Path(tempfile.mkdtemp(prefix=f"sh-policy-{lens}-"))
     conf = confinement_for(cfg, lens, pdf_dir)
-    settings_path = ""
     try:
-        if conf.enforced:
-            sp, sha = write_pinned_settings(policy_dir, conf.disallowed_tools)
-            settings_path = str(sp)
-            conf = dataclasses.replace(conf, settings_sha256=sha)
+        conf, settings_path = reviewer_cli.stage_settings(conf, policy_dir)
     except OSError as e:
         # The scratch directory is created before the `try` that owns the teardown, so
         # its cleanup has to be here too. Refusing rather than running unconfined: a
@@ -553,39 +548,24 @@ def run_lens(cfg: Config, pid: str, lens: str, prompt: Path, out: Path, *,
     cmd = (resolve_cmd(cfg, lens, pdf_dir, settings=settings_path)
            .replace("{prompt}", str(prompt)).replace("{out}", str(staged)))
     started = time.time()
-    # Started in its own process group/session so a timeout can kill the WHOLE tree, not
-    # just the immediate shell. `shell=True` on either platform launches a shell that is
-    # itself the parent of the real work — `cmd.exe` for a pipeline, `sh -c` for one — and
-    # `Popen.kill()` alone only terminates that shell. The reviewer it launched keeps
-    # running as an orphan: it can still be writing to `staged` after this function has
-    # already declared the attempt timed out and unlinked that same path, and it can
-    # still be running when a retry starts a second reviewer over the same prompt.
-    group_kwargs: dict = (
-        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32"
-        else {"start_new_session": True})
     sandbox = Path(tempfile.mkdtemp(prefix=f"sh-lens-{lens}-"))
     try:
         try:
-            # `stdin=DEVNULL`, not inherited. A delegated reviewer that decides to ask a
-            # question would otherwise block on the operator's own terminal until the
-            # timeout — a human checkpoint inside an autonomous stage that nobody put
-            # there deliberately, and one that looks like a hang rather than a refusal.
-            # An EOF on stdin makes the reviewer answer or fail; it can never wait.
-            proc = subprocess.Popen(cmd, shell=True, cwd=str(sandbox),
-                                    stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, encoding="utf-8", errors="replace", **group_kwargs)
+            # Own process group so a timeout can kill the WHOLE tree, not just the
+            # immediate shell — see `reviewer_cli.spawn_and_wait`. The reviewer it
+            # launched would otherwise keep running as an orphan: still writing to
+            # `staged` after this function has already declared the attempt timed out
+            # and unlinked that same path, and still running when a retry starts a
+            # second reviewer over the same prompt. `stdin=DEVNULL` there too, so a
+            # delegated reviewer that decides to ask a question fails rather than
+            # blocking on the operator's own terminal until the timeout.
+            p, timed_out = reviewer_cli.spawn_and_wait(cmd, sandbox, cfg.audit_timeout_s)
         except OSError as e:
             staged.unlink(missing_ok=True)
             raise AuditDriverError(f"could not start the command: {e}") from e
-        try:
-            stdout, stderr = proc.communicate(timeout=cfg.audit_timeout_s)
-        except subprocess.TimeoutExpired:
-            _kill_tree(proc)
-            proc.communicate()                   # reap the process now that it is dead
+        if timed_out:
             staged.unlink(missing_ok=True)
             raise AuditDriverError(f"timed out after {cfg.audit_timeout_s}s") from None
-        p = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
         if not staged.exists():
             # Classify the reviewer's OWN words first: a rate limit, a revoked
@@ -1027,7 +1007,11 @@ if __name__ == "__main__":       # self-check: python -m harness.audit_driver
         assert _affordance not in _called, (
             f"{_affordance!r} is a human checkpoint inside an autonomous stage; the danger "
             f"is not a bug in such a call, it is having one")
-    # And the child cannot reach the operator's terminal even if it tries to ask.
-    assert "stdin=subprocess.DEVNULL" in _inspect.getsource(run_lens)
+    # And the child cannot reach the operator's terminal even if it tries to ask. The
+    # spawn mechanics (and `stdin=DEVNULL`) moved to `reviewer_cli.spawn_and_wait` when
+    # the confined-call boilerplate was consolidated across every `*_driver.py` — checked
+    # there now, plus that `run_lens` actually calls it.
+    assert "stdin=subprocess.DEVNULL" in _inspect.getsource(reviewer_cli.spawn_and_wait)
+    assert "reviewer_cli.spawn_and_wait" in _inspect.getsource(run_lens)
 
     print(json.dumps({"self_check": "ok", "gate_default": cfg.allow_auto_audit}, indent=2))

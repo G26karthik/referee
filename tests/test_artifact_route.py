@@ -225,28 +225,19 @@ def test_an_ast_warning_alone_cannot_establish_scientific_failure():
                    for a in ARTIFACT_AUTHORITY)
 
 
-def test_only_class_a_rules_are_reviewer_visible_and_class_b_feeds_the_auditor():
+def test_only_class_a_rules_are_reviewer_visible():
     """That a source pattern matched is deterministic; what it MEANS is not."""
     assert artifact_evidence.REVIEWER_VISIBLE == ("A",)
-    assert artifact_evidence.FEEDS_AUDITOR == ("B",)
 
+    assert artifact_evidence.rule_authority("leak-unseeded-split") == "A"
     assert artifact_evidence.reviewer_visible("leak-unseeded-split")
-    assert not artifact_evidence.feeds_auditor("leak-unseeded-split")
 
-    for class_b in ("leak-fit-on-test", "leak-fit-before-split", "cripple-config-table",
-                    "metric-best-of-n", "metric-filters-ground-truth",
-                    "metric-shadows-standard", "cripple-per-arm-budget"):
-        assert artifact_evidence.rule_authority(class_b) == "B", class_b
-        assert not artifact_evidence.reviewer_visible(class_b), class_b
-        assert artifact_evidence.feeds_auditor(class_b), class_b
-
-    for class_d in ("leak-model-selection-on-test", "cripple-augmentation-one-arm"):
-        assert not artifact_evidence.reviewer_visible(class_d), class_d
-        assert not artifact_evidence.feeds_auditor(class_d), class_d
-
-    # An unaudited rule is neither: the audit licenses a rule, not its existence.
-    assert not artifact_evidence.reviewer_visible("some-rule-added-later")
-    assert not artifact_evidence.feeds_auditor("some-rule-added-later")
+    # An unaudited rule (the nine deleted ones, or any rule added later) defaults to D:
+    # the audit licenses a rule, not its existence.
+    for unaudited in ("some-rule-added-later", "leak-model-selection-on-test",
+                      "cripple-augmentation-one-arm"):
+        assert artifact_evidence.rule_authority(unaudited) == "D", unaudited
+        assert not artifact_evidence.reviewer_visible(unaudited), unaudited
 
 
 # --------------------------------------------------------------------------- #
@@ -513,28 +504,26 @@ def test_the_review_does_not_print_a_detector_the_audit_classified_unsafe():
     from harness.stages import report as report_stage
 
     audit = CodeAudit(repo_path="r", files_scanned=165, lines_scanned=40_000, findings=[
+        # A rule id that no longer exists in code_audit.py's rule set (deleted along with
+        # the other eight measured-false/never-fired heuristics) must still default to
+        # class D here rather than being trusted because it once had a name.
         CodeAuditFinding(
             finding_id="code-01", rule_id="leak-model-selection-on-test",
             category="data_leakage", severity="MAJOR", title="selection on test",
             statement="s", file="run_pruning.py", line=157,
             code_quote="rescaled_eval_metrics = test(model, eval_dataloader, head_mask)"),
         CodeAuditFinding(
-            finding_id="code-02", rule_id="leak-fit-on-test", category="data_leakage",
-            severity="MAJOR", title="fit on test", statement="s", file="leaky.py", line=3,
-            code_quote="scaler.fit(X_test)"),
-        CodeAuditFinding(
-            finding_id="code-03", rule_id="leak-unseeded-split", category="data_leakage",
+            finding_id="code-02", rule_id="leak-unseeded-split", category="data_leakage",
             severity="MINOR", title="unseeded split", statement="s",
             file="utils/utils.py", line=600,
             code_quote="train_dataset, eval_dataset = torch.utils.data.random_split("),
     ])
     rendered = "\n".join(report_stage._code_audit_block(audit))
     assert "utils/utils.py" in rendered, "the class-A fact is reported"
-    assert "run_pruning.py" not in rendered, "the measured-false detector is not"
-    assert "leaky.py" not in rendered, "a class-B hit is not a reviewer observation either"
+    assert "run_pruning.py" not in rendered, "an unclassified/retired rule id is not"
     assert "audited as unsafe for reviewer output" in rendered
-    # The machine trace keeps all three: suppression is a rendering decision.
-    assert len(audit.findings) == 3
+    # The machine trace keeps both: suppression is a rendering decision.
+    assert len(audit.findings) == 2
 
 
 # --------------------------------------------------------------------------- #

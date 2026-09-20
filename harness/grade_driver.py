@@ -24,17 +24,16 @@ THREE THINGS THIS MODULE CLAIMED AND DID NOT DO, each fixed below:
      `stages/grade.accept_grade` both did — so the one delegated role with the strongest
      isolation claim was the only one that wrote nothing down about it.
 
-`_kill_tree`, the confinement machinery, the result-envelope reader and the failure
-classification are all reused from `audit_driver` rather than re-implemented — one
-instance of each, not two that could drift apart.
+The confined-call mechanics (tree-kill on timeout, pinned-settings staging), the
+confinement machinery, the result-envelope reader and the failure classification are all
+reused from `reviewer_cli` rather than re-implemented — one instance of each, not two
+that could drift apart.
 """
 from __future__ import annotations
 
-import dataclasses
 import hashlib
 import json
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -46,9 +45,9 @@ from .artifacts import Grade
 from .config import Config
 from .prompts import grade as GP
 from .reviewer_cli import (KNOWN_TOOLS, Confinement, NonRetryable, RateLimited,
-                           _kill_tree, classify_delegated_failure, denied_tools,
+                           classify_delegated_failure, denied_tools,
                            envelope_provenance, keep_prompt_copy, operator_confinement,
-                           prompt_fingerprint, unwrap_envelope, write_pinned_settings)
+                           prompt_fingerprint, unwrap_envelope)
 
 
 class GradeDriverError(RuntimeError):
@@ -238,12 +237,8 @@ def run_candidate(cfg: Config, pid: str, slug: str, prompt: Path, out: Path, *,
     prompt_copy = keep_prompt_copy(prompt, prompt_sha)
     policy_dir = Path(tempfile.mkdtemp(prefix=f"sh-grade-policy-{slug}-"))
     conf = grade_confinement(cfg)
-    settings_path = ""
     try:
-        if conf.enforced:
-            sp, sha = write_pinned_settings(policy_dir, conf.disallowed_tools)
-            settings_path = str(sp)
-            conf = dataclasses.replace(conf, settings_sha256=sha)
+        conf, settings_path = reviewer_cli.stage_settings(conf, policy_dir)
     except OSError as e:
         # See `audit_driver.run_lens`: refuse rather than grade unconfined.
         shutil.rmtree(policy_dir, ignore_errors=True)
@@ -251,29 +246,18 @@ def run_candidate(cfg: Config, pid: str, slug: str, prompt: Path, out: Path, *,
     cmd = (resolve_cmd(cfg, settings=settings_path)
            .replace("{prompt}", str(prompt)).replace("{out}", str(staged)))
     started = time.time()
-    group_kwargs: dict = (
-        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32"
-        else {"start_new_session": True})
     sandbox = Path(tempfile.mkdtemp(prefix=f"sh-grade-{slug}-"))
     try:
         try:
-            # `stdin=DEVNULL` — see `audit_driver.run_lens`. A grader that stops to ask a
-            # question is a human checkpoint in the middle of an autonomous stage.
-            proc = subprocess.Popen(cmd, shell=True, cwd=str(sandbox),
-                                    stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, encoding="utf-8", errors="replace", **group_kwargs)
+            # `stdin=DEVNULL` — see `reviewer_cli.spawn_and_wait`. A grader that stops to
+            # ask a question is a human checkpoint in the middle of an autonomous stage.
+            p, timed_out = reviewer_cli.spawn_and_wait(cmd, sandbox, cfg.grade_timeout_s)
         except OSError as e:
             staged.unlink(missing_ok=True)
             raise GradeDriverError(f"could not start the command: {e}") from e
-        try:
-            stdout, stderr = proc.communicate(timeout=cfg.grade_timeout_s)
-        except subprocess.TimeoutExpired:
-            _kill_tree(proc)
-            proc.communicate()
+        if timed_out:
             staged.unlink(missing_ok=True)
             raise GradeDriverError(f"timed out after {cfg.grade_timeout_s}s") from None
-        p = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
         if not staged.exists():
             tail = (p.stderr or p.stdout or "").strip()[-300:]

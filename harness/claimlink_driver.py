@@ -18,12 +18,9 @@ of which four did not resolve is a different reader from one that proposed eight
 """
 from __future__ import annotations
 
-import dataclasses
 import hashlib
 import json
 import shutil
-import subprocess
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -32,8 +29,8 @@ from . import claimlink, delegation, reviewer_cli, sealing, state
 from .artifacts import ClaimLink, ClaimLinkSet, PaperDoc
 from .config import Config
 from .prompts import claimlink as CP
-from .reviewer_cli import (Confinement, _kill_tree, denied_tools, envelope_provenance,
-                           operator_confinement, unwrap_envelope, write_pinned_settings)
+from .reviewer_cli import (Confinement, denied_tools, envelope_provenance,
+                           operator_confinement, unwrap_envelope)
 
 # Same reasoning as `verdict_driver.WRITERS`: read off the delegation vocabulary so a mode
 # cannot be sealed by one path and refused by another, which presents as "no links exist"
@@ -247,37 +244,21 @@ def run(cfg: Config, pid: str, doc: PaperDoc, prompt_text: str, *,
         prompt.write_text(prompt_text, encoding="utf-8")
         policy_dir = Path(tempfile.mkdtemp(prefix="sh-claimlink-policy-"))
         conf = link_confinement(cfg, pdf_dir=pdf_dir)
-        settings_path = ""
         try:
-            if conf.enforced:
-                sp, sha = write_pinned_settings(policy_dir, conf.disallowed_tools)
-                settings_path = str(sp)
-                conf = dataclasses.replace(conf, settings_sha256=sha)
+            conf, settings_path = reviewer_cli.stage_settings(conf, policy_dir)
         except OSError:
             shutil.rmtree(policy_dir, ignore_errors=True)
             return None
         cmd = (resolve_cmd(cfg, settings=settings_path, pdf_dir=pdf_dir)
                .replace("{prompt}", str(prompt)).replace("{out}", str(out)))
-        group_kwargs: dict = (
-            {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32"
-            else {"start_new_session": True})
         sandbox = Path(tempfile.mkdtemp(prefix="sh-claimlink-sandbox-"))
         try:
             try:
-                proc = subprocess.Popen(cmd, shell=True, cwd=str(sandbox),
-                                        stdin=subprocess.DEVNULL,
-                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                        text=True, encoding="utf-8", errors="replace",
-                                        **group_kwargs)
+                p, timed_out = reviewer_cli.spawn_and_wait(cmd, sandbox,
+                                                           cfg.claimlink_timeout_s)
             except OSError:
                 return None
-            try:
-                proc.communicate(timeout=cfg.claimlink_timeout_s)
-            except subprocess.TimeoutExpired:
-                _kill_tree(proc)
-                proc.communicate()
-                return None
-            if not out.exists():
+            if timed_out or not out.exists():
                 return None
             try:
                 proposals, notes, meta = parse_links(out.read_text(encoding="utf-8"))
@@ -289,7 +270,7 @@ def run(cfg: Config, pid: str, doc: PaperDoc, prompt_text: str, *,
                 seal(cfg, pid, linkset, {
                     "written_by": "claimlink_driver", "reader": "",
                     "delegation_mode": "CLI_SUBPROCESS",
-                    "command": cmd, "returncode": proc.returncode,
+                    "command": cmd, "returncode": p.returncode,
                     "seconds": round(time.time() - started, 1),
                     "tool_policy": conf.summary(), "tool_policy_detail": conf.policy(),
                     "prompt_sha256": prompt_sha,

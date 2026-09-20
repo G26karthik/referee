@@ -26,11 +26,9 @@ stale opinion about a different set of findings is worse than paying for a fresh
 """
 from __future__ import annotations
 
-import dataclasses
 import hashlib
 import json
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -40,16 +38,14 @@ from . import delegation, reviewer_cli, sealing, state
 from .artifacts import SubstantiveVerdict
 from .config import Config
 from .prompts import verdict as VP
-from .reviewer_cli import (KNOWN_TOOLS, Confinement, _kill_tree, denied_tools,
-                           envelope_provenance, operator_confinement, unwrap_envelope,
-                           write_pinned_settings)
+from .reviewer_cli import (KNOWN_TOOLS, Confinement, denied_tools,
+                           envelope_provenance, operator_confinement, unwrap_envelope)
 
 # Every writer a validated path can produce: this module's own subprocess, plus every
 # mode `harness.delegation` admits. Read off that vocabulary rather than written out, so a
 # mode cannot be sealed by `accept_verdict` and then refused by `load_accepted` — which
 # would present as "no whole-paper read exists" for an artifact that does.
-WRITERS = ("verdict_driver",) + tuple(
-    __import__("harness.delegation", fromlist=["WRITTEN_BY"]).WRITTEN_BY.values())
+WRITERS = ("verdict_driver",) + tuple(delegation.WRITTEN_BY.values())
 
 
 class VerdictDriverError(RuntimeError):
@@ -189,7 +185,6 @@ def accept_verdict(cfg: Config, pid: str, raw: str, *, reader: str = "",
     # isolated subagent produced autonomously and an opinion a person typed are different
     # provenance, and this artifact is the one the self-audit reads to decide whether the
     # paper was judged as a whole — so which of the two it was has to survive.
-    from . import delegation
     prov = delegation.provenance_record(mode=mode, reviewer=reader,
                                         tool_policy=tool_policy)
     return _seal(cfg, pid, verdict, {"written_by": prov["written_by"],
@@ -264,12 +259,8 @@ def run(cfg: Config, prompt_text: str, *, timeout_s: int = 300,
         prompt.write_text(prompt_text, encoding="utf-8")
         policy_dir = Path(tempfile.mkdtemp(prefix="sh-verdict-policy-"))
         conf = verdict_confinement(cfg)
-        settings_path = ""
         try:
-            if conf.enforced:
-                sp, sha = write_pinned_settings(policy_dir, conf.disallowed_tools)
-                settings_path = str(sp)
-                conf = dataclasses.replace(conf, settings_sha256=sha)
+            conf, settings_path = reviewer_cli.stage_settings(conf, policy_dir)
         except OSError:
             # This driver never raises — see `run`'s docstring. An unwritable policy
             # degrades to no opinion, which is the same outcome as any other failure here.
@@ -277,26 +268,14 @@ def run(cfg: Config, prompt_text: str, *, timeout_s: int = 300,
             return None
         cmd = (resolve_cmd(cfg, settings=settings_path)
                .replace("{prompt}", str(prompt)).replace("{out}", str(out)))
-        group_kwargs: dict = (
-            {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32"
-            else {"start_new_session": True})
         sandbox = Path(tempfile.mkdtemp(prefix="sh-verdict-sandbox-"))
         try:
             try:
-                # `stdin=DEVNULL` — see `audit_driver.run_lens`.
-                proc = subprocess.Popen(cmd, shell=True, cwd=str(sandbox),
-                                        stdin=subprocess.DEVNULL,
-                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                        text=True, encoding="utf-8", errors="replace", **group_kwargs)
+                # `stdin=DEVNULL` — see `reviewer_cli.spawn_and_wait`.
+                p, timed_out = reviewer_cli.spawn_and_wait(cmd, sandbox, timeout_s)
             except OSError:
                 return None
-            try:
-                stdout, _stderr = proc.communicate(timeout=timeout_s)
-            except subprocess.TimeoutExpired:
-                _kill_tree(proc)
-                proc.communicate()
-                return None
-            if not out.exists():
+            if timed_out or not out.exists():
                 return None
             try:
                 verdict, meta = parse_verdict_report(out.read_text(encoding="utf-8"))
@@ -307,7 +286,7 @@ def run(cfg: Config, prompt_text: str, *, timeout_s: int = 300,
                     _seal(cfg, pid, verdict, {
                         "written_by": "verdict_driver", "reader": "",
                         "delegation_mode": "CLI_SUBPROCESS",
-                        "command": cmd, "returncode": proc.returncode,
+                        "command": cmd, "returncode": p.returncode,
                         "seconds": round(time.time() - started, 1),
                         "tool_policy": conf.summary(),
                         "tool_policy_detail": conf.policy(),
@@ -420,6 +399,8 @@ if __name__ == "__main__":       # self-check: python -m harness.verdict_driver
         assert _forbidden not in _imported, _forbidden
     for _affordance in ("input", "getpass", "confirm", "approve", "prompt_user"):
         assert _affordance not in _called, _affordance
-    assert "stdin=subprocess.DEVNULL" in _inspect.getsource(run)
+    # Spawn mechanics (incl. `stdin=DEVNULL`) live in `reviewer_cli.spawn_and_wait` now.
+    assert "stdin=subprocess.DEVNULL" in _inspect.getsource(reviewer_cli.spawn_and_wait)
+    assert "reviewer_cli.spawn_and_wait" in _inspect.getsource(run)
 
     print(json.dumps({"self_check": "ok", "gate_default": cfg.allow_substantive_verdict}, indent=2))

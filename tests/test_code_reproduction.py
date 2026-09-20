@@ -127,78 +127,42 @@ def test_the_standalone_scaffold_refuses_to_produce_a_number(tmp_path: Path):
 
 
 # --------------------------------------------------------------------------- #
-# 3. Static auditing — the three cheat classes, and the FATAL boundary
+# 3. Static auditing — the one surviving rule, and the FATAL boundary
 # --------------------------------------------------------------------------- #
-BASELINE_CRIPPLED = '''
-def train(arm):
-    if arm == "baseline":
-        epochs = 5
-    else:
-        epochs = 200
-    return epochs
-'''
+# Nine of the original ten AST rules (baseline crippling, most data-leakage and metric-
+# deviation heuristics) were deleted: measured over the four repository papers this corpus
+# ever ran, they produced six hits of which five were false, all from matching substrings
+# of identifiers rather than a semantic category, and seven of the ten never fired on a
+# real repository at all. `artifact_review_driver`'s LLM-based read of the checkout (see
+# tests/test_artifact_route.py) already does the judgment those rules were approximating.
+# What remains is the one rule whose hit is true by construction: a data-splitting call
+# with no seed keyword is not reproducible, whatever it means scientifically.
+UNSEEDED_SPLIT = '''
+import torch
 
-LEAKY = '''
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-
-def go(X, y):
-    Xs = StandardScaler().fit_transform(X)
-    return train_test_split(Xs, y, random_state=0)
-'''
-
-ORACLE_METRIC = '''
-def accuracy(y_true, y_pred, scores):
-    return max(scores)
+def make_splits(dataset):
+    return torch.utils.data.random_split(dataset, [8, 2])
 '''
 
 
-def test_baseline_crippling_is_detected_with_both_numbers():
-    hits = code_audit.audit_source("t.py", BASELINE_CRIPPLED)
-    assert [f.rule_id for f in hits] == ["cripple-branch-budget"], hits
-    assert hits[0].category == "baseline_crippling" and hits[0].severity == "MAJOR"
-    assert "epochs = 5" in hits[0].code_quote, "the quote must be the source line, verbatim"
+def test_an_unseeded_split_is_detected():
+    hits = code_audit.audit_source("t.py", UNSEEDED_SPLIT)
+    assert [f.rule_id for f in hits] == ["leak-unseeded-split"], hits
+    assert hits[0].category == "data_leakage" and hits[0].severity == "MINOR"
+    assert "random_split" in hits[0].code_quote, "the quote must be the source line, verbatim"
 
 
-def test_a_symmetric_budget_is_not_flagged():
-    symmetric = BASELINE_CRIPPLED.replace("epochs = 5", "epochs = 200")
-    assert code_audit.audit_source("t.py", symmetric) == [], \
-        "equal budgets are the correct design and must never be reported"
-
-
-def test_a_baseline_given_the_larger_budget_is_not_flagged():
-    generous = BASELINE_CRIPPLED.replace("epochs = 5", "epochs = 400")
-    assert [f.rule_id for f in code_audit.audit_source("t.py", generous)] == []
-
-
-def test_scaling_before_the_split_is_detected():
-    hits = {f.rule_id for f in code_audit.audit_source("t.py", LEAKY)}
-    assert "leak-fit-before-split" in hits, hits
-
-
-def test_a_split_done_before_scaling_is_clean():
-    fixed = '''
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-
-def go(X, y):
-    Xtr, Xte, ytr, yte = train_test_split(X, y, random_state=0)
-    scaler = StandardScaler().fit(Xtr)
-    return scaler.transform(Xtr), scaler.transform(Xte)
-'''
-    assert code_audit.audit_source("t.py", fixed) == [], code_audit.audit_source("t.py", fixed)
-
-
-def test_an_oracle_metric_is_detected():
-    hits = {f.rule_id for f in code_audit.audit_source("t.py", ORACLE_METRIC)}
-    assert "metric-best-of-n" in hits, hits
+def test_a_seeded_split_is_not_flagged():
+    seeded = UNSEEDED_SPLIT.replace(
+        "random_split(dataset, [8, 2])", "random_split(dataset, [8, 2], generator=g)")
+    assert code_audit.audit_source("t.py", seeded) == [], \
+        "a seeded split is reproducible and must never be reported"
 
 
 def test_static_analysis_never_returns_fatal():
     """FATAL belongs to a reproduction that was run and failed, never to a grep."""
-    every = BASELINE_CRIPPLED + LEAKY + ORACLE_METRIC
-    hits = code_audit.audit_source("t.py", every)
-    assert hits, "the combined fixture must trip something"
+    hits = code_audit.audit_source("t.py", UNSEEDED_SPLIT)
+    assert hits, "the fixture must trip the rule"
     assert all(f.severity in ("MAJOR", "MINOR") for f in hits), [f.severity for f in hits]
 
 
@@ -213,13 +177,14 @@ def test_auditing_a_missing_checkout_reports_skipped(tmp_path: Path):
 
 def test_vendored_third_party_code_is_not_audited(tmp_path: Path):
     (tmp_path / "third_party").mkdir()
-    (tmp_path / "third_party" / "x.py").write_text(BASELINE_CRIPPLED, encoding="utf-8")
+    (tmp_path / "third_party" / "x.py").write_text(UNSEEDED_SPLIT, encoding="utf-8")
     assert code_audit.audit_repo(tmp_path).findings == [], \
         "a vendored library's code is not the paper's contribution"
 
 
 def test_findings_are_uniquely_numbered_and_severity_ordered(tmp_path: Path):
-    (tmp_path / "a.py").write_text(BASELINE_CRIPPLED + LEAKY, encoding="utf-8")
+    two_files = UNSEEDED_SPLIT + "\ntorch.utils.data.random_split(other, [1, 1])\n"
+    (tmp_path / "a.py").write_text(two_files, encoding="utf-8")
     result = code_audit.audit_repo(tmp_path)
 
     ids = [f.finding_id for f in result.findings]

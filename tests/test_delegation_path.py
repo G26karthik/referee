@@ -34,7 +34,7 @@ from pathlib import Path
 
 import pytest
 
-from harness import audit_driver, grade_driver, grading, verdict_driver
+from harness import audit_driver, grade_driver, grading, reviewer_cli, verdict_driver
 from harness.artifacts import Finding, Grade, LensReport, SubstantiveVerdict
 from harness.audit_driver import (CODE_RUNNING_TOOLS, HARNESS_OWNED_FINDING_KEYS,
                                   KNOWN_TOOLS, Confinement)
@@ -1113,8 +1113,13 @@ def test_no_delegated_child_inherits_the_operators_terminal(fn):
     operator's own terminal until the timeout — a human checkpoint inside an autonomous
     stage that nobody put there deliberately, and one that looks like a hang rather than a
     refusal.
+
+    The spawn mechanics (incl. `stdin=DEVNULL`) were consolidated into
+    `reviewer_cli.spawn_and_wait` across all `*_driver.py` files — checked there once,
+    plus that this launcher actually calls it rather than spawning its own subprocess.
     """
-    assert "stdin=subprocess.DEVNULL" in inspect.getsource(fn)
+    assert "stdin=subprocess.DEVNULL" in inspect.getsource(reviewer_cli.spawn_and_wait)
+    assert "reviewer_cli.spawn_and_wait" in inspect.getsource(fn)
 
 
 def test_a_gate_flag_widens_and_never_narrows():

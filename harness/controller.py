@@ -511,7 +511,6 @@ def _phase_assess(cfg: Config, case: CaseState, **_) -> PhaseOutcome:
     # Grades are attached here rather than read raw, because the gate reads COUNTED
     # severity: a lens-asserted FATAL the blinded grader demoted must not stop a paper,
     # and `counted_severity` is written by `stages.grade.attach`.
-    from .stages import grade as grade_stage
     grade_stage.attach(cfg, case.paper_id, doc, reports)
     findings = [f for r in reports for f in r.findings]
 

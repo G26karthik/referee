@@ -24,7 +24,6 @@ three requirements and not this module's.
 """
 from __future__ import annotations
 
-import dataclasses
 import hashlib
 import json
 import shutil
@@ -40,8 +39,8 @@ from .artifacts import (ARTIFACT_IDENTITY_BASES, ARTIFACT_IDENTITY_STATES,
                         ArtifactInspection, ArtifactSnapshot, PaperDoc)
 from .config import Config
 from .prompts import artifact_review as AP
-from .reviewer_cli import (Confinement, _kill_tree, denied_tools, envelope_provenance,
-                           operator_confinement, unwrap_envelope, write_pinned_settings)
+from .reviewer_cli import (Confinement, denied_tools, envelope_provenance,
+                           operator_confinement, unwrap_envelope)
 
 WRITERS = ("artifact_review_driver",) + tuple(delegation.WRITTEN_BY.values())
 
@@ -410,39 +409,24 @@ def run(cfg: Config, pid: str, doc: PaperDoc, root: str | Path, prompt_text: str
         prompt.write_text(prompt_text, encoding="utf-8")
         policy_dir = Path(tempfile.mkdtemp(prefix="sh-artreview-policy-"))
         conf = review_confinement(cfg, repo_dir=str(root))
-        settings_path = ""
         try:
-            if conf.enforced:
-                sp, sha = write_pinned_settings(policy_dir, conf.disallowed_tools)
-                settings_path = str(sp)
-                conf = dataclasses.replace(conf, settings_sha256=sha)
+            conf, settings_path = reviewer_cli.stage_settings(conf, policy_dir)
         except OSError as e:
             shutil.rmtree(policy_dir, ignore_errors=True)
             _record_failure(cfg, pid, f"the pinned tool policy could not be written: {e}")
             return None
         cmd = (resolve_cmd(cfg, settings=settings_path, repo_dir=str(root))
                .replace("{prompt}", str(prompt)).replace("{out}", str(out)))
-        group_kwargs: dict = (
-            {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32"
-            else {"start_new_session": True})
         sandbox = Path(tempfile.mkdtemp(prefix="sh-artreview-sandbox-"))
         try:
             try:
-                proc = subprocess.Popen(cmd, shell=True, cwd=str(sandbox),
-                                        stdin=subprocess.DEVNULL,
-                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                        text=True, encoding="utf-8", errors="replace",
-                                        **group_kwargs)
+                p, timed_out = reviewer_cli.spawn_and_wait(
+                    cmd, sandbox, cfg.artifact_review_timeout_s)
             except OSError as e:
                 _record_failure(cfg, pid, f"the reader could not be started: {e}",
                                 command=cmd)
                 return None
-            stdout, stderr = "", ""
-            try:
-                stdout, stderr = proc.communicate(timeout=cfg.artifact_review_timeout_s)
-            except subprocess.TimeoutExpired:
-                _kill_tree(proc)
-                proc.communicate()
+            if timed_out:
                 _record_failure(
                     cfg, pid,
                     f"the reader did not answer within "
@@ -452,16 +436,17 @@ def run(cfg: Config, pid: str, doc: PaperDoc, root: str | Path, prompt_text: str
             if not out.exists():
                 _record_failure(
                     cfg, pid, "the reader exited without writing the output file",
-                    command=cmd, returncode=proc.returncode,
-                    stderr=(stderr or "")[-1200:], stdout=(stdout or "")[-1200:],
+                    command=cmd, returncode=p.returncode,
+                    stderr=(p.stderr or "")[-1200:], stdout=(p.stdout or "")[-1200:],
                     seconds=round(time.time() - started, 1))
                 return None
+            raw = ""
             try:
                 raw = out.read_text(encoding="utf-8")
                 proposals, notes, meta = parse_concerns(raw)
             except (OSError, ArtifactReviewDriverError) as e:
                 _record_failure(cfg, pid, f"the reader's output was unusable: {e}",
-                                command=cmd, returncode=proc.returncode,
+                                command=cmd, returncode=p.returncode,
                                 raw_head=(raw if isinstance(raw, str) else "")[:1500],
                                 seconds=round(time.time() - started, 1))
                 return None
@@ -476,7 +461,7 @@ def run(cfg: Config, pid: str, doc: PaperDoc, root: str | Path, prompt_text: str
                 seal(cfg, pid, inspection, {
                     "written_by": "artifact_review_driver", "reader": "",
                     "delegation_mode": "CLI_SUBPROCESS",
-                    "command": cmd, "returncode": proc.returncode,
+                    "command": cmd, "returncode": p.returncode,
                     "seconds": round(time.time() - started, 1),
                     "tool_policy": conf.summary(), "tool_policy_detail": conf.policy(),
                     "prompt_sha256": prompt_sha, "notes": notes,

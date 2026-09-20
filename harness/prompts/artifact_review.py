@@ -5,10 +5,10 @@
 **This is the one reader that is shown CODE.** Every other model in this system reads the
 paper; this one reads the paper's method section alongside the authors' pinned checkout and
 answers whether the second does what the first says. That question is not answerable from
-the paper alone and not answerable by the ten AST rules in `harness/code_audit.py`, which
-match substrings of identifiers — measured over the four repository papers those rules
-produced six hits of which five are false, every one because an identifier is not a
-semantic category.
+the paper alone and was never reliably answerable by AST pattern matching either —
+`harness/code_audit.py` carried ten such rules, measured over the four repository papers
+those rules produced six hits of which five were false, every one because an identifier is
+not a semantic category, and nine of the ten are now deleted rather than kept unused.
 
 **It proposes; it establishes nothing.** Its access is the paper, a read-only view of the
 pinned checkout, and no execution. Every code citation it writes is relocated by

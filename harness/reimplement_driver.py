@@ -37,12 +37,10 @@ code execution lands without that boundary enforced.
 """
 from __future__ import annotations
 
-import dataclasses
 import hashlib
 import json
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -52,16 +50,14 @@ from . import delegation, reviewer_cli, sealing, state
 from .artifacts import ReimplementationBinding, ReimplementationConformance, ReimplementationReadiness
 from .config import Config
 from .prompts import reimplement as RP
-from .reviewer_cli import (KNOWN_TOOLS, Confinement, _kill_tree, denied_tools,
-                           envelope_provenance, operator_confinement, unwrap_envelope,
-                           write_pinned_settings)
+from .reviewer_cli import (KNOWN_TOOLS, Confinement, denied_tools,
+                           envelope_provenance, operator_confinement, unwrap_envelope)
 
 # Every writer a validated reconstruction can carry: this module's own subprocess, a human
 # `accept_reimplementation` call, plus every mode `harness.delegation` admits — the same
 # vocabulary `verdict_driver.WRITERS` reads off, for the same reason: a mode sealed here
 # must not be refused by `load_accepted`.
-WRITERS = ("reimplement_driver",) + tuple(
-    __import__("harness.delegation", fromlist=["WRITTEN_BY"]).WRITTEN_BY.values())
+WRITERS = ("reimplement_driver",) + tuple(delegation.WRITTEN_BY.values())
 
 # Only these five carry a REQUIRED paper locator (`hyperparameters`/`architecture`/
 # `preprocessing` are optional — see `harness.reimplement.INGREDIENTS`) and only these
@@ -152,35 +148,19 @@ def _invoke_fresh(cfg: Config, prompt_text: str, timeout_s: int) -> tuple[str, d
         policy_dir = Path(tempfile.mkdtemp(prefix="sh-reimpl-policy-"))
         sandbox = Path(tempfile.mkdtemp(prefix="sh-reimpl-sandbox-"))
         conf_conn = reimplementation_confinement(cfg)
-        settings_path = ""
         try:
-            if conf_conn.enforced:
-                sp, sha = write_pinned_settings(policy_dir, conf_conn.disallowed_tools)
-                settings_path = str(sp)
-                conf_conn = dataclasses.replace(conf_conn, settings_sha256=sha)
+            conf_conn, settings_path = reviewer_cli.stage_settings(conf_conn, policy_dir)
             cmd = (resolve_cmd(cfg, settings=settings_path)
                    .replace("{prompt}", str(prompt)).replace("{out}", str(out)))
-            group_kwargs: dict = (
-                {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-                if sys.platform == "win32" else {"start_new_session": True})
             try:
-                proc = subprocess.Popen(
-                    cmd, shell=True, cwd=str(sandbox), stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                    encoding="utf-8", errors="replace", **group_kwargs)
+                p, timed_out = reviewer_cli.spawn_and_wait(cmd, sandbox, timeout_s)
             except OSError:
                 return None
-            try:
-                proc.communicate(timeout=timeout_s)
-            except subprocess.TimeoutExpired:
-                _kill_tree(proc)
-                proc.communicate()
-                return None
-            if not out.exists():
+            if timed_out or not out.exists():
                 return None
             raw = out.read_text(encoding="utf-8")
             return raw, {
-                "command": cmd, "returncode": proc.returncode,
+                "command": cmd, "returncode": p.returncode,
                 "tool_policy": conf_conn.summary(),
                 "tool_policy_detail": conf_conn.policy(),
                 "raw_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
@@ -369,7 +349,6 @@ def accept_reimplementation(cfg: Config, pid: str, target_id: str, raw: str,
     script, bindings, _notes, _meta = parse_reimplementation_report(raw)
     conf = conformance(readiness, script, bindings, generated_by=generated_by,
                        verified_by=reviewer)
-    from . import delegation
     prov = delegation.provenance_record(mode=mode, reviewer=reviewer, tool_policy=tool_policy)
     return _seal(cfg, pid, target_id, script, conf, {
         "written_by": prov["written_by"], "delegation_mode": prov["delegation_mode"],
@@ -611,7 +590,10 @@ if __name__ == "__main__":       # self-check: python -m harness.reimplement_dri
             _imported.update(a.name.split(".")[0] for a in _node.names)
     for _forbidden in ("backends", "local_exec", "stages", "planner", "grading", "taxonomy"):
         assert _forbidden not in _imported, _forbidden
-    assert "stdin=subprocess.DEVNULL" in _inspect.getsource(_invoke_fresh)
+    # Spawn mechanics (incl. `stdin=DEVNULL`) live in `reviewer_cli.spawn_and_wait` now —
+    # see `audit_driver`'s self-check for the same consolidation.
+    assert "stdin=subprocess.DEVNULL" in _inspect.getsource(reviewer_cli.spawn_and_wait)
+    assert "reviewer_cli.spawn_and_wait" in _inspect.getsource(_invoke_fresh)
 
     print(json.dumps({"self_check": "ok",
                       "gate_default": cfg.allow_reimplementation_driver}, indent=2))

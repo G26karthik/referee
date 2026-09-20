@@ -670,7 +670,6 @@ def unchecked_central(objects: list | None, outcomes: list | None) -> list:
     # the derivation cannot be, and it reproduces the old five exactly.
     by_id = {getattr(o, "target_id", ""): o for o in (outcomes or [])}
     out = []
-    from .. import taxonomy
     for obj in (objects or []):
         if getattr(obj, "centrality", "") != "CENTRAL" or not getattr(obj, "harness_addressable", False):
             continue
@@ -911,7 +910,7 @@ def _chain_block(c: ExperimentalChain) -> list[str]:
             ("executed", f"yes — {c.executions} process(es)" if c.executed else "no"),
             ("execution log", f"`{c.execution_log}`" if c.execution_log else "—"),
             ("reconciliation", c.reconciliation or "—")]
-    out = ["| link | state |", "|---|---|"] + [f"| {k} | {v} |" for k, v in rows]
+    out = _kv_table(rows, ("link", "state"))
     if c.broken_link:
         out += ["", f"⛔ The chain breaks at **{c.broken_link}**. Nothing after that link was "
                     f"established, so no reproduction verdict follows — this is a limit of "
@@ -1107,8 +1106,7 @@ def _repo_block(a: RepoAcquisition) -> list[str]:
     if a.entrypoint:
         rows.append(("entrypoint", f"`{a.entrypoint}`"))
     rows.append(("environment", a.env_status))
-    out += ["| item | value |", "|---|---|"]
-    out += [f"| {k} | {v} |" for k, v in rows]
+    out += _kv_table(rows)
     if a.reason:
         out += ["", a.reason]
     if a.reimplementation is not None:
@@ -1238,6 +1236,11 @@ def _cell(s: str, n: int) -> str:
     """One markdown table cell: pipes escaped, newlines flattened, length capped."""
     s = " ".join((s or "").split()).replace("|", "\\|")
     return (s[: n - 1] + "…") if len(s) > n else s
+
+
+def _kv_table(rows: list[tuple[str, str]], headers: tuple[str, str] = ("item", "value")) -> list[str]:
+    """[(key, value), ...] as a two-column markdown table. Pure formatting, no judgement."""
+    return [f"| {headers[0]} | {headers[1]} |", "|---|---|"] + [f"| {k} | {v} |" for k, v in rows]
 
 
 def _scientific_block(r: EvalReport) -> list[str]:
@@ -2130,8 +2133,7 @@ def render_reviewer_report(report: EvalReport, target_set=None) -> str:
         # is additionally the exact phrase `provenance.PROVENANCE_LABEL` reserves for a
         # sealed reimplementation. The disposition was already honest; the subject of the
         # sentence was not.
-        from ..provenance import label as _prov_label
-        _ran = (f"ran: `{_prov_label(o.provenance)}`" if int(getattr(o, "launched", 0) or 0)
+        _ran = (f"ran: `{provenance_label(o.provenance)}`" if int(getattr(o, "launched", 0) or 0)
                 else "nothing ran")
         L += ["", f"- **{o.target_id}** — planned: {o.action.replace('_', ' ').lower()} · "
                   f"{_ran}, ended `{o.disposition}`",

@@ -494,6 +494,52 @@ def classify_delegated_failure(text: str) -> tuple[str, str, str]:
 
 
 # --------------------------------------------------------------------------- #
+# THE CONFINED CALL — the subprocess mechanics every `*_driver.py`'s `call()`/`run_lens()`
+# used to reimplement on its own (policy staging, process-group spawn, timeout+kill-tree).
+# Originally copy-pasted into eight files when `reviewer_cli.py` was split out of
+# `audit_driver.py` (see this module's own docstring) — the ARGV each driver builds still
+# differs per role, so only the mechanics below it are shared.
+# --------------------------------------------------------------------------- #
+def stage_settings(conf: Confinement, policy_dir: Path) -> tuple[Confinement, str]:
+    """Write `conf`'s pinned settings into `policy_dir` if `conf` is enforced.
+
+    Returns `(conf, "")` unchanged when `conf` is not enforced (an operator-supplied
+    command line this module did not build — see `Confinement.enforced`). Raises OSError
+    on write failure; every caller already has its own message and cleanup for that, so
+    this does not swallow it.
+    """
+    if not conf.enforced:
+        return conf, ""
+    sp, sha = write_pinned_settings(policy_dir, conf.disallowed_tools)
+    return dataclasses.replace(conf, settings_sha256=sha), str(sp)
+
+
+def spawn_and_wait(cmd: str, cwd: Path, timeout_s: float
+                   ) -> tuple[subprocess.CompletedProcess | None, bool]:
+    """Run ONE confined shell command to completion or timeout. Returns (result, timed_out).
+
+    Own process group so a timeout can kill the WHOLE tree, not just the immediate shell —
+    see `_kill_tree`. `result` is None only when it timed out (the tree was killed and
+    reaped; there is nothing left to report). Raises OSError if the process could not even
+    start — every caller already has its own message for that, so it is left to propagate
+    rather than folded into the two-tuple.
+    """
+    group_kwargs: dict = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32"
+        else {"start_new_session": True})
+    proc = subprocess.Popen(cmd, shell=True, cwd=str(cwd), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace", **group_kwargs)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        proc.communicate()                       # reap the process now that it is dead
+        return None, True
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr), False
+
+
+# --------------------------------------------------------------------------- #
 # THE ARGV TEMPLATE — the one-shot piped invocation every built-in driver command shares
 # --------------------------------------------------------------------------- #
 def cli_pipe_command(exe: str, extra_flags: str) -> str:

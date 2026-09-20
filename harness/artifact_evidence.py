@@ -5,7 +5,7 @@
 **The question this route answers is "what can the released artifact itself establish?",
 and the reason it needed building is that the harness already read the code and threw the
 scientific result away.** `harness/code_audit.py` has run on every cloned paper since the
-first version: it parses the checkout, applies ten rules, and writes `CodeAudit.findings`
+first version: it parses the checkout, applies its rule(s), and writes `CodeAudit.findings`
 into the machine report under `## Static code audit`. Nothing consumes them. They reach no
 question, no target, no route and no evidence state — `ARTIFACT_EVIDENCE` and its
 resolution `RESOLVED_FROM_ARTIFACT` were in the vocabulary with no disposition mapping to
@@ -59,87 +59,33 @@ from .artifacts import (ARTIFACT_QUESTION_SCOPES, SETTLEABLE_BY_ARTIFACT_FACT,
                         SourceSpan)
 
 # --------------------------------------------------------------------------- #
-# §8 — the ten existing AST rules, classified by the authority they can carry
+# §8 — the surviving AST rule, classified by the authority it can carry
 # --------------------------------------------------------------------------- #
-# NOT ALL TEN ARE EXPOSED, and "it exists" is not a reason to expose one. Each rule is
-# sorted into one of four classes, and the classification is a MEASUREMENT over the four
-# repository papers rather than a reading of the rule's docstring: the corpus produced six
-# hits and five of them are false, every one for the same reason — the rules match
-# SUBSTRINGS of identifiers, and an identifier is not a semantic category.
+# `code_audit.py` used to carry ten pattern-matching rules across three cheat classes.
+# Nine are deleted outright (not merely reclassified): measured over the four repository
+# papers this corpus ever ran, the ten rules produced six hits and five were false, every
+# one because the rules matched SUBSTRINGS of identifiers rather than a semantic category,
+# and seven of the ten never fired on any real repository at all. `artifact_review_driver`
+# already does the judgment those nine were a noisy substitute for — a full LLM read of the
+# checkout against the paper's method section, with every citation it makes relocated and
+# hashed below before it counts for anything.
+#
+# What is left is classified the same way the ten were, so a rule added later is not
+# automatically trusted:
 #
 #   A  deterministic artifact fact     what it reports is true of the checkout by
-#                                      construction, whatever it means
-#   B  candidate concern               it located something real and what that something
-#                                      MEANS needs interpretation this harness cannot do
-#   C  diagnostic only                 kept in the machine trace, never shown to a reviewer
-#   D  unsafe for reviewer output      measured false positives with no bounded reading
-#
-# WHAT EACH CLASS MAY DO, and B does NOT reach a referee directly. That a source pattern
-# matched is deterministic; the SCIENTIFIC INTERPRETATION of the match is not, and a class-B
-# rule is defined by needing one. Seven of the ten have never fired on any real repository,
-# so rendering a first-ever B hit as a reviewer observation would put an unmeasured detector
-# in front of a human wearing the same clothes as a measured one.
-#
-#   A -> rendered as a bounded ARTIFACT observation, because what it reports is a property
-#        of the source text and is true whatever it means.
-#   B -> handed to the authors'-code auditor as a PLACE TO LOOK. It becomes reviewer-visible
-#        only after exact source relocation and bounded semantic review, i.e. through
-#        `artifact_review_driver`, at the authority that channel earns — never through the
-#        rule.
-#   C -> machine trace only.
-#   D -> machine trace only, and it may not become a concern through this rule at all.
+#                                      construction, whatever it means — rendered to a
+#                                      referee as a bounded ARTIFACT observation
+#   D  unsafe for reviewer output      unclassified, or measured false — machine trace only
 RULE_AUTHORITY = {
-    # --- A: what the rule reports is a property of the source text --------------------
     # The call site passes no `random_state`, `seed`, `generator` or `stratify`. That is
     # a fact about the call, decidable from the AST, and true whatever a global seed does
     # elsewhere. Fired once on `apt-icml` (`utils/utils.py:600`,
     # `torch.utils.data.random_split(total_dataset, [n, m])`) and the fact is correct.
     "leak-unseeded-split": "A",
-
-    # --- B: located something real; what it means is not decidable here ---------------
-    # Both branches of one `if` set the SAME knob to different literals and the arm the
-    # condition names as the baseline gets the smaller one. The asymmetry is in the code;
-    # whether it is a defect depends on whether each method's own published recipe calls
-    # for it, which is exactly what `counter_explanations` says. Did not fire on the
-    # corpus, so this classification rests on the rule's structure, not on a measurement.
-    "cripple-per-arm-budget": "B",
-    "cripple-config-table": "B",
-    # A preprocessor fitted before the split, and the unambiguous `.fit(X_test)`. Both
-    # locate a real call ordering; both have a stated legitimate reading (refit after the
-    # split, transductive evaluation). Neither fired on the corpus.
-    "leak-fit-before-split": "B",
-    "leak-fit-on-test": "B",
-    # A hand-written metric beside imported standard ones. What it establishes is that
-    # the two should be diffed, which is a question and not a finding.
-    "metric-shadows-standard": "B",
-    # Both fire only inside a function whose NAME is metric-like, which bounds them; what
-    # a maximum or a ground-truth comparison inside a metric means is interpretation.
-    # Neither fired on the corpus.
-    "metric-best-of-n": "B",
-    "metric-filters-ground-truth": "B",
-
-    # --- D: measured false, with no bounded reading -----------------------------------
-    # FOUR OF THE CORPUS'S SIX HITS, ALL FALSE, ALL ON `apt-icml/run_pruning.py`. The
-    # detector is a regex over raw lines whose first alternative is
-    # `val(idation)?[\\w\\[\\]'". ]*=\\s*[\\w\\.]*test`. The source lines read
-    # `rescaled_eval_metrics = test(model, eval_dataloader, ...)` — "eval" CONTAINS "val",
-    # and `test` here is the name of the evaluation FUNCTION. So the rule reported that
-    # the test split drives model selection in a file where it does not, four times, on a
-    # line that calls an evaluator on `eval_dataloader`. There is no narrower reading that
-    # rescues the hit: nothing on the line is a split, a checkpoint or a selection.
-    "leak-model-selection-on-test": "D",
-    # THE FIFTH FALSE HIT. It fires when an `if` condition contains an `_OURS` token and
-    # its body contains an augmentation token. The corpus line is
-    # `if new_transform_r > model.layer_transformation.r and ...` — `new_` is the arm
-    # token and `transform` is the augmentation token, in a branch that resizes a LoRA
-    # rank. Neither substring means what the rule takes it to mean, and the rule's own
-    # statement ("data augmentation is applied on the proposed arm only") is false of the
-    # branch it points at.
-    "cripple-augmentation-one-arm": "D",
 }
 
 REVIEWER_VISIBLE = ("A",)
-FEEDS_AUDITOR = ("B",)
 
 
 def rule_authority(rule_id: str) -> str:
@@ -154,16 +100,6 @@ def rule_authority(rule_id: str) -> str:
 def reviewer_visible(rule_id: str) -> bool:
     """May this rule's hit be rendered to a referee AS IT STANDS? Class A only."""
     return rule_authority(rule_id) in REVIEWER_VISIBLE
-
-
-def feeds_auditor(rule_id: str) -> bool:
-    """May this rule's hit be handed to the authors'-code auditor as a place to look?
-
-    Class B: the match is deterministic and its meaning is not. What the auditor does with
-    it is subject to relocation and to the authority ladder, so the rule contributes a
-    LOCATION and never a conclusion.
-    """
-    return rule_authority(rule_id) in FEEDS_AUDITOR
 
 
 # --------------------------------------------------------------------------- #
@@ -1187,26 +1123,19 @@ if __name__ == "__main__":       # self-check: python -m harness.artifact_eviden
 
     # --- §8, the rule audit ---------------------------------------------------------
     from . import code_audit
-    ids = set()
-    for rule in code_audit._RULES:
-        ids |= {m for m in re.findall(r'rule_id="([^"]+)"', rule.__doc__ or "")}
+    assert set(code_audit._RULES) == {code_audit._rule_unseeded_split}, (
+        "a rule was added or removed in code_audit.py without updating this classification")
     # Every rule the module can emit is classified, and an unknown one is not visible.
     assert not reviewer_visible("a-rule-nobody-audited")
-    assert rule_authority("leak-model-selection-on-test") == "D"
-    assert not reviewer_visible("leak-model-selection-on-test")
+    assert rule_authority("a-rule-nobody-audited") == "D"
     assert reviewer_visible("leak-unseeded-split")
-    assert set(RULE_AUTHORITY.values()) <= {"A", "B", "C", "D"}
+    assert set(RULE_AUTHORITY.values()) <= {"A", "D"}
 
     # An AST warning is never a scientific failure, and there is no value for one.
     from .artifacts import ARTIFACT_AUTHORITY
     assert "SCIENTIFIC_FAILURE" not in ARTIFACT_AUTHORITY
     assert ARTIFACT_AUTHORITY == ("ARTIFACT_FACT", "ENDPOINTS_VERIFIED_ARTIFACT_CONCERN",
                                   "PAPER_ARTIFACT_MISMATCH", "NONE")
-    # CLASS B IS NOT REVIEWER-VISIBLE. That a source pattern matched is deterministic;
-    # what the match MEANS is not, and a class-B rule is defined by needing a reading.
-    assert not reviewer_visible("leak-fit-on-test") and feeds_auditor("leak-fit-on-test")
-    assert reviewer_visible("leak-unseeded-split")
-    assert not feeds_auditor("leak-model-selection-on-test")
 
     # A reproduction question is not answerable by reading.
     assert requires_execution("REPRODUCTION") and requires_execution("PRINTED_QUANTITY")

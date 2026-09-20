@@ -25,12 +25,9 @@ is counted as an attempted forgery rather than merged in. Invariant 2, on a four
 """
 from __future__ import annotations
 
-import dataclasses
 import hashlib
 import json
 import shutil
-import subprocess
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -40,8 +37,7 @@ from .artifacts import (LITERATURE_RELATIONS, LiteratureSearch, PaperDoc, PriorA
                         SearchClaim, SearchCutoff, WorkIdentity)
 from .config import Config
 from .prompts import literature as LP
-from .reviewer_cli import (Confinement, _kill_tree, denied_tools, operator_confinement,
-                           unwrap_envelope, write_pinned_settings)
+from .reviewer_cli import Confinement, denied_tools, operator_confinement, unwrap_envelope
 
 WRITERS = ("literature_driver",) + tuple(delegation.WRITTEN_BY.values())
 
@@ -323,12 +319,8 @@ def call(cfg: Config, prompt_text: str, *, tag: str = "literature"
         prompt.write_text(prompt_text, encoding="utf-8")
         policy_dir = Path(tempfile.mkdtemp(prefix="sh-lit-policy-"))
         conf = review_confinement(cfg, query=tag.startswith("queries"))
-        settings_path = ""
         try:
-            if conf.enforced:
-                sp, sha = write_pinned_settings(policy_dir, conf.disallowed_tools)
-                settings_path = str(sp)
-                conf = dataclasses.replace(conf, settings_sha256=sha)
+            conf, settings_path = reviewer_cli.stage_settings(conf, policy_dir)
         except OSError as exc:
             shutil.rmtree(policy_dir, ignore_errors=True)
             record.update({"failure": "policy_unwritable", "detail": str(exc)})
@@ -339,31 +331,21 @@ def call(cfg: Config, prompt_text: str, *, tag: str = "literature"
                        "tool_policy_detail": conf.policy(), "model": conf.model,
                        "prompt_sha256": hashlib.sha256(
                            prompt_text.encode("utf-8")).hexdigest()})
-        group_kwargs: dict = (
-            {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32"
-            else {"start_new_session": True})
         sandbox = Path(tempfile.mkdtemp(prefix="sh-lit-sandbox-"))
         try:
             try:
-                proc = subprocess.Popen(cmd, shell=True, cwd=str(sandbox),
-                                        stdin=subprocess.DEVNULL,
-                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                        text=True, encoding="utf-8", errors="replace",
-                                        **group_kwargs)
+                p, timed_out = reviewer_cli.spawn_and_wait(cmd, sandbox,
+                                                           cfg.literature_timeout_s)
             except OSError as exc:
                 record.update({"failure": "process_unstartable", "detail": str(exc)})
                 return "", record
-            try:
-                stdout, stderr = proc.communicate(timeout=cfg.literature_timeout_s)
-            except subprocess.TimeoutExpired:
-                _kill_tree(proc)
-                proc.communicate()
+            if timed_out:
                 record.update({"failure": "timeout",
                                "seconds": round(time.time() - started, 1)})
                 return "", record
-            record.update({"returncode": proc.returncode,
-                           "stdout_tail": (stdout or "")[-400:],
-                           "stderr_tail": (stderr or "")[-400:],
+            record.update({"returncode": p.returncode,
+                           "stdout_tail": (p.stdout or "")[-400:],
+                           "stderr_tail": (p.stderr or "")[-400:],
                            "seconds": round(time.time() - started, 1)})
             if not out.exists():
                 record["failure"] = "no_output_file"

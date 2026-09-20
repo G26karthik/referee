@@ -205,8 +205,6 @@ def add_cost(cfg: Config, pid: str, cost_usd: float) -> None:
         save_meta(cfg, pid, meta)
 
 
-
-
 # In-process only: several lens/grade calls now run concurrently on threads within one
 # controller invocation, and a plain `open(..., "a").write(...)` from two threads at once
 # can interleave two records into one unparseable line. A per-process lock is enough —
