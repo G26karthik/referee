@@ -14,7 +14,7 @@ Exit codes:  0 complete · 2 waiting on lens evidence · 1 error ·
              3 complete but CONTESTED (the independent substantive read disagrees
              sharply with the deterministic verdict — see `EvalReport.verdict_contested`).
 
-This file formats; `harness/controller.py` decides. Run with the repo venv:
+This file formats; `harness/pipeline.py` decides. Run with the repo venv:
     ../.venv/Scripts/python.exe run.py ...
 """
 from __future__ import annotations
@@ -24,17 +24,13 @@ import json
 import sys
 from pathlib import Path
 
-from harness import controller, dossier, state, verdict_driver
+from harness import agent, pipeline, routes, state
+from harness.audit import LENSES, accept_grade, accept_lens, run_audit, run_grade
 from harness.config import Config
-from harness.stages import audit as audit_stage
-from harness.stages import grade as grade_stage
 from harness.stages import ingest as ingest_stage
-from harness.stages import probe as probe_stage
-from harness.stages import report as report_stage
 
-STAGES = {"ingest": ingest_stage.run_ingest, "audit": audit_stage.run_audit,
-          "grade": grade_stage.run_grade, "probe": probe_stage.run,
-          "report": report_stage.run_report}
+STAGES = {"ingest": ingest_stage.run_ingest, "audit": run_audit, "grade": run_grade,
+          "probe": routes.run, "report": pipeline.run_report_stage}
 
 
 def _echo_steps(prefix: str, res: dict) -> None:
@@ -59,7 +55,7 @@ def cmd_review(args: argparse.Namespace) -> int:
                 auto_audit=args.auto_audit, auto_grade=args.auto_grade)
 
     if len(args.paper) == 1:
-        res = controller.review(cfg, args.paper[0], **opts)
+        res = pipeline.review(cfg, args.paper[0], **opts)
         _echo_steps("", res)
         if res["status"] == "error":
             print(json.dumps(res, indent=2, default=str))
@@ -83,8 +79,8 @@ def cmd_review(args: argparse.Namespace) -> int:
                             for k, n in cats.items()) or "no findings survived verification"
         print(f"\n=== {res['title']} ===")
         # THE DISPOSITION FIRST, because it is the one line a caller acts on. It is not a
-        # verdict and does not replace the colour — see `harness/disposition.py` — it says
-        # what happens to the paper now.
+        # verdict and does not replace the colour — see `harness/decide.py` — it says what
+        # happens to the paper now.
         rep = _detail(res, "S4 report")
         if disp := rep.get("disposition"):
             basis = rep.get("disposition_basis") or "NONE"
@@ -103,13 +99,13 @@ def cmd_review(args: argparse.Namespace) -> int:
         return 0
 
     out = Path(args.out) if args.out else None
-    res = controller.review_papers(cfg, args.paper, dossier_out=out, **opts)
+    res = pipeline.review_papers(cfg, args.paper, dossier_out=out, **opts)
     for r in res["results"]:
         _echo_steps(f"[{r.get('paper_id', r['input'])}] ", r)
 
     # CORPUS ACCOUNTING FIRST, and by REQUEST rather than by result. "5 papers reviewed"
     # when six were asked for is the summary shape this block exists to make impossible:
-    # every requested paper appears on exactly one line, and `harness.corpus.account` has
+    # every requested paper appears on exactly one line, and `harness.pipeline.account` has
     # already asserted that the states sum to the request count.
     corpus = res.get("corpus") or {}
     if corpus:
@@ -161,7 +157,7 @@ def cmd_accept(args: argparse.Namespace) -> int:
 
     The manual channel has always been first-class — `review` without `--auto-audit`
     writes `audit/prompts/<lens>.md`, exits 2, and resumes once the lens files exist —
-    but the only way to actually SEAL one was to import `stages.audit.accept_lens` from
+    but the only way to actually SEAL one was to import `harness.audit.accept_lens` from
     Python. So the documented path required writing code, and the obvious alternative
     (drop the JSON straight into `audit/<lens>.json`) is exactly the side-write that
     `lens_is_accepted` refuses, because it skips `parse_lens_json`'s validation and
@@ -169,7 +165,7 @@ def cmd_accept(args: argparse.Namespace) -> int:
 
     Reads from a staging directory rather than accepting inline JSON: a lens report runs
     to tens of kilobytes, which does not belong on a command line, and staging-then-
-    promoting is the same discipline `audit_driver.run_lens` already uses.
+    promoting is the same discipline `agent.run_lens` already uses.
     """
     cfg = Config.load()
     root = state.project_dir(cfg, args.paper)
@@ -192,10 +188,10 @@ def cmd_accept(args: argparse.Namespace) -> int:
             src.unlink(missing_ok=True)
 
     lens_dir = Path(args.staged) if args.staged else root / "audit" / ".staged"
-    for lens in sorted(audit_stage.LENSES):
+    for lens in sorted(LENSES):
         if (src := lens_dir / f"{lens}.json").exists():
             take(src, f"lens:{lens}",
-                 lambda raw, ln=lens: str(audit_stage.accept_lens(
+                 lambda raw, ln=lens: str(accept_lens(
                      cfg, args.paper, ln, raw, reviewer=args.reviewer,
                      tool_policy=args.tool_policy,
                      mode=args.mode)["findings"]) + " finding(s)")
@@ -203,22 +199,21 @@ def cmd_accept(args: argparse.Namespace) -> int:
     # A paper long enough to need part-splitting has no `audit/<lens>.json` to stage into
     # until every one of that lens's units is sealed — `accept_lens` above only ever
     # targets the composed file. `tools/subagent_accept.py` is the gate for a part or a
-    # synthesis unit (`python tools/subagent_accept.py seal <pid> <unit-id> <staged-file>`
-    # or `sweep <pid>` over `audit/.staged_subagent/`); this command does not duplicate it.
+    # synthesis unit; this command does not duplicate it.
 
     # Grades live one level down, keyed by candidate slug rather than by lens name, so
     # this takes whatever is there instead of iterating a known vocabulary.
     grade_dir = root / "audit" / "grade" / ".staged"
     for src in sorted(grade_dir.glob("*.json")) if grade_dir.is_dir() else []:
         take(src, f"grade:{src.stem}",
-             lambda raw, s=src.stem: grade_stage.accept_grade(
+             lambda raw, s=src.stem: accept_grade(
                  cfg, args.paper, s, raw, grader=args.reviewer,
                  tool_policy=args.tool_policy, mode=args.mode)["verdict"])
 
     # The whole-paper read: one per paper, so a single staged file rather than a directory.
     if (src := root / "reports" / ".staged" / "substantive.json").exists():
         take(src, "whole-paper",
-             lambda raw: verdict_driver.accept_verdict(
+             lambda raw: agent.accept_verdict(
                  cfg, args.paper, raw, reader=args.reviewer,
                  tool_policy=args.tool_policy, mode=args.mode)["verdict"])
 
@@ -226,12 +221,11 @@ def cmd_accept(args: argparse.Namespace) -> int:
     if (src := root / "control" / ".staged" / "spec.json").exists():
         take(src, "spec",
              lambda raw: (
-                 f"sealed, sha256={probe_stage.accept_spec(cfg, args.paper, raw, reviewer=args.reviewer, tool_policy=args.tool_policy, mode=args.mode)['content_sha256'][:12]}"
+                 f"sealed, sha256={routes.accept_spec(cfg, args.paper, raw, reviewer=args.reviewer, tool_policy=args.tool_policy, mode=args.mode)['content_sha256'][:12]}"
              ))
 
-    from harness import delegation
     if accepted:
-        print(f"mode     : {args.mode} — {delegation.ISOLATION_CLAIM.get(args.mode, '?')}")
+        print(f"mode     : {args.mode} — {agent.ISOLATION_CLAIM.get(args.mode, '?')}")
     for label, what in accepted.items():
         print(f"accepted : {label:<34} {what}")
     for label, why in refused.items():
@@ -244,9 +238,10 @@ def cmd_accept(args: argparse.Namespace) -> int:
 
 def cmd_dossier(args: argparse.Namespace) -> int:
     """Consolidate finished reports. Runs no stage."""
+    from harness import summarize
     cfg = Config.load()
-    res = dossier.build(cfg, args.papers or reviewed_papers(cfg),
-                        Path(args.out) if args.out else None)
+    res = summarize.build_dossier(cfg, args.papers or reviewed_papers(cfg),
+                                  Path(args.out) if args.out else None)
     print(json.dumps(res, indent=2))
     return 0 if res["papers"] else 1
 
@@ -257,14 +252,7 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     Runs before a batch, spends nothing, and reviews nothing. Exit 0 when every requested
     file is a distinct document; exit 2 when the batch is refused, which happens when two
     requested files are byte-identical or a file cannot be read.
-
-    A duplicate is refused rather than reviewed twice because it inflates every corpus
-    count silently: `allocate_paper_id` correctly recognises the second file as the same
-    document and resumes its project, which is right per paper and invisible in aggregate.
-    An eight-file request that is seven documents produces seven reviews and a claim about
-    eight papers.
     """
-    from harness import preflight
     from harness.config import BASE_DIR
     cfg = Config.load()
     papers_dir = BASE_DIR / "papers"
@@ -272,8 +260,8 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     if not sources:
         print(f"no PDFs to check: pass --paper, or put some in {papers_dir}")
         return 2
-    res = preflight.run(cfg, sources, Path(args.out) if args.out else None)
-    print(preflight.render(res))
+    res = pipeline.run_preflight(cfg, sources, Path(args.out) if args.out else None)
+    print(pipeline.render_preflight(res))
     print(f"\nwritten: {res['paths']['md']}\n         {res['paths']['json']}")
     return 0 if res["ok"] else 2
 
@@ -284,13 +272,13 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     Deliberately separate from `dossier`, which is a reader's summary of the papers. This
     is a summary of the SYSTEM — how much of each paper it could address, how often it
     judged an experiment necessary, which gate stopped the rest — and it reports nothing
-    it cannot count. See `harness/evaluation.LIMITATIONS` for what is absent and why.
+    it cannot count. See `harness/summarize.LIMITATIONS` for what is absent and why.
     """
-    from harness import evaluation
+    from harness import summarize
     cfg = Config.load()
-    res = evaluation.run(cfg, args.papers or reviewed_papers(cfg),
-                         Path(args.out) if args.out else None)
-    print(evaluation.render(res))
+    res = summarize.run_evaluate(cfg, args.papers or reviewed_papers(cfg),
+                                 Path(args.out) if args.out else None)
+    print(summarize.render_evaluation(res))
     print(f"\nwritten: {res['paths']['md']}\n         {res['paths']['json']}")
     return 0 if res["papers_measured"] else 1
 
@@ -309,25 +297,15 @@ def reviewed_papers(cfg: Config) -> list[str]:
 def cmd_stage(args: argparse.Namespace) -> int:
     """Run ONE stage and print its compact result. For debugging, not for review.
 
-    Locked exactly the way `controller.step` locks a phase handler —
+    Locked exactly the way `pipeline.step` locks a phase handler —
     `with state.project_lock(cfg, case.paper_id): ...` — so this debug entrypoint cannot
     interleave writes to `control/probe_results.json`, `control/targets/<id>/outcome.json`,
     `artifact/<pid>.route.json`, or any other case-state file with a concurrent `review`
-    run or a second `stage` invocation against the same paper. Unlike `controller.step`,
-    there is no `CaseState` here to read a `paper_id` off, so the lock key is derived the
-    same way `controller.open_case` derives one: `--paper` for the `ingest` stage is a PDF
-    path, and the paper id is not allocated until ingestion runs, which is exactly the
-    situation `open_case` represents with an empty `case.paper_id` — so the lock key here
-    is `""` for that same situation, matching what `step` actually locks on today rather
-    than inventing a different key. (Locking on the raw PDF path itself would be worse
-    than no lock: `state.project_dir` joins it under `projects_dir` with `Path.__truediv__`,
-    which for an ABSOLUTE path silently discards `projects_dir` entirely and resolves to
-    the PDF's own path, so `project_lock` would then try to `mkdir` a directory at the
-    location of the PDF file itself.) Every other stage's `--paper` is already a case id.
+    run or a second `stage` invocation against the same paper.
     """
     cfg = Config.load()
     pid = args.paper
-    if args.name == "ingest" and controller.is_new_pdf_source(args.paper):
+    if args.name == "ingest" and pipeline.is_new_pdf_source(args.paper):
         pid = ""  # not yet ingested — same lock key `step` uses pre-ingest
     with state.project_lock(cfg, pid):
         result = STAGES[args.name](cfg, args.paper)
@@ -342,7 +320,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         print("(no papers ingested yet)")
         return 0
     for pid in pids:
-        case = controller.load_case(cfg, pid)
+        case = pipeline.load_case(cfg, pid)
         meta = state.load_meta(cfg, pid)
         status = f"{case.status}/{case.phase}" if case else "-"
         print(f"{pid:<30} {status:<18} {case.verdict if case else '':<7} "
@@ -353,7 +331,7 @@ def cmd_list(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     cfg = Config.load()
     meta = state.load_meta(cfg, args.paper_id)
-    case = controller.load_case(cfg, args.paper_id)
+    case = pipeline.load_case(cfg, args.paper_id)
     print(f"paper   : {meta['id']}\ntitle   : {meta.get('direction')}")
     print(f"source  : {meta.get('paper_path', '(unknown)')}")
     if case:
@@ -411,7 +389,7 @@ def main() -> int:
                     help="what isolation the reviewer actually ran under. Defaults to "
                          "'unrecorded' rather than to anything reassuring: only the "
                          "CLI_SUBPROCESS mode can prove a sandbox was enforced, and "
-                         "`harness.delegation` forces this back to 'unrecorded' for every "
+                         "`harness.agent` forces this back to 'unrecorded' for every "
                          "other mode rather than trusting what is passed here.")
     ac.add_argument("--mode", default="MANUAL",
                     choices=["CLI_SUBPROCESS", "SESSION_SUBAGENT", "MANUAL"],
@@ -449,7 +427,7 @@ def main() -> int:
 
     sub.add_parser("list", help="list reviewed papers").set_defaults(func=cmd_list)
 
-    sp = sub.add_parser("status", help="one paper's controller state and history")
+    sp = sub.add_parser("status", help="one paper's pipeline state and history")
     sp.add_argument("paper_id")
     sp.set_defaults(func=cmd_status)
 
