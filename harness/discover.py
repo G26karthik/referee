@@ -865,7 +865,7 @@ def run(cfg, pid: str, *, investigation_open: bool = True) -> dict:
     doc = PaperDoc(**state.read_json(doc_path))
     state.set_phase(cfg, pid, "discover")
 
-    reports = audit_stage.load_reports(cfg, pid, doc)
+    reports, _dropped, _invalid = audit_stage.load_reports(cfg, pid, doc)
     findings = [f for r in reports for f in r.findings]
 
     prior = load(cfg, pid)
