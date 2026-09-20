@@ -226,16 +226,21 @@ python run.py dossier                                         # consolidate fini
 python run.py evaluate                                        # system metrics over the corpus
 python run.py sandbox [--release]                             # leased remote machines
 python run.py preflight                                       # is this batch N distinct papers?
-python -m pytest tests -q                                     # 2332 tests (2299 passed,
-                                                                # 31 skipped, 2 failures —
+python -m pytest tests -q                                     # not re-verified against the
+                                                                # 2026-09-20 pass; see the
+                                                                # "not network" run below
+python -m pytest tests -q -m "not network"                    # 2301 passed, 14 skipped,
+                                                                # 7 deselected, 1 failure,
                                                                 # confirmed pre-existing/
-                                                                # environment-dependent: a
-                                                                # container runtime and a
-                                                                # second-boundary timing
-                                                                # race, neither touched by
-                                                                # the 2026-09-19 pass)
-python -m pytest tests -q -m "not network"                    # 2290 passed, 33 skipped,
-                                                                # 7 deselected, same 2 failures
+                                                                # environment-dependent (no
+                                                                # reachable container runtime
+                                                                # on this host). The other
+                                                                # documented flake — a
+                                                                # second-boundary timing race
+                                                                # in test_artifact_route_
+                                                                # caching — is timing-
+                                                                # dependent and did not
+                                                                # trigger on this run
 ```
 
 **The two env vars above are not decoration.** `--auto-audit` and `--auto-grade` select a
@@ -886,6 +891,24 @@ times on `rescaled_eval_metrics = test(model, eval_dataloader, ...)` — "eval" 
 once on a branch that resizes a LoRA rank, because `new_transform_r` contains both an arm
 token and an augmentation token.
 
+**This paragraph describes the ten-rule system, and it no longer exists.** The 2026-09-20
+simplification pass traced `code_audit.py`'s rule hits into the production path
+(`stages/artifact.py`) and found them vestigial: `run_route`/`_reviewer_facts` never
+imported `code_audit` at all, and `feeds_auditor()` — the mechanism this document describes
+as feeding class-B hits to `artifact_review_driver`'s prompt — had zero production callers,
+so a class-B hit never actually reached the LLM auditor despite the claim two paragraphs
+above. Nine of the ten rules were deleted outright (the eight measured false or never-fired
+above, plus `cripple-branch-budget`, whose own `RULE_AUTHORITY` entry had been keyed under
+the wrong id — `cripple-per-arm-budget` — a latent bug that silently fell through to
+fail-closed class D and was never caught because the rule never fired on real data). What
+remains is `leak-unseeded-split` (class A, fired once, correctly, needs no interpretation).
+`code_audit.py` went from 847 to 460 lines; `RULE_AUTHORITY`/`reviewer_visible` shrank to
+the one surviving rule; `feeds_auditor`/`FEEDS_AUDITOR` were deleted with the last class-B
+rule. `artifact_review_driver` never depended on `code_audit`'s hits in the first place, so
+it needed no change. The five-terminal-state ladder, the scope-restriction rule and the
+relocate+hash discipline two sections above are unchanged — only the noisy deterministic
+pre-scan that fed a reviewer nothing is gone.
+
 **Only class A is reviewer-visible; class B FEEDS THE AUDITOR.** That a source pattern
 matched is deterministic and what the match MEANS is not, and a class-B rule is defined by
 needing a reading — so a B hit is a place to look, and it reaches a referee only after
@@ -1143,6 +1166,70 @@ implementation this restores ran one to *author* experiments, which measures the
 rather than the paper.
 
 ## Known limitations
+
+**Found by the 2026-09-20 simplification pass, each verified against the running code:**
+
+- **`code_audit.py`'s ten-rule AST engine was vestigial and is now one rule.** See the
+  correction inline in "What the released artifact can establish" above for the full
+  account — `code_audit`'s hits were never consumed by the production artifact route, and
+  `feeds_auditor()` had zero callers, so the class-B-feeds-the-auditor mechanism this
+  document describes never actually fired in practice. 847 → 460 lines, plus a latent
+  rule-id misclassification (`cripple-per-arm-budget` vs the real `cripple-branch-budget`)
+  that fell through to fail-closed and was never caught for the same reason.
+- **The 8 `*_driver.py` files each reimplemented the same ~15-20 line confined-subprocess
+  pair** (policy-dir staging, then spawn/timeout/kill-tree) that the 2026-09-19 pass's
+  `reviewer_cli.py` consolidation had left uncollected. `reviewer_cli.stage_settings` and
+  `reviewer_cli.spawn_and_wait` now hold it once; all 8 drivers call them with zero
+  behavior change. Net −93 lines, and one shared implementation instead of eight
+  independently-maintained copies of process-group kill-tree logic — the risk reduction
+  matters more than the line count here.
+- **Aggressive whole-file test deletion was attempted once this pass and was wrong.** A
+  first cut removed 7 test files as "orchestration convenience," and on inspection 5 of
+  the 7 actually guarded real invariants (anti-self-certification, never-raise-severity,
+  no-embedded-credentials, an execution-admissibility boundary, and identity-provenance
+  bookkeeping being an ordered log rather than an overwrite). All 7 were restored; the
+  suite was then trimmed in-file only, with the same one-test-per-real-defect discipline
+  as the production code confirmed independently four times over. The net cut across the
+  whole 71-file, 2,333-test, 29,081-line suite was one parametrize list narrowed from 9
+  cases to 3 (`test_finding_traceability.py` — verified all 9 hit the identical
+  `_MEANINGLESS_QUOTE.fullmatch` branch in `stages/audit.py` before cutting). This suite
+  does not have the kind of low-value bulk the 22-30k production LOC target assumed
+  either kind of file would have.
+- **`harness/validation_driver.py` has no `load()`/sealing pattern, unlike its five
+  siblings** (`literature_driver`, `claimlink_driver`, `verdict_driver`,
+  `reimplement_driver`, `artifact_review_driver` all persist a commit+`prompt_sha256`
+  seal and check it before re-dispatching). A repeat invocation would re-run the
+  haiku-tier design call rather than reuse one. Not fixed here: adding it properly means
+  introducing a persistence layer to a driver that has none, not extending an existing
+  one, and it is currently zero-impact — `stages/validation.py`'s deterministic `no_arms`
+  check has blocked the model call in 100% of measured cases across the whole corpus, so
+  the design route has never actually fired. Worth a dedicated pass if that ever changes.
+- **A conservation-law violation was found on `paper4-snri-nullresult`, pre-existing and
+  unrelated to this pass.** `run.py evaluate`'s conservation check (`harness/evaluation.py`,
+  "must be 0") currently reports 1 violation: `paper4-snri-nullresult`'s
+  `reports/paper4-snri-nullresult.json` carries `triage: null` and `review_path: null`,
+  so it is undercounted by the `triage`, `binary_verdict` and `review_paths` rollups
+  though it has a report file and is counted in `papers_measured`. Confirmed pre-existing
+  (this paper was never touched this pass) and not fixed here — root cause not yet
+  diagnosed.
+- **Re-running an already-complete paper through `--auto-audit` is not idempotent when
+  its existing results carry different delegation provenance than the mode requested,
+  and this is correct, not a bug — but it has no guard against a slow surprise.**
+  Invoking `run.py review --auto-audit --auto-grade` on `apt-icml` (whose lens results
+  were `SESSION_SUBAGENT`-provenanced, from an interactive session, not
+  `CLI_SUBPROCESS`) correctly began a fresh, honestly re-provenanced audit dispatch rather
+  than silently relabeling the existing result — reusing a `SESSION_SUBAGENT` result under
+  a `CLI_SUBPROCESS` request would itself be the provenance lie this system exists to
+  prevent. But nothing signals *before* dispatch that a mode mismatch is about to trigger a
+  real, costly redispatch of an already-complete paper, and `controller.json`'s live
+  phase/history tracking resets to the in-progress attempt immediately, before any new
+  phase actually completes — so an interrupted redispatch (this one was killed after 3 of
+  8 lens/part units, verified zero terminal artifacts overwritten) leaves the controller
+  log looking like the paper was never reviewed, even though every composed lens file,
+  the report, the ledger and `discovery/targets.json` are untouched on disk. Recovered by
+  hand for `apt-icml` from those intact artifacts. A future pass should have `review` warn
+  (or require a flag) before redispatching audit on a paper whose `phase` is already
+  `done` under a different delegation mode than requested, rather than starting silently.
 
 **Found by the 2026-09-16 release audit, each verified by reading the code rather than
 by grep:**
