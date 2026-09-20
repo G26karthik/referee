@@ -52,6 +52,15 @@ PROVENANCE_LABEL = {
     "template": "SYNTHESIZED_DIAGNOSTIC",
 }
 
+# v4 schema pre-work: the plain provenance tokens and their reader-facing labels, DERIVED
+# from the dict above rather than retyped, so other fields describing this same
+# vocabulary (`TargetOutcome.provenance`, `EvalReport.execution_provenance`) reference one
+# constant instead of retyping the enumeration as free prose — which is how
+# `TargetOutcome.provenance`'s description drifted to list the tokens in a different order
+# than this dict declares them.
+PROVENANCE_VALUES: tuple[str, ...] = tuple(PROVENANCE_LABEL)
+PROVENANCE_LABELS: tuple[str, ...] = tuple(dict.fromkeys(PROVENANCE_LABEL.values()))
+
 
 def admits(provenance: str = "") -> bool:
     """May a reconciliation on this provenance settle a printed quantity, either way?

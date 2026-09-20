@@ -18,6 +18,11 @@ from pydantic import BaseModel, ConfigDict, Field
 # pure regex and imports nothing from this package, so the vocabulary can be defined
 # beside the classification logic that owns it rather than duplicated here.
 from .disposition import DISPOSITION_BASIS, PAPER_DISPOSITIONS
+# Same reasoning: `harness.provenance` has no imports of its own, so this cannot cycle.
+# v4 schema pre-work — `TargetOutcome.provenance` and `EvalReport.execution_provenance`
+# used to retype this vocabulary as free prose instead of referencing the one place it is
+# derived (see `provenance.py`'s own comment on where that retyping drifted).
+from .provenance import PROVENANCE_LABELS, PROVENANCE_VALUES
 from .failures import FAILURE_KINDS
 # Same argument again: `harness.materiality` is pure regex and pure derivation over
 # duck-typed inputs, and imports nothing from this package, so the vocabulary lives beside
@@ -538,7 +543,12 @@ class Finding(_Base):
 
     finding_id: str = ""
     lens: str = Field(default="", description="overclaim | protocol | confound | contradiction")
-    severity: str = Field(default="MINOR", description="FATAL | MAJOR | MINOR")
+    # v4 ratchet (2026-09-20): this used to hardcode "FATAL | MAJOR | MINOR", omitting
+    # NOTE — which `SEVERITIES` (declared above) already includes, which `grading.RANK`
+    # already includes, which `grading.derive` already returns, and which real findings
+    # on disk already carry (151+ in the lens/grade artifacts alone). A schema generated
+    # from the OLD description string would have made every NOTE finding unrepresentable.
+    severity: str = Field(default="MINOR", description=" | ".join(SEVERITIES))
     title: str = Field(default="", description="one compressed line, <=90 chars")
     statement: str = Field(default="", description="the defect, one or two sentences")
     target: str = Field(default="", description="the claim or cell under attack, verbatim")
@@ -1454,6 +1464,13 @@ FAILURE_CLASSES = (
     "commit_mismatch",          # the code that would run is not the code that was audited
     "backend_unavailable",      # no registered backend can host this experiment
     "credentials_unavailable",  # a backend could host it but cannot be provisioned from here
+    # v4 ratchet (2026-09-20): these two were emitted by local_exec.reconcile /
+    # backends.authorize before this tuple declared them — a real production path
+    # writing a value its own closed vocabulary refused to name. Declared here rather
+    # than fixed by renaming the emitter, because the emitter's name is the one a
+    # reader of a reconciliation actually needs.
+    "reimplementation_nonconformant",  # provenance is reimpl_exec but conformance never bound
+    "infrastructure_failure",          # a host/environment fact, never a scientific one
 )
 
 # How an execution request was decided. `allowed` is the whole decision; the code names
@@ -1477,6 +1494,17 @@ EXEC_DECISIONS = (
     # noise-floor template, whose number would then be reconciled against the paper's
     # printed cell under a provenance the ceiling admits. See `local_exec.run_probe`.
     "spec_incomplete",
+    # v4 ratchet (2026-09-20): three more decisions `authorize()` was already emitting
+    # that this tuple did not declare — closed vocabularies open in practice, found by
+    # sweeping every `decision=`/`failure_class=` string literal in harness/ against its
+    # own vocabulary. `isolation_insufficient` and `conformance_unproven` are two of
+    # authorize()'s own safety refusals (the reimpl_exec branch exists specifically so a
+    # model-written reconstruction cannot fall into the `not_repo_execution` free pass
+    # and run unconfined); `commit_changed_during_execution` is local_exec's post-run
+    # re-verification, distinct from `commit_unverified` (checked before the run starts).
+    "isolation_insufficient",           # backend isolation does not meet the repo-exec floor
+    "conformance_unproven",             # reimpl_exec without a bound ReimplementationConformance
+    "commit_changed_during_execution",  # the tree moved under a run already in progress
 )
 
 
@@ -2268,7 +2296,7 @@ class EvalReport(_Base):
     )
     execution_provenance: str = Field(
         default="",
-        description="AUTHOR_REPOSITORY | INDEPENDENT_REIMPLEMENTATION | SYNTHESIZED_DIAGNOSTIC — "
+        description=" | ".join(PROVENANCE_LABELS) + " — "
                     "what actually ran, in the reader's vocabulary. Fails closed to "
                     "SYNTHESIZED_DIAGNOSTIC so nothing unrecognised is ever reported as the "
                     "authors' own code.",
@@ -3343,8 +3371,7 @@ class TargetOutcome(_Base):
     disposition: str = Field(default="NOT_ATTEMPTED", description=" | ".join(TARGET_DISPOSITIONS))
     action: str = Field(default="", description="the PlanDecision.action that led here")
     route: str = Field(default="NONE", description=" | ".join(VERIFICATION_ROUTES))
-    provenance: str = Field(
-        default="", description="template | synthesized | driver | repo_exec | reimpl_exec")
+    provenance: str = Field(default="", description=" | ".join(PROVENANCE_VALUES))
     reconciliation: Reconciliation | None = None
     failure_class: str = Field(default="none", description=" | ".join(FAILURE_CLASSES))
     reason: str = ""
