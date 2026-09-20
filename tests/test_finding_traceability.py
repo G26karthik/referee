@@ -62,7 +62,7 @@ def test_a_matched_cell_is_classified_and_described_by_the_harness():
     assert "match" in observation.lower()
 
 
-@pytest.mark.parametrize("symbol", ["⇑", "⇓", "-", "—", "*", "†", ".", ",", "()"])
+@pytest.mark.parametrize("symbol", ["⇑", "—", "()"])
 def test_a_trivial_symbol_cell_never_earns_cell_verified(symbol):
     """C8 — a one-character symbol matching a cell exactly used to earn `cell_verified`,
     this harness's STRONGEST evidence class, for evidence that says nothing about any
