@@ -50,8 +50,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .artifacts import (GIB, PaperDoc, ResourceCapability, ResourceEvidence,
-                        ResourceRequirement)
+from .schema import (GIB, PaperDoc, ResourceCapability, ResourceEvidence,
+                     ResourceRequirement)
 
 # --------------------------------------------------------------------------- #
 # Reading a demand out of prose
@@ -519,7 +519,7 @@ def assess_resources(req: ResourceRequirement | None, resources, backend: str = 
 
 
 if __name__ == "__main__":  # self-check: python -m harness.resources
-    from .artifacts import Section, Table
+    from .schema import Section, Table
 
     # --- host probing -----------------------------------------------------------------
     vram, gpu, n = host_vram_bytes()

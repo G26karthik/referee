@@ -47,7 +47,7 @@ import time
 from pathlib import Path
 
 from . import delegation, reviewer_cli, sealing, state
-from .artifacts import ReimplementationBinding, ReimplementationConformance, ReimplementationReadiness
+from .schema import ReimplementationBinding, ReimplementationConformance, ReimplementationReadiness
 from .config import Config
 from .prompts import reimplement as RP
 from .reviewer_cli import (KNOWN_TOOLS, Confinement, denied_tools,
@@ -441,7 +441,7 @@ if __name__ == "__main__":       # self-check: python -m harness.reimplement_dri
     import inspect as _inspect
     import tempfile as _tf
 
-    from .artifacts import ReimplementationIngredient
+    from .schema import ReimplementationIngredient
 
     cfg = Config.load()
     closed = Config(allow_reimplementation_driver=False)

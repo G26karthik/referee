@@ -22,7 +22,7 @@ import re
 from pathlib import Path
 
 from .. import experiment_id as experiment_id_mod
-from ..artifacts import CandidateCommand, IdentityEvidence
+from ..schema import CandidateCommand, IdentityEvidence
 
 # quantity -> patterns matching a CALL or a DEFINITION that computes it, not merely a
 # word that names it. Each is anchored on a real function/attribute a metric library or a

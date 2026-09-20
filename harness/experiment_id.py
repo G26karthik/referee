@@ -32,8 +32,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .artifacts import (CandidateCommand, ConfigurationIdentity, ExperimentIdentity,
-                        IdentityEvidence, MetricIdentity, PaperDoc, Table)
+from .schema import (CandidateCommand, ConfigurationIdentity, ExperimentIdentity,
+                     IdentityEvidence, MetricIdentity, PaperDoc, Table)
 
 # Quantity vocabulary. Deliberately small and explicit: the point is to REFUSE a
 # comparison between different quantities, which needs only enough resolution to tell

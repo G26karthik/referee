@@ -31,7 +31,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from .artifacts import PaperDoc, RepoAcquisition
+from .schema import PaperDoc, RepoAcquisition
 
 
 @dataclass
@@ -221,7 +221,7 @@ if __name__ == "__main__":  # self-check: python -m harness.probe_synth
     import ast
     import pathlib
 
-    from .artifacts import Section
+    from .schema import Section
 
     def _doc(title: str, body: str) -> PaperDoc:
         return PaperDoc(paper_id="t", title=title, source_path="x", n_pages=1,

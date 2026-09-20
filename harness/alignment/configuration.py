@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import re
 
-from ..artifacts import CandidateCommand, Table
+from ..schema import CandidateCommand, Table
 
 # field -> substrings recognised in a CLI FLAG NAME. Used by `alignment.candidates` to
 # decide which `--flag value` pair in a script's own text is worth keeping as a
@@ -207,7 +207,7 @@ def narrow(fitting: list[CandidateCommand],
 
 # --------------------------------------------------------------------------- #
 def _self_check() -> None:
-    from ..artifacts import Table
+    from ..schema import Table
 
     # --- field extraction: row wins over caption ---------------------------------------
     t = Table(table_idx=2, caption="Table 2: accuracy under 50% sparsity on LLaMA-7B",

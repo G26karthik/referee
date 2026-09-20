@@ -44,7 +44,7 @@ import tomllib
 from pathlib import Path
 from typing import Callable, Protocol
 
-from .artifacts import CommitVerification, ExecCapability, PaperDoc, RepoAcquisition
+from .schema import CommitVerification, ExecCapability, PaperDoc, RepoAcquisition
 from .config import Config
 
 # Hosts worth cloning. Anything else (project pages, personal sites) is not a repo.
@@ -1059,7 +1059,7 @@ def synthesize_standalone(root: Path, pid: str, claim: str, cell_ref: str,
 
 
 if __name__ == "__main__":  # self-check: python -m harness.repo
-    from .artifacts import Section
+    from .schema import Section
 
     d = PaperDoc(paper_id="t", sections=[Section(
         section_idx=0,

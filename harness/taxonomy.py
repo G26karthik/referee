@@ -494,7 +494,7 @@ def _self_check() -> None:
     assert set(_EVIDENCE_FOR_DISPOSITION.values()) <= set(EVIDENCE_STATES)
     # every disposition the artifacts vocabulary admits has an entry here, so a new one
     # cannot reach the reporting layer through the `NOT_INVESTIGATED` default unnoticed.
-    from .artifacts import TARGET_DISPOSITIONS
+    from .schema import TARGET_DISPOSITIONS
     missing = [d for d in TARGET_DISPOSITIONS if d not in _EVIDENCE_FOR_DISPOSITION]
     assert not missing, f"dispositions with no evidence state: {missing}"
 

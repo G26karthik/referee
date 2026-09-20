@@ -17,7 +17,7 @@ hardest to notice.
 """
 from __future__ import annotations
 
-from .artifacts import Finding, PaperAssessment
+from .schema import Finding, PaperAssessment
 
 
 def assess(findings: list[Finding]) -> PaperAssessment:

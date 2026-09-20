@@ -54,9 +54,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import claims, repo as repo_mod
-from .artifacts import (ARTIFACT_QUESTION_SCOPES, SETTLEABLE_BY_ARTIFACT_FACT,
-                        ArtifactFact, ArtifactInspection, ArtifactSnapshot, PaperDoc,
-                        SourceSpan)
+from .schema import (ARTIFACT_QUESTION_SCOPES, SETTLEABLE_BY_ARTIFACT_FACT,
+                     ArtifactFact, ArtifactInspection, ArtifactSnapshot, PaperDoc,
+                     SourceSpan)
 
 # --------------------------------------------------------------------------- #
 # §8 — the surviving AST rule, classified by the authority it can carry
@@ -902,7 +902,7 @@ if __name__ == "__main__":       # self-check: python -m harness.artifact_eviden
     import sys
     import tempfile
 
-    from .artifacts import Section
+    from .schema import Section
 
     doc = PaperDoc(paper_id="p", title="A Paper", n_pages=2, sections=[
         Section(section_idx=0, title="Abstract", page_start=1,
@@ -1132,7 +1132,7 @@ if __name__ == "__main__":       # self-check: python -m harness.artifact_eviden
     assert set(RULE_AUTHORITY.values()) <= {"A", "D"}
 
     # An AST warning is never a scientific failure, and there is no value for one.
-    from .artifacts import ARTIFACT_AUTHORITY
+    from .schema import ARTIFACT_AUTHORITY
     assert "SCIENTIFIC_FAILURE" not in ARTIFACT_AUTHORITY
     assert ARTIFACT_AUTHORITY == ("ARTIFACT_FACT", "ENDPOINTS_VERIFIED_ARTIFACT_CONCERN",
                                   "PAPER_ARTIFACT_MISMATCH", "NONE")

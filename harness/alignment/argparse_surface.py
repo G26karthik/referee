@@ -21,7 +21,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from ..artifacts import ArgSpec
+from ..schema import ArgSpec
 
 # `add_argument("--flag", ...)` or `add_argument('-f', '--flag', ...)`. The flag captured
 # is the LAST long-form token (`--foo-bar`), which is the one a real invocation writes;

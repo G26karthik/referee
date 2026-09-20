@@ -29,7 +29,7 @@ import re
 from pathlib import Path
 
 from .. import experiment_id as experiment_id_mod
-from ..artifacts import CandidateCommand
+from ..schema import CandidateCommand
 from . import argparse_surface, configs
 from .configuration import FIELD_FLAG_HINTS
 
@@ -176,7 +176,7 @@ def _self_check() -> None:
     assert script_text_fields("python eval.py --sparsity 0.06\\\n  --seed 1") == {
         "sparsity": "0.06"}
 
-    from ..artifacts import ArgSpec
+    from ..schema import ArgSpec
     specs = [ArgSpec(flag="--pruning_ratio", default="0.2"),
             ArgSpec(flag="--epochs", default="10")]
     assert argparse_default_fields(specs) == {"sparsity": "0.2"}

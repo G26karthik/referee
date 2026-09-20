@@ -37,7 +37,7 @@ import re
 import sys
 from pathlib import Path
 
-from .artifacts import CodeAudit, CodeAuditFinding, RuntimeDemand
+from .schema import CodeAudit, CodeAuditFinding, RuntimeDemand
 
 # Directories that are never the paper's own contribution. Auditing a vendored copy of
 # someone else's library produces findings against the wrong authors.

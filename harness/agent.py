@@ -88,10 +88,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import artifact_evidence, failures, state
-from .artifacts import (ARTIFACT_IDENTITY_BASES, ARTIFACT_IDENTITY_STATES, ArtifactFact,
-                        ArtifactInspection, ArtifactSnapshot, Finding, Grade, LensReport,
-                        PaperDoc, ReimplementationBinding, ReimplementationConformance,
-                        ReimplementationReadiness, SubstantiveVerdict)
+from .schema import (ARTIFACT_IDENTITY_BASES, ARTIFACT_IDENTITY_STATES, ArtifactFact,
+                     ArtifactInspection, ArtifactSnapshot, Finding, Grade, LensReport,
+                     PaperDoc, ReimplementationBinding, ReimplementationConformance,
+                     ReimplementationReadiness, SubstantiveVerdict)
 from .config import Config
 from .prompts import artifact_review as ARTIFACT_P
 from .prompts import audit as AUDIT_P

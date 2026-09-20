@@ -50,8 +50,8 @@ import hashlib
 from pathlib import Path
 
 from .. import artifact_evidence, artifact_review_driver, claims, state
-from ..artifacts import (ArtifactFact, ArtifactInspection, DiscoveredObject, PaperDoc,
-                         PlanDecision, TargetOutcome, TargetSet)
+from ..schema import (ArtifactFact, ArtifactInspection, DiscoveredObject, PaperDoc,
+                      PlanDecision, TargetOutcome, TargetSet)
 from ..config import Config
 from ..prompts import artifact_review as AP
 
@@ -441,7 +441,7 @@ if __name__ == "__main__":       # self-check: python -m harness.stages.artifact
     import tempfile
 
     from .. import taxonomy
-    from ..artifacts import ClaimRef, Section
+    from ..schema import ClaimRef, Section
 
     doc = PaperDoc(paper_id="p", title="T", n_pages=1, repo_url="https://example.invalid/r",
                    sections=[Section(section_idx=0, title="Method", page_start=1,

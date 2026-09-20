@@ -23,7 +23,7 @@ import json
 import re
 from pathlib import Path
 
-from ..artifacts import CandidateCommand
+from ..schema import CandidateCommand
 
 _CONFIG_EXTS = (".yaml", ".yml", ".json")
 _CONFIG_DIRS = ("configs", "conf", "config")
