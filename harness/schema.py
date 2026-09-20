@@ -10,18 +10,35 @@ For WHY each vocabulary has the members it has, and the corpus incidents that sh
 see `docs/INVARIANT_MAP.md` and `docs/HARNESS_ARCHITECTURE.md`. This module states WHAT;
 those state WHY.
 
-**Trust posture, unchanged from the reference for now.** `_Base` still allows `extra`
-fields, and no field is enforced as a `Literal` yet. The v4 plan's write-side-validation
-step (declare `Literal`s from these tuples, add an enumerated `LEGACY_VALUES` map for
-reading old run artifacts) is follow-up work gated on loading every `projects/*/**.json`
-through these models first — see the "Schema pre-work" list in `INVARIANT_MAP.md`. Doing
-that before this consolidation would have meant validating a moving target.
+**Trust posture: write-side enforcement now lands for the fields that matter.** `_Base`
+still allows `extra` fields (a stage adding a field must not break the pipeline) — that is
+a different concern from a DECLARED field's value being wrong, which is what changed here.
+Ten fields — `ExecAuthorization.decision`/`.failure_class`, `Reconciliation.provenance`/
+`.failure_class`, `ProbeSpec.provenance`, `TargetOutcome.provenance`/`.failure_class`,
+`CaseState.phase`/`.status`/`.verdict` — are now enforced via `Vocab(...)`: a real
+membership check against their declared tuple, or against a specific, one-line-noted
+`LEGACY_VALUES` exception. These ten were chosen because they are the fields the v4 plan's
+own trust-boundary review depends on (execution authorization/reconciliation decisions,
+provenance, disposition, phase/status) — a wrong value in one of these is a silent
+trust-boundary failure, not a cosmetic typo. Every OTHER vocabulary-bearing field (the
+~30 "prose-only" scientific/reporting ones a lens or grader writes) stays plain `str`,
+unchanged from the reference: enforcing all 782 originally-annotated fields in one pass
+would convert "drop this one bad field" into "crash the whole review" on a model's typo,
+which is the opposite of `_Base`'s own reason for existing.
+
+`LEGACY_VALUES` starts EMPTY, deliberately: a hand-guessed exception is exactly the
+retyping-as-free-prose mistake this whole schema exists to stop. A real one is added only
+after `tools/validate_legacy_json.py` (or equivalent) loads real `projects/*/**.json`
+through these ten fields and a `ValidationError` names a genuine historical value — see
+that script's own output before ever adding an entry here.
 
 `python -m harness.schema` runs the self-check.
 """
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Annotated, TypeAlias
+
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
 from .disposition import DISPOSITION_BASIS, PAPER_DISPOSITIONS
 from .provenance import PROVENANCE_LABELS, PROVENANCE_VALUES
@@ -32,6 +49,47 @@ from .taxonomy import EVIDENCE_STATES, RESOLUTION_STATES, SCIENTIFIC_CLASSES
 
 class _Base(BaseModel):
     model_config = ConfigDict(extra="allow")
+
+
+# --------------------------------------------------------------------------------------- #
+# Enforced-field machinery — see the module docstring for which ten fields use this and why
+# the other ~772 annotated fields do not.
+# --------------------------------------------------------------------------------------- #
+LEGACY_VALUES: dict[str, tuple[str, ...]] = {
+    # Confirmed by `tools/validate_legacy_json.py` against real controller.json files (at
+    # least `projects/acl/controller.json` and `projects/cvpr-defect-3/controller.json`,
+    # plus older archived copies under `projects/_run_2026-09_v1/`): `CaseState.verdict` —
+    # a binary RED|GREEN field — has genuinely carried "YELLOW" across multiple real runs.
+    # This is the reference implementation's own known conservation-law-adjacent defect
+    # (CLAUDE.md's Known Limitations documents the sibling case on `paper4-snri-nullresult`'s
+    # report), grandfathered here rather than widening `verdict`'s vocabulary to three
+    # values — RED|GREEN is the correct domain; "YELLOW" was always a bug, and enforcement
+    # on any NEW instance of it must still fail.
+    "CaseState.verdict": ("YELLOW",),
+}
+
+
+def _vocab_validator(vocab: tuple[str, ...], legacy_key: str):
+    """A plain validator CALLABLE (not a type) for one enforced field. Kept separate from
+    the `Annotated[...]` construction at each field because pyright rejects a function CALL
+    used directly in type-annotation position, even though `Annotated`'s own metadata slot
+    (everything after the first comma) is ordinary runtime data pyright never type-checks —
+    which is why this callable is only ever built here and referenced inside `AfterValidator`
+    at the field, never used as the annotation itself.
+    """
+    allowed = set(vocab) | set(LEGACY_VALUES.get(legacy_key, ()))
+
+    def _check(value: str) -> str:
+        if value == "" or value in allowed:
+            return value
+        raise ValueError(
+            f"{legacy_key}: {value!r} is not a member of its declared vocabulary "
+            f"({', '.join(vocab)}) and is not a named LEGACY_VALUES exception. If this is "
+            f"a new, intentional value, add it to the vocabulary tuple; if it is a real "
+            f"historical artifact, add a one-line-noted LEGACY_VALUES entry instead of "
+            f"widening the vocabulary silently.")
+
+    return _check
 
 
 # =============================================================================
@@ -879,14 +937,48 @@ class ExecutionRecord(_Base):
     metric: float | None = Field(default=None)
 
 
+# `TargetOutcome.provenance` is NOT the reproduction ceiling's domain — it is broader.
+# Confirmed against REAL files, not assumed: `stages/discover.py`'s `_paper_only_outcome`
+# writes `provenance="paper"` for the ARITHMETIC_RECHECK route (nothing executed, the
+# paper's own composition was recomputed — `taxonomy.evidence_state` maps
+# PAPER_ARITHMETIC_CONTRADICTION unconditionally, never consulting the reproduction ceiling:
+# "'paper' provenance is not and must never become a member of the reproduction ceiling",
+# that module's own words); and a real `outcome.json` on disk
+# (`projects/acl/.../TGT-CLM-P181762-1916/outcome.json`) carries `provenance="artifact"` for
+# an `ARTIFACT_INSPECTION_INCONCLUSIVE` disposition — the static-inspection route's own
+# token, distinct from both the paper route and the five execution-ceiling ones. Neither is
+# a historical mistake; both are current, intentional, non-reproduction provenances this
+# field must hold, so they are added to its OWN vocabulary rather than pushed into
+# `LEGACY_VALUES`, which is reserved for genuine past errors.
+TARGET_OUTCOME_PROVENANCE_VALUES = PROVENANCE_VALUES + ("paper", "artifact")
+
+# Enforced-field type aliases for the four ladder objects below. Written as literal
+# `Annotated[str, AfterValidator(fn)]` at each name — see `_vocab_validator`'s own
+# docstring for why this cannot be a call returning the type directly.
+_ExecDecisionField: TypeAlias = Annotated[
+    str, AfterValidator(_vocab_validator(EXEC_DECISIONS, "ExecAuthorization.decision"))]
+_ExecFailureClassField: TypeAlias = Annotated[
+    str, AfterValidator(_vocab_validator(FAILURE_CLASSES, "ExecAuthorization.failure_class"))]
+_ReconciliationProvenanceField: TypeAlias = Annotated[
+    str, AfterValidator(_vocab_validator(PROVENANCE_VALUES, "Reconciliation.provenance"))]
+_ReconciliationFailureClassField: TypeAlias = Annotated[
+    str, AfterValidator(_vocab_validator(FAILURE_CLASSES, "Reconciliation.failure_class"))]
+_ProbeSpecProvenanceField: TypeAlias = Annotated[
+    str, AfterValidator(_vocab_validator(PROVENANCE_VALUES, "ProbeSpec.provenance"))]
+_TargetOutcomeProvenanceField: TypeAlias = Annotated[
+    str, AfterValidator(_vocab_validator(TARGET_OUTCOME_PROVENANCE_VALUES, "TargetOutcome.provenance"))]
+_TargetOutcomeFailureClassField: TypeAlias = Annotated[
+    str, AfterValidator(_vocab_validator(FAILURE_CLASSES, "TargetOutcome.failure_class"))]
+
+
 class ExecAuthorization(_Base):
     """Whether an execution request may proceed — the record of a refusal, not just a
     bool. See `harness/execute.py`'s `authorize()` for the ordered ladder that fills this."""
 
     allowed: bool = False
-    decision: str = Field(default="gate_closed", description=" | ".join(EXEC_DECISIONS))
+    decision: _ExecDecisionField = "gate_closed"
     backend: str = Field(default="")
-    failure_class: str = Field(default="execution_unauthorized", description=" | ".join(FAILURE_CLASSES))
+    failure_class: _ExecFailureClassField = "execution_unauthorized"
     detail: str = Field(default="")
 
 
@@ -910,8 +1002,8 @@ class Reconciliation(_Base):
         default=None, description="half the rounding interval the paper's own digits imply")
     noise_band: float = Field(default=0.0, description="2 * seed-to-seed sigma")
     status: str = Field(default="NOT_ATTEMPTED", description=" | ".join(RECONCILIATION_STATUSES))
-    provenance: str = Field(default="", description="only driver/repo_exec/reimpl_exec may reach a verdict")
-    failure_class: str = Field(default="none", description=" | ".join(FAILURE_CLASSES))
+    provenance: _ReconciliationProvenanceField = ""
+    failure_class: _ReconciliationFailureClassField = "none"
     experiment_state: str = Field(default="unmapped")
     metric_state: str = Field(default="unmapped")
     configuration_state: str = Field(default="unmapped")
@@ -998,7 +1090,7 @@ class ProbeSpec(_Base):
     claimed_cell_value: str = Field(default="")
     target_id: str = Field(default="")
     written_by: str = Field(default="", description="'harness' = persisted by `execute.py` itself")
-    provenance: str = Field(
+    provenance: _ProbeSpecProvenanceField = Field(
         default="template",
         description="template=noise floor · synthesized=planner-authored from the paper · "
                     "driver=human-written · repo_exec=authors' checkout · "
@@ -1539,9 +1631,9 @@ class TargetOutcome(_Base):
     disposition: str = Field(default="NOT_ATTEMPTED", description=" | ".join(TARGET_DISPOSITIONS))
     action: str = Field(default="")
     route: str = Field(default="NONE", description=" | ".join(VERIFICATION_ROUTES))
-    provenance: str = Field(default="", description=" | ".join(PROVENANCE_VALUES))
+    provenance: _TargetOutcomeProvenanceField = ""
     reconciliation: Reconciliation | None = None
-    failure_class: str = Field(default="none", description=" | ".join(FAILURE_CLASSES))
+    failure_class: _TargetOutcomeFailureClassField = "none"
     reason: str = ""
     execution_ref: str = Field(default="", description="e.g. 'runs/<pid>/execution.jsonl'")
     authorized: bool | None = Field(default=None)
@@ -1686,6 +1778,14 @@ class PhaseEvent(_Base):
     ts: str = ""
 
 
+_CasePhaseField: TypeAlias = Annotated[
+    str, AfterValidator(_vocab_validator(PHASES, "CaseState.phase"))]
+_CaseStatusField: TypeAlias = Annotated[
+    str, AfterValidator(_vocab_validator(CASE_STATUSES, "CaseState.status"))]
+_CaseVerdictField: TypeAlias = Annotated[
+    str, AfterValidator(_vocab_validator(("RED", "GREEN"), "CaseState.verdict"))]
+
+
 class CaseState(_Base):
     """One paper's position in the workflow, persisted at `projects/<pid>/controller.json`
     so a batch survives the process ending and resumes exactly where it stopped."""
@@ -1693,14 +1793,14 @@ class CaseState(_Base):
     paper_id: str = ""
     source: str = Field(default="")
     content_sha: str = ""
-    phase: str = Field(default="ingest", description=" | ".join(PHASES))
-    status: str = Field(default="pending", description=" | ".join(CASE_STATUSES))
+    phase: _CasePhaseField = "ingest"
+    status: _CaseStatusField = "pending"
     attempts: dict[str, int] = Field(default_factory=dict)
     history: list[PhaseEvent] = Field(default_factory=list)
     awaiting: list[str] = Field(default_factory=list)
     blocked_reason: str = Field(default="")
     reproduction_class: str = Field(default="")
-    verdict: str = Field(default="")
+    verdict: _CaseVerdictField = ""
     assessment: PaperAssessment | None = Field(default=None)
     disposition: str = Field(default="NOT_REVIEWED", description="carried from the report: " + " | ".join(PAPER_DISPOSITIONS))
     disposition_basis: str = Field(default="NONE", description=" | ".join(DISPOSITION_BASIS))
