@@ -28,10 +28,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from harness import audit_driver, delegation, state  # noqa: E402
-from harness.artifacts import PaperDoc  # noqa: E402
+from harness import agent, state  # noqa: E402
+from harness import audit as audit_stage  # noqa: E402
 from harness.config import Config  # noqa: E402
-from harness.stages import audit as audit_stage  # noqa: E402
+from harness.schema import PaperDoc  # noqa: E402
 
 REVIEWER = "desktop session subagent (Agent tool), one isolated context per reading"
 
@@ -74,7 +74,7 @@ def seal(cfg: Config, pid: str, unit_id: str, staged: Path) -> dict:
         raise SystemExit(f"{pid}: no such unit {unit_id!r}; run `pending` to list them")
     unit = match[0]
     raw = staged.read_text(encoding="utf-8")
-    report = audit_driver.parse_lens_json(raw, unit.lens)   # the one validation path
+    report = agent.parse_lens_json(raw, unit.lens)   # the one validation path
     unit.out_path.parent.mkdir(parents=True, exist_ok=True)
     state.write_json(unit.out_path, report.model_dump())
     # The raw response is kept beside the accepted one for the same reason `run_lens`
@@ -84,12 +84,12 @@ def seal(cfg: Config, pid: str, unit_id: str, staged: Path) -> dict:
     raw_path.write_text(raw, encoding="utf-8")
     record = {
         "lens": unit.lens, "unit_id": unit.unit_id, "paper_id": pid,
-        **delegation.provenance_record(mode="SESSION_SUBAGENT", reviewer=REVIEWER),
+        **agent.provenance_record(mode="SESSION_SUBAGENT", reviewer=REVIEWER),
         "controller": "claude code desktop (Claude Opus 5 session)",
         "model_requested": "sonnet",
         "authorization": "RUN_AUTHORIZATION.json",
         "content_sha256": hashlib.sha256(unit.out_path.read_bytes()).hexdigest(),
-        "prompt_sha256": audit_driver.prompt_fingerprint(unit.prompt_path),
+        "prompt_sha256": agent.prompt_fingerprint(unit.prompt_path),
         "prompt_path": str(unit.prompt_path),
         "raw_sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
         "raw_response": raw_path.name,

@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from harness.exhaustion import (  # noqa: E402
+from harness.decide import (  # noqa: E402
     CONFIGURATION_STATES, DISCHARGING_STATES)
 
 PAPERS = ["0c06a98d7c818f6f", "2024-icml-sapg", "5993d35ff0996b52", "acl",
