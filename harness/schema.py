@@ -40,11 +40,56 @@ from typing import Annotated, TypeAlias
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
-from .disposition import DISPOSITION_BASIS, PAPER_DISPOSITIONS
 from .provenance import PROVENANCE_LABELS, PROVENANCE_VALUES
 from .failures import FAILURE_KINDS
-from .materiality import MATERIALITY_BASES
 from .taxonomy import EVIDENCE_STATES, RESOLUTION_STATES, SCIENTIFIC_CLASSES
+
+# What happens to a paper once the review completes. Never a severity and never a
+# colour -- moved here (was harness/disposition.py) because decide.py, which derives it,
+# already imports every other vocabulary tuple from this module; disposition.py's own
+# `derive_disposition` logic lives in decide.py now.
+PAPER_DISPOSITIONS: tuple[str, ...] = (
+    "STOP_MATERIAL_FAILURE",       # a material failure was established; see `basis`
+    "BLOCKED_SPECIFICATION",       # a central question needed detail the paper omits
+    "BLOCKED_ARTIFACT",            # a central question needed code that is absent or unbindable
+    "BLOCKED_RESOURCES",           # a central question needed hardware not obtainable here
+    # A central question needed a verification approach this system does not implement --
+    # no address, no printed quantity to compare against, no route, or a route with no
+    # arithmetic behind its comparison. Never the paper's fault, never the artifact's,
+    # never the host's: this review's own method inventory ran out.
+    "BLOCKED_METHOD",
+    "PASS_TO_HUMAN_UNRESOLVED",    # a central question was pursued admissibly and stayed open
+    "PASS_TO_HUMAN_CONCERNS",      # verified concerns that weaken a claim without rejecting it
+    "PASS_TO_HUMAN_CLEAN",         # nothing of the above, within the audited scope
+    "NOT_REVIEWED",                # the pipeline did not complete
+)
+
+# ON WHAT a material failure was established. Never a severity and never a colour: this
+# says which KIND of evidence carried the decision, because "four lenses agreed and the
+# blinded grader sustained it" and "the authors' own code did not produce the number" are
+# different things to hand a referee.
+DISPOSITION_BASIS: tuple[str, ...] = (
+    "AUTHOR_CODE_REPRODUCTION",      # the authors' own checkout, at a verified commit
+    "INDEPENDENT_REIMPLEMENTATION",  # a reproduction the ceiling admits that is NOT theirs
+    "PAPER_ARITHMETIC",              # the paper's own printed composition does not evaluate
+    "NONE",
+)
+
+# Which locator a central-claim dependency was established from -- moved here (was
+# harness/materiality.py) for the same reason as the two tuples above.
+MATERIALITY_BASES: tuple[str, ...] = (
+    "ABSTRACT_CLAIM",   # the address resolves inside the paper's own Abstract
+    "CONCLUSION_CLAIM",  # the address resolves inside the paper's own Conclusion
+    "ABSTRACT_TABLE_REFERENCE",
+    "CONCLUSION_TABLE_REFERENCE",
+    "ABSTRACT_FIGURE_REFERENCE",
+    "CONCLUSION_FIGURE_REFERENCE",
+    "ABSTRACT_EQUATION_REFERENCE",
+    "CONCLUSION_EQUATION_REFERENCE",
+    "ABSTRACT_RESULT_REFERENCE",
+    "CONCLUSION_RESULT_REFERENCE",
+    "NONE",
+)
 
 
 class _Base(BaseModel):

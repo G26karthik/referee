@@ -49,7 +49,6 @@ from . import probe_synth
 from . import reimplement_driver
 from . import repo as repo_mod
 from . import resources as resources_mod
-from . import comparison as comparison_mod
 from .stages import artifact as artifact_stage
 
 _CELL_REF = re.compile(r"^T\d+:r\d+:c\d+$")
@@ -562,7 +561,7 @@ def _superseded_by_established_failure(obj, plan, stopper) -> TargetOutcome:
 def establish_comparison(spec: ProbeSpec, route: str) -> ProbeSpec:
     """What this spec's result would be held against, derived from the ROUTE it took —
     every execution ends at `execute.reconcile`, which performs exactly one comparison."""
-    spec.comparison = comparison_mod.derive(
+    spec.comparison = decide.derive_comparison(
         route, printed_value_available=bool((spec.claimed_cell_value or "").strip()))
     return spec
 
@@ -572,7 +571,7 @@ def may_be_compared(spec: ProbeSpec) -> tuple[bool, str]:
     comparison recorded passes, which keeps every hand-written spec.json behaving exactly
     as it did."""
     c = spec.comparison
-    if comparison_mod.admits_verdict(c):
+    if decide.admits_verdict(c):
         return True, ""
     assert c is not None
     return False, (

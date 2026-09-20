@@ -307,8 +307,11 @@ _WS = re.compile(r"\s+")
 
 
 def budget_chars() -> int:
-    from . import coverage as _coverage           # noqa: PLC0415 -- one reader of the env
-    return _coverage.budget_chars()
+    # Deferred import: report.py imports RANK from this module at its own top level, so a
+    # top-level import here would be a cycle. By the time this function is actually
+    # CALLED both modules have finished loading.
+    from . import report as _report                # noqa: PLC0415 -- one reader of the env
+    return _report.budget_chars()
 
 
 def _flat(s: str) -> str:

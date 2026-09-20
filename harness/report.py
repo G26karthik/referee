@@ -2731,7 +2731,7 @@ def prose_presented(sections: list, budget: int) -> tuple[int, int, int]:
     the BASELINE that `prose_visible` is measured against — it is `paper.render_sections`,
     which divides one budget across every section and hard-slices each, the mechanism
     `harness.reading` replaced."""
-    from .pdf import section_presentation
+    from .paper import section_presentation
     p = section_presentation(list(sections or []), int(budget))
     return p.presented_chars, p.total_chars, p.sections_truncated
 
@@ -2739,7 +2739,7 @@ def prose_presented(sections: list, budget: int) -> tuple[int, int, int]:
 def prose_visible(doc: PaperDoc, budget: int) -> tuple[int, int, int]:
     """(visible, total, parts) — what a reader was ACTUALLY carried, under the plan.
     Delegates to `reading.plan`, the same call the audit stage makes to build the prompts."""
-    from .reading import plan as reading_plan
+    from .paper import plan as reading_plan
     cov = reading_plan(doc, int(budget)).coverage
     return cov.part_local_chars, cov.extracted_prose_chars, cov.parts
 
