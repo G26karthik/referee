@@ -138,8 +138,8 @@ papers → controller → ingest → audit → collect → grade → assess → 
 | assess | `assessment.py` | findings + grades → `CaseState.assessment` | has a material failure already been established, and is the investigation still open | never blocks; `investigation_open` is an INPUT to `planner.classify` |
 | **discover** | `stages/discover.py` | doc + findings → `discovery/targets.json` | what is addressable, what it is worth, whether an experiment is justified | records a NAMED refusal per target |
 | ↳ artifact | `stages/artifact.py` + `artifact_evidence.py` | doc + pinned checkout → `ArtifactFact` × N | what the RELEASED CODE establishes, for a question whose SCOPE it answers | `ARTIFACT_INSPECTION_INCONCLUSIVE` when it settles nothing |
-| ↳ literature | `stages/literature.py` + `literature.py` | doc + public indexes → `PriorArtFact` × N | what EARLIER PUBLISHED WORK bears on a novelty claim the paper makes about itself | `SEARCH_COMPLETED_NO_MATCH_FOUND`, which settles nothing |
-| ↳ validation | `stages/validation.py` + `validation.py` + `between_arms.py` | doc + pinned checkout → one CONTROLLED CONTRAST | what the smallest ONE-VARIABLE experiment the paper supports would discriminate between | `SPECIFICATION_BLOCKED`, naming the ingredient the paper does not state |
+| ~~↳ literature~~ | **DELETED 2026-09-20** — `stages/literature.py`/`literature.py`/`literature_providers.py` measured zero endpoint-verified concerns and zero structurally-bound relations over the eight-paper corpus; see Known limitations. |
+| ~~↳ validation~~ | **DELETED 2026-09-20** — `stages/validation.py`/`validation.py`/`between_arms.py` never reached an executable design over the eight-paper corpus (0 of 7 targets); see Known limitations. |
 | verify | `stages/probe.py` | doc + repo → `ProbeSpec` per target | identity, capability, resources, commit, backend | leaves the spec unpromoted |
 | execute | `backends.py` + `local_exec.py` | spec → `ProbeResult` | `authorize()` alone | `verdict: blocked` |
 | reconcile | `local_exec.reconcile` | metric vs the addressed quantity | arithmetic only | `INCONCLUSIVE` |
@@ -164,12 +164,12 @@ reviewer actually asks get separated:
 
 | question | module | what it may read |
 |---|---|---|
-| what does the paper's own summary rest on? | `claimlink.py` + `claimgraph.py` | the parsed doc, and address pairs a reader proposed which this harness has already verified |
+| ~~what does the paper's own summary rest on?~~ | **DELETED 2026-09-20** — `claimlink.py`/`claimgraph.py` measured 0 structurally-bound links of 63 endpoint-verified over the eight-paper corpus; see Known limitations. |
 | where does the paper say this? | `claims.py` | the parsed doc — a lens supplies a quote, the harness mints the address |
 | what would settle this concern? | `questions.py` | a finding's own closed-vocabulary self-classification |
 | what KIND of problem is this? | `taxonomy.py` | the same closed vocabulary; never a number, a name or a paper |
-| has somebody already done this? | `literature.py` + `literature_providers.py` | the paper's own novelty sentences, and bibliographic records a public index returned |
-| what is the smallest experiment that would discriminate? | `validation.py` + `between_arms.py` | the claim graph's own COMPARISON nodes, and configuration values quoted from the paper or the pinned checkout |
+| ~~has somebody already done this?~~ | **DELETED 2026-09-20** — `literature.py`/`literature_providers.py` measured 0 endpoint-verified concerns over the eight-paper corpus; see Known limitations. |
+| ~~what is the smallest experiment that would discriminate?~~ | **DELETED 2026-09-20** — `validation.py`/`between_arms.py` never reached an executable design over the eight-paper corpus; see Known limitations. |
 | what is checkable, and how central? | `discovery.py` | structure: abstract, cited addresses, parsed quantities |
 | is it worth it, and is it justified? | `priority.py`, `planner.py` | vocabulary strings and booleans only |
 
@@ -224,23 +224,27 @@ python run.py status <paper-id>                               # controller state
 python run.py list                                            # reviewed papers
 python run.py dossier                                         # consolidate finished reports
 python run.py evaluate                                        # system metrics over the corpus
-python run.py sandbox [--release]                             # leased remote machines
 python run.py preflight                                       # is this batch N distinct papers?
-python -m pytest tests -q                                     # not re-verified against the
-                                                                # 2026-09-20 pass; see the
-                                                                # "not network" run below
-python -m pytest tests -q -m "not network"                    # 2301 passed, 14 skipped,
-                                                                # 7 deselected, 1 failure,
-                                                                # confirmed pre-existing/
-                                                                # environment-dependent (no
-                                                                # reachable container runtime
-                                                                # on this host). The other
-                                                                # documented flake — a
+                                                                # (`run.py sandbox` and
+                                                                # `harness/sandbox.py` were
+                                                                # deleted 2026-09-20 — never
+                                                                # leased on this host; see
+                                                                # Known limitations)
+python -m pytest tests -q                                     # re-verified after the
+                                                                # 2026-09-20 DESTRUCTIVE pass
+                                                                # (Docker reachable, so no
+                                                                # container tests skipped for
+                                                                # that reason): 2073 passed,
+                                                                # 14 skipped, 1 failure — the
+                                                                # already-documented
                                                                 # second-boundary timing race
                                                                 # in test_artifact_route_
-                                                                # caching — is timing-
-                                                                # dependent and did not
-                                                                # trigger on this run
+                                                                # caching (a 1-second
+                                                                # timestamp mismatch between
+                                                                # two JSON snapshots taken a
+                                                                # tick apart), reproduced
+                                                                # exactly as predicted here,
+                                                                # not a new regression
 ```
 
 **The two env vars above are not decoration.** `--auto-audit` and `--auto-grade` select a
@@ -482,7 +486,10 @@ Do not weaken these to make more papers executable or more findings reportable.
     synthesis is asked to fold. The key errs toward the second. Over the evaluated corpus
     it now merges 0 of 227 findings, which is correct: each lens there read once.
 
-31. **A proposed claim link is two quotations, and the harness writes everything else.**
+31. **[DELETED 2026-09-20 — `claimlink.py`/`claimlink_driver.py`/`claimgraph.py` removed; see
+    Known limitations. Kept below as the historical record of what this channel enforced
+    while it existed — 0 of 63 endpoint-verified links ever reached structural binding.]**
+    **A proposed claim link is two quotations, and the harness writes everything else.**
     `harness/claimlink.py` re-mints the claim quotation, requires it to resolve inside the
     Abstract or the Conclusion, re-resolves the evidence address against the quotation
     given for it, and re-derives the arithmetic. `accepted`, `refusal`,
@@ -596,7 +603,10 @@ Do not weaken these to make more papers executable or more findings reportable.
     so a corpus claim can be checked against `distinct_documents` rather than against the
     length of the request. `run.py preflight` remains, for asking before spending.
 
-36. **Finding prior art may support a concern; failing to find it establishes nothing,
+36. **[DELETED 2026-09-20 — `literature.py`/`literature_providers.py`/`literature_driver.py`
+    removed; see Known limitations. Kept below as the historical record — 0 endpoint-verified
+    concerns, 0 structurally-bound relations, over the eight-paper corpus.]**
+    **Finding prior art may support a concern; failing to find it establishes nothing,
     and the vocabulary is what makes that so.** `harness/literature.py` runs a bounded
     prior-art search — the paper's own novelty sentences, minted by `claims.mint`, against
     public indexes with stable identifiers — and there is NO authority, NO disposition and
@@ -626,7 +636,10 @@ Do not weaken these to make more papers executable or more findings reportable.
     paper is not novel", has no spelling**, and no literature disposition is in
     `establishes_failure`.
 
-37. **A controlled experiment this review designed may say what the experiment did,
+37. **[DELETED 2026-09-20 — `validation.py`/`validation_driver.py`/`between_arms.py` removed;
+    see Known limitations. Kept below as the historical record — 0 executable designs of 7
+    targets reached over the eight-paper corpus, both blocked at the same unbound ingredient.]**
+    **A controlled experiment this review designed may say what the experiment did,
     and only a conformant one may say anything about the paper.**
     `harness/validation.py` derives the smallest one-variable contrast the paper and its
     pinned checkout support, and refuses to build one otherwise: all eight entries of
@@ -747,6 +760,14 @@ a final lens-local synthesis combines only quotation-grounded observations from 
 to recover cross-section relationships.*
 
 ## The one correspondence a paper does not print
+
+> **DELETED 2026-09-20.** `harness/claimlink.py`, `harness/claimlink_driver.py` and
+> `harness/claimgraph.py` — everything this section describes — were removed in the
+> destructive simplification pass: measured over the eight-paper corpus, 0 of 63
+> endpoint-verified links ever reached `STRUCTURALLY_BOUND_LINK`, and the channel was never
+> wired into any decision (`materiality.basis_for_ref` and `discovery._centrality` never
+> read it). Kept below verbatim as the historical record of what it enforced while it
+> existed. See Known limitations for the deletion rationale.
 
 **A referee's first question about a number is "does the conclusion depend on this?", and
 until now nothing here could answer it.** Every model-free mechanism fired on almost
@@ -943,6 +964,13 @@ four repository papers and 0 established mismatches.
 
 ## What a bounded prior-art search can establish, and what it cannot
 
+> **DELETED 2026-09-20.** `harness/literature.py`, `harness/literature_providers.py`,
+> `harness/literature_driver.py` and `harness/stages/literature.py` — everything this
+> section describes — were removed in the destructive simplification pass: measured over
+> the eight-paper corpus, 0 endpoint-verified concerns and 0 structurally-bound relations
+> ever resulted, across 306 queries and 3,798 distinct works considered. Kept below
+> verbatim as the historical record. See Known limitations for the deletion rationale.
+
 **The original brief asked for novelty search, and the honest version of that capability
 is asymmetric.** Finding an earlier work that appears to make the same contribution is a
 concern a referee must look at. Finding nothing is not the opposite result — it is a
@@ -1005,6 +1033,15 @@ art for itself, and printing it would have been an accusation about their schola
 the run-to-run variance in the reviewer's own readings, and why each zero is right.
 
 ## What a controlled experiment this review designed can establish
+
+> **DELETED 2026-09-20.** `harness/validation.py`, `harness/validation_driver.py`,
+> `harness/between_arms.py` and `harness/stages/validation.py` — everything this section
+> describes — were removed in the destructive simplification pass: measured over the
+> eight-paper corpus, 0 of 7 focused-validation targets that reached the route ever produced
+> an executable design; both attempted designs blocked at the same unbound
+> `arm_instantiation` ingredient, and opening the design gate changed nothing (the
+> deterministic half refused first). Kept below verbatim as the historical record. See
+> Known limitations for the deletion rationale.
 
 **A referee's hardest questions are not about a number, and re-running the number cannot
 answer them.** Two variables changed between the arms and the paper credits one of them;
@@ -1081,13 +1118,13 @@ first, at `no_arms`, and the designer is never called.
 | auto-audit | `SH_ALLOW_AUTO_AUDIT` | off | shelling out to a reviewer for the lenses |
 | grading | `SH_ALLOW_GRADING` | off | a second, blinded reviewer per FATAL/MAJOR finding — zero tools, no filesystem access at all (`grade_driver.py`) |
 | substantive verdict | `SH_ALLOW_SUBSTANTIVE_VERDICT` | off | one best-effort, never-retried, whole-paper opinion — printed, consumed by no threshold (`verdict_driver.py`) |
-| claim links | `SH_ALLOW_CLAIM_LINKS` | off | one best-effort reading per paper pairing each headline claim with the evidence it rests on; both halves verified here (`claimlink_driver.py`) |
+| ~~claim links~~ | **DELETED 2026-09-20** | `SH_ALLOW_CLAIM_LINKS`/`claimlink.py`/`claimlink_driver.py`/`claimgraph.py` measured 0 structurally-bound links over the eight-paper corpus; see Known limitations. |
 | authors' code | `SH_ALLOW_ARTIFACT_REVIEW` | off | one read-only pass over the PINNED checkout asking whether the code does what the paper says; `Read`+`Grep` only, every citation relocated (`artifact_review_driver.py`) |
-| prior-art search | `SH_ALLOW_LITERATURE_SEARCH` | off | querying public scholarly indexes (OpenAlex, Crossref, arXiv) for work that predates the paper |
-| literature review | `SH_ALLOW_LITERATURE_REVIEW` | off | one reading per novelty claim, comparing it against what those indexes returned; ZERO tools, so it cannot search on its own (`literature_driver.py`) |
-| validation design | `SH_ALLOW_VALIDATION_DESIGN` | off | one reading per focused-validation target, naming the variable the arms differ in and the settlement rule; ZERO tools, every value relocated against the paper (`validation_driver.py`). It buys the DESIGN, never a run: execution still passes `SH_ALLOW_REPO_EXEC` and `backends.authorize` |
+| ~~prior-art search~~ | **DELETED 2026-09-20** | `SH_ALLOW_LITERATURE_SEARCH`/`literature.py`/`literature_providers.py` measured 0 endpoint-verified concerns over the eight-paper corpus; see Known limitations. |
+| ~~literature review~~ | **DELETED 2026-09-20** | `SH_ALLOW_LITERATURE_REVIEW`/`literature_driver.py` deleted with the search route it read; see Known limitations. |
+| ~~validation design~~ | **DELETED 2026-09-20** | `SH_ALLOW_VALIDATION_DESIGN`/`validation.py`/`validation_driver.py`/`between_arms.py` never reached an executable design over the eight-paper corpus; see Known limitations. |
 | install | `SH_ALLOW_INSTALL` | off | building `runs/<pid>/env` from the repo's requirements |
-| sandbox | `SH_ALLOW_SANDBOX` | off | **leasing a remote Linux machine** and staging the audited commit into it (`harness/sandbox.py`) |
+| ~~sandbox~~ | **DELETED 2026-09-20** | `SH_ALLOW_SANDBOX`/`harness/sandbox.py` — the remote sandbox was never leased on this host; see Known limitations. |
 | execute | `SH_ALLOW_REPO_EXEC` | off | running the repository's own entrypoint |
 | reimpl. driver | `SH_ALLOW_REIMPLEMENTATION_DRIVER` | off | delegating the governed reconstruction's authoring and its separate conformance verification |
 | reimpl. exec | `SH_ALLOW_REIMPLEMENTATION_EXEC` | off | running a reconstruction that conformance verification bound; checked inside `authorize()` |
@@ -1166,6 +1203,89 @@ implementation this restores ran one to *author* experiments, which measures the
 rather than the paper.
 
 ## Known limitations
+
+**Deleted by a SECOND, DESTRUCTIVE 2026-09-20 pass, later the same day than the conservative
+pass below — three routes and the remote-sandbox backend, each with a corpus measurement
+behind the decision rather than a line-count target:**
+
+- **`harness/claimlink.py`, `harness/claimlink_driver.py`, `harness/claimgraph.py`,
+  `harness/prompts/claimlink.py` and `tests/test_claim_links.py` deleted.** Over the
+  eight-paper corpus this channel proposed 76 links, endpoint-verified 63, and structurally
+  bound 0 — it was never wired into any decision (`materiality.basis_for_ref` and
+  `discovery._centrality` never read it) and existed only to inform navigation and coverage.
+  Invariant 31 above and "The one correspondence a paper does not print" section are kept as
+  the historical record of what it enforced, each now carrying a correction banner.
+- **`harness/literature.py`, `harness/literature_providers.py`, `harness/literature_driver.py`,
+  `harness/stages/literature.py`, `harness/prompts/literature.py`, `tests/test_literature_route.py`
+  and `tests/test_literature_live.py` deleted.** Over the eight-paper corpus, both gates open:
+  306 queries, 3,798 distinct works considered, 0 endpoint-verified concerns, 0
+  structurally-bound relations. Invariant 36 and "What a bounded prior-art search can
+  establish" are kept as the historical record.
+- **`harness/validation.py`, `harness/validation_driver.py`, `harness/between_arms.py`,
+  `harness/stages/validation.py`, `harness/prompts/validation.py` and
+  `tests/test_focused_validation.py` deleted.** Over the eight-paper corpus: 0 of 7 targets
+  that reached the route ever produced an executable design; both attempted designs blocked
+  at the same unbound `arm_instantiation` ingredient, and opening the design gate changed
+  nothing (the deterministic half refused first). Invariant 37 and "What a controlled
+  experiment this review designed can establish" are kept as the historical record.
+- **`harness/sandbox.py`, `.env.sandbox.example`, `run.py sandbox`, `SH_ALLOW_SANDBOX` and
+  `tests/test_sandbox_backend.py` deleted.** Never leased on this host in any revision (no
+  provider credentials were ever present); `ContainerBackend` is this host's real, credentialed
+  isolation path and remains fully intact — this deletion removed an unexercised alternative
+  backend, not the only one. `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET` and every `modal`-specific
+  branch in `harness/backends.py` went with it.
+- **Cascade through the surviving code**, verified by re-running the full suite rather than
+  by inspection alone: `harness/comparison.py` (`COMPARISON_FOR_ROUTE`/`VERIFICATION_ROUTES`
+  narrowed), `harness/discovery.py`, `harness/planner.py` (the `FOCUSED_VALIDATION_EXPERIMENT`
+  branch removed — an object whose only route was that one now correctly resolves
+  `NO_EXPERIMENT_NEEDED` rather than a route-specific refusal, since the route no longer
+  exists to be infeasible), `harness/priority.py`, `harness/taxonomy.py`,
+  `harness/materiality.py` (fell back to its pre-claimgraph structural rule, its own
+  documented degrade path), `harness/outcome.py` (`EXECUTION_ABOUT_THE_PAPER` correctly
+  shrunk from 4 states to 2 after the between-arms route left), `harness/guarantees.py`
+  (novelty guarantee now reads "no prior-art search route; novelty not assessed" rather than
+  "prior art searched within declared bounds; novelty not established" — a stronger, more
+  honest statement now that the route genuinely does not exist rather than merely being
+  closed), and `harness/stages/{audit,discover,probe,report}.py`.
+- **A first pass of this same test-suite cut was too aggressive and was independently
+  caught and reverted before commit.** An automated audit of every file this pass staged
+  for deletion found 33 of 36 actually guarded a real, otherwise-now-uncovered invariant —
+  including the provenance ceiling (`test_reimplementation_path.py`), the materiality/RED-gate
+  table (`test_materiality_dependencies.py`), the coverage-fabrication guard
+  (`test_review_surface_coverage.py`, invariant 27), the preflight gate (`test_preflight_gate.py`,
+  invariant 35), sealing (`test_spec_sealing.py`), and the disposition function that decides
+  stop-vs-pass (`test_paper_disposition.py`) — none of which had ANY surviving coverage
+  elsewhere in the repository. All 33 were restored; only 6 files were legitimately cut:
+  the 5 that test the deleted routes/backend above, plus `test_report_ranking.py`, whose
+  invariant (`counted_severity`/severity-rank caps) is independently covered by
+  `test_architecture_guarantees.py`, `test_delegation_path.py`, `test_reasoning_architecture.py`
+  and `test_scientific_taxonomy.py`. **The lesson: verify a test's invariant has SURVIVING
+  coverage elsewhere before cutting the file, not merely that the file's own subject sounds
+  orchestration-adjacent** — the same lesson the round-1 mistake below already taught, learned
+  a second time because the destructive pass repeated the round-1 process rather than reusing
+  its conclusion.
+- **Fresh end-to-end verification, run after the destructive pass, on `acl` — one of the
+  original eight corpus papers, not a new fixture.** `run.py review --paper papers/ACl.pdf
+  --auto-audit --auto-grade` (the documented entrypoint, `SH_ALLOW_AUTO_AUDIT`/
+  `SH_ALLOW_GRADING` only) completed end to end: ingest → 12 audit units across 2 bounded
+  parts → collect (20 substantiated, 6 dropped) → grade (3 candidates) → assess → discover
+  (37 objects, 30 addressable) → probe → report, landing **YELLOW**, `CONCERNS_RECORDED`
+  with 0 established as material. Compared against the pre-destructive-pass baseline for
+  the same paper (`../_pre-destructive-backup-2026-09-20/runs_final_2026-09-16/projects/acl`,
+  a full-gate corpus run predating BOTH this session's passes): same review path
+  (PAPER_AND_ARTIFACT), same triage (YELLOW), same document-integrity count (9, all
+  EXTRACTION), same "nothing was positively verified" framing, same reconstruction target
+  (`TGT-REP-P60-155`) discovered and prioritized identically. The two visible differences
+  are NOT route-deletion regressions: (1) the reconstruction never launched today
+  (`AUTHORIZATION_BLOCKED`) versus reaching execution and an honest `INCONCLUSIVE` in the
+  baseline — because today's run deliberately used only the documented minimal entrypoint
+  flags, and `SH_ALLOW_REIMPLEMENTATION_DRIVER`/`SH_ALLOW_REIMPLEMENTATION_EXEC` default off
+  in both revisions; the reconstruction/execution code path itself is untouched by this pass
+  and independently verified by the full suite. (2) finding count and category mix differ
+  (20 vs 29) — expected lens-to-lens non-determinism, the same kind already documented above
+  for the literature reviewer's own run-to-run variance, not a capability loss. No finding
+  was fabricated, no severity was raised, no material failure was invented, and the same
+  four reader-facing rows and the same guarantees section rendered correctly.
 
 **Found by the 2026-09-20 simplification pass, each verified against the running code:**
 
