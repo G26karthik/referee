@@ -1,15 +1,18 @@
-"""PDF -> `PaperDoc`, the bounded-part reading plan that traverses it, and repo-URL
-discovery. Pure functions: no LLM, no network, no `Config`. This is the only module in
-the harness that opens a PDF.
+"""PDF -> `PaperDoc`, and the bounded-part reading plan that traverses it. Pure
+functions: no LLM, no network, no `Config`. This is the only module in the harness that
+opens a PDF.
 
-Consolidates three reference-implementation modules (tag `reference-implementation-
+Consolidates two reference-implementation modules (tag `reference-implementation-
 2026-09-20`) into one:
   - `harness/pdf.py`       — PyMuPDF for page text, pdfplumber for ruled table structure.
   - `harness/reading.py`   — splitting a long paper into bounded, blind parts per lens,
                              with a deterministic anchor packet carried across them.
-  - `harness/repo.py`      — ONLY `find_repo_urls`/`official_repo_url` and their direct
-                             helpers. Acquire/pin/verify_commit are a different, future
-                             module's job (`execute.py`) and stay in `repo.py`.
+
+Repository URL discovery (`find_repo_urls`/`official_repo_url`) stays in `harness/repo.py`
+alongside acquire/pin/verify_commit, which is the only caller (`stages/ingest.py` reaches
+it through `repo`, not through this module) — an earlier revision of this module carried
+its own duplicate copy of both functions plus a `parse()` entry point that called them;
+neither was ever wired to a caller, and both were removed 2026-09-21.
 
 Same models as the reference (`PaperDoc`, `Section`, `Table`, `Figure`, `Equation`,
 `CrossRef`, `QuantFinding`), now defined once in `harness/schema.py` and imported here
@@ -18,7 +21,7 @@ rather than redefined. `abstract_section_idx`/`conclusion_section_idx` are `harn
 `harness.locate`'s (the v4 home of the old `harness/claims.py`).
 
 `python -m harness.paper <file.pdf>` runs the self-check; omit the path to run only the
-fixture-based half (reading plan + repo-URL discovery need no PDF).
+fixture-based half (reading plan needs no PDF).
 """
 from __future__ import annotations
 
@@ -1344,177 +1347,6 @@ def render_part_with_anchor(part, anchor: AnchorPacket) -> str:
 
 
 # =========================================================================================
-# Repository URL discovery — ported from `harness/repo.py`; acquire/pin/verify_commit and
-# everything downstream of "which URL" stay there for a future `execute.py`.
-# =========================================================================================
-
-# Hosts worth cloning. Anything else (project pages, personal sites) is not a repo.
-_HOSTS = ("github.com", "gitlab.com", "bitbucket.org", "huggingface.co")
-
-
-def _host_pattern(host: str) -> str:
-    """A host literal that tolerates PDF-inserted whitespace around each dot — a line
-    wrap can fall on either side of the dot in "github.com" as easily as anywhere else
-    in a URL ("github. com/owner/repo", measured on a real paper)."""
-    return re.escape(host).replace(r"\.", r"\s*\.\s*")
-
-
-_URL = re.compile(
-    r"https?\s*:\s*/\s*/\s*(?:www\.)?(" + "|".join(_host_pattern(h) for h in _HOSTS) + r")"
-    r"\s*/\s*((?:[A-Za-z0-9_.]|-\s{0,2})+)\s*/\s*((?:[A-Za-z0-9_.]|-\s{0,2})+)",
-    re.IGNORECASE,
-)
-# Phrases marking a link as THIS paper's code rather than a citation to someone else's.
-_CUES = (
-    "code is available", "code are available", "code available", "code will be",
-    "code is accessible", "code are accessible", "accessible at",
-    "code and models", "code and data", "project is available", "project page",
-    "open source code", "our code", "our implementation", "implementation is available",
-    "source code", "codebase is", "released at", "available at", "available here", "code:",
-)
-_CUE_WINDOW = 140          # chars before the URL searched for a cue
-# Section headings whose contents are citations to other people's work, never this
-# paper's own artifacts.
-_REFERENCE_HEADING = re.compile(r"^(?:\d+\.?\s+)?(references|bibliography|works cited)\b", re.I)
-
-
-def _normalize(host: str, owner: str, name: str) -> str:
-    """Rebuild a canonical clone URL from the three captured pieces.
-
-    Captured separately precisely so the whitespace PDF extraction injects
-    (`https: //github .com / owner / repo`) never reaches the output, including
-    whitespace a typesetter inserted mid-identifier by breaking a line at a real hyphen
-    (`hassan- mahmood` -> `hassan-mahmood`).
-    """
-    host = re.sub(r"\s+", "", host)
-    name = re.sub(r"-\s+", "-", name)
-    owner = re.sub(r"-\s+", "-", owner)
-    name = name.rstrip(".,;:)]}")               # sentence punctuation glued to the path
-    if name.lower().endswith(".git"):
-        name = name[:-4]
-    owner = owner.strip(".,;:)]}")
-    if not owner or not name:
-        return ""
-    return f"https://{host.lower()}/{owner}/{name}"
-
-
-def _score(text: str, start: int, host: str, url: str) -> int:
-    """How likely is this the paper's OWN code? Higher is better."""
-    window = text[max(0, start - _CUE_WINDOW):start].lower()
-    score = 0
-    if any(c in window for c in _CUES):
-        score += 3
-    if host.lower() == "github.com":
-        score += 1
-    # "2https://github.com/facebookresearch/vissl" — a footnote marker fused to the URL
-    # is the signature of a citation to someone else's repository.
-    if start > 0 and text[start - 1].isdigit():
-        score -= 2
-    if "/blob/" in url or "/tree/" in url:
-        score -= 1
-    return score
-
-
-def _cued(text: str, start: int) -> bool:
-    """Does an availability phrase precede this URL — 'our code is available at', etc.?"""
-    return any(c in text[max(0, start - _CUE_WINDOW):start].lower() for c in _CUES)
-
-
-def _reference_spans(doc: PaperDoc, joiner: int = 1) -> list[tuple[int, int]]:
-    """Character ranges of the bibliography, in the same concatenation `find_repo_urls`
-    scans. A URL inside the reference list is a citation to somebody else's artifact by
-    construction, however official it looks."""
-    spans, pos = [], 0
-    for s in doc.sections:
-        end = pos + len(s.text)
-        if _REFERENCE_HEADING.match((s.title or "").strip()):
-            spans.append((pos, end))
-        pos = end + joiner
-    return spans
-
-
-def find_repo_urls(doc: PaperDoc) -> list[str]:
-    """Every candidate repository URL in the paper, most-likely-official first."""
-    text = "\n".join(s.text for s in doc.sections)
-    best: dict[str, tuple[int, int]] = {}
-    for m in _URL.finditer(text):
-        host = re.sub(r"\s+", "", m.group(1))
-        url = _normalize(host, m.group(2), m.group(3))
-        if not url:
-            continue
-        rank = (_score(text, m.start(), host, m.group(0)), -m.start())
-        if url not in best or rank > best[url]:
-            best[url] = rank
-    return [u for u, _ in sorted(best.items(), key=lambda kv: kv[1], reverse=True)]
-
-
-def official_repo_url(doc: PaperDoc) -> str:
-    """The repository THIS paper advertises as its own, or '' when it advertises none.
-
-    **`doc.repo_url` is NOT `repo_urls[0]`.** `find_repo_urls` answers "what repository
-    URLs appear in this paper", a complete diagnostic list; this answers "which URL may
-    the harness clone and audit AS THIS PAPER'S CODE", and the burden of proof runs the
-    other way — absent positive evidence of authorship, the answer is none.
-
-    Two requirements, both necessary: an availability cue must precede the URL (a bare
-    link is not a claim of authorship), and the URL must not sit in the reference list
-    (every link there is a citation). Measured failure this prevents: a paper whose only
-    GitHub URL was the bibliography entry for a third-party model it evaluated had that
-    repository recorded as its own, which would have produced a static code audit — and,
-    with the execution gate open, a run — of a stranger's codebase filed against these
-    authors.
-    """
-    text = "\n".join(s.text for s in doc.sections)
-    refs = _reference_spans(doc)
-    best: dict[str, tuple[int, int]] = {}
-    for m in _URL.finditer(text):
-        url = _normalize(m.group(1), m.group(2), m.group(3))
-        if not url or not _cued(text, m.start()):
-            continue
-        if any(lo <= m.start() < hi for lo, hi in refs):
-            continue
-        rank = (_score(text, m.start(), m.group(1), m.group(0)), -m.start())
-        if url not in best or rank > best[url]:
-            best[url] = rank
-    ranked = sorted(best.items(), key=lambda kv: kv[1], reverse=True)
-    return ranked[0][0] if ranked else ""
-
-
-# =========================================================================================
-# One entry point: PDF path -> fully-populated PaperDoc
-# =========================================================================================
-
-def parse(path: str | Path, paper_id: str = "") -> PaperDoc:
-    """Parse one PDF into a `PaperDoc`: sections, tables, figures, equations, crossrefs,
-    reported numbers, and the repo-URL candidates/official pick.
-
-    Mirrors `stages/ingest.py`'s call sequence exactly, minus what belongs to that
-    stage's own job — paper-id allocation against existing projects, `content_sha`,
-    caching/staleness bookkeeping and `state` writes. Callers that need those keep using
-    `stages/ingest.py`; this is the pure parse this module now owns end to end.
-    """
-    src = Path(path)
-    pages = page_texts(src)
-    sections = split_sections(pages)
-    tables = extract_tables(src, pages)
-    figures = extract_figures(pages)
-    equations = extract_equations(pages)
-    crossrefs = extract_crossrefs(sections)
-    numbers = table_numbers(tables) + prose_numbers(sections)
-    title = guess_title(pages) or src.stem
-
-    doc = PaperDoc(paper_id=paper_id or src.stem, title=title, source_path=str(src),
-                   n_pages=len(pages), sections=sections, tables=tables, figures=figures,
-                   equations=equations, reported_numbers=numbers, crossrefs=crossrefs,
-                   body_end_section_idx=references_boundary(sections),
-                   extraction_version=EXTRACTION_VERSION)
-    doc.repo_urls = find_repo_urls(doc)
-    # NOT repo_urls[0] — see `official_repo_url`.
-    doc.repo_url = official_repo_url(doc)
-    return doc
-
-
-# =========================================================================================
 if __name__ == "__main__":  # self-check: python -m harness.paper [file.pdf]
     import sys
 
@@ -1551,30 +1383,6 @@ if __name__ == "__main__":  # self-check: python -m harness.paper [file.pdf]
     empty = plan(PaperDoc(paper_id="e"), 70_000)
     assert empty.coverage.part_local_fraction is None, "no prose is not full coverage"
 
-    urls_doc = PaperDoc(paper_id="t", sections=[Section(
-        section_idx=0,
-        text="Code is available: https: //github.com/wuyang98/weathergen and see "
-             "2https://github.com/facebookresearch/vissl for the baseline. "
-             "This project is available at https: //github.com/mbzuai-nlp/finchain.git.")])
-    urls = find_repo_urls(urls_doc)
-    assert urls[0] == "https://github.com/wuyang98/weathergen", urls
-    assert "https://github.com/mbzuai-nlp/finchain" in urls, urls
-    assert urls[-1] == "https://github.com/facebookresearch/vissl", "footnote cite must rank last"
-
-    hyphen_broken = PaperDoc(paper_id="t2", sections=[Section(
-        section_idx=0,
-        text="The code of this work is available at "
-             "https://github.com/hassan- mahmood/SemanticMLLAttacks.git")])
-    assert official_repo_url(hyphen_broken) == \
-        "https://github.com/hassan-mahmood/SemanticMLLAttacks", \
-        "a hyphen the owner name really contains must survive a typesetter's line break"
-
-    host_broken = PaperDoc(paper_id="t3", sections=[Section(
-        section_idx=0,
-        text="Code is accessible at https://github. com/yankd22/FedSaC/.")])
-    assert official_repo_url(host_broken) == "https://github.com/yankd22/FedSaC", \
-        "a line break inside the host literal itself must still resolve to that host"
-
     print("harness.paper fixture self-check ok")
 
     # --- PDF-based half: only when a file is given ------------------------------------
@@ -1593,9 +1401,6 @@ if __name__ == "__main__":  # self-check: python -m harness.paper [file.pdf]
     figs, eqs = extract_figures(pg), extract_equations(pg)
     xrefs, boundary = extract_crossrefs(secs), references_boundary(secs)
     pres = section_presentation(secs, 70_000)
-    doc_urls = PaperDoc(paper_id="selfcheck", sections=secs)
-    doc_urls.repo_urls = find_repo_urls(doc_urls)
-    doc_urls.repo_url = official_repo_url(doc_urls)
     print(f"{src.name}: {len(pg)} pages, {len(secs)} sections, {len(tbls)} tables, "
          f"{len(figs)} figure caption(s), {len(eqs)} equation(s), "
          f"{len(xrefs)} cross-reference(s) [extraction v{EXTRACTION_VERSION}]")
@@ -1603,7 +1408,6 @@ if __name__ == "__main__":  # self-check: python -m harness.paper [file.pdf]
     print(f"back matter begins at section {boundary}; "
           f"prose shown to a lens: {pres.presented_chars}/{pres.total_chars} chars, "
           f"{pres.sections_truncated}/{pres.sections} section(s) truncated")
-    print(f"repo_url: {doc_urls.repo_url!r}  ({len(doc_urls.repo_urls)} candidate(s))")
     assert pg, "no pages extracted"
     assert secs, "no sections extracted"
     assert sum(len(s.text) for s in secs) > 500, "suspiciously little text extracted"
@@ -1625,15 +1429,6 @@ if __name__ == "__main__":  # self-check: python -m harness.paper [file.pdf]
         got = _resolve(probe_doc, xr.span)
         assert got.resolution == "resolved", (xr.span, got.resolution, got.detail)
         assert got.quote == xr.quote, (xr.span, got.quote[:60], xr.quote[:60])
-
-    # `parse()` must agree with the piecewise calls above on every extracted count.
-    whole_doc = parse(src, paper_id="selfcheck-whole")
-    assert len(whole_doc.sections) == len(secs)
-    assert len(whole_doc.tables) == len(tbls)
-    assert len(whole_doc.figures) == len(figs)
-    assert len(whole_doc.equations) == len(eqs)
-    assert len(whole_doc.crossrefs) == len(xrefs)
-    assert whole_doc.repo_url == doc_urls.repo_url
 
     for s in secs[:12]:
         print(f"  §{s.section_idx} p{s.page_start}-{s.page_end} {s.title!r} ({len(s.text)} chars)")
