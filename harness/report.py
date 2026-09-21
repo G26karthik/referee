@@ -257,11 +257,17 @@ def claim_status(findings: list[Finding], reconciliation: Reconciliation | None 
     INCONCLUSIVE is deliberately NOT a failure: a missing dataset, a units mismatch, an
     unparsed metric, a shut gate and an 8 GiB card facing a 24 GiB demand all land here.
     """
-    if is_calibration(probe):
-        return "NOT_VERIFIED", (
-            "the only thing that ran was the identical-arms noise-floor calibration, which "
-            "measures this machine and reconciles nothing about the paper")
-    source, kind = material_target_failure(objects, outcomes, reconciliation)
+    # A calibration probe measures this MACHINE, not the paper (invariant 8's "measured
+    # against this host's own noise floor" case) — but that only means ITS OWN reconciliation
+    # carries no evidence either way. It must not suppress a material failure established
+    # through `objects`/`outcomes` on a DIFFERENT target than the one calibration ran on
+    # (that used to short-circuit the whole fold ahead of `material_target_failure`, so an
+    # unrelated calibration probe could silently acquit an established paper-arithmetic
+    # contradiction or a failed repo_exec reproduction elsewhere — invariant 16's "a blocked
+    # target ends that target, never the paper" applies to a CALIBRATED target too).
+    calibration = is_calibration(probe)
+    rec = None if calibration else reconciliation
+    source, kind = material_target_failure(objects, outcomes, rec)
     if kind == "reconciliation":
         return "VERIFIED_FAILURE", "a reproduction attempt failed against the printed cell"
     if kind == "target":
@@ -273,12 +279,16 @@ def claim_status(findings: list[Finding], reconciliation: Reconciliation | None 
         return "VERIFIED_FAILURE", (
             f"target {getattr(source, 'target_id', '?')} failed reproduction on "
             f"{getattr(source, 'provenance', '?')} provenance")
-    if (reconciliation is not None and reconciliation.status == "RESOLVED_VERIFIED"
+    if calibration:
+        return "NOT_VERIFIED", (
+            "the only thing that ran was the identical-arms noise-floor calibration, which "
+            "measures this machine and reconciles nothing about the paper")
+    if (rec is not None and rec.status == "RESOLVED_VERIFIED"
             # THE CEILING, IN THE ACQUITTING DIRECTION TOO (invariant 3 says "either
             # direction"). Safe today only because `local_exec.reconcile` refuses to emit
             # RESOLVED_VERIFIED on an inadmissible provenance — checked here as well so a
             # hand-edited artifact cannot unlock "verified"/"supported"/"confirmed".
-            and provenance_mod.admits(reconciliation.provenance)):
+            and provenance_mod.admits(rec.provenance)):
         return "VERIFIED_SUPPORT", "an executed metric reconciled with the printed cell"
     return "NOT_VERIFIED", "no material failure established, and nothing positively reproduced"
 
@@ -311,49 +321,26 @@ def overall_verdict(findings: list[Finding], reconciliation: Reconciliation | No
     `claim_status` is VERIFIED_FAILURE — no count, no accumulation, no second mechanism.
     Reaches the SAME `material_target_failure` call `claim_status` makes, so the two cannot
     disagree about whether a paper failed."""
-    if is_calibration(probe):
-        return "GREEN", (
-            "the only thing that ran was the identical-arms noise-floor calibration, "
-            "which measures this machine and reconciles nothing about the paper")
-    source, kind = material_target_failure(objects, outcomes, reconciliation)
-    if reconciliation is not None and reconciliation.status == "FAILED_REPRODUCTION":
-        if reconciliation.provenance not in ADMISSIBLE_REPRODUCTION_PROVENANCE:
-            # The ceiling, held at the verdict gate too. Reaching here means an upstream
-            # bug or an edited artifact; a program not entitled to reconcile a printed cell
-            # does not get to convict a paper — reported as a harness defect INSTEAD of the
-            # conviction, never alongside it.
-            return "GREEN", (
-                f"A reconciliation reported FAILED_REPRODUCTION with provenance "
-                f"'{reconciliation.provenance or '(none)'}', which the provenance ceiling "
-                f"does not admit. That status should have been unreachable, so it is "
-                f"treated as a harness defect and NOT as evidence about the paper.")
-        if kind != "reconciliation":
-            # Tier 1 held; Tier 2 did not — an established defect that does not stop the
-            # paper. Still printed under `## Established failures` and still in the ledger.
-            return "GREEN", (
-                f"A reproduction failed at "
-                f"{reconciliation.target_id or reconciliation.table_ref or 'a target'} and "
-                f"the failure is established, but this review did not establish that a "
-                f"central scientific claim of the paper depends on it, so it does not "
-                f"reject the paper. It is reported in full below.")
-        where = f" at {reconciliation.table_ref}" if reconciliation.table_ref else ""
-        # WHO ran decides what the failure means. Only `repo_exec` is the authors' own
-        # checkout; attributing a `driver` script's failure to them would be the one
-        # accusation this system must never make by accident.
-        if reconciliation.provenance == "repo_exec":
-            blame = ("The audited repository's own code does not reproduce the number it "
-                     "prints, so the central claim does not stand on the evidence the "
-                     "authors supplied.")
-        elif reconciliation.provenance == "driver":
-            blame = ("The program that ran was a human-written reproduction of the paper's "
-                     "method, not the authors' checkout. Whether it is faithful is not "
-                     "machine-checked, so read the script before relying on this verdict.")
-        else:
-            blame = (f"The program that ran was '{reconciliation.provenance}', which the "
-                     f"provenance ceiling does not admit, so this status should not have "
-                     f"been reachable — treat it as a harness defect.")
-        return "RED", f"Failed code reproduction{where}: {reconciliation.reason} {blame}"
+    # Calibration scoping: see the matching comment in `claim_status`. It suppresses only
+    # the paper-level `reconciliation` argument's own contribution — never the fold over
+    # `objects`/`outcomes`, which can establish a material failure on a DIFFERENT target
+    # than the one calibration ran on.
+    calibration = is_calibration(probe)
+    rec = None if calibration else reconciliation
+    source, kind = material_target_failure(objects, outcomes, rec)
 
+    # `kind == "target"` is checked BEFORE `rec`'s own FAILED_REPRODUCTION status: Tier 1
+    # and Tier 2 (materiality) are ALREADY BOTH established by the time `kind == "target"`
+    # comes back from `material_target_failure` — it is not "Tier 1 held, Tier 2 did not".
+    # Checking `rec.status` first used to let an established `objects`/`outcomes` failure on
+    # one target be overruled by a SEPARATE `rec` argument (typically the very same probe
+    # result, since `routes.py` derives `outcomes[0]` from it) whose own `target_id` failed
+    # the Tier-2 check on its own — printing "this review did not establish that a central
+    # claim depends on it" about a target the review had, one branch earlier, established
+    # exactly that about. `claim_status` never had this bug because `kind == "reconciliation"`
+    # and `kind == "target"` are mutually exclusive outcomes of `material_target_failure`
+    # (Tier 1/2 is tried first; the legacy single-reconciliation path only runs when it finds
+    # nothing) — the bug was specific to `rec.status` being tested directly, ahead of `kind`.
     if kind == "target":
         where = getattr(source, "target_id", "?")
         prov = getattr(source, "provenance", "")
@@ -369,6 +356,50 @@ def overall_verdict(findings: list[Finding], reconciliation: Reconciliation | No
                  "machine-checked.")
         return "RED", (f"Failed code reproduction at target {where}: "
                        f"{getattr(source, 'reason', '')} {blame}")
+
+    if rec is not None and rec.status == "FAILED_REPRODUCTION":
+        if rec.provenance not in ADMISSIBLE_REPRODUCTION_PROVENANCE:
+            # The ceiling, held at the verdict gate too. Reaching here means an upstream
+            # bug or an edited artifact; a program not entitled to reconcile a printed cell
+            # does not get to convict a paper — reported as a harness defect INSTEAD of the
+            # conviction, never alongside it.
+            return "GREEN", (
+                f"A reconciliation reported FAILED_REPRODUCTION with provenance "
+                f"'{rec.provenance or '(none)'}', which the provenance ceiling "
+                f"does not admit. That status should have been unreachable, so it is "
+                f"treated as a harness defect and NOT as evidence about the paper.")
+        if kind != "reconciliation":
+            # kind == "" here (never "target" — handled above): Tier 2 did not bind THIS
+            # reconciliation's own target_id to a central claim. An established defect that
+            # does not stop the paper. Still printed under `## Established failures`.
+            return "GREEN", (
+                f"A reproduction failed at "
+                f"{rec.target_id or rec.table_ref or 'a target'} and "
+                f"the failure is established, but this review did not establish that a "
+                f"central scientific claim of the paper depends on it, so it does not "
+                f"reject the paper. It is reported in full below.")
+        where = f" at {rec.table_ref}" if rec.table_ref else ""
+        # WHO ran decides what the failure means. Only `repo_exec` is the authors' own
+        # checkout; attributing a `driver` script's failure to them would be the one
+        # accusation this system must never make by accident.
+        if rec.provenance == "repo_exec":
+            blame = ("The audited repository's own code does not reproduce the number it "
+                     "prints, so the central claim does not stand on the evidence the "
+                     "authors supplied.")
+        elif rec.provenance == "driver":
+            blame = ("The program that ran was a human-written reproduction of the paper's "
+                     "method, not the authors' checkout. Whether it is faithful is not "
+                     "machine-checked, so read the script before relying on this verdict.")
+        else:
+            blame = (f"The program that ran was '{rec.provenance}', which the "
+                     f"provenance ceiling does not admit, so this status should not have "
+                     f"been reachable — treat it as a harness defect.")
+        return "RED", f"Failed code reproduction{where}: {rec.reason} {blame}"
+
+    if calibration:
+        return "GREEN", (
+            "the only thing that ran was the identical-arms noise-floor calibration, "
+            "which measures this machine and reconciles nothing about the paper")
 
     concerns = material_concerns(findings)
     n_minor = sum(1 for f in findings if counted(f) == "MINOR")

@@ -1305,7 +1305,13 @@ def attach(cfg: Config, pid: str, doc: PaperDoc, reports: list[LensReport]) -> d
             finding_class, counted_severity, binding_cap, derivation = derive(
                 lens_severity=f.severity, verification_state=f.verification_state,
                 calc_class=f.calc_class, graded=True, grade_verdict=g.verdict,
-                grade_severity=g.severity, confidence=g.confidence,
+                grade_severity=g.severity,
+                # A grader-supplied confidence outside the closed vocabulary (wrong case,
+                # a synonym, garbage) used to reach a bare `CONFIDENCE_RANK[...]` index and
+                # raise KeyError, permanently blocking this case on every resume until the
+                # sealed grade JSON was hand-edited -- clamped the same way the lens's own
+                # `confidence` already is at parse time, above.
+                confidence=_enum(g.confidence, CONFIDENCES),
                 falsification_survived=g.falsification_survived,
                 has_impact_statement=bool(g.impact_statement.strip()),
                 has_steelman=bool(g.steelman.strip()),

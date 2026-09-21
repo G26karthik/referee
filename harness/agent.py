@@ -556,7 +556,11 @@ HARNESS_OWNED_FINDING_KEYS: tuple[str, ...] = (
     "source_part", "merged_from", "cross_section",
 )
 POINTER_OWNED_KEYS: tuple[str, ...] = ("evidence_class", "verified_observation")
-HARNESS_OWNED_REPORT_KEYS: tuple[str, ...] = ("merged_duplicates",)
+# `schema_version` decides whether `audit.pass_b_state` treats this report's degeneracy
+# fields as checkable (`"legacy"` skips the verification_state == "incomplete" -> NOTE cap
+# entirely, invariant 2) -- a lens naming its own version is exactly the self-certification
+# invariant 2 forbids, so it is harness-owned and forced below, not merely stripped-if-absent.
+HARNESS_OWNED_REPORT_KEYS: tuple[str, ...] = ("merged_duplicates", "schema_version")
 # `evidence_origin` is deliberately ABSENT: `stages/audit._coerce` compares the lens's own
 # claimed origin against the one derived from the reference's shape, and stripping this key
 # here would silently disable that check while leaving it looking like it still runs.
@@ -671,6 +675,11 @@ def parse_lens_report(text: str, lens: str) -> tuple[LensReport, dict]:
     meta["harness_keys_stripped"] = stripped
     meta["unknown_keys_dropped"] = unknown
     data["lens"] = lens
+    # Harness-owned, forced regardless of what strip_harness_keys removed or the lens wrote
+    # (invariant 2): a lens naming a stale or absent version would otherwise put its own
+    # pass-B degeneracy check into `audit.pass_b_state`'s uncapped "legacy" branch, deciding
+    # for itself whether its own falsification/steelman fields are checkable.
+    data["schema_version"] = 2
     try:
         return LensReport(**data), meta
     except Exception as e:

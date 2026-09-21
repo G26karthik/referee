@@ -100,6 +100,14 @@ def cmd_review(args: argparse.Namespace) -> int:
 
     out = Path(args.out) if args.out else None
     res = pipeline.review_papers(cfg, args.paper, dossier_out=out, **opts)
+    # A PREFLIGHT REFUSAL (invariant 35) has a different shape than a completed batch --
+    # no "papers"/"complete"/"errors" keys, because nothing was allocated. Printing the
+    # named-files message here is the whole point of refusing before spending anything;
+    # falling through to the success-shaped block below crashed with KeyError: 'papers'
+    # on every refused batch, which hid the message the refusal exists to show.
+    if err := res.get("error"):
+        print(f"\n=== BATCH REFUSED — nothing was reviewed ===\n{err}")
+        return 1
     for r in res["results"]:
         _echo_steps(f"[{r.get('paper_id', r['input'])}] ", r)
 
