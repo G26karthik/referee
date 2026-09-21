@@ -158,10 +158,11 @@ def build_spec(cfg: Config, pid: str, doc: PaperDoc, target=None) -> ProbeSpec:
     driver-supplied value is kept or it is grounded in a cited cell — never scraped from
     prose."""
     from . import audit as audit_stage
+    from . import report as report_stage
 
     root = state.project_dir(cfg, pid)
-    reports = audit_stage.load_reports(cfg, pid, doc)
-    candidates = [f for f in audit_stage.rank([f for r in reports for f in r.findings])
+    reports, _dropped, _invalid_lenses = audit_stage.load_reports(cfg, pid, doc)
+    candidates = [f for f in report_stage.rank([f for r in reports for f in r.findings])
                  if f.verifiable_by_experiment]
     finding_target = candidates[0] if candidates else None
     target_finding_id = ""
