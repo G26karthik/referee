@@ -138,44 +138,51 @@ one reading echoed four times.
 ## 3. The pipeline
 
 ```
-papers → controller → ingest → audit → collect → grade → discover → probe → report
-                                                    └ questions · targets · priority · plan
+papers → pipeline → ingest → audit → collect → grade → assess → discover → probe → report
+                                                              └ questions · targets · priority · plan
 ```
+
+> **v4 note (2026-09-21):** this section previously named the reference implementation's
+> module set (`stages/*.py`, `*_driver.py`, `grading.py`, etc). 89 modules were
+> consolidated into 12 new ones plus a smaller kept-satellite set; the table below names
+> the current module for each responsibility. `harness/pipeline.py` is the v4 name for
+> what this file used to call `controller.py`.
 
 | phase | module | input → output | decides | refuses by |
 |---|---|---|---|---|
 | ingest | `stages/ingest.py` | PDF → `paper/doc.json` | nothing (deterministic) | `error` on an unreadable PDF |
-| audit | `stages/audit.py` + `audit_driver.py` | doc → `audit/<lens>.json` ×4 | the four lenses judge | `waiting`, resumable |
-| collect | `stages/audit.load_reports` | lens files → verified findings | quote ≟ paper | drops the finding, counts it |
-| grade | `stages/grade.py` + `grade_driver.py` | serious findings → `audit/grade/<slug>.json` | a second, blinded reviewer per candidate | partial coverage; never blocks a report by default |
-| **discover** | `stages/discover.py` | doc + findings → `discovery/targets.json` | what is addressable, what it is worth, whether an experiment is justified | a NAMED refusal per target |
-| verify | `stages/probe.py` | doc + repo → `ProbeSpec` per target | identity, capability, resources, commit, backend | leaves the spec unpromoted |
-| execute | `backends.py` + `local_exec.py` + `sandbox.py` | spec → `ProbeResult` | `authorize()` alone | `verdict: blocked` |
-| reconcile | `local_exec.reconcile` | metric vs the addressed quantity | arithmetic only | `INCONCLUSIVE` |
-| report | `stages/report.py` | everything → `reports/<pid>.review.md` | threshold table over `counted_severity` | — |
+| audit | `harness/audit.py`, dispatched via `harness/agent.py` | doc → `audit/<lens>.json` ×4 | the four lenses judge | `waiting`, resumable |
+| collect | `harness/audit.load_reports` | lens files → verified findings | quote ≟ paper | drops the finding, counts it |
+| grade | `harness/audit.py` + `harness/agent.py`'s grade role | serious findings → `audit/grade/<slug>.json` | a second, blinded reviewer per candidate | partial coverage; never blocks a report by default |
+| **discover** | `harness/discover.py` | doc + findings → `discovery/targets.json` | what is addressable, what it is worth, whether an experiment is justified | a NAMED refusal per target |
+| verify | `harness/routes.py` | doc + repo → `ProbeSpec` per target | identity, capability, resources, commit, backend | leaves the spec unpromoted |
+| execute | `harness/execute.py` | spec → `ProbeResult` | `authorize()` alone | `verdict: blocked` |
+| reconcile | `harness/execute.reconcile` | metric vs the addressed quantity | arithmetic only | `INCONCLUSIVE` |
+| report | `harness/report.py` | everything → `reports/<pid>.review.md` | threshold table over `counted_severity` | — |
 
-`harness/controller.py` drives; the deterministic code below it decides what may be
+`harness/pipeline.py` drives; the deterministic code below it decides what may be
 concluded. **Neither side may overrule the other.** A model may direct attention. It may
 not manufacture provenance.
 
 ### The discover phase consults no model at all
 
 This is where the four questions a first reviewer actually asks are separated, and each
-gets its own pure module with a deliberately narrow signature:
+gets its own pure module (or function group within one) with a deliberately narrow
+signature:
 
 | question | module | may read |
 |---|---|---|
-| where does the paper say this? | `claims.py` | the parsed doc — a lens supplies a quote, the harness mints the address |
-| what would settle this concern? | `questions.py` | a finding's own closed-vocabulary self-classification |
-| what KIND of problem is this? | `taxonomy.py` | the same closed vocabulary; never a number, a name or a paper |
-| what is checkable, and how central? | `discovery.py` | structure: abstract, cited addresses, parsed quantities |
-| is it worth it, and is it justified? | `priority.py`, `planner.py` | vocabulary strings and booleans only |
+| where does the paper say this? | `harness/locate.py` | the parsed doc — a lens supplies a quote, the harness mints the address |
+| what would settle this concern? | `harness/discover.py` | a finding's own closed-vocabulary self-classification |
+| what KIND of problem is this? | `harness/taxonomy.py` | the same closed vocabulary; never a number, a name or a paper |
+| what is checkable, and how central? | `harness/discover.py` | structure: abstract, cited addresses, parsed quantities |
+| is it worth it, and is it justified? | `harness/decide.py` (`classify_plan`, `plan`) | vocabulary strings and booleans only |
 
-**Those signatures are the invariant.** `grading.derive`, `priority.score`,
-`planner.classify` and `taxonomy.classify` take vocabulary strings and booleans and
+**Those signatures are the invariant.** `harness/audit.derive`, `harness/decide.classify_plan`
+and `harness/taxonomy.classify` take vocabulary strings and booleans and
 nothing else — no count, no metric name, no paper identity. That makes "no std dev =
 MAJOR", "if epsilon=0.05 never flag" and "if <paper> appears, soften" *inexpressible*
-rather than merely absent. `tests/test_reasoning_architecture.py` asserts it. If you widen
+rather than merely absent. If you widen
 one of those signatures you have removed the guarantee, whatever the new parameter is for.
 
 ### Three questions, never one
@@ -185,7 +192,7 @@ The reviewer's whole job is keeping these apart:
 | question | where it lives | what it may do |
 |---|---|---|
 | Is there an issue? | `candidate_class` (lens) + `grade.verdict` (blinded grader) | only CONFIRMED_FINDING is eligible for FATAL/MAJOR |
-| How sure are we? | `confidence`, bounded by `grading.evidence_support` | evidence TYPE caps confidence; a second independent check LIFTS the cap |
+| How sure are we? | `confidence`, bounded by `harness/audit.evidence_support` | evidence TYPE caps confidence; a second independent check LIFTS the cap |
 | How much does it matter? | `severity` → `counted_severity` | nothing here SETS it; every mechanism only caps it |
 
 **Every mechanism that touches severity may only CAP it.** Nothing in the reviewer can
@@ -206,86 +213,75 @@ the second is the specific overclaim the split exists to prevent. Likewise
 `probe_stage_seconds` is named for what it measures — acquisition, static audit, planning
 and gate evaluation — and is **not** the cost of running experiments.
 
-### Three routes that hang off discover/probe, and each has a rung it cannot reach
+### One route that hangs off discover/probe, and the rung it cannot reach
 
-Three further modules answer questions the four-lens audit cannot. Each is bounded by a
+A further module answers a question the four-lens audit cannot. It is bounded by a
 named **empty-tuple device** rather than a threshold, so its top rung is not merely
 unreached — there is no value that could reach it, which a sweep over the whole vocabulary
 asserts rather than a docstring promises.
 
-**Static artifact inspection** (`harness/artifact_evidence.py`, `harness/stages/artifact.py`)
+**Static artifact inspection** (`harness/artifact_evidence.py`, `harness/stages/artifact.py`
+— both kept as their own files, unchanged, in the v4 redesign)
 asks what the RELEASED CODE establishes, for a question whose SCOPE a bounded probe answers
 — `FILE_PRESENCE`, `ENTRYPOINT_PRESENCE`, `DEPENDENCY_DECLARED`, `MANIFEST_PRESENCE`,
 `CONFIG_LITERAL`, `COMMAND_PRESENCE`. With a paper span that also relocates and an experiment
 identity a deterministic source establishes, it can report a `PAPER_ARTIFACT_MISMATCH`. It
 cannot settle `IMPLEMENTATION_CORRESPONDENCE` — "does this code implement the method" — which
 is excluded from what a bounded fact may discharge by construction, and it cannot say the
-paper's result is false: `artifacts.ARTIFACT_AUTHORITY` has exactly three members and that
-rung is not one of them.
+paper's result is false: `harness/schema.ARTIFACT_AUTHORITY` has exactly three members and
+that rung is not one of them.
 
-**Bounded prior-art search** (`harness/literature.py`, `harness/stages/literature.py`) asks
-whether EARLIER PUBLISHED WORK bears on a novelty claim the paper makes about itself — a
-model proposes queries against the paper's own novelty sentences, public indexes answer, and
-a verified pairing can raise a concern a referee must adjudicate. It can never report that a
-contribution is novel: `artifacts.NOVELTY_ESTABLISHING_AUTHORITIES` is the empty tuple, so
-"novel" has no value to assign, and a completed search that matched nothing is
-`SEARCH_COMPLETED_NO_MATCH_FOUND` — a fact about the search, not about the paper.
-
-**Focused validation** (`harness/validation.py`, `harness/between_arms.py`,
-`harness/stages/validation.py`) exists for the question a reconciliation cannot ask: not "did
-the printed number reproduce" but "which of two competing explanations does a new,
-one-variable-changed experiment discriminate between". It derives the smallest such contrast
-the paper AND its pinned checkout together support — all eight `VALIDATION_INGREDIENTS` must
-bind or the design is `SPECIFICATION_BLOCKED` naming the missing one — and runs both arms in
-the authors' own code against a settlement rule declared before either ran. It cannot
-establish that the credited mechanism causes the effect: `artifacts.CAUSAL_ATTRIBUTION_AUTHORITIES`
-is the empty tuple. And it is never reconciled against a printed cell, because the paper
-printed neither arm — `local_exec.reconcile` refuses a `BETWEEN_ARMS` spec outright.
+> Two sibling routes described here in earlier revisions of this document — bounded
+> prior-art search and focused (between-arms) validation — were deleted 2026-09-20 for
+> measuring zero endpoint-verified value over the eight-paper corpus (0 structurally-bound
+> relations; 0 of 7 targets reaching an executable design). See `CLAUDE.md`'s "Known
+> limitations" for the measurements. They are not part of the current system.
 
 ---
 
 ## 3b. Four layers that describe the REVIEW, not the paper
 
-These run inside the report stage, read only artifacts that already exist, and decide
-nothing. Each is its own module so that what it may see is a signature rather than a
-convention — the same discipline `grading.derive` uses to make "no variance = MAJOR"
-inexpressible rather than merely absent.
+These run inside `harness/report.py` (consolidated from four separate reference-
+implementation modules into distinct function groups within one file), read only
+artifacts that already exist, and decide nothing. Each stays a distinct group so that what
+it may see is a signature rather than a convention — the same discipline
+`harness/audit.derive` uses to make "no variance = MAJOR" inexpressible rather than merely
+absent.
 
 ```
-harness/outcome.py        the four rows a reviewer reads first
-harness/coverage.py       how much of the PAPER this review addressed and examined
-harness/docintegrity.py   mechanically determined document facts — observations, not findings
-harness/guarantees.py     what the review promises, what it does not, and which held
+harness/report.py — outcome layer        the four rows a reviewer reads first
+harness/report.py — coverage layer       how much of the PAPER this review addressed and examined
+harness/report.py — document-integrity   mechanically determined document facts — observations, not findings
+harness/report.py — guarantees layer     what the review promises, what it does not, and which held
 ```
 
-**`outcome.py` — four rows over disjoint inputs.** `## Review outcome` opens every review
-with what was established, what was resolved, what execution produced, and what the whole
-thing is an assessment of. `finding_state` reads `claim_status` and a count of kept
-findings and *nothing* about execution, so a blocked or refused or inadmissible run cannot
-move what the review established. If you add a parameter to `finding_state`, a sweep in
-`tests/test_architecture_guarantees.py` will tell you why not.
+**The outcome layer — four rows over disjoint inputs.** `## Review outcome` opens every
+review with what was established, what was resolved, what execution produced, and what
+the whole thing is an assessment of. `finding_state` reads `claim_status` and a count of
+kept findings and *nothing* about execution, so a blocked or refused or inadmissible run
+cannot move what the review established.
 
-**`coverage.py` — a denominator you cannot fabricate.** `surface(doc)` takes a `PaperDoc`
-and nothing derived from the review; `measure` takes its numerators as address **strings**.
-The rate this replaced divided the harness's own object list by itself, so a worse
-extractor scored higher on it. Read the module docstring: it is the clearest statement in
-the repository of what an honest measurement of one's own coverage costs.
+**The coverage layer — a denominator you cannot fabricate.** `surface(doc)` takes a
+`PaperDoc` and nothing derived from the review; `measure` takes its numerators as address
+**strings**. The rate this replaced divided the harness's own object list by itself, so a
+worse extractor scored higher on it.
 
-**`docintegrity.py` — observations, and whose property each one is.** Every
+**The document-integrity layer — observations, and whose property each one is.** Every
 `DocumentObservation` says `PAPER` or `EXTRACTION`, required, no default. A naive
 "cited but not recovered" check over the shipped corpus produced twelve claims that a table
 or an equation was missing, and all twelve of those objects are in the papers. The layer
 gates nothing, carries no severity field, and is unreachable from every decision function.
 
-**`guarantees.py` — a guarantee checked from an artifact, or not claimed.** Three groups:
-PROCESS guarantees enforced in every run (a failure here is a **harness defect** and is the
-only thing reaching `unmet`); CONDITIONAL properties true only when a gate was open;
-SCIENTIFIC non-guarantees, false on every input by sweep. If you add an invariant to
-`CLAUDE.md`, `tests/test_guarantees.py` requires you to decide whether a review can report
-it — and to write down the reason if it cannot.
+**The guarantees layer — a guarantee checked from an artifact, or not claimed.** Three
+groups: PROCESS guarantees enforced in every run (a failure here is a **harness defect**
+and is the only thing reaching `unmet`); CONDITIONAL properties true only when a gate was
+open; SCIENTIFIC non-guarantees, false on every input by sweep. If you add an invariant to
+`CLAUDE.md`, decide whether a review can report it — and write down the reason if it
+cannot.
 
-And one runs before the pipeline: **`preflight.py`** answers "is this batch N distinct
-papers" from the PDFs' bytes and refuses a batch containing the same document twice.
+And one runs before the pipeline: **`harness/pipeline.preflight_check`** answers "is this
+batch N distinct papers" from the PDFs' bytes and refuses a batch containing the same
+document twice.
 
 ```bash
 ../.venv/Scripts/python.exe run.py preflight      # do this before any corpus run
@@ -325,54 +321,54 @@ asked for.
 
 ---
 
-## 5. Execution: gates, backends, and the remote sandbox
+## 5. Execution: gates and backends
 
 Everything that costs money or runs someone else's code is a separate, named, off-by-default
 gate. They are graded by risk rather than bundled, because fetching code and running code
 are different acts.
 
+> **v4 note (2026-09-21):** the prior-art search, literature review, validation design and
+> remote-sandbox gates/rows this section described in earlier revisions were deleted
+> 2026-09-20, before this rewrite — each measured zero endpoint-verified value (prior-art
+> and literature) or zero executable designs (validation) over the eight-paper corpus, and
+> the sandbox backend had never been leased on this host in any revision. See `CLAUDE.md`'s
+> "Known limitations" for the measurements. This table lists what remains.
+
 | gate | env var | default | permits |
 |---|---|---|---|
 | network | `SH_ALLOW_NETWORK` | **on** | `git clone --depth 1` of the URL the paper advertises, read-only |
-| synthesis | `SH_ALLOW_SYNTHESIS` | **on** | the planner authors `runs/<pid>/probe.py` from the paper |
+| synthesis | `SH_ALLOW_SYNTHESIS` | **on** | `harness/decide.py` authors `runs/<pid>/probe.py` from the paper |
 | auto-audit | `SH_ALLOW_AUTO_AUDIT` | off | shelling out to a reviewer for the four lenses |
 | grading | `SH_ALLOW_GRADING` | off | a second, blinded reviewer per FATAL/MAJOR finding — zero tools, no filesystem |
 | substantive verdict | `SH_ALLOW_SUBSTANTIVE_VERDICT` | off | one whole-paper opinion; printed, counted by nothing |
 | authors' code | `SH_ALLOW_ARTIFACT_REVIEW` | off | one read-only pass over the pinned checkout, `Read`+`Grep` only, every citation relocated |
-| prior-art search | `SH_ALLOW_LITERATURE_SEARCH` | off | querying public scholarly indexes (Crossref, arXiv) for work predating the paper |
-| literature review | `SH_ALLOW_LITERATURE_REVIEW` | off | one reading per novelty claim against what those indexes returned; zero tools, so it cannot search on its own |
-| validation design | `SH_ALLOW_VALIDATION_DESIGN` | off | one reading per focused-validation target, naming the changed variable and the settlement rule; zero tools, every value relocated against the paper. Buys the DESIGN only — execution still needs `SH_ALLOW_REPO_EXEC` and `authorize()` |
 | install | `SH_ALLOW_INSTALL` | off | building the repository's declared stack |
-| **sandbox** | `SH_ALLOW_SANDBOX` | off | **leasing a remote Linux machine** |
 | execute | `SH_ALLOW_REPO_EXEC` | off | running the repository's own entrypoint |
 
-**All four new gates run to a terminal state with the gate closed**, because each is a
-deterministic half sitting in front of an optional model reading: `stages.artifact` produces
-its level-1 facts with `SH_ALLOW_ARTIFACT_REVIEW=0`; `stages.literature` reaches
-`SEARCH_COMPLETED_NO_MATCH_FOUND` on every one of eight papers with
-`SH_ALLOW_LITERATURE_REVIEW=0`, purely from cache, in about a tenth of a second each; and
-`stages.validation` blocks at the same ingredient with `SH_ALLOW_VALIDATION_DESIGN=0` as with
-it open — verified by running both gate states over the same targets and comparing the
-records. That property is what makes each model channel MEASURABLE at all: closing the gate
-removes the one step a model could have taken, not the route.
+**The artifact-review gate runs to a terminal state with the gate closed**, because it is a
+deterministic half sitting in front of an optional model reading: `stages/artifact.py`
+produces its level-1 facts with `SH_ALLOW_ARTIFACT_REVIEW=0`. That property is what makes
+the model channel MEASURABLE at all: closing the gate removes the one step a model could
+have taken, not the route.
 
 `SH_MAX_TARGETS` (default 3) is a **budget, not a gate**: which targets are worth pursuing
-is `planner`'s decision and the order is `priority`'s, so lowering it drops the least
-useful targets rather than an arbitrary subset. Raising it costs compute and changes no rule.
+is `harness/decide.py`'s decision (`classify_plan`) and the order is set alongside it, so
+lowering it drops the least useful targets rather than an arbitrary subset. Raising it costs
+compute and changes no rule.
 
 ### Backends
 
 | name | what it is | `can_execute` |
 |---|---|---|
 | `local` | this machine, subprocesses | yes |
-| `modal` | a leased Linux sandbox (`harness/sandbox.py`) | yes, with credentials + the gate |
+| `container` | a Docker container (`harness/container.py`) — this host's real, credentialed isolation path | yes |
 | `kaggle`, `colab` | declarations of published hardware | **no** — `execute()` raises |
 
 The declarations are not stubs to be filled in. They exist so a refusal can say *"a 16 GiB
 T4 would fit this experiment but cannot be provisioned from here"*, which tells an operator
 what to do next where a bare "no backend" does not.
 
-`backends.select_for` is a **matching** problem, not a config lookup: it compares the cited
+`execute.select_for` is a **matching** problem, not a config lookup: it compares the cited
 experiment's declared demand against every registered profile. Among backends that all meet
 every stated requirement, the one the operator NAMED wins, then the smallest sufficient.
 
@@ -381,44 +377,10 @@ on `local` whatever `SH_EXEC_BACKEND` says, because running it elsewhere would m
 different machine and answer a different question. Only third-party repository execution is
 subject to backend selection.
 
-### Running a paper's code remotely
-
-Copy `.env.sandbox.example` to `.env.sandbox`, add a provider token
-(`MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`, or `modal token new`), and set
-`SH_EXEC_BACKEND=modal`, `SH_ALLOW_SANDBOX=1`, `SH_ALLOW_NETWORK=1`, `SH_ALLOW_INSTALL=1`,
-and `SH_ALLOW_REPO_EXEC=1`.
-
-**Do your first run with `SH_ALLOW_REPO_EXEC=0`.** That exercises leasing, staging by SHA,
-in-place commit verification, capability assessment and release, while executing nothing.
-
-One sandbox is leased **per paper**, not per command: `plan_execution` runs once per target
-and a review runs one checkout many times, so a provider call per command would re-clone and
-re-install for each one. `provision` fetches the audited commit, interrogates the machine,
-refuses it if it is smaller than the reservation, and builds the repository's stack.
-`stages/probe.run` releases the lease in a `finally`; `SH_SANDBOX_IDLE_TIMEOUT` makes a
-leaked one terminate itself; `run.py sandbox --release` catches the rest. **A sandbox
-nobody released bills until its own timeout** — that is the one failure mode in this seam
-that costs money rather than accuracy, and it accrues silently.
-
-Four things about the remote path are asserted rather than assumed
-(`tests/test_sandbox_backend.py`):
-
-- **No silent local fallback.** Every failure to obtain or stage a machine refuses, and a
-  host path in an argv is refused rather than rewritten. A backend that ran a Linux
-  repository on a Windows host because the provider was down would produce a startup crash
-  whose stderr is indistinguishable from the authors' code being broken.
-- **E2 is verified inside the sandbox, by the same function.** `repo.GitTree` abstracts the
-  three reads commit verification needs, so `verify_commit` is written once and certifies a
-  local checkout and a remote one identically. A missing session yields a tree that cannot
-  be read → `unknown` → blocked, rather than falling back to certifying this disk.
-- **The import check is delegated** to the interpreter that will run it.
-- **A reservation is not a measurement.** `resources()` is the request; `execute()` stamps
-  what the machine reported.
-
-There is deliberately **no agent in the sandbox**. The earlier system this capability was
-restored from ran a coding agent inside the pod to author and run experiments from a brief.
-That is the right shape for generating research and the wrong shape for reviewing it: a
-number produced by code an agent wrote in a container measures the agent, not the paper.
+> A remote-sandbox backend (`harness/sandbox.py`, leased-per-paper Linux execution via
+> Modal) existed here and was deleted 2026-09-20: never leased on this host in any
+> revision (no provider credentials were ever present). `container` above is this host's
+> real isolation path for running a paper's own code and is unaffected by that deletion.
 
 ---
 
@@ -460,7 +422,7 @@ you are most likely to trip over.
 11. **Every mechanism that touches severity may only CAP it.**
 12. **Nothing may collapse the three questions into one.** In particular no cap is keyed on
     *evidence type* — a weak citation bounds CONFIDENCE, and confidence bounds severity.
-13. **Every requested paper reaches exactly one terminal state**, and `harness/corpus.py`
+13. **Every requested paper reaches exactly one terminal state**, and `harness/pipeline.account`
     asserts it.
 14. **A retry budget is spent only where spending it could change the answer.** A rate
     limit, an outage, a missing CLI, a revoked credential, an unknown flag and an unreadable
@@ -526,7 +488,7 @@ Read this before you quote a capability to anyone.
   `tool_policy: unrecorded`. Per-lens isolation held — four processes, no shared context —
   but the sandboxed cwd, the `--allowedTools` restriction and per-lens model selection did
   not apply.
-- **No adjudicated ground truth exists for this corpus.** `harness/evaluation.py` therefore
+- **No adjudicated ground truth exists for this corpus.** `harness/summarize.py` therefore
   reports no precision, recall, or agreement-with-humans number, and says so inside the
   artifact. Reviewer accuracy is **unmeasured**, not measured-and-good.
 - **`scientific_class` falls back to the lens name** when a finding declared neither a

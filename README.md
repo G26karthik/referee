@@ -12,10 +12,12 @@ ledger, and keeps the venue decision — REFEREE produces no accept/reject recom
 
 Reproduction is one evidence route inside the reviewer, not its definition. The system
 also checks the paper's own arithmetic, statically inspects a released repository for
-narrow configuration facts, runs a bounded prior-art search behind novelty claims, designs
-focused one-variable contrasts when a claim is about attribution rather than a printed
-number, and — when no code was published but the paper specifies enough — drafts and
-independently verifies a governed reconstruction. Nothing here is a score or a colour: the
+narrow configuration facts, and — when no code was published but the paper specifies
+enough — drafts and independently verifies a governed reconstruction. (Two further routes,
+a bounded prior-art search behind novelty claims and a focused one-variable-contrast
+designer for attribution claims, existed in an earlier revision and were deleted
+2026-09-20 for measuring zero endpoint-verified value over the eight-paper corpus; see
+`CLAUDE.md`'s "Known limitations".) Nothing here is a score or a colour: the
 output is a complete, typed account of what was asked, what was tried, and exactly where
 each attempt stopped.
 
@@ -31,20 +33,19 @@ and to anything the harness has already decided:
 | `confound` | a comparison that changes more than the one thing it credits |
 | `contradiction` | two places in the paper (or paper vs. artifact) that disagree |
 
-Beyond the four lenses, up to nine further specialist roles are gated individually and run
+Beyond the four lenses, further specialist roles are gated individually and run
 only where their own gate is open, each confined to the one bounded question it exists to
 answer: a **blinded grader** re-examines serious candidates with zero tools, deciding only
 confirmed-finding vs. plausible-concern; a **whole-paper reader** gives a qualitative
 opinion with no decision authority, printed beside the machine result but never fed back
-into it; a **claim-link reader** proposes which evidence a headline sentence depends on,
-with both ends re-verified by the harness; a **literature query proposer and reviewer**
-run a bounded prior-art search and judge overlap, never novelty itself; an
-**authors'-code reader** (`Read`+`Grep` only) has every citation it returns relocated to a
-real line before it is trusted; a **focused-validation designer** names the one variable a
-controlled contrast should vary; and a **reconstruction generator** paired with a
-**separately-attributed conformance verifier** drafts and checks an independent
+into it; an **authors'-code reader** (`Read`+`Grep` only) has every citation it returns
+relocated to a real line before it is trusted; and a **reconstruction generator** paired
+with a **separately-attributed conformance verifier** drafts and checks an independent
 reimplementation when no code was published, so generated code can never certify its own
-conformance.
+conformance. (A claim-link reader, a literature query proposer/reviewer, and a
+focused-validation designer existed in an earlier revision and were deleted 2026-09-20 —
+each measured zero structurally-useful output over the eight-paper corpus; see
+`CLAUDE.md`'s "Known limitations".)
 
 **What every one of these roles returns is a proposal and nothing more.** None of them
 decides anything: quotation verification, evidence-authority ceilings, admissibility,
@@ -68,7 +69,7 @@ established:
 ```
 
 The reader-facing result is a **typed disposition** — `PASS_TO_HUMAN_CLEAN`,
-`BLOCKED_METHOD`, `BLOCKED_SPECIFICATION`, and so on (`harness/disposition.py`,
+`BLOCKED_METHOD`, `BLOCKED_SPECIFICATION`, and so on (`harness/decide.py`,
 `reports/corpus.json`) — the action a human should take on this paper. A legacy
 RED/YELLOW/GREEN triage is retained internally for queue routing and is printed under the
 review's *scope* section, never as the headline: RED means a material failure was
@@ -238,40 +239,52 @@ not the evaluation corpus.
 
 ## Repository
 
+> **v4 note (2026-09-21):** 89 reference-implementation modules (43,756 production lines)
+> were consolidated into the 12 new modules below plus a smaller set of kept
+> single-purpose "satellite" files, landing at 32,174 production lines. The tree below is
+> current; see `CLAUDE.md`'s "Known limitations" for the redesign's own record.
+
 ```
 run.py                 CLI. Formats; decides nothing.
 harness/
-  controller.py        the driver: phase machine, retries, batch scheduling, entry points
-  artifacts.py         every typed artifact that crosses a stage boundary
-  taxonomy.py          the four closed-vocabulary axes and their derivations
-  config.py            paths and gates, all from the environment
+  schema.py             every typed artifact that crosses a stage boundary
+  locate.py              the address grammar: mint/resolve a quote-grounded reference
+  paper.py               PDF → PaperDoc; the bounded-part reading plan
+  agent.py                the one model-delegation runner: lens, grade and verdict roles
+  prompts/                prompt text per role
+  audit.py                lens dispatch, evidence verification, dedup, severity derivation,
+                           blinded grading
+  discover.py             questions, targets, priority, experiment necessity
+  decide.py               taxonomy, materiality, provenance ceiling, disposition, route
+                           exhaustion, plan gates — what may be concluded
+  routes.py               per-target orchestration: acquisition, static audit, planning
+  execute.py              backends, the authorization ladder, the runner, reconciliation
+  report.py               ranking, thresholds, the four reader-facing rows, coverage,
+                           document integrity, guarantees, self-audit, the ledger
+  pipeline.py             the driver: phase machine, retries, batch scheduling, preflight,
+                           corpus accounting, entry points
+  summarize.py            dossier consolidation + corpus-wide evaluation metrics
+  taxonomy.py             the four closed-vocabulary axes and their derivations (satellite)
+  config.py               paths and gates, all from the environment
   stages/
-    ingest.py          PDF → PaperDoc
-    audit.py           lens prompts + evidence verification
-    discover.py         questions, targets, priority, experiment necessity
-    artifact.py         static artifact inspection + the authors'-code auditor route
-    literature.py        bounded prior-art search
-    validation.py         focused one-variable contrast design
-    probe.py            identity, capability, resources, authorization planning
-    report.py            ranking, thresholds, rendering
-  audit_driver.py      lens delegation, one subprocess or subagent per lens
-  grade_driver.py      the blinded grader, zero tools
-  claimlink_driver.py, literature_driver.py, validation_driver.py,
-  artifact_review_driver.py, reimplement_driver.py
-                        the remaining gated specialist roles, each its own module
-  backends.py          execution backends, requirement matching, authorization
-  sandbox.py           the remote-sandbox driver — lease, stage a commit, run, release
-  experiment_id.py     experiment / metric / configuration identity
-  reimplement.py       eligibility for an independent reconstruction, deterministic
-  local_exec.py        runs probes, parses metrics, reconciles
-  pdf.py               PDF → sections, tables, numbers
-  outcome.py           the four reader-facing rows, folded over disjoint inputs
-  coverage.py          structural review-surface coverage, denominator read off the paper
-  docintegrity.py      deterministic document integrity — observations, never findings
-  guarantees.py        what a review promises, what it does not, and which held
-  disposition.py       the typed reader-facing outcome per paper
-  corpus.py            every requested paper reaches exactly one terminal state
-tests/                 2,296 tests (2,289 with network-dependent tests deselected)
+    ingest.py             PDF → PaperDoc (kept satellite)
+    artifact.py            static artifact inspection + the authors'-code auditor route
+  artifact_evidence.py, artifact_review_driver.py, reimplement_driver.py,
+  reviewer_cli.py, delegation.py, sealing.py, failures.py
+                          kept single-purpose satellites: relocate/discharge logic,
+                          the authors'-code auditor, the reconstruction generator +
+                          conformance verifier, CLI confinement mechanics, delegation-mode
+                          vocabulary, write-then-verify sealing, retry classification
+  experiment_id.py, resources.py, repo.py, code_audit.py, probe_synth.py,
+  container.py, provenance.py, isolation.py, assessment.py, alignment/
+                          kept single-purpose satellites: identity resolution, resource
+                          assessment, git acquisition, the one surviving AST cheat-pattern
+                          rule, probe authoring, the container backend, the provenance
+                          ceiling and isolation-floor constants, material-failure
+                          prioritization, experiment-identity narrowing
+tests/                 99 collected, 60 files fail to import as of 2026-09-21 (stale
+                        references to modules the v4 consolidation removed — a known gap,
+                        not yet repointed; see `CLAUDE.md`'s "Known limitations")
 docs/                  the architecture map and measurement records
   archive/             historical build logs and superseded drafts — see its own README
 papers/                source PDFs (this release ships only its own small fixtures)
