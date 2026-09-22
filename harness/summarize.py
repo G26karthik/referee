@@ -17,37 +17,25 @@ from pathlib import Path
 from . import provenance as provenance_mod
 from . import state
 from .config import Config
-from .schema import CaseLedger, EvalReport
+from .schema import PAPER_DISPOSITIONS, CaseLedger, EvalReport
 
 # ========================================================================================
 # DOSSIER — was dossier.py. Two outputs from the same content: a markdown dossier
 # (canonical, diffable) and a best-effort PDF rendered with PyMuPDF's Story API.
 # ========================================================================================
-BADGE = {"RED": "\U0001F534 RED", "GREEN": "\U0001F7E2 GREEN"}
-TRIAGE_BADGE = {"RED": "\U0001F534 RED", "YELLOW": "\U0001F7E1 YELLOW", "GREEN": "\U0001F7E2 GREEN"}
 SEVERITIES = ("FATAL", "MAJOR", "MINOR")
 VENUES = {"acl": "ACL", "iclr": "ICLR", "cvpr": "CVPR", "neurips": "NeurIPS",
          "emnlp": "EMNLP", "icml": "ICML"}
 CRITICAL_LIMIT = 6
 
 
-def triage_badge(triage: str) -> str:
-    return TRIAGE_BADGE.get((triage or "").strip(), "—")
-
-
-def heading_badge(report: dict) -> str:
-    """The badge a per-paper section is headed with: the triage when the report carries
-    one, the binary verdict otherwise — a pre-triage report still reads as what it
-    decided rather than as an em dash."""
-    t = (report.get("triage") or "").strip()
-    return TRIAGE_BADGE[t] if t in TRIAGE_BADGE else badge(report.get("verdict") or "")
-
-
-def badge(verdict: str) -> str:
-    """Falls closed to an explicit STALE marker rather than passing an unrecognised
-    string through — a retired vocabulary value left on disk must not render as live."""
-    v = (verdict or "").strip()
-    return BADGE.get(v, f"⚠️ STALE ({v or 'none'}) — re-run this paper")
+def disposition_heading(report: dict) -> str:
+    """The heading a per-paper section is headed with: the disposition, plain — not a
+    colour, not an accept/reject score. Falls closed to an explicit STALE marker rather
+    than passing an unrecognised string through — a retired vocabulary value left on disk
+    must not render as live."""
+    d = (report.get("disposition") or "").strip()
+    return f"`{d}`" if d else "`NOT_REVIEWED` — STALE, re-run this paper"
 
 
 def venue_of(pid: str) -> str:
@@ -188,9 +176,9 @@ def _abbrev(counter: dict[str, int]) -> str:
 
 def matrix(reports: list[dict]) -> list[list[str]]:
     """The multi-paper evaluation matrix. Leads with SCIENTIFIC CATEGORIES — what the
-    review produces — with triage as a routing column and the binary verdict after it."""
+    review produces — with disposition as a routing column, not a colour."""
     rows = [["Paper", "Venue", "Findings by category", "Settled", "Repo / Code",
-            "Probe Status", "Triage", "Verdict"]]
+            "Probe Status", "Disposition"]]
     for r in reports:
         res = resolution_counts(r)
         settled = sum(n for k, n in res.items() if k.startswith("RESOLVED"))
@@ -199,7 +187,7 @@ def matrix(reports: list[dict]) -> list[list[str]]:
             _abbrev(category_counts(r)),
             f"{settled}/{sum(res.values())}" if res else "—",
             repo_status(r), probe_status(r),
-            triage_badge(r.get("triage") or ""), badge(r.get("verdict") or "")])
+            disposition_heading(r)])
     return rows
 
 
@@ -233,9 +221,10 @@ def _finding_lines(report: dict) -> list[str]:
 
 def render_markdown(reports: list[dict], missing: list[str]) -> str:
     L = ["# Executive Review Dossier", "",
-        f"{len(reports)} paper(s) reviewed by single-harness. Every decision below is the "
-        "deterministic output of the materiality table in `report.py`; no model call "
-        "decides one. RED means a material failure was ESTABLISHED; GREEN means one was "
+        f"{len(reports)} paper(s) reviewed by single-harness. Every disposition below is "
+        "the deterministic output of the materiality table and `decide.derive_disposition` "
+        "in `report.py`/`decide.py`; no model call decides one. STOP_MATERIAL_FAILURE means "
+        "a material failure was ESTABLISHED; the PASS_TO_HUMAN_* dispositions mean one was "
         "not within the audited scope, which is not a certificate of correctness. Every "
         "quoted line was re-verified against the parsed PDF at report time.", ""]
     if missing:
@@ -249,9 +238,9 @@ def render_markdown(reports: list[dict], missing: list[str]) -> str:
          f"**{dropped}** finding(s) dropped as unsubstantiated.", "", "---", ""]
     for r in reports:
         c = counts(r)
-        L += [f"## {heading_badge(r)} — `{r['paper_id']}`", "",
+        L += [f"## {disposition_heading(r)} — `{r['paper_id']}`", "",
              f"**{r.get('title') or r['paper_id']}**", "",
-             f"> {r.get('verdict_reason', '')}", "",
+             f"> {r.get('disposition_reason', '')}", "",
              f"{r.get('n_pages', 0)} pages · {r.get('n_sections', 0)} sections · "
              f"{r.get('n_tables', 0)} tables · {r.get('n_numbers', 0)} reported numbers · "
              f"lenses: {', '.join(r.get('lenses_run') or []) or '(none)'}", "",
@@ -271,8 +260,7 @@ def render_markdown(reports: list[dict], missing: list[str]) -> str:
 
 _INLINE = [(re.compile(r"`([^`]+)`"), r"<code>\1</code>"),
           (re.compile(r"\*\*([^*]+)\*\*"), r"<b>\1</b>")]
-_PDF_GLYPHS = {"\U0001F534 ": "", "\U0001F7E1 ": "", "\U0001F7E2 ": "",
-              "⚠️": "(!)", "⚠": "(!)", "“": '"', "”": '"',
+_PDF_GLYPHS = {"⚠️": "(!)", "⚠": "(!)", "“": '"', "”": '"',
               "’": "'", "—": "-", "σ": "sigma", "Δ": "delta",
               "±": "+/-", "…": "..."}
 
@@ -542,7 +530,7 @@ def per_paper(cfg: Config, pid: str) -> dict | None:
             violations += 1
 
     return {
-        "paper_id": pid, "verdict": report.verdict, "triage": report.triage,
+        "paper_id": pid, "disposition": report.disposition,
         "reproduction_status": report.reproduction_status,
         "lenses_run": len(report.lenses_run), "findings_kept": kept,
         "findings_dropped_unsubstantiated": dropped,
@@ -634,10 +622,8 @@ def corpus(cfg: Config, pids: list[str]) -> dict:
     summary = {
         "papers_requested": len(pids), "papers_measured": len(papers),
         "papers_without_a_report": missing,
-        "triage": {level: sum(1 for p in papers if p["triage"] == level)
-                  for level in ("RED", "YELLOW", "GREEN")},
-        "binary_verdict": {level: sum(1 for p in papers if p["verdict"] == level)
-                          for level in ("RED", "GREEN")},
+        "dispositions": {d: sum(1 for p in papers if p.get("disposition") == d)
+                        for d in PAPER_DISPOSITIONS},
         "findings_kept": kept, "findings_dropped_unsubstantiated": dropped,
         "finding_verification_rate": _ratio(kept, kept + dropped),
         "questions_generated": total("questions_generated"), "targets_discovered": discovered,
@@ -687,14 +673,14 @@ def render_evaluation(summary: dict) -> str:
         f"{summary['papers_measured']} of {summary['papers_requested']} requested paper(s) "
         f"have a report and are measured below.", "",
         "| Paper | Questions | Targets | Addressable | Needed an experiment | "
-        "Settled w/o execution | Blocked | Triage |",
+        "Settled w/o execution | Blocked | Disposition |",
         "|---|---:|---:|---:|---:|---:|---:|---|"]
     for p in summary["per_paper"]:
         L.append(f"| `{p['paper_id']}` | {p['questions_generated']} | "
                 f"{p['targets_discovered']} | {p['targets_addressable']} | "
                 f"{p['targets_requiring_execution']} | "
                 f"{p['targets_resolved_without_execution']} | "
-                f"{p['targets_blocked_before_execution']} | {p['triage'] or '—'} |")
+                f"{p['targets_blocked_before_execution']} | {p.get('disposition') or '—'} |")
     f = summary.get("funnel") or {}
     L += ["", "## From discovery to a settled question", "",
          "Six terms, each read off a different artifact and none interchangeable.", "",
@@ -789,8 +775,8 @@ def _self_check() -> None:
     import tempfile
 
     fake = {
-        "paper_id": "demo", "title": "A Demonstration", "verdict": "GREEN",
-        "verdict_reason": "one MAJOR finding", "n_pages": 8, "n_sections": 6,
+        "paper_id": "demo", "title": "A Demonstration", "disposition": "PASS_TO_HUMAN_CONCERNS",
+        "disposition_reason": "one MAJOR finding", "n_pages": 8, "n_sections": 6,
         "n_tables": 2, "n_numbers": 11, "lenses_run": ["overclaim"], "dropped_findings": 0,
         "unasked_question": "Why was the obvious baseline not run?",
         "findings": [
@@ -812,10 +798,9 @@ def _self_check() -> None:
     cols = {name: i for i, name in enumerate(rows[0])}
     assert rows[0][0] == "Paper" and len(rows) == 2
     assert rows[1][cols["Findings by category"]] == "—"
-    assert rows[1][cols["Verdict"]] == "\U0001F7E2 GREEN"
-    assert rows[1][cols["Triage"]] == "—"
-    assert triage_badge("YELLOW") == "\U0001F7E1 YELLOW"
-    assert "STALE" not in triage_badge("YELLOW")
+    assert rows[1][cols["Disposition"]] == "`PASS_TO_HUMAN_CONCERNS`"
+    assert disposition_heading({"disposition": "STOP_MATERIAL_FAILURE"}) == "`STOP_MATERIAL_FAILURE`"
+    assert "STALE" in disposition_heading({})
 
     md = render_markdown([fake], ["ghost"])
     assert "Executive Review Dossier" in md
@@ -829,7 +814,7 @@ def _self_check() -> None:
     with tempfile.TemporaryDirectory() as td:
         cfg = Config(projects_dir=Path(td) / "projects")
         (cfg.projects_dir / "p" / "reports").mkdir(parents=True)
-        report = EvalReport(paper_id="p", title="t", verdict="GREEN", triage="YELLOW",
+        report = EvalReport(paper_id="p", title="t", disposition="PASS_TO_HUMAN_CONCERNS",
                             dropped_findings=3, findings=[], reproduction_status="NOT_ATTEMPTED")
         (cfg.projects_dir / "p" / "reports" / "p.json").write_text(
             json.dumps(report.model_dump()), encoding="utf-8")
@@ -845,7 +830,8 @@ def _self_check() -> None:
         s = corpus(cfg, ["p", "absent"])
         assert s["papers_requested"] == 2 and s["papers_measured"] == 1
         assert s["papers_without_a_report"] == ["absent"]
-        assert s["triage"] == {"RED": 0, "YELLOW": 1, "GREEN": 0}
+        assert s["dispositions"]["PASS_TO_HUMAN_CONCERNS"] == 1
+        assert s["dispositions"]["STOP_MATERIAL_FAILURE"] == 0
         assert s["objects_addressable_rate"] == 0.6
         assert s["provenance_violations"] == 0
         text = render_evaluation(s)

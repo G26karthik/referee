@@ -13,23 +13,26 @@ those state WHY.
 **Trust posture: write-side enforcement now lands for the fields that matter.** `_Base`
 still allows `extra` fields (a stage adding a field must not break the pipeline) — that is
 a different concern from a DECLARED field's value being wrong, which is what changed here.
-Ten fields — `ExecAuthorization.decision`/`.failure_class`, `Reconciliation.provenance`/
+Nine fields — `ExecAuthorization.decision`/`.failure_class`, `Reconciliation.provenance`/
 `.failure_class`, `ProbeSpec.provenance`, `TargetOutcome.provenance`/`.failure_class`,
-`CaseState.phase`/`.status`/`.verdict` — are now enforced via `Vocab(...)`: a real
+`CaseState.phase`/`.status` — are now enforced via `Vocab(...)`: a real
 membership check against their declared tuple, or against a specific, one-line-noted
-`LEGACY_VALUES` exception. These ten were chosen because they are the fields the v4 plan's
+`LEGACY_VALUES` exception. These nine were chosen because they are the fields the v4 plan's
 own trust-boundary review depends on (execution authorization/reconciliation decisions,
 provenance, disposition, phase/status) — a wrong value in one of these is a silent
 trust-boundary failure, not a cosmetic typo. Every OTHER vocabulary-bearing field (the
 ~30 "prose-only" scientific/reporting ones a lens or grader writes) stays plain `str`,
 unchanged from the reference: enforcing all 782 originally-annotated fields in one pass
 would convert "drop this one bad field" into "crash the whole review" on a model's typo,
-which is the opposite of `_Base`'s own reason for existing.
+which is the opposite of `_Base`'s own reason for existing. `CaseState.verdict` — the old
+binary RED|GREEN colour field this list used to include — was removed outright in the
+2026-09-21 de-triage pass rather than kept and enforced; `CaseState.disposition` (a
+`PAPER_DISPOSITIONS` value, never a colour) is what a caller reads for routing now.
 
 `LEGACY_VALUES` starts EMPTY, deliberately: a hand-guessed exception is exactly the
 retyping-as-free-prose mistake this whole schema exists to stop. A real one is added only
 after `tools/validate_legacy_json.py` (or equivalent) loads real `projects/*/**.json`
-through these ten fields and a `ValidationError` names a genuine historical value — see
+through these nine fields and a `ValidationError` names a genuine historical value — see
 that script's own output before ever adding an entry here.
 
 `python -m harness.schema` runs the self-check.
@@ -101,16 +104,14 @@ class _Base(BaseModel):
 # the other ~772 annotated fields do not.
 # --------------------------------------------------------------------------------------- #
 LEGACY_VALUES: dict[str, tuple[str, ...]] = {
-    # Confirmed by `tools/validate_legacy_json.py` against real controller.json files (at
-    # least `projects/acl/controller.json` and `projects/cvpr-defect-3/controller.json`,
-    # plus older archived copies under `projects/_run_2026-09_v1/`): `CaseState.verdict` —
-    # a binary RED|GREEN field — has genuinely carried "YELLOW" across multiple real runs.
-    # This is the reference implementation's own known conservation-law-adjacent defect
-    # (CLAUDE.md's Known Limitations documents the sibling case on `paper4-snri-nullresult`'s
-    # report), grandfathered here rather than widening `verdict`'s vocabulary to three
-    # values — RED|GREEN is the correct domain; "YELLOW" was always a bug, and enforcement
-    # on any NEW instance of it must still fail.
-    "CaseState.verdict": ("YELLOW",),
+    # `CaseState.verdict` — the old binary RED|GREEN colour field — carried "YELLOW" on
+    # multiple real runs (`tools/validate_legacy_json.py` against `projects/acl/controller.json`
+    # and others; CLAUDE.md's Known Limitations documents the sibling case on
+    # `paper4-snri-nullresult`'s report). The 2026-09-21 de-triage pass removed the field
+    # entirely rather than widen its vocabulary — `CaseState.disposition` (a
+    # `decide.PAPER_DISPOSITIONS` value, never a colour) is the field a caller reads for
+    # routing now. `_Base`'s `extra="allow"` means an old controller.json that still carries
+    # a stray `verdict` key reads fine; nothing enforces or interprets that key any more.
 }
 
 
@@ -1217,10 +1218,8 @@ class ReviewOutcome(_Base):
     scope_state: str = Field(default="NO_TARGET_PURSUED", description=" | ".join(SCOPE_STATES))
     scope_detail: str = ""
     claim_status: str = Field(default="NOT_VERIFIED", description="carried, not decided here")
-    triage: str = Field(default="GREEN", description="carried, not decided here; routing only")
 
 
-VERDICTS = ("RED", "GREEN")
 CLAIM_STATUSES = ("VERIFIED_FAILURE", "VERIFIED_SUPPORT", "NOT_VERIFIED")
 REPRODUCTION_STATUSES = ("REPRODUCED", "FAILED_REPRODUCTION", "NOT_VERIFIED", "NOT_ATTEMPTED")
 VERDICT_AGREEMENTS = ("agree", "harness_harsher", "model_harsher", "contested", "unavailable")
@@ -1233,10 +1232,6 @@ CONTRIBUTION_VERDICTS = ("YES", "YES_QUALIFIED", "NO", "UNDETERMINED")
 class EvalReport(_Base):
     paper_id: str
     title: str = ""
-    verdict: str = Field(default="", description=" | ".join(VERDICTS))
-    verdict_reason: str = Field(default="")
-    triage: str = Field(default="", description="RED|YELLOW|GREEN — a strict projection of verdict")
-    triage_reason: str = Field(default="")
     targets_summary: dict = Field(default_factory=dict)
     review_efficiency: dict = Field(default_factory=dict, description="CaseLedger.efficiency, carried")
     reviewer_report_path: str = Field(default="")
@@ -1258,10 +1253,12 @@ class EvalReport(_Base):
     n_numbers: int = 0
     lenses_run: list[str] = Field(default_factory=list)
     dropped_findings: int = Field(default=0)
-    verdict_if_cell_backed_only: str = Field(default="", description="same table, findings with a verified cell only")
+    claim_status_if_cell_backed_only: str = Field(
+        default="", description="same claim-status table, findings with a verified cell only")
     probe: ProbeResult | None = Field(default=None)
     experimental_chain: "ExperimentalChain | None" = Field(default=None)
-    verdict_if_lens_severity_only: str = Field(default="", description="same table, counted_severity erased")
+    claim_status_if_lens_severity_only: str = Field(
+        default="", description="same claim-status table, counted_severity erased")
     grade_coverage: dict = Field(default_factory=dict)
     substantive_verdict: "SubstantiveVerdict | None" = Field(default=None)
     verdict_agreement: str = Field(default="", description=" | ".join(VERDICT_AGREEMENTS))
@@ -1333,7 +1330,6 @@ class CorpusEntry(_Base):
     paper_id: str = ""
     state: str = Field(default="requested", description=" | ".join(CORPUS_STATES))
     reason: str = ""
-    verdict: str = ""
     phase: str = ""
     reproduction_class: str = ""
     failure_kind: str = Field(default="", description=" | ".join(FAILURE_KINDS))
@@ -1573,8 +1569,6 @@ NECESSITY_FOR_DISPOSITION = {
     "NO_EXPERIMENT_NEEDED": "NO_EXPERIMENT_NEEDED",
     "CITATION_VERIFIED_ONLY": "EXPERIMENT_WARRANTED",
 }
-
-TRIAGE_LEVELS = ("RED", "YELLOW", "GREEN")
 
 QUESTION_KINDS = ("PRINTED_QUANTITY", "COMPOSITION", "ATTRIBUTION", "CONTROL_PRESENCE",
                   "PROTOCOL_CONFORMANCE", "SPECIFICATION", "PRIOR_ART", "UNCLASSIFIED")
@@ -1827,8 +1821,6 @@ _CasePhaseField: TypeAlias = Annotated[
     str, AfterValidator(_vocab_validator(PHASES, "CaseState.phase"))]
 _CaseStatusField: TypeAlias = Annotated[
     str, AfterValidator(_vocab_validator(CASE_STATUSES, "CaseState.status"))]
-_CaseVerdictField: TypeAlias = Annotated[
-    str, AfterValidator(_vocab_validator(("RED", "GREEN"), "CaseState.verdict"))]
 
 
 class CaseState(_Base):
@@ -1845,7 +1837,6 @@ class CaseState(_Base):
     awaiting: list[str] = Field(default_factory=list)
     blocked_reason: str = Field(default="")
     reproduction_class: str = Field(default="")
-    verdict: _CaseVerdictField = ""
     assessment: PaperAssessment | None = Field(default=None)
     disposition: str = Field(default="NOT_REVIEWED", description="carried from the report: " + " | ".join(PAPER_DISPOSITIONS))
     disposition_basis: str = Field(default="NONE", description=" | ".join(DISPOSITION_BASIS))

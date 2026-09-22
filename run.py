@@ -12,7 +12,8 @@ re-run one stage by hand while debugging.
 
 Exit codes:  0 complete · 2 waiting on lens evidence · 1 error ·
              3 complete but CONTESTED (the independent substantive read disagrees
-             sharply with the deterministic verdict — see `EvalReport.verdict_contested`).
+             sharply with the deterministic claim status — see
+             `EvalReport.verdict_contested`).
 
 This file formats; `harness/pipeline.py` decides. Run with the repo venv:
     ../.venv/Scripts/python.exe run.py ...
@@ -69,7 +70,7 @@ def cmd_review(args: argparse.Namespace) -> int:
             return 2
         if res.get("verdict_contested"):
             print("\nCONTESTED - the independent substantive read disagrees sharply "
-                 "with this verdict; see the report.")
+                 "with this claim status; see the report.")
         if unmet := _detail(res, "S4 report").get("self_audit_failed"):
             print(f"\nWARNING: reviewer self-audit: {len(unmet)} check(s) unmet "
                  f"({', '.join(unmet)}) — see '## Reviewer self-audit' in the report. "
@@ -78,9 +79,9 @@ def cmd_review(args: argparse.Namespace) -> int:
         summary = ", ".join(f"{n} {k.replace('_', ' ').lower()}"
                             for k, n in cats.items()) or "no findings survived verification"
         print(f"\n=== {res['title']} ===")
-        # THE DISPOSITION FIRST, because it is the one line a caller acts on. It is not a
-        # verdict and does not replace the colour — see `harness/decide.py` — it says what
-        # happens to the paper now.
+        # THE DISPOSITION FIRST, because it is the one line a caller acts on — see
+        # `harness/decide.py`. It is a routing description, not an accept/reject score:
+        # it says what happens to the paper now.
         rep = _detail(res, "S4 report")
         if disp := rep.get("disposition"):
             basis = rep.get("disposition_basis") or "NONE"
@@ -119,10 +120,10 @@ def cmd_review(args: argparse.Namespace) -> int:
     if corpus:
         print(f"\n=== CORPUS: {corpus.get('summary', '')} ===")
         for e in corpus.get("entries", []):
-            # DISPOSITION, not verdict. `state` says how the run ended and `disposition`
-            # says what happens to the paper; a batch summary that printed only the first
-            # made STOP_MATERIAL_FAILURE and BLOCKED_ARTIFACT both read as `completed`.
-            extra = e.get("disposition") or e.get("verdict") or e.get("failure_kind") or ""
+            # `state` says how the run ended and `disposition` says what happens to the
+            # paper; a batch summary that printed only the first made STOP_MATERIAL_FAILURE
+            # and BLOCKED_ARTIFACT both read as `completed`.
+            extra = e.get("disposition") or e.get("failure_kind") or ""
             note = f" · {e['resume_after']}" if e.get("resume_after") else ""
             print(f"  {e['state']:<13} {(e.get('paper_id') or e['source'])[:34]:<34} "
                   f"{extra:<26} {e.get('reason', '')[:60]}{note}")
@@ -331,7 +332,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         case = pipeline.load_case(cfg, pid)
         meta = state.load_meta(cfg, pid)
         status = f"{case.status}/{case.phase}" if case else "-"
-        print(f"{pid:<30} {status:<18} {case.verdict if case else '':<7} "
+        print(f"{pid:<30} {status:<18} {case.disposition if case else '':<22} "
               f"{meta.get('direction', '')[:50]}")
     return 0
 
@@ -343,7 +344,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"paper   : {meta['id']}\ntitle   : {meta.get('direction')}")
     print(f"source  : {meta.get('paper_path', '(unknown)')}")
     if case:
-        print(f"phase   : {case.phase}   status: {case.status}   verdict: {case.verdict or '-'}")
+        print(f"phase   : {case.phase}   status: {case.status}   disposition: {case.disposition or '-'}")
         if case.reproduction_class:
             print(f"repro   : {case.reproduction_class}")
         if case.blocked_reason:

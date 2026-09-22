@@ -46,7 +46,7 @@ from .schema import (
     ProbeResult, QUESTION_STATES, REPRODUCTION_STATUSES, Reconciliation, ReadingRecord,
     RepoAcquisition, ReviewGuarantees, ReviewOutcome, ReviewQuestion, ReviewSelfAudit,
     ReviewSurface, SCOPE_STATES, SURFACE_KINDS, ScientificFinding, SelfAuditItem,
-    SubstantiveVerdict, TARGET_DISPOSITIONS, TRIAGE_LEVELS, TargetOutcome, TargetSet,
+    SubstantiveVerdict, TARGET_DISPOSITIONS, TargetOutcome, TargetSet,
 )
 
 # Nothing inside decide.py itself renders prose -- this is the one module that does, so
@@ -164,8 +164,9 @@ def parse_magnitude(text: str) -> float:
 
 
 def counted(f: Finding) -> str:
-    """The severity `overall_verdict` actually counts for `f` — falls back to the lens's
-    own `severity` when `counted_severity` is empty, which is what makes grading-off
+    """The severity `claim_status`/`decide.derive_disposition` actually counts for `f` —
+    falls back to the lens's own `severity` when `counted_severity` is empty, which is what
+    makes grading-off
     reproduce the pre-grading verdict byte for byte. `grading.RANK[counted_severity] <=
     RANK[severity]` always, so the fallback can never be a promotion in disguise."""
     return f.counted_severity or f.severity
@@ -220,9 +221,10 @@ def material_target_failure(objects: list | None, outcomes: list | None,
                             reconciliation: Reconciliation | None = None
                             ) -> tuple[object | None, str]:
     """THE ONE materiality decision on the paper-level path. `(source, kind)`, `kind` is
-    "target" | "reconciliation" | "" — `claim_status` and `overall_verdict` both call
-    THIS and nothing else, which is what makes it impossible for them to disagree about
-    whether a paper failed. Wraps `decide.material_target_failure` (Tier 1: did the
+    "target" | "reconciliation" | "" — `claim_status` and, through it,
+    `decide.derive_disposition` both depend on THIS and nothing else, which is what makes
+    it impossible for them to disagree about whether a paper failed. Wraps
+    `decide.material_target_failure` (Tier 1: did the
     target's own route establish a defect; Tier 2: is a CENTRAL claim established to depend
     on it) and joins the legacy single-reconciliation path the same way, through
     `Reconciliation.target_id` — a reconciliation carrying no joinable target establishes
@@ -314,109 +316,6 @@ def provenance_label(provenance: str) -> str:
     return provenance_mod.label(provenance)
 
 
-def overall_verdict(findings: list[Finding], reconciliation: Reconciliation | None = None,
-                    *, outcomes: list | None = None, objects: list | None = None,
-                    probe: ProbeResult | None = None) -> tuple[str, str]:
-    """The binary paper-level decision, plus the rule that produced it. RED iff
-    `claim_status` is VERIFIED_FAILURE — no count, no accumulation, no second mechanism.
-    Reaches the SAME `material_target_failure` call `claim_status` makes, so the two cannot
-    disagree about whether a paper failed."""
-    # Calibration scoping: see the matching comment in `claim_status`. It suppresses only
-    # the paper-level `reconciliation` argument's own contribution — never the fold over
-    # `objects`/`outcomes`, which can establish a material failure on a DIFFERENT target
-    # than the one calibration ran on.
-    calibration = is_calibration(probe)
-    rec = None if calibration else reconciliation
-    source, kind = material_target_failure(objects, outcomes, rec)
-
-    # `kind == "target"` is checked BEFORE `rec`'s own FAILED_REPRODUCTION status: Tier 1
-    # and Tier 2 (materiality) are ALREADY BOTH established by the time `kind == "target"`
-    # comes back from `material_target_failure` — it is not "Tier 1 held, Tier 2 did not".
-    # Checking `rec.status` first used to let an established `objects`/`outcomes` failure on
-    # one target be overruled by a SEPARATE `rec` argument (typically the very same probe
-    # result, since `routes.py` derives `outcomes[0]` from it) whose own `target_id` failed
-    # the Tier-2 check on its own — printing "this review did not establish that a central
-    # claim depends on it" about a target the review had, one branch earlier, established
-    # exactly that about. `claim_status` never had this bug because `kind == "reconciliation"`
-    # and `kind == "target"` are mutually exclusive outcomes of `material_target_failure`
-    # (Tier 1/2 is tried first; the legacy single-reconciliation path only runs when it finds
-    # nothing) — the bug was specific to `rec.status` being tested directly, ahead of `kind`.
-    if kind == "target":
-        where = getattr(source, "target_id", "?")
-        prov = getattr(source, "provenance", "")
-        if getattr(source, "disposition", "") == "PAPER_ARITHMETIC_CONTRADICTION":
-            blame = ("The paper's own printed composition does not evaluate to the total it "
-                     "states. Nothing was executed and no artifact was required.")
-            return "RED", (f"Paper-internal arithmetic contradiction at target {where}: "
-                           f"{getattr(source, 'reason', '')} {blame}")
-        blame = ("The audited repository's own code does not reproduce the number it prints "
-                 "for this target." if prov == "repo_exec" else
-                 "The program that ran was a human-written reproduction of the paper's "
-                 "method, not the authors' checkout; whether it is faithful is not "
-                 "machine-checked.")
-        return "RED", (f"Failed code reproduction at target {where}: "
-                       f"{getattr(source, 'reason', '')} {blame}")
-
-    if rec is not None and rec.status == "FAILED_REPRODUCTION":
-        if rec.provenance not in ADMISSIBLE_REPRODUCTION_PROVENANCE:
-            # The ceiling, held at the verdict gate too. Reaching here means an upstream
-            # bug or an edited artifact; a program not entitled to reconcile a printed cell
-            # does not get to convict a paper — reported as a harness defect INSTEAD of the
-            # conviction, never alongside it.
-            return "GREEN", (
-                f"A reconciliation reported FAILED_REPRODUCTION with provenance "
-                f"'{rec.provenance or '(none)'}', which the provenance ceiling "
-                f"does not admit. That status should have been unreachable, so it is "
-                f"treated as a harness defect and NOT as evidence about the paper.")
-        if kind != "reconciliation":
-            # kind == "" here (never "target" — handled above): Tier 2 did not bind THIS
-            # reconciliation's own target_id to a central claim. An established defect that
-            # does not stop the paper. Still printed under `## Established failures`.
-            return "GREEN", (
-                f"A reproduction failed at "
-                f"{rec.target_id or rec.table_ref or 'a target'} and "
-                f"the failure is established, but this review did not establish that a "
-                f"central scientific claim of the paper depends on it, so it does not "
-                f"reject the paper. It is reported in full below.")
-        where = f" at {rec.table_ref}" if rec.table_ref else ""
-        # WHO ran decides what the failure means. Only `repo_exec` is the authors' own
-        # checkout; attributing a `driver` script's failure to them would be the one
-        # accusation this system must never make by accident.
-        if rec.provenance == "repo_exec":
-            blame = ("The audited repository's own code does not reproduce the number it "
-                     "prints, so the central claim does not stand on the evidence the "
-                     "authors supplied.")
-        elif rec.provenance == "driver":
-            blame = ("The program that ran was a human-written reproduction of the paper's "
-                     "method, not the authors' checkout. Whether it is faithful is not "
-                     "machine-checked, so read the script before relying on this verdict.")
-        else:
-            blame = (f"The program that ran was '{rec.provenance}', which the "
-                     f"provenance ceiling does not admit, so this status should not have "
-                     f"been reachable — treat it as a harness defect.")
-        return "RED", f"Failed code reproduction{where}: {rec.reason} {blame}"
-
-    if calibration:
-        return "GREEN", (
-            "the only thing that ran was the identical-arms noise-floor calibration, "
-            "which measures this machine and reconciles nothing about the paper")
-
-    concerns = material_concerns(findings)
-    n_minor = sum(1 for f in findings if counted(f) == "MINOR")
-    established = [o for o in (outcomes or []) if getattr(o, "establishes_failure", False)]
-    non_material = (f" {len(established)} established defect(s) are reported below and none "
-                    f"of them is on a target this review established a central claim to "
-                    f"depend on, so none rejects the paper." if established else "")
-    if concerns:
-        return "GREEN", (f"No material failure established. {len(concerns)} MAJOR concern(s) and "
-                         f"{n_minor} MINOR were recorded and are printed in full — a concern "
-                         f"weakens a claim, it does not reject one, and no number of them "
-                         f"accumulates into a rejection.{non_material}")
-    return "GREEN", (f"No material failure established; {n_minor} MINOR finding(s). This is the "
-                     f"absence of an established failure within the audited scope, not a "
-                     f"certificate of correctness.{non_material}")
-
-
 # A central target that was ATTEMPTED and settled nothing — the ONLY non-finding state that
 # colours a paper (invariant 17, CLAUDE.md). Anything less specific measures this harness's
 # own configuration rather than the paper.
@@ -457,54 +356,6 @@ def unchecked_central(objects: list | None, outcomes: list | None) -> list:
     return out
 
 
-def triage(findings: list[Finding], reconciliation: Reconciliation | None = None,
-           *, outcomes: list | None = None, objects: list | None = None,
-           probe: ProbeResult | None = None) -> tuple[str, str]:
-    """RED | YELLOW | GREEN — the REVIEW-level routing decision. RED is exactly
-    `claim_status == VERIFIED_FAILURE`. What this adds is a split inside the old GREEN:
-
-        YELLOW  something needs your attention: a verified MAJOR concern, or a central
-                claim this system could address and could not settle.
-        GREEN   nothing needed attention within the audited scope — stated, because GREEN
-                is not a certificate of correctness.
-
-    Neither YELLOW nor GREEN is an accusation. Every input is harness-derived; a model
-    cannot write any of the three.
-    """
-    verdict, reason = overall_verdict(findings, reconciliation, outcomes=outcomes,
-                                      objects=objects, probe=probe)
-    if verdict == "RED":
-        return "RED", reason
-
-    concerns = material_concerns(findings)
-    stalled = unresolved_central(objects, outcomes)
-    if concerns or stalled:
-        parts = []
-        if concerns:
-            lenses = ", ".join(sorted({f.lens for f in concerns}))
-            parts.append(f"{len(concerns)} MAJOR concern(s) from {lenses} survived verification")
-        if stalled:
-            parts.append(f"{len(stalled)} central claim(s) an experiment was run for and which "
-                         f"it did not settle")
-        return "YELLOW", (
-            "Needs a human reviewer's attention: " + "; ".join(parts) + ". No material "
-            "failure was established — a concern weakens a claim and does not reject one, "
-            "and an unsettled check is a limit of this review, not a defect in the paper.")
-
-    n_minor = sum(1 for f in findings if counted(f) == "MINOR")
-    established = [o for o in (outcomes or []) if getattr(o, "establishes_failure", False)]
-    if established:
-        return "GREEN", (
-            f"No material failure: {len(established)} established defect(s) are reported "
-            f"below and none of them is on a target this review established a central "
-            f"claim to depend on, so none rejects the paper. {n_minor} MINOR finding(s) "
-            f"recorded. Read the established defects — this is not a clean bill of health.")
-    return "GREEN", (
-        f"No material failure and no unresolved central concern within the audited scope; "
-        f"{n_minor} MINOR finding(s) recorded. This is the absence of an established "
-        f"problem in what was checked, not a certificate of correctness.")
-
-
 def severity_review(findings: list[Finding]) -> list[str]:
     """Currently-COUNTED FATAL/MAJOR findings whose evidence is not a checkable cell
     citation. Flags only; `harness.grading.derive` is where earning happens, and even a
@@ -533,23 +384,24 @@ def grading_review(findings: list[Finding]) -> list[str]:
             for f in findings if f.counted_severity and f.counted_severity != f.severity]
 
 
-def verdict_sensitivity(findings: list[Finding], reconciliation: Reconciliation | None = None,
-                        *, outcomes: list | None = None, objects: list | None = None) -> str:
-    """The identical materiality table, applied only to findings whose evidence is a
-    verified table cell. Not a second opinion — a reproduction failure passes through
-    unchanged, because it is arithmetic against a cell rather than a graded finding."""
+def claim_status_sensitivity(findings: list[Finding], reconciliation: Reconciliation | None = None,
+                             *, outcomes: list | None = None, objects: list | None = None) -> str:
+    """The identical `claim_status` epistemic-state table, applied only to findings whose
+    evidence is a verified table cell. Not a second opinion — a reproduction failure passes
+    through unchanged, because it is arithmetic against a cell rather than a graded finding."""
     cell_backed = [f for f in findings if f.evidence_class == "cell_verified"]
-    return overall_verdict(cell_backed, reconciliation, outcomes=outcomes, objects=objects)[0]
+    return claim_status(cell_backed, reconciliation, outcomes=outcomes, objects=objects)[0]
 
 
-def verdict_if_lens_severity_only(findings: list[Finding],
-                                  reconciliation: Reconciliation | None = None,
-                                  *, outcomes: list | None = None,
-                                  objects: list | None = None) -> str:
-    """The verdict this paper would have received before independent grading existed — the
-    identical table over the identical findings with `counted_severity` erased."""
+def claim_status_if_lens_severity_only(findings: list[Finding],
+                                       reconciliation: Reconciliation | None = None,
+                                       *, outcomes: list | None = None,
+                                       objects: list | None = None) -> str:
+    """The epistemic state this paper would have carried before independent grading
+    existed — the identical table over the identical findings with `counted_severity`
+    erased."""
     lens_only = [f.model_copy(update={"counted_severity": ""}) for f in findings]
-    return overall_verdict(lens_only, reconciliation, outcomes=outcomes, objects=objects)[0]
+    return claim_status(lens_only, reconciliation, outcomes=outcomes, objects=objects)[0]
 
 
 def build_chain(findings: list[Finding], probe: ProbeResult | None) -> ExperimentalChain | None:
@@ -938,8 +790,10 @@ def _scientific_block(r: EvalReport) -> list[str]:
 def render_eval_report(r: EvalReport) -> str:
     """EvalReport -> markdown, the complete machine trace. Pure: no LLM, no network."""
     ranked = rank(r.findings)
-    badge = {"RED": "🔴 RED — a material failure was established",
-             "GREEN": "🟢 GREEN — no material failure established"}.get(r.verdict, r.verdict)
+    disposition_label = {
+        "STOP_MATERIAL_FAILURE": "STOP_MATERIAL_FAILURE — a material failure was established",
+        "PASS_TO_HUMAN_CLEAN": "PASS_TO_HUMAN_CLEAN — no material failure established",
+    }.get(r.disposition, r.disposition or "NOT_REVIEWED")
     counts = {s: sum(1 for f in r.findings if counted(f) == s) for s in _SEVERITY_RANK}
     lens_counts = {s: sum(1 for f in r.findings if f.severity == s) for s in _SEVERITY_RANK}
     graded_delta = counts != lens_counts
@@ -947,19 +801,19 @@ def render_eval_report(r: EvalReport) -> str:
     L = [
         f"# First-Round Review — {r.title or r.paper_id}",
         "",
-        f"**Verdict: {badge}**",
+        f"**Disposition: {disposition_label}**",
     ]
     if r.verdict_contested:
         L += ["", f"🚩 **CONTESTED** — the independent substantive read below "
                  f"(`{r.substantive_verdict.verdict if r.substantive_verdict else ''}`) disagrees "
-                 f"sharply with this deterministic verdict. Neither is overruled; this needs a "
-                 f"human look before the verdict above is relied on as-is."]
+                 f"sharply with this deterministic disposition. Neither is overruled; this needs a "
+                 f"human look before the disposition above is relied on as-is."]
     executed = bool(r.probe and ((r.probe.executions or 0) > 0 or r.probe.seeds_run))
     route_label = "What ran" if executed else "Prepared route"
     route_value = (r.execution_provenance or "SYNTHESIZED_DIAGNOSTIC") if r.probe else "NONE"
     L += [
         "",
-        f"> {r.verdict_reason}",
+        f"> {r.disposition_reason}",
         "",
         f"`{r.paper_id}` · {r.n_pages} pages · {r.n_sections} sections · {r.n_tables} tables · "
         f"{r.n_numbers} reported numbers",
@@ -973,7 +827,7 @@ def render_eval_report(r: EvalReport) -> str:
         "",
         "| | |",
         "|---|---|",
-        f"| **Paper decision** | {r.verdict} |",
+        f"| **Disposition** | `{r.disposition or 'NOT_REVIEWED'}` |",
         f"| **Claim status** | `{r.claim_status or 'NOT_VERIFIED'}` |",
         f"| **Supporting evidence** | "
         f"{_SUPPORT_ROW.get(r.claim_status, _SUPPORT_ROW['NOT_VERIFIED'])} |",
@@ -1053,10 +907,12 @@ def render_eval_report(r: EvalReport) -> str:
               f"serious candidate(s) independently graded by a second, blinded reviewer that saw "
               f"none of: the lens's severity, the lens's name, any other finding, or how findings "
               f"are counted.", ""]
-        if r.verdict_if_lens_severity_only and r.verdict_if_lens_severity_only != r.verdict:
-            L += [f"**Grading moved this verdict.** On the lenses' own asserted severities alone, "
-                  f"the same materiality table would have yielded "
-                  f"**{r.verdict_if_lens_severity_only}** rather than **{r.verdict}**.", ""]
+        if (r.claim_status_if_lens_severity_only
+                and r.claim_status_if_lens_severity_only != r.claim_status):
+            L += [f"**Grading moved this claim status.** On the lenses' own asserted "
+                  f"severities alone, the same materiality table would have yielded "
+                  f"**{r.claim_status_if_lens_severity_only}** rather than "
+                  f"**{r.claim_status}**.", ""]
         moved = grading_review(r.findings)
         for line in moved[:MAX_THREAT_BULLETS]:
             L.append(f"- {line}")
@@ -1129,18 +985,20 @@ def render_eval_report(r: EvalReport) -> str:
         L += ["## Severity caveat", "",
               f"{len(ungraded)} of {sum(1 for f in r.findings if f.severity in ('FATAL', 'MAJOR'))} "
               f"FATAL/MAJOR finding(s) rest on prose rather than a cited table cell. Severity is "
-              f"assigned by the lens and is not machine-verified, and it is what the verdict "
-              f"counts — check these first:", ""]
+              f"assigned by the lens and is not machine-verified, and it is what the claim "
+              f"status counts — check these first:", ""]
         L += [f"- {u}" for u in ungraded]
         L += [""]
-        if r.verdict_if_cell_backed_only and r.verdict_if_cell_backed_only != r.verdict:
-            L += [f"**This verdict depends on them.** Counting only findings whose evidence is a "
-                  f"verified table cell, the same materiality table yields "
-                  f"**{r.verdict_if_cell_backed_only}** rather than **{r.verdict}**. The "
-                  f"difference is carried entirely by grades the harness cannot check.", ""]
-        elif r.verdict_if_cell_backed_only:
-            L += [f"The verdict does not depend on them: counting only cell-verified findings, the "
-                  f"same materiality table still yields **{r.verdict_if_cell_backed_only}**.", ""]
+        if (r.claim_status_if_cell_backed_only
+                and r.claim_status_if_cell_backed_only != r.claim_status):
+            L += [f"**This claim status depends on them.** Counting only findings whose "
+                  f"evidence is a verified table cell, the same materiality table yields "
+                  f"**{r.claim_status_if_cell_backed_only}** rather than **{r.claim_status}**. "
+                  f"The difference is carried entirely by grades the harness cannot check.", ""]
+        elif r.claim_status_if_cell_backed_only:
+            L += [f"The claim status does not depend on them: counting only cell-verified "
+                  f"findings, the same materiality table still yields "
+                  f"**{r.claim_status_if_cell_backed_only}**.", ""]
 
     # Blockquoted, not interpolated bare, so a stray '#' or '```' in the lens's own prose
     # cannot forge a heading or open an unclosed fence that swallows the rest of the report.
@@ -1201,7 +1059,7 @@ def render_eval_report(r: EvalReport) -> str:
 # Twelve distinct caps, none collapsible into another: each bounds a DIFFERENT section, so
 # a paper with issues in six categories still shows a few of each rather than emptying one
 # budget into another silently.
-_MAX_RED, _MAX_YELLOW, _MAX_HELD, _MAX_OPEN = 5, 4, 3, 3
+_MAX_ESTABLISHED, _MAX_STALLED, _MAX_HELD, _MAX_OPEN = 5, 4, 3, 3
 _MAX_READING = 4
 _MAX_PER_CATEGORY = 3
 _MAX_FINDINGS_SHOWN = 8
@@ -1243,13 +1101,6 @@ def _rate(value) -> str:
     """A rate, or the word that must appear where one cannot be computed. `None` is not
     zero and is not one: an empty surface has no denominator."""
     return "not computable" if value is None else f"{value:.0%}"
-
-
-_TRIAGE_GLOSS = {
-    "RED": "a material problem was established on evidence this system re-verified",
-    "YELLOW": "needs a human reviewer's attention; nothing was established either way",
-    "GREEN": "no material problem established within the scope that was actually checked",
-}
 
 
 def _targets_summary(outcomes: list | None) -> dict:
@@ -1503,7 +1354,7 @@ def render_reviewer_report(report: EvalReport, target_set: TargetSet | None = No
     failed = [o for o in outcomes if getattr(o, "establishes_failure", False)]
     if failed:
         L.append("## Established failures")
-        for o in failed[:_MAX_RED]:
+        for o in failed[:_MAX_ESTABLISHED]:
             obj = next((x for x in objects if x.target_id == o.target_id), None)
             _basis = getattr(obj, "materiality_basis", "NONE") or "NONE"
             _material_line = (
@@ -1576,7 +1427,7 @@ def render_reviewer_report(report: EvalReport, target_set: TargetSet | None = No
     stalled = unresolved_central(objects, outcomes)
     if stalled:
         L += ["## Central claims an experiment ran for and did not settle"]
-        for obj in stalled[:_MAX_YELLOW]:
+        for obj in stalled[:_MAX_STALLED]:
             o = by_target.get(obj.target_id)
             L += ["", f"- **{obj.target_id}** — {_short(getattr(obj, 'claim_text', ''))}",
                   f"  - {_short(getattr(o, 'reason', '') or 'not attempted', 200)}"]
@@ -1585,8 +1436,8 @@ def render_reviewer_report(report: EvalReport, target_set: TargetSet | None = No
     held = [o for o in outcomes if o.disposition in ("REPRODUCED", "PAPER_ONLY_RESOLVED")]
     L += ["", "## What held up"]
     if not held:
-        L += ["", "Nothing was positively verified. GREEN here would mean 'not checked', "
-                  "and this report does not say that."]
+        L += ["", "Nothing was positively verified. An empty section here would mean "
+                  "'not checked', and this report does not say that."]
     for o in held[:_MAX_HELD]:
         obj = next((x for x in objects if x.target_id == o.target_id), None)
         L += ["", f"- **{o.target_id}** ({o.disposition.replace('_', ' ').lower()}) — "
@@ -1677,7 +1528,6 @@ def render_reviewer_report(report: EvalReport, target_set: TargetSet | None = No
             L.append(f"- …and {len(unchecked) - _MAX_OPEN} more; see `discovery/targets.json`.")
 
     eff = report.review_efficiency or {}
-    triage_level = report.triage or report.verdict or "GREEN"
     fun = {
         "discovered": eff.get("targets_discovered", 0),
         "checkable": eff.get("targets_addressable", 0),
@@ -1716,8 +1566,10 @@ def render_reviewer_report(report: EvalReport, target_set: TargetSet | None = No
               f"{v} {k.replace('_', ' ').lower()}"
               for k, v in sorted((report.targets_summary or {}).items()) if v)
               or "no target reached an outcome"),
-          f"- triage for routing: **{triage_level}** — {_TRIAGE_GLOSS.get(triage_level, '')}",
-          f"  {_short(report.triage_reason or report.verdict_reason, 400)}",
+          f"- disposition: **{report.disposition or 'NOT_REVIEWED'}**"
+          + (f" (established by {report.disposition_basis})"
+             if report.disposition_basis and report.disposition_basis != "NONE" else ""),
+          f"  {_short(report.disposition_reason, 400)}",
           (f"- review-surface coverage: an address was minted for "
            f"{cov.addressed}/{cov.surface_size} addressable unit(s) of the paper "
            f"({_rate(cov.addressed_rate)}), and a route was pursued for "
@@ -1974,7 +1826,6 @@ def derive_outcome(report: EvalReport, target_set: TargetSet | None = None, *,
                       if unchecked_central else
                       f"{pursued} of {len(outs)} target(s) reached an evidence route"),
         claim_status=getattr(report, "claim_status", "") or "NOT_VERIFIED",
-        triage=getattr(report, "triage", "") or getattr(report, "verdict", "") or "GREEN",
     )
 
 
@@ -2211,7 +2062,7 @@ ESTABLISHED_BY: dict[str, str] = {
     "SEVERITY_ONLY_CAPPED":
         "Finding.counted_severity against Finding.severity, ranked by grading.RANK",
     "NO_MODEL_WROTE_THE_DECISION":
-        "EvalReport.verdict against EvalReport.claim_status and its "
+        "EvalReport.disposition against EvalReport.claim_status and its "
         "machine-checkable cause",
     "NO_EXPERIMENT_DOWNSCALED":
         "TargetOutcome.launched on every RESOURCE_BLOCKED target",
@@ -2226,7 +2077,8 @@ ESTABLISHED_BY: dict[str, str] = {
     "REFEREE_ACCURACY_MEASURED":
         "no artifact: no adjudicated ground truth exists for this corpus",
     "PAPER_CORRECTNESS":
-        "no artifact: GREEN is the absence of an established failure, not support",
+        "no artifact: PASS_TO_HUMAN_CLEAN is the absence of an established failure, not "
+        "support for correctness",
     "NOVELTY_ASSESSED":
         "no artifact: this system has no route to prior-art search",
     "EVERY_IMPORTANT_EXPERIMENT_EXECUTABLE":
@@ -2487,12 +2339,12 @@ def _check_severity_caps(report: EvalReport) -> tuple[bool, str]:
 
 
 def _check_decision(report: EvalReport, outcomes: list) -> tuple[bool, str]:
-    verdict = (getattr(report, "verdict", "") or "").strip().upper()
+    disposition = (getattr(report, "disposition", "") or "").strip().upper()
     claim = (getattr(report, "claim_status", "") or "").strip().upper()
     established = claim == "VERIFIED_FAILURE"
-    if (verdict == "RED") != established:
-        return False, (f"verdict {verdict or '(none)'} does not project from claim status "
-                       f"{claim or '(none)'}")
+    if decide.stops_the_paper(disposition) != established:
+        return False, (f"disposition {disposition or '(none)'} does not project from claim "
+                       f"status {claim or '(none)'}")
     if established:
         fatal = sum(1 for f in (getattr(report, "findings", None) or [])
                     if (getattr(f, "counted_severity", "") or getattr(f, "severity", ""))
@@ -2505,11 +2357,11 @@ def _check_decision(report: EvalReport, outcomes: list) -> tuple[bool, str]:
         if not (fatal or target or recs):
             return False, ("a material failure was established with no deterministic "
                            "failing target or admissible failed reproduction behind it")
-        return True, (f"{verdict} from claim status {claim}: "
+        return True, (f"{disposition} from claim status {claim}: "
                       f"{len(target)} failing target(s), {len(recs)} admissible failed "
                       f"reconciliation(s)")
-    return True, (f"{verdict or 'GREEN'} from claim status {claim or 'NOT_VERIFIED'}, "
-                  f"with no material failure established")
+    return True, (f"{disposition or 'PASS_TO_HUMAN_CLEAN'} from claim status "
+                  f"{claim or 'NOT_VERIFIED'}, with no material failure established")
 
 
 def _check_no_downscale(report: EvalReport, outcomes: list) -> tuple[bool, str]:
@@ -3785,18 +3637,22 @@ def build_ledger(report: EvalReport, target_set: TargetSet | None,
 # PART 9 — assemble_report: the pure equivalent of the old `run_report`
 # =============================================================================
 
-def _verdict_agreement(substantive: SubstantiveVerdict | None, verdict: str
+def _verdict_agreement(substantive: SubstantiveVerdict | None, claim: str
                        ) -> tuple[str, bool]:
-    """Compare the whole-paper model read against the deterministic verdict. Printed,
-    never counted — its only consequence is the CONTESTED flag."""
+    """Compare the whole-paper model read against the deterministic claim status. Printed,
+    never counted — its only consequence is the CONTESTED flag. `claim != "VERIFIED_FAILURE"`
+    is exactly the old `verdict == "GREEN"` condition; `claim == "VERIFIED_FAILURE"` is
+    exactly the old `verdict == "RED"` condition — `overall_verdict`'s RED/GREEN was always
+    a strict projection of `claim_status`, so this substitution changes no behavior."""
     if substantive is None:
         return "unavailable", False
-    if substantive.verdict == "CENTRAL_CLAIM_NOT_ESTABLISHED" and verdict == "GREEN":
+    established = claim == "VERIFIED_FAILURE"
+    if substantive.verdict == "CENTRAL_CLAIM_NOT_ESTABLISHED" and not established:
         return "contested", True
-    if substantive.verdict in ("STRONG", "SOUND_WITH_MINOR_CONCERNS") and verdict == "RED":
+    if substantive.verdict in ("STRONG", "SOUND_WITH_MINOR_CONCERNS") and established:
         return "harness_harsher", False
     if (substantive.verdict in ("SUBSTANTIAL_CONCERNS", "CENTRAL_CLAIM_NOT_ESTABLISHED")
-            and verdict == "GREEN"):
+            and not established):
         return "model_harsher", False
     return "agree", False
 
@@ -3827,24 +3683,19 @@ def assemble_report(*, pid: str, title: str, doc: PaperDoc, reports: list[LensRe
     objects = list(target_set.objects) if target_set else []
 
     rec = probe.reconciliation if probe else None
-    verdict, reason = overall_verdict(findings, rec, outcomes=outcomes, objects=objects,
-                                      probe=probe)
     status, status_why = claim_status(findings, rec, outcomes=outcomes, objects=objects,
                                       probe=probe)
-    triage_level, triage_why = triage(findings, rec, outcomes=outcomes, objects=objects,
-                                      probe=probe)
-    assert triage_level in TRIAGE_LEVELS, triage_level
     repro = reproduction_status(probe)
     ran_as = provenance_label(probe.provenance) if probe else "SYNTHESIZED_DIAGNOSTIC"
-    agreement, contested = _verdict_agreement(substantive_verdict, verdict)
+    agreement, contested = _verdict_agreement(substantive_verdict, status)
 
     report = EvalReport(
-        paper_id=pid, title=title, verdict=verdict, verdict_reason=reason,
+        paper_id=pid, title=title,
         claim_status=status, claim_status_reason=status_why,
         reproduction_status=repro, execution_provenance=ran_as,
-        verdict_if_cell_backed_only=verdict_sensitivity(findings, rec, outcomes=outcomes,
-                                                        objects=objects),
-        verdict_if_lens_severity_only=verdict_if_lens_severity_only(
+        claim_status_if_cell_backed_only=claim_status_sensitivity(
+            findings, rec, outcomes=outcomes, objects=objects),
+        claim_status_if_lens_severity_only=claim_status_if_lens_severity_only(
             findings, rec, outcomes=outcomes, objects=objects),
         findings=findings, unasked_question=pick_unasked_question(reports),
         n_pages=doc.n_pages, n_sections=len(doc.sections), n_tables=len(doc.tables),
@@ -3855,7 +3706,6 @@ def assemble_report(*, pid: str, title: str, doc: PaperDoc, reports: list[LensRe
         grade_coverage={k: v for k, v in grade_coverage.items() if k != "paper_id"},
         substantive_verdict=substantive_verdict, verdict_agreement=agreement,
         verdict_contested=contested,
-        triage=triage_level, triage_reason=triage_why,
         targets_summary=_targets_summary(outcomes),
     )
     report.scientific_findings = scientific_findings(report, target_set)
@@ -3928,10 +3778,8 @@ def _self_check_decision() -> None:
         assert material_failures([_f(str(i), "protocol", s) for i, s in enumerate(sevs)]) == []
 
     # model severity cannot grant itself rejection authority
-    assert overall_verdict([_f("a", "overclaim", "FATAL")])[0] == "GREEN"
-    assert overall_verdict([_f(str(i), "protocol", "MAJOR") for i in range(40)])[0] == "GREEN"
-    assert overall_verdict([])[0] == "GREEN"
     assert claim_status([_f("a", "overclaim", "FATAL")])[0] == "NOT_VERIFIED"
+    assert claim_status([_f(str(i), "protocol", "MAJOR") for i in range(40)])[0] == "NOT_VERIFIED"
     assert claim_status([])[0] == "NOT_VERIFIED"
     assert reproduction_status(None) == "NOT_ATTEMPTED"
     assert provenance_label("repo_exec") == "AUTHOR_REPOSITORY"
@@ -3945,10 +3793,11 @@ def _self_check_decision() -> None:
     assert [f.finding_id for f in order] == ["j", "l", "k", "m"], order
     assert rank(order) == order, "rank must be stable/idempotent"
 
-    rep = EvalReport(paper_id="p", title="T", verdict="RED", verdict_reason="because",
+    rep = EvalReport(paper_id="p", title="T", disposition="STOP_MATERIAL_FAILURE",
+                     disposition_reason="because", claim_status="VERIFIED_FAILURE",
                      findings=order, unasked_question="why no baseline?", lenses_run=["protocol"])
     md = render_eval_report(rep)
-    assert "🔴 RED — a material failure was established" in md and "why no baseline?" in md
+    assert "STOP_MATERIAL_FAILURE — a material failure was established" in md and "why no baseline?" in md
     assert md.count("\n|") >= 4 and md.endswith("\n")
     assert _cell("a|b\nc", 99) == "a\\|b c", "pipes must be escaped or the table breaks"
 
@@ -3957,38 +3806,37 @@ def _self_check_decision() -> None:
         return Reconciliation(table_ref="T1:r0:c1", claimed_raw="59.28", claimed_value=59.28,
                               noise_band=0.1, status=status, reason="r", **kw)
 
-    # A failed reproduction on a MATERIAL target is RED on its own; the same defect on a
-    # target whose materiality was not established is GREEN but still reported.
+    # A failed reproduction on a MATERIAL target is VERIFIED_FAILURE on its own; the same
+    # defect on a target whose materiality was not established is NOT_VERIFIED but still
+    # reported.
     material = [DiscoveredObject(target_id="T1", materiality_basis="ABSTRACT_CLAIM")]
     incidental = [DiscoveredObject(target_id="T1", materiality_basis="NONE")]
     failed_rec = _rec("FAILED_REPRODUCTION", reproduced_value=64.1, delta_error=4.82,
                       target_id="T1")
-    v, why = overall_verdict([], failed_rec, objects=material)
-    assert v == "RED" and "Failed code reproduction" in why, why
-    v2, why2 = overall_verdict([], failed_rec, objects=incidental)
-    assert v2 == "GREEN" and "did not establish" in why2, why2
-    assert overall_verdict([], failed_rec)[0] == "GREEN", (
+    s, why = claim_status([], failed_rec, objects=material)
+    assert s == "VERIFIED_FAILURE" and "reproduction attempt failed" in why, why
+    s2, why2 = claim_status([], failed_rec, objects=incidental)
+    assert s2 == "NOT_VERIFIED" and "nothing positively reproduced" in why2, why2
+    assert claim_status([], failed_rec)[0] == "NOT_VERIFIED", (
         "a paper-level stop may never depend on whether a caller passed materiality context")
     for objs in (material, incidental, None):
-        v3, _ = overall_verdict([], failed_rec, objects=objs)
+        d, _, _ = decide.derive_disposition(
+            claim_status=claim_status([], failed_rec, objects=objs)[0])
         s3, _ = claim_status([], failed_rec, objects=objs)
-        assert (v3 == "RED") == (s3 == "VERIFIED_FAILURE"), (objs, v3, s3)
-    assert overall_verdict([], _rec("INCONCLUSIVE"))[0] == "GREEN"
-    assert overall_verdict([], _rec("RESOLVED_VERIFIED"))[0] == "GREEN"
-    assert overall_verdict([_f("a", "overclaim", "FATAL")], _rec("RESOLVED_VERIFIED"))[0] == "GREEN"
+        assert decide.stops_the_paper(d) == (s3 == "VERIFIED_FAILURE"), (objs, d, s3)
+    assert claim_status([], _rec("INCONCLUSIVE"))[0] == "NOT_VERIFIED"
+    assert claim_status([], _rec("RESOLVED_VERIFIED"))[0] == "VERIFIED_SUPPORT"
+    assert claim_status([_f("a", "overclaim", "FATAL")], _rec("RESOLVED_VERIFIED"))[0] == "VERIFIED_SUPPORT"
 
     # THE PROVENANCE CEILING, APPLIED A SECOND TIME AT THE REPORTING LAYER. The reconciler
     # (`local_exec.reconcile`) already refused to let a `synthesized` provenance settle a
     # printed cell; this asserts the SAME refusal happens again here, independently, if a
     # FAILED_REPRODUCTION carrying an inadmissible provenance ever reaches this layer
     # anyway (an edited artifact, an upstream bug) — it must read as a harness defect
-    # (GREEN, "should have been unreachable"), never as a paper-level conviction, and the
-    # matching execution-row state is EXECUTION_PRODUCED_NO_ADMISSIBLE_EVIDENCE, not
-    # EXECUTION_CONTRADICTED_A_PRINTED_QUANTITY.
+    # (NOT_VERIFIED, never a paper-level conviction), and the matching execution-row state
+    # is EXECUTION_PRODUCED_NO_ADMISSIBLE_EVIDENCE, not EXECUTION_CONTRADICTED_A_PRINTED_QUANTITY.
     inadmissible_rec = _rec("FAILED_REPRODUCTION", provenance="synthesized",
                            reproduced_value=1.0, delta_error=99, target_id="T1")
-    v4, why4 = overall_verdict([], inadmissible_rec, objects=material)
-    assert v4 == "GREEN" and "should have been unreachable" in why4, why4
     s4, _ = claim_status([], inadmissible_rec, objects=material)
     assert s4 == "NOT_VERIFIED"
     warrant = [PlanDecision(target_id="T1", requires_execution=True)]
@@ -4099,7 +3947,7 @@ def _self_check_outcome() -> None:
         plans=[PlanDecision(target_id="T", requires_execution=True)],
         outcomes=[TargetOutcome(target_id="T", disposition="INCONCLUSIVE", launched=1,
                                 provenance="synthesized", reason="the metric was unparsed")])
-    rep = EvalReport(paper_id="p", title="t", verdict="GREEN", triage="YELLOW",
+    rep = EvalReport(paper_id="p", title="t",
                      claim_status="NOT_VERIFIED", findings=[], scientific_findings=[])
     o = derive_outcome(rep, ts, unchecked_central=1)
     assert o.finding_state == "NO_CONCERN_SURVIVED_VERIFICATION"
@@ -4119,7 +3967,7 @@ def _self_check_outcome() -> None:
                     outcomes=[TargetOutcome(target_id="T1", disposition="FAILED_REPRODUCTION",
                                             provenance="repo_exec", launched=1,
                                             reason="0.61 vs 0.42")])
-    rep2 = EvalReport(paper_id="p2", verdict="RED", claim_status="VERIFIED_FAILURE",
+    rep2 = EvalReport(paper_id="p2", claim_status="VERIFIED_FAILURE",
                       findings=[_f("a", "protocol", "MAJOR")])
     o2 = derive_outcome(rep2, ts2)
     assert o2.finding_state == "MATERIAL_FAILURE_ESTABLISHED"
@@ -4178,7 +4026,7 @@ def _self_check_guarantees() -> None:
     good = Finding(finding_id="f-01", lens="overclaim", severity="MINOR", title="t",
                    statement="s", evidence_quote="q", evidence_ref="T1:r0:c0",
                    evidence_class="cell_verified")
-    rep = EvalReport(paper_id="p", verdict="GREEN", claim_status="NOT_VERIFIED",
+    rep = EvalReport(paper_id="p", claim_status="NOT_VERIFIED",
                      findings=[good], dropped_findings=2,
                      ledger_path="reports/p.ledger.json",
                      review_efficiency={"targets_discovered": 12})
@@ -4210,7 +4058,7 @@ def _self_check_guarantees() -> None:
     convicted = TargetSet(paper_id="p", outcomes=[TargetOutcome(
         target_id="T1", disposition="FAILED_REPRODUCTION", provenance="repo_exec",
         failure_class="dependency_missing", launched=1, reason="a wheel was missing")])
-    bad = derive_guarantees(rep.model_copy(update={"verdict": "RED",
+    bad = derive_guarantees(rep.model_copy(update={"disposition": "STOP_MATERIAL_FAILURE",
                                                    "claim_status": "VERIFIED_FAILURE"}),
                             convicted)
     assert "INFRASTRUCTURE_FAILURE_NEVER_CONVICTED" in bad.unmet
@@ -4223,7 +4071,8 @@ def _self_check_guarantees() -> None:
         good.model_copy(update={"severity": "MINOR", "counted_severity": "FATAL"})]})
     assert "SEVERITY_ONLY_CAPPED" in derive_guarantees(promoted, ts).unmet
     assert "NO_MODEL_WROTE_THE_DECISION" in derive_guarantees(
-        rep.model_copy(update={"verdict": "RED", "claim_status": "VERIFIED_FAILURE"}),
+        rep.model_copy(update={"disposition": "STOP_MATERIAL_FAILURE",
+                               "claim_status": "VERIFIED_FAILURE"}),
         ts).unmet
     shrunk = TargetSet(paper_id="p", outcomes=[TargetOutcome(
         target_id="T1", disposition="RESOURCE_BLOCKED", launched=1,
@@ -4259,7 +4108,7 @@ def _self_check_guarantees() -> None:
     assert trimmed.endswith("more, in the ledger)")
 
     # the section cannot become the outcome: parameter absence, same discipline as tier 1
-    for fn in (overall_verdict, claim_status, triage):
+    for fn in (claim_status, decide.derive_disposition):
         params = set(inspect.signature(fn).parameters)
         for bad_param in ("guarantees", "guarantee", "non_guarantees", "unmet"):
             assert bad_param not in params, (fn.__name__, bad_param)
@@ -4632,7 +4481,7 @@ def _self_check_ledger() -> None:
     ts.outcomes[0].launched = 3
     assert ts.outcomes[1].establishes_failure
 
-    led = build_ledger(EvalReport(paper_id="p", title="t", verdict="RED"), ts)
+    led = build_ledger(EvalReport(paper_id="p", title="t", disposition="STOP_MATERIAL_FAILURE"), ts)
     targets = [e for e in led.entries if e.entry_id.startswith("L")]
     assert [e.target_id for e in targets] == ["A", "B", "C"]
     a = targets[0]
@@ -4661,7 +4510,7 @@ def _self_check_ledger() -> None:
     assert "probe_stage_seconds" in e and "execution_seconds" not in e
 
     ts.outcomes[0].provenance = "synthesized"
-    led2 = build_ledger(EvalReport(paper_id="p", title="t", verdict="GREEN"), ts)
+    led2 = build_ledger(EvalReport(paper_id="p", title="t"), ts)
     syn = [x for x in led2.entries if x.target_id == "A"][0]
     assert "NOT admissible" in syn.admissibility
     assert led2.efficiency["executions_completed"] == 1
@@ -4679,8 +4528,8 @@ def _self_check_render_caps() -> None:
                         ref=f"T{i}:r0:c0")
                      for i in range(200)]
     assert len(many_findings) > MAX_TABLE_ROWS and len(many_findings) > MAX_THREAT_BULLETS
-    eval_rep = EvalReport(paper_id="cap-test", title="T", verdict="GREEN",
-                          verdict_reason="none established", findings=many_findings,
+    eval_rep = EvalReport(paper_id="cap-test", title="T", disposition="PASS_TO_HUMAN_CLEAN",
+                          disposition_reason="none established", findings=many_findings,
                           lenses_run=["protocol"])
     eval_md = render_eval_report(eval_rep)
     assert eval_md.count("further FATAL/MAJOR finding(s)") == 1, (
@@ -4743,9 +4592,9 @@ def _self_check_render_caps() -> None:
 
     cap_ts = TargetSet(paper_id="cap-test", objects=objects, outcomes=outcomes,
                        questions=questions_)
-    cap_rep = EvalReport(paper_id="cap-test", title="T", verdict="GREEN",
-                         verdict_reason="see established failures", triage="RED",
-                         triage_reason="material failures established",
+    cap_rep = EvalReport(paper_id="cap-test", title="T",
+                         disposition="STOP_MATERIAL_FAILURE",
+                         disposition_reason="material failures established",
                          claim_status="VERIFIED_FAILURE", scientific_findings=sfs,
                          lenses_run=["protocol"],
                          targets_summary=_targets_summary(outcomes))
@@ -4753,12 +4602,12 @@ def _self_check_render_caps() -> None:
     sections = dict(_split_sections(review_md))
 
     established_body = sections.get("## Established failures", "")
-    assert established_body.count("**Paper-internal arithmetic contradiction") == _MAX_RED, (
-        "_MAX_RED must bound how many established failures are printed")
+    assert established_body.count("**Paper-internal arithmetic contradiction") == _MAX_ESTABLISHED, (
+        "_MAX_ESTABLISHED must bound how many established failures are printed")
 
     stalled_body = sections.get(
         "## Central claims an experiment ran for and did not settle", "")
-    assert stalled_body.count("- **Y") == _MAX_YELLOW, "_MAX_YELLOW must bound this section"
+    assert stalled_body.count("- **Y") == _MAX_STALLED, "_MAX_STALLED must bound this section"
 
     held_body = sections.get("## What held up", "")
     assert held_body.count("- **H") == _MAX_HELD

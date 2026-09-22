@@ -109,13 +109,22 @@ gloss said "see the chain below" in an artifact that has no chain, which was tru
 the seven shipped reviews. The section is gone. Its state is the execution row and its
 counts are in `## Scope of this review`, where a denominator belongs.
 
-**The triage is a ROUTING decision and is printed under `## Scope of this review`.** RED
-means a material failure was ESTABLISHED. YELLOW means something needs a human's attention
-and is never an accusation. GREEN means neither, within the scope actually checked; it is
-not a certificate of correctness, and `claim_status` keeps VERIFIED_SUPPORT ("checked and
-held") apart from NOT_VERIFIED ("could not check") underneath it. RED is exactly the binary
-`overall_verdict`, unchanged. None of the three is the review's result — the findings and
-their resolution states are, and leading with the colour said otherwise.
+**The paper disposition is a ROUTING decision and is printed under `## Scope of this
+review`.** `decide.derive_disposition` (`harness/decide.py`) is the sole paper-level
+routing signal, one of the nine `schema.PAPER_DISPOSITIONS`: `STOP_MATERIAL_FAILURE`
+means a material failure was ESTABLISHED. `PASS_TO_HUMAN_UNRESOLVED` and
+`PASS_TO_HUMAN_CONCERNS` mean something needs a human's attention and are never an
+accusation. The four `BLOCKED_*` values mean this review's own gates, resources or method
+inventory could not reach a central claim — a fact about this harness, never about the
+paper. `PASS_TO_HUMAN_CLEAN` means none of the above, within the scope actually checked;
+it is not a certificate of correctness, and `claim_status` keeps VERIFIED_SUPPORT
+("checked and held") apart from NOT_VERIFIED ("could not check") underneath it.
+`STOP_MATERIAL_FAILURE` is exactly `decide.stops_the_paper`, unchanged from what the old
+binary `overall_verdict`'s RED used to mean. None of the nine values is the review's
+result — the findings and their resolution states are, and leading with a colour said
+otherwise, which is why the global triage and binary verdict were removed outright in the
+2026-09-21 de-triage pass: REFEREE is a reviewer copilot, not an acceptance-decision
+system.
 
 You are the pipeline's reviewer. `harness/pipeline.py` drives; deterministic code
 below it decides what may be concluded. Neither side may overrule the other.
@@ -224,7 +233,7 @@ every pure module below exists to stop one of them collapsing into another:
 | How much does it matter? | `severity` → `counted_severity` | nothing here SETS it; every mechanism only caps it |
 
 Plus, over the finished report: `harness/report.py`'s self-audit layer (did the review
-exercise its own discipline — 12 machine-checked items, verdict-inert) and
+exercise its own discipline — 12 machine-checked items, disposition-inert) and
 `harness/pipeline.account` (every requested paper in exactly one terminal state,
 conservation law asserted).
 
@@ -326,15 +335,20 @@ Do not weaken these to make more papers executable or more findings reportable.
 7. Capability, environment, dependency and platform failures yield `INCONCLUSIVE`, never
    `FAILED_REPRODUCTION`. Only a crash *after* the experiment demonstrably started may
    convict.
-8. The paper decision is a materiality TABLE in `harness/report.py`, not a model judgement
-   and not a count: `MATERIAL_SEVERITY = ()`. RED iff `claim_status` is
+8. The paper decision is a materiality TABLE in `harness/report.py` and `harness/decide.py`,
+   not a model judgement and not a count: `MATERIAL_SEVERITY = ()`. `claim_status` is
    VERIFIED_FAILURE — deterministic paper arithmetic or a failed reproduction from an
    admissible provenance, AND `decide.material_target_failure` establishing that a
-   central claim depends on that target. Both are necessary: an admissible FAILED
-   REPRODUCTION on a target no central claim is established to depend on is GREEN with
-   the defect reported, which 'RED iff VERIFIED_FAILURE' alone does not convey. A model-assigned FATAL is an attention signal with no rejection
-   authority. Nothing accumulates: no number of MAJORs or MINORs ever reaches RED, because a
-   concern weakens a claim and does not reject one, and the old `RED_MAJOR_ONE_LENS=3` /
+   central claim depends on that target — and only then does `decide.derive_disposition`
+   route the paper to `STOP_MATERIAL_FAILURE`. Both are necessary: an admissible FAILED
+   REPRODUCTION on a target no central claim is established to depend on leaves
+   `claim_status` at NOT_VERIFIED and the disposition at `PASS_TO_HUMAN_CONCERNS` with the
+   defect still reported, which 'STOP_MATERIAL_FAILURE iff VERIFIED_FAILURE' alone does not
+   convey. A model-assigned FATAL is an attention signal with no authority to route the
+   paper to `STOP_MATERIAL_FAILURE`. Nothing accumulates: no number of MAJORs or MINORs
+   ever reaches `STOP_MATERIAL_FAILURE` — the most a count of MAJORs can do is select
+   `PASS_TO_HUMAN_CONCERNS` over `PASS_TO_HUMAN_CLEAN` — because a concern weakens a claim
+   and does not reject one, and the old `RED_MAJOR_ONE_LENS=3` /
    `RED_MAJOR_TOTAL=10` thresholds made the decision a property of how many things a
    panel chose to write down rather than of the paper. Independent grading
    (`harness/audit.py`) still cannot promote: it changes what is *eligible* to be
@@ -374,12 +388,21 @@ Do not weaken these to make more papers executable or more findings reportable.
     `TargetOutcome`, and only `establishes_failure` — FAILED_REPRODUCTION on `driver` or
     `repo_exec` provenance — may contribute a material failure. One paper reporting a
     blocked target, a reproduced one and a failed one must report all three.
-17. **A colour may not be a property of this harness's configuration.** The first version
-    of the triage flagged every unsettled central target and made all seven corpus papers
-    YELLOW, because the execution gates are shut by default. Only a target that was
-    ATTEMPTED and settled nothing colours a paper; "we were not permitted to check this"
-    is reported in the review's scope section and counts toward nothing. This is the same
-    defect the removed `RED_MAJOR_TOTAL=10` threshold had.
+17. **A disposition may not be a property of this harness's own configuration.** The first
+    version of the triage flagged every unsettled central target and made all seven corpus
+    papers YELLOW, because the execution gates are shut by default. Only a target that was
+    ATTEMPTED and settled nothing may move the paper toward `STOP_MATERIAL_FAILURE` or a
+    `PASS_TO_HUMAN_*` disposition that reads as needing attention; "we were not permitted
+    to check this" is reported in the review's scope section, as a `BLOCKED_*`
+    disposition, and counts toward nothing. This is the same defect the removed
+    `RED_MAJOR_TOTAL=10` threshold had.
+
+    **2026-09-21 de-triage pass:** the colour axis itself was removed from the
+    architecture; this rule is no longer enforced by keeping a triage colour off of closed
+    gates — there is no triage colour left to keep off of anything — it is enforced
+    directly by `decide.derive_disposition`, whose four `BLOCKED_*` values are exactly
+    where a closed gate on a central target routes, and none of which is, or ever reaches,
+    `STOP_MATERIAL_FAILURE`.
 18. **Positional coincidence may not establish a reconciliation.** `parse_metric` prefers
     a target-bound output object over a named one over a structured one over a bare key,
     and REFUSES when the winning tier disagrees with itself. The generic last-JSON-wins
@@ -451,8 +474,8 @@ Do not weaken these to make more papers executable or more findings reportable.
     default: a naive "cited but not recovered" check over the shipped corpus produced
     twelve claims that a table or equation was missing, and all twelve of those objects
     are in the papers and absent only from what extraction recovered. Reporting those as
-    defects would make a colour a property of extraction quality, which is the defect
-    invariant 17 forbids.
+    defects would make the disposition a property of extraction quality, which is the
+    defect invariant 17 forbids.
 27. **A coverage denominator is counted off the PAPER and cannot be fabricated.**
     `harness/report.surface` takes a `PaperDoc` and nothing derived from the review; `measure`
     takes its numerators as plain address STRINGS, so a numerator cannot redefine a
@@ -717,7 +740,8 @@ experiment or a 24 GiB demand on an 8 GiB card still gets a complete review;
 a handful of open review questions is a complete, correct review of good work — not a
 reviewer that failed to try. `prompts/audit.STANCE` says so to the lens, `## Open review
 questions` prints the questions as questions, and `grading.CANDIDATE_CAP` makes sure they
-count toward no threshold. Do not read a GREEN as a missed finding.
+count toward no threshold. Do not read a `PASS_TO_HUMAN_CLEAN` disposition as a missed
+finding.
 
 **A refused experiment is a result too, and the refusals are not one refusal.**
 `planner.plan` returning INFEASIBLE_SPECIFICATION on a central attribution question is the
@@ -880,10 +904,11 @@ correction the claim-link channel needed, on a second channel, and
 between its two verified ends is still a model's reading.
 
 `artifacts.ARTIFACT_AUTHORITY` has exactly three members and level 3 is not one of them.
-An AST warning may not become RED. A code or configuration inconsistency may create a
-verified concern, establish a reproducibility defect, trigger execution, trigger focused
-validation, and become material where a central claim provably depends on it — every one
-of those is a downstream decision, and none is reachable by writing a stronger string in
+An AST warning may not route the paper to `STOP_MATERIAL_FAILURE`. A code or
+configuration inconsistency may create a verified concern, establish a reproducibility
+defect, trigger execution, trigger focused validation, and become material where a
+central claim provably depends on it — every one of those is a downstream decision, and
+none is reachable by writing a stronger string in
 this layer. `ARTIFACT_RESOLVED` is deliberately excluded from
 `TargetOutcome.establishes_failure`.
 
@@ -1240,6 +1265,58 @@ module name below was checked against the current code during this pass; the his
 prose, corpus measurements and incident records throughout this file describe what happened
 under the OLD code and remain true as history.
 
+**2026-09-21, the de-triage pass — done after, and separate from, the v4 consolidation
+above.** The global RED/YELLOW/GREEN triage and the binary RED/GREEN paper verdict were
+removed from the architecture and from the report, per an explicit user instruction:
+REFEREE is a reviewer copilot, not an acceptance-decision system, and the colour/
+accept-reject layer was not to be replaced with another disguised accept/reject score.
+`harness/report.py`'s `overall_verdict()` (the binary RED/GREEN) and `triage()`
+(RED/YELLOW/GREEN) were DELETED outright; `claim_status()` (VERIFIED_FAILURE /
+VERIFIED_SUPPORT / NOT_VERIFIED — an epistemic state, not a colour) is UNCHANGED and
+remains the substantive decision function, already feeding `finding_state` before this
+pass and still doing so. `harness/decide.py`'s `derive_disposition()` — PRE-EXISTING, not
+new today; every review already computed it, it was simply never reader-facing — is now
+the sole paper-level routing signal, over the nine `schema.PAPER_DISPOSITIONS` values
+(`STOP_MATERIAL_FAILURE`, `BLOCKED_SPECIFICATION`, `BLOCKED_ARTIFACT`, `BLOCKED_RESOURCES`,
+`BLOCKED_METHOD`, `PASS_TO_HUMAN_UNRESOLVED`, `PASS_TO_HUMAN_CONCERNS`,
+`PASS_TO_HUMAN_CLEAN`, `NOT_REVIEWED`), derived purely from `claim_status`,
+`material_concerns`, `unresolved_central` and `established_non_material` counts — never
+from a model, never a colour; `decide.stops_the_paper(disposition)` is the boolean
+equivalent of the old RED. The reviewer-facing report no longer has a "triage for
+routing: **YELLOW**" line — it has a "disposition: **{report.disposition}**" line, whose
+text comes from `report.disposition_reason`. The machine report no longer has a 🔴/🟢
+badge or a "Paper decision: RED/GREEN" table row — it has "Disposition:
+{report.disposition}", with `> {report.disposition_reason}` at the top in place of
+`> {report.verdict_reason}`. `EvalReport.verdict`, `.verdict_reason`, `.triage`,
+`.triage_reason`, `CaseState.verdict`, `schema.TRIAGE_LEVELS`, `schema.VERDICTS` and
+`ReviewOutcome.triage` (set but never rendered anywhere — dead weight) were all DELETED;
+`EvalReport.disposition`/`.disposition_basis`/`.disposition_reason` and
+`CaseState.disposition`/`.disposition_basis` (all PRE-EXISTING fields, not new) are what a
+reader or caller now uses instead. `EvalReport.verdict_if_cell_backed_only`/
+`.verdict_if_lens_severity_only` were RENAMED to `claim_status_if_cell_backed_only`/
+`claim_status_if_lens_severity_only` and now hold `claim_status` values instead of
+RED/GREEN. The CONTESTED mechanism (`EvalReport.verdict_contested`, exit code 3 from
+`run.py review`) is UNCHANGED in behavior — it still compares the model's independent
+whole-paper read against the deterministic conclusion, now phrased "against the
+deterministic claim status"/"against this deterministic disposition" instead of "against
+this verdict"; the field name `verdict_contested` itself was kept, since it names a
+disagreement rather than a colour. `harness/summarize.py`'s dossier and
+corpus-evaluation renderers (`run.py dossier`, `run.py evaluate`) no longer print a
+🔴🟡🟢 badge or matrix column — the per-paper section heading is the plain disposition
+string (e.g. `` `STOP_MATERIAL_FAILURE` ``), and the corpus rollup key changed from
+`"triage": {...}` / `"binary_verdict": {...}` to `"dispositions": {d: n for d in
+PAPER_DISPOSITIONS}`. Every finding, severity/materiality, evidence status, provenance,
+verification/reproduction state and unresolved-question field that made up the review's
+actual substance is UNCHANGED by this pass; invariants 1 through 16 and 18 through 37 are
+untouched, and only invariants 8 and 17 were reworded to state the same rules in
+`claim_status`/`disposition` vocabulary rather than RED/GREEN/YELLOW. Verification for
+this pass came from `harness/report.py`'s, `harness/schema.py`'s, `harness/pipeline.py`'s
+and `harness/summarize.py`'s own self-checks (`python -m harness.<module>`, all passing)
+plus a real end-to-end review run, not a newly-authored test suite — the same posture as,
+and subject to the same caveat as, the v4 redesign entry above: most of `tests/` does not
+currently collect, so this pass could not be independently re-verified by the test suite
+either.
+
 **Deleted by a SECOND, DESTRUCTIVE 2026-09-20 pass, later the same day than the conservative
 pass below — three routes and the remote-sandbox backend, each with a corpus measurement
 behind the decision rather than a line-count target:**
@@ -1469,7 +1546,7 @@ by grep:**
   reuse-dependent tests failed, exactly the invalidation tests still passed). The
   reconstruction-execution half of this same gap (next bullet) remains open.
 - **`harness/report.unearned_support_language` is enforced at TEST time, not at run time.**
-  It is the "GREEN may not borrow the words of evidence it does not have" guard and the
+  It is the "`claim_status` may not borrow support language it has not earned" guard and the
   renderer never calls it: `tests/test_guarantees.py` and `tests/test_reimplementation_path.py`
   run it over rendered output as an independent check. That is a defensible design (a linter
   over the renderer beats a filter inside it) and it is not what "the report refuses to say
@@ -1942,14 +2019,16 @@ were current.
   — the one thing a threshold table structurally cannot do — and it is **printed, never
   counted**. Its only consequence is a CONTESTED flag and `run.py` exit 3 when it
   disagrees sharply with the table. That is the deliberate settlement between "do not
-  derive the verdict by counting findings" and invariant #8; a model that could write the
-  colour would make every gate under it advisory.
-- The review triage is a fold over typed evidence and no model writes it, but its YELLOW
-  is dominated by `counted_severity` — which, with grading off, is the lens's own asserted
-  severity. What is machine-checked underneath it is the evidence, the derivation and the
-  caps; the grade itself is still a model's word unless `--auto-grade` ran. Demoting the
-  triage out of the review's headline limits what this costs a reader, and does not fix
-  it: the same assertion still decides which findings the triage folds over.
+  derive the disposition by counting findings" and invariant #8; a model that could write
+  the disposition would make every gate under it advisory.
+- The paper disposition is a fold over typed evidence and no model writes it, but a
+  `PASS_TO_HUMAN_CONCERNS`/`STOP_MATERIAL_FAILURE` outcome is dominated by
+  `counted_severity` — which, with grading off, is the lens's own asserted severity. What
+  is machine-checked underneath it is the evidence, the derivation and the caps; the grade
+  itself is still a model's word unless `--auto-grade` ran. Demoting the triage out of the
+  review's headline (invariant 17), and later removing the colour axis outright in the
+  2026-09-21 de-triage pass, limits what this costs a reader and does not fix it: the same
+  assertion still decides which findings `decide.derive_disposition` folds over.
 - Extraction still bounds what can be cited, and says so rather than guessing. Display
   equations are recovered in both real-world shapes (body-and-number on one line, and a
   right-margin number text extraction put on its own), but a paper whose equations

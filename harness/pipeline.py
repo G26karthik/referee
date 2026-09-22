@@ -554,7 +554,7 @@ def run_report_stage(cfg: Config, pid: str) -> dict:
 
     state.append_log(
         cfg, pid, artifact_type="eval_report", phase="report",
-        headers={"verdict": report.verdict, "claim_status": report.claim_status,
+        headers={"disposition": report.disposition, "claim_status": report.claim_status,
                  "reproduction_status": report.reproduction_status,
                  "review_path": report.review_path, "artifact_state": report.artifact_state,
                  "document_observations": len(report.document_observations),
@@ -573,12 +573,11 @@ def run_report_stage(cfg: Config, pid: str) -> dict:
                  "self_audit_failed": report.self_audit.failed if report.self_audit else []},
         path=str(md_path),
     )
-    return {"paper_id": pid, "verdict": report.verdict, "reason": report.verdict_reason,
+    return {"paper_id": pid, "reason": report.disposition_reason,
             "scientific_classes": classes,
             "review_path": report.review_path, "artifact_state": report.artifact_state,
             "document_observations": len(report.document_observations),
             "guarantees_unmet": (list(report.guarantees.unmet) if report.guarantees else []),
-            "triage": report.triage, "triage_reason": report.triage_reason,
             "disposition": report.disposition, "disposition_basis": report.disposition_basis,
             "disposition_reason": report.disposition_reason,
             "targets": report.targets_summary,
@@ -597,11 +596,10 @@ def _phase_report(cfg: Config, case: CaseState, **_) -> PhaseOutcome:
     res = run_report_stage(cfg, case.paper_id)
     if "error" in res:
         return PhaseOutcome("error", res["error"])
-    case.verdict = res.get("triage") or res["verdict"]
     case.disposition = res.get("disposition") or "NOT_REVIEWED"
     case.disposition_basis = res.get("disposition_basis") or "NONE"
     case.report_path = res["report_md"]
-    return PhaseOutcome("ok", res.get("triage_reason") or res["reason"], res)
+    return PhaseOutcome("ok", res["reason"], res)
 
 
 _HANDLERS = {
@@ -729,7 +727,8 @@ def summarize(cases: list[CaseState]) -> dict:
         "waiting": {c.paper_id or c.source: c.blocked_reason
                     for c in cases if c.status == "waiting"},
         "errors": {c.paper_id or c.source: c.blocked_reason for c in cases if c.status == "error"},
-        "verdicts": {c.paper_id: c.verdict for c in cases if c.verdict},
+        "dispositions": {c.paper_id: c.disposition for c in cases
+                         if c.disposition and c.disposition != "NOT_REVIEWED"},
         "reproduction": {c.paper_id: c.reproduction_class
                          for c in cases if c.reproduction_class},
     }
@@ -776,7 +775,7 @@ def as_result(cfg: Config, case: CaseState) -> dict:
 
     synth, collected = _detail(case, "report"), _detail(case, "collect")
     return {"status": "complete", "paper_id": case.paper_id, "title": title,
-            "verdict": case.verdict, "reason": synth.get("reason", ""),
+            "disposition": case.disposition, "reason": synth.get("reason", ""),
             "findings": synth.get("findings", collected.get("findings", 0)),
             "dropped_unsubstantiated": synth.get("dropped_unsubstantiated",
                                                  collected.get("dropped", 0)),
@@ -910,7 +909,7 @@ def _state_for(case: CaseState | None) -> tuple[str, str]:
         return "requested", "no case was ever opened for this input"
     st = _FROM_STATUS.get(case.status, "started")
     if st == "completed":
-        return st, case.verdict or "complete"
+        return st, case.disposition or "complete"
     return st, case.blocked_reason or f"status={case.status} at phase={case.phase}"
 
 
@@ -924,7 +923,7 @@ def account(requests: list[str], cases: list[CaseState | None]) -> CorpusReport:
         st, reason = _state_for(case)
         entries.append(CorpusEntry(
             source=source, paper_id=(case.paper_id if case else ""), state=st,
-            reason=reason, verdict=(case.verdict if case else ""),
+            reason=reason,
             phase=(case.phase if case else ""),
             reproduction_class=(case.reproduction_class if case else ""),
             failure_kind=(case.failure_kind if case else ""),
@@ -1076,7 +1075,7 @@ if __name__ == "__main__":  # self-check: python -m harness.pipeline
 
     # --- corpus accounting: conservation and a lost case are both visible -------------
     done = CaseState(paper_id="a", source="a.pdf", status="complete", phase="done",
-                     verdict="GREEN", report_path="reports/a.md")
+                     disposition="PASS_TO_HUMAN_CLEAN", report_path="reports/a.md")
     stuck = CaseState(paper_id="b", source="b.pdf", status="waiting", phase="audit",
                       blocked_reason="rate-limited", failure_kind="rate_limited")
     broken = CaseState(paper_id="c", source="c.pdf", status="error", phase="ingest",
