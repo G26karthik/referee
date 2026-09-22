@@ -21,9 +21,8 @@ from .provenance import admits
 from .schema import (
     ClaimRef, Comparison, DiscoveredObject, PaperDoc, PlanDecision, RouteAttempt,
     Section, TargetSet, TargetOutcome,
-    COMPARISON_KINDS, COMPARISON_STATES, DISPOSITION_BASIS, EXPERIMENT_NECESSITY,
-    MATERIALITY_BASES, NECESSITY_FOR_ACTION, PAPER_DISPOSITIONS, PLAN_ACTIONS,
-    ROUTE_ATTEMPT_STATES, VERIFICATION_ROUTES,
+    DISPOSITION_BASIS, MATERIALITY_BASES, NECESSITY_FOR_ACTION, PAPER_DISPOSITIONS,
+    PLAN_ACTIONS, VERIFICATION_ROUTES,
 )
 
 # =============================================================================
@@ -212,14 +211,6 @@ def derive_disposition(*, review_complete: bool = True, claim_status: str = "NOT
 
 def stops_the_paper(disposition: str = "") -> bool:
     return (disposition or "") == "STOP_MATERIAL_FAILURE"
-
-
-def passes_to_human(disposition: str = "") -> bool:
-    """Every disposition except a stop and a non-review does — including BLOCKED, which
-    is a limit of this review rather than a finding about the paper."""
-    return (disposition or "") in (
-        "BLOCKED_SPECIFICATION", "BLOCKED_ARTIFACT", "BLOCKED_RESOURCES", "BLOCKED_METHOD",
-        "PASS_TO_HUMAN_UNRESOLVED", "PASS_TO_HUMAN_CONCERNS", "PASS_TO_HUMAN_CLEAN")
 
 
 # =============================================================================
@@ -780,10 +771,6 @@ def established_defects(outcomes) -> list:
     """TIER 1 ALONE: every outcome whose own evidence route established a defect,
     deliberately blind to materiality, objects and route."""
     return [o for o in (outcomes or []) if getattr(o, "establishes_failure", False)]
-
-
-def has_established_defect(outcomes) -> bool:
-    return bool(established_defects(outcomes))
 
 
 def unjoinable_established_failures(objects, outcomes) -> list[str]:

@@ -58,6 +58,11 @@ WHAT YOU MUST PRODUCE:
      (`impl_quote`, copied verbatim from the script you are submitting — this will be
      checked against the script text you return, so it must match exactly).
 
+REPLICATION: if the paper states how many seeds, trials, runs or repetitions THIS
+experiment used, report that number in `replication.runs` with the sentence stating it,
+copied verbatim, in `replication.paper_quote`. The harness runs exactly that many seeds;
+never report fewer than the paper used. If the paper states none, use null and "".
+
 If you cannot write a binding for some required ingredient without inventing a detail the
 paper omits, say so plainly in `notes` and leave that ingredient's `impl_ref`/`impl_quote`
 empty rather than fabricating a locator. An honest partial answer is a correct outcome
@@ -75,6 +80,7 @@ Print ONLY this JSON to standard output:
    {"kind": "metric", "impl_ref": "...", "impl_quote": "..."},
    {"kind": "comparison_target", "impl_ref": "...", "impl_quote": "..."}
  ],
+ "replication": {"runs": 10, "paper_quote": "the paper's sentence stating it, verbatim"},
  "notes": "anything you could not bind without inventing a detail, or '' if none"}"""
 
 

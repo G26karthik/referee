@@ -52,17 +52,11 @@ class ReviewerCLIError(RuntimeError):
         self.kind, self.retry, self.reset_hint = kind, retry, reset_hint
 
 
-# Back-compat: every existing call site across this codebase says `AuditDriverError` —
-# `harness/audit_driver.py` re-exports this same alias so `from harness.audit_driver import
-# AuditDriverError` keeps working for callers that predate this module's split out of it.
-AuditDriverError = ReviewerCLIError
-
-
 class RateLimited(ReviewerCLIError):
     """A refusal that a LATER attempt could satisfy and an immediate one cannot: the
     operator's own account over its usage limit, a 429, an overloaded or 5xx upstream.
 
-    A subclass of `ReviewerCLIError` so every existing `except AuditDriverError` still
+    A subclass of `ReviewerCLIError` so every existing `except ReviewerCLIError` still
     catches it, and a distinct class so `fill()` can route it away from `failed` (a
     quality problem with the reviewer's output that a retry might well fix) for the
     controller to treat differently — a `later` failure must not consume a retry attempt.

@@ -379,7 +379,7 @@ def resolve_metric(doc: PaperDoc, table_ref: str, cmd: CandidateCommand | None,
 
     if not ident.cell_quantity:
         ident.state = "unmapped"
-        merged = len(re.findall(r"\(\s*[⇓⇑]\s*\)|mem|time", header, re.I)) > 1
+        merged = len(re.findall(r"\(\s*[⇓⇑]\s*\)|\bmem\b|\btime\b", header, re.I)) > 1
         ident.reason = (
             f"the column header {header!r} "
             + ("collapses several columns into one during extraction, so which quantity this "

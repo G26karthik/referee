@@ -15,6 +15,9 @@ cannot prove what it could reach.
 
     python tools/subagent_accept.py pending <paper-id> [...]
     python tools/subagent_accept.py seal <paper-id> <unit-id> <staged-file>
+    python tools/subagent_accept.py reimpl-brief <paper-id> <out-dir>
+    python tools/subagent_accept.py reimpl-verify-brief <paper-id> <generated.json> <out.md>
+    python tools/subagent_accept.py reimpl-seal <paper-id> <target-id> <generated.json> [<verdict.json>]
 
 `unit-id` is what `AuditUnit.unit_id` prints: `overclaim` for a whole-paper reading,
 `overclaim/part-02` or `overclaim/synthesis` for a split one.
@@ -28,7 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from harness import agent, state  # noqa: E402
+from harness import agent, reimplement_driver, state  # noqa: E402
 from harness import audit as audit_stage  # noqa: E402
 from harness.config import Config  # noqa: E402
 from harness.schema import PaperDoc  # noqa: E402
@@ -158,7 +161,80 @@ def main(argv: list[str]) -> int:
         print(f"{argv[1]}/{argv[2]}: {rec['findings']} finding(s) "
               f"sha={rec['content_sha256'][:12]} mode={rec['delegation_mode']}")
         return 0
+    if argv[0] == "reimpl-brief":
+        for tid, path in reimpl_briefs(cfg, argv[1], Path(argv[2])):
+            print(f"brief    {argv[1]}/{tid}: {path}")
+        return 0
+    if argv[0] == "reimpl-verify-brief":
+        ready = _readiness(cfg, argv[1])
+        script, bindings, _notes, meta = reimplement_driver.parse_reimplementation_report(
+            Path(argv[2]).read_text(encoding="utf-8"))
+        Path(argv[3]).write_text(reimplement_driver._verification_brief(
+            ready, script, bindings, meta.get("replication")), encoding="utf-8")
+        print(f"verify   {argv[3]}")
+        return 0
+    if argv[0] == "reimpl-seal":
+        conf = reimpl_seal(cfg, argv[1], argv[2], Path(argv[3]),
+                           Path(argv[4]) if len(argv) > 4 else None)
+        print(f"{argv[1]}/{argv[2]}: established={conf.established} — {conf.reason[:160]}")
+        return 0
     raise SystemExit(__doc__)
+
+
+# --- governed reconstruction through session subagents ---------------------------------
+# `reimplement_driver.run` is the only automated writer, and it spawns CLI subprocesses.
+# These three commands are the same brief, the same independent-verifier brief and the
+# same `accept_reimplementation` seal, with the generator and the verifier being two
+# separate session subagents. The verifier is named on the seal ONLY if its reply parses
+# as approved under `reimplement_driver._parse_verification` — the rule `run()` applies —
+# so a rejected or absent verdict seals a reconstruction `authorize()` will refuse.
+
+def _readiness(cfg: Config, pid: str):
+    from harness import discover
+    doc = PaperDoc(**state.read_json(state.project_dir(cfg, pid) / "paper" / "doc.json"))
+    return discover.reimplementation_readiness(doc)
+
+
+def reimpl_briefs(cfg: Config, pid: str, out_dir: Path) -> list[tuple[str, Path]]:
+    """One generator brief per INDEPENDENT_RECONSTRUCTION target, built exactly as
+    `routes.attempt_reimplementation_fallback` builds it."""
+    from harness import routes
+    doc = PaperDoc(**state.read_json(state.project_dir(cfg, pid) / "paper" / "doc.json"))
+    ready = _readiness(cfg, pid)
+    if not ready.established:
+        raise SystemExit(f"{pid}: the paper does not specify enough for a reconstruction")
+    _ts, pairs, deferred = routes._executable_targets(cfg, pid)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = []
+    for obj, plan in pairs + deferred:
+        if plan.route != "INDEPENDENT_RECONSTRUCTION":
+            continue
+        spec = routes.build_spec(cfg, pid, doc, obj)
+        tid = spec.target_id or "default"
+        path = out_dir / f"{tid}.brief.md"
+        path.write_text(reimplement_driver.build_brief(
+            ready, paper_title=doc.title, claim=spec.claim, table_ref=spec.table_ref,
+            claimed_cell_value=spec.claimed_cell_value,
+            paper_text=routes._full_paper_text(doc)), encoding="utf-8")
+        out.append((tid, path))
+    return out
+
+
+def reimpl_seal(cfg: Config, pid: str, target_id: str, generated: Path,
+                verdict: Path | None):
+    approved = False
+    if verdict is not None and verdict.is_file():
+        approved, _why = reimplement_driver._parse_verification(
+            verdict.read_text(encoding="utf-8"))
+    reimplement_driver.accept_reimplementation(
+        cfg, pid, target_id, generated.read_text(encoding="utf-8"), _readiness(cfg, pid),
+        reviewer="session subagent verifier (separate isolated context)" if approved else "",
+        generated_by="session subagent generator (isolated context)",
+        mode="SESSION_SUBAGENT")
+    sealed = reimplement_driver.load_accepted(cfg, pid, target_id)
+    if sealed is None:
+        raise SystemExit(f"{pid}/{target_id}: sealed and still refused by load_accepted")
+    return sealed[1]
 
 
 if __name__ == "__main__":

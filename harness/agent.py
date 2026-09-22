@@ -580,6 +580,8 @@ def strip_harness_keys(data: dict) -> tuple[dict, int, int]:
     for key, value in data.items():
         if key in _LENS_ALLOWED:
             clean[key] = value
+        elif key in HARNESS_OWNED_REPORT_KEYS:
+            stripped += 1
         else:
             unknown += 1
     out_findings = []
@@ -994,7 +996,7 @@ if __name__ == "__main__":
     assert _f.verified_observation == "", "a lens may not certify its own reasoning"
     assert _f.evidence_class == "unverified" and _f.counted_severity == ""
     assert _f.finding_class == "UNGRADED"
-    assert _meta["harness_keys_stripped"] == 4, _meta
+    assert _meta["harness_keys_stripped"] == 5, _meta     # 4 finding keys + schema_version
     assert _meta["unknown_keys_dropped"] == 1, _meta
     for _k in HARNESS_OWNED_FINDING_KEYS:
         assert _k in Finding.model_fields, _k          # every harness-owned key is real

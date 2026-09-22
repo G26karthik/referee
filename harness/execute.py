@@ -66,6 +66,7 @@ from . import isolation as isolation_mod
 from . import provenance as provenance_mod
 from . import state
 from .config import Config
+from .experiment_id import identities_established
 from .schema import (
     ArmStats, CommitVerification, ConfigurationIdentity, ExecAuthorization, ExecCapability,
     ExecutionRecord, ExperimentIdentity, MetricIdentity, ProbeResult, ProbeSpec,
@@ -276,8 +277,12 @@ class ExecutionBackend(ABC):
     @abstractmethod
     def execute(self, req: ExecRequest) -> ExecOutcome: ...
 
-    @abstractmethod
-    def cleanup(self, root: Path, pid: str) -> list[str]: ...
+    def cleanup(self, root: Path, pid: str) -> list[str]:
+        env_dir = Path(root) / "runs" / pid / "env"
+        if not env_dir.is_dir():
+            return []
+        shutil.rmtree(env_dir, ignore_errors=True)
+        return [str(env_dir)]
 
     def release(self, root: Path, pid: str) -> tuple[bool, str]:
         return False, "this backend leases nothing, so there is nothing to release"
@@ -350,13 +355,6 @@ class LocalBackend(ExecutionBackend):
         return ExecOutcome(launched=True, completed=True, returncode=p.returncode,
                            stdout=p.stdout or "", stderr=p.stderr or "",
                            seconds=round(time.time() - t0, 3), ended_at=_utc(), **stamp)
-
-    def cleanup(self, root: Path, pid: str) -> list[str]:
-        env_dir = Path(root) / "runs" / pid / "env"
-        if not env_dir.is_dir():
-            return []
-        shutil.rmtree(env_dir, ignore_errors=True)
-        return [str(env_dir)]
 
 
 class ContainerBackend(ExecutionBackend):
@@ -587,13 +585,6 @@ class ContainerBackend(ExecutionBackend):
                            stdout=p.stdout or "", stderr=p.stderr or "",
                            seconds=round(time.time() - t0, 3), ended_at=_utc(), **stamp)
 
-    def cleanup(self, root: Path, pid: str) -> list[str]:
-        env_dir = Path(root) / "runs" / pid / "env"
-        if not env_dir.is_dir():
-            return []
-        shutil.rmtree(env_dir, ignore_errors=True)
-        return [str(env_dir)]
-
 
 class DeclaredBackend(ExecutionBackend):
     """An environment this harness knows the specification of but cannot drive. Every
@@ -672,10 +663,6 @@ _REGISTRY: dict[str, type[ExecutionBackend]] = {
     "kaggle": KaggleBackend,
     "colab": ColabBackend,
 }
-
-
-def register_backend(name: str, cls: type[ExecutionBackend]) -> None:
-    _REGISTRY[name] = cls
 
 
 def registered_backends() -> list[str]:
@@ -887,17 +874,6 @@ def verify_commit(repo: str | Path, expected: str, tree=None) -> CommitVerificat
 # resolution algorithms that PRODUCE these identities) are not yet folded in — see the
 # module docstring.
 # ========================================================================================
-def identities_established(experiment: ExperimentIdentity | None, metric: MetricIdentity | None,
-                           configuration: ConfigurationIdentity | None) -> tuple[bool, str, str]:
-    """(ok, failure_class, reason). The single place the three links are ANDed together."""
-    for ident, cls, label in ((experiment, "experiment_unidentified", "experiment"),
-                              (metric, "metric_unbound", "metric"),
-                              (configuration, "configuration_unmatched", "configuration")):
-        if ident is None:
-            return False, cls, f"{label} identity was never assessed"
-        if not ident.established:
-            return False, cls, f"{label} identity is '{ident.state}': {ident.reason}"
-    return True, "none", "experiment, metric and configuration identity all established"
 
 
 # ========================================================================================
@@ -1912,6 +1888,13 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
                 f"seed-to-seed noise measured as exactly 0 over {len(result.seeds_run)} seeds "
                 f"on {device}: the seed is not perturbing the pipeline. Measured delta was "
                 f"{delta:+.4f}.")
+        elif len(spec.arms) < 2:
+            # One arm has no between-arm delta: "within_noise" of itself would contradict
+            # the cell reconciliation below, which is this run's only verdict.
+            result.verdict = "single_arm"
+            result.reason = (
+                f"one arm ({spec.arms[0] if spec.arms else '?'}), std {std:.4f} ({how}) over "
+                f"{len(result.seeds_run)} seeds on {device}; see the cell reconciliation")
         elif calibration:
             if spec.claimed_delta is not None:
                 result.claim_within_noise = abs(spec.claimed_delta) < 2 * std

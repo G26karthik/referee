@@ -508,6 +508,10 @@ class ReimplementationConformance(_Base):
     bindings: list[ReimplementationBinding] = Field(default_factory=list)
     unbound: list[str] = Field(default_factory=list)
     reason: str = ""
+    # The paper's own replication count for this experiment, as the generator declared it.
+    # 0 = none declared; used only after `routes` re-finds `replication_quote` in the paper.
+    replication_runs: int = 0
+    replication_quote: str = ""
 
 
 # =============================================================================
@@ -747,20 +751,6 @@ class CandidateCommand(_Base):
     label: str = Field(default="")
 
 
-class ArgSpec(_Base):
-    """One CLI argument an entrypoint's own `argparse.add_argument` declares. Read from
-    SOURCE only, never from a real invocation."""
-
-    flag: str = ""
-    default: str = ""
-    choices: list[str] = Field(default_factory=list)
-    type: str = ""
-    required: bool = False
-    is_flag: bool = Field(default=False, description="store_true: presence only")
-    source_ref: str = ""
-    returncode: int | None = None
-
-
 class _Identity(_Base):
     state: str = Field(default="unmapped", description=" | ".join(IDENTITY_STATES))
     evidence: list[IdentityEvidence] = Field(default_factory=list)
@@ -936,7 +926,7 @@ RECONCILIATION_STATUSES = ("RESOLVED_VERIFIED", "FAILED_REPRODUCTION", "INCONCLU
                           "NOT_ATTEMPTED")
 # "not_started" appended: a corpus review of `paper4-snri-nullresult` found this value
 # in production data with no declared home — see INVARIANT_MAP.md's conservation-law note.
-PROBE_VERDICTS = ("detectable", "within_noise", "calibration", "degenerate", "failed",
+PROBE_VERDICTS = ("detectable", "within_noise", "calibration", "degenerate", "failed", "single_arm",
                  "not_started")
 
 

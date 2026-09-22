@@ -30,7 +30,6 @@ call can smuggle a decision in unverified.
 """
 from __future__ import annotations
 
-import bisect
 import os
 import re
 from collections import Counter
@@ -554,13 +553,17 @@ def _probe_block(p: ProbeResult) -> list[str]:
                     "detectable": (f"🟢 **Synthesized mechanism probe (`{p.mechanism}`) — the effect "
                                    f"CLEARS the noise band.**")}.get(p.verdict, "")
     else:
+        # A one-arm result written before `single_arm` existed still says within_noise.
+        verdict = "single_arm" if len(p.arms) < 2 else p.verdict
         head = {"within_noise": "🔴 **The measured effect sits inside the noise band.**",
-                "detectable": "🟢 **The measured effect clears the noise band.**"}.get(p.verdict, "")
+                "detectable": "🟢 **The measured effect clears the noise band.**",
+                "single_arm": "⚪ **One arm, no between-arm delta** — the cell reconciliation "
+                              "is this run's verdict."}.get(verdict, "")
     out = [head, "", f"Ran on `{p.device}` over {len(p.seeds_run)} seeds"
                      f"{f' ({len(p.seeds_failed)} failed)' if p.seeds_failed else ''}"
                      f" in {p.seconds:.0f}s.", "",
            "| quantity | value |", "|---|---|"]
-    if not calibration:
+    if not calibration and len(p.arms) >= 2:
         out.append(f"| measured delta | {p.measured_delta:+.4f} |")
     out += [f"| seed noise (1σ) | {p.measured_std:.4f} |",
             f"| detectability band (2σ) | {p.noise_band:.4f} |"]
@@ -625,7 +628,10 @@ _REPO_HEAD = {
 }
 _RECONCILE_HEAD = {
     "RESOLVED_VERIFIED": "🟢 **RESOLVED / VERIFIED** — the executed metric matches the printed cell.",
-    "FAILED_REPRODUCTION": "🔴 **FATAL — FAILED CODE REPRODUCTION.**",
+    # Not "FATAL" (severity is the materiality model's, not this block's) and not "CODE"
+    # (a reimplementation fails here too); the provenance row says what ran.
+    "FAILED_REPRODUCTION": "🔴 **FAILED REPRODUCTION** — the executed metric does not match "
+                           "the printed cell.",
     "INCONCLUSIVE": "⚪ **Inconclusive** — no reproduction verdict can be drawn.",
     "NOT_ATTEMPTED": "⚪ **Not attempted.**",
 }
@@ -1143,7 +1149,7 @@ CATEGORY_GLOSS = {
 _RESOLUTION_GLOSS = {
     "RESOLVED_FROM_PAPER": "settled against the paper itself",
     "RESOLVED_FROM_ARTIFACT": "settled by reading the released code",
-    "RESOLVED_BY_EXECUTION": "settled by running the authors' code",
+    "RESOLVED_BY_EXECUTION": "settled by an admissible execution",
     "UNRESOLVED": "open",
     "NOT_INVESTIGATED": "not investigated",
 }
@@ -1221,12 +1227,17 @@ def coverage_numerators(target_set: TargetSet | None = None) -> tuple[tuple[str,
     return tuple(addressed), tuple(examined)
 
 
-def artifact_axis(probe: ProbeResult | None) -> tuple[str, str]:
+def artifact_axis(probe: ProbeResult | None, inspected_commit: str = "") -> tuple[str, str]:
     """(artifact_state, review_path) — see `taxonomy.artifact_state`. `execution_provenance`
     alone reads SYNTHESIZED_DIAGNOSTIC for a paper with no code, a refused clone, a failed
-    clone, and an unauthorized clone: four opposite facts under one token."""
+    clone, and an unauthorized clone: four opposite facts under one token.
+
+    `inspected_commit` is the ARTIFACT_INSPECTION route's pinned snapshot: that route clones
+    without building a ProbeResult, and without it a checkout on disk read "never ran"."""
     acq = getattr(probe, "repo", None) if probe is not None else None
     status = getattr(acq, "status", "") or ""
+    if status in ("", "not_attempted") and inspected_commit:
+        status = "cloned"
     cap = getattr(probe, "capability", None) if probe is not None else None
     established = bool(getattr(cap, "established", False))
     state = taxonomy.artifact_state(status, capability_established=established)
@@ -1378,8 +1389,13 @@ def render_reviewer_report(report: EvalReport, target_set: TargetSet | None = No
                 L += ["", f"- **Failed reproduction — {o.target_id}**",
                       f"  - claim: {_short(getattr(obj, 'claim_text', ''))}",
                       f"  - evidence: {_short(o.reason)}",
-                      f"  - why it matters: the authors' own artifact does not produce the "
-                      f"quantity the paper prints for this target.",
+                      ("  - why it matters: an independent reimplementation of the paper's "
+                       "stated method (not the authors' code) does not produce the quantity "
+                       "the paper prints for this target."
+                       if provenance_mod.label(getattr(o, "provenance", "")) == "INDEPENDENT_REIMPLEMENTATION"
+                           else
+                       "  - why it matters: the authors' own artifact does not produce the "
+                       "quantity the paper prints for this target."),
                       _material_line]
         L.append("")
 
@@ -2826,11 +2842,7 @@ _WINDOW_BEFORE, _WINDOW_AFTER = 40, 90
 
 _AVERAGE_HEADER = re.compile(r"^(avg|avg\.|average|mean|overall|all)\b", re.IGNORECASE)
 _NUMBER = re.compile(r"^[-+]?\d+(?:\.\d+)?$")
-_WS = re.compile(r"\s+")
-
-
-def _norm(text: str) -> str:
-    return _WS.sub(" ", (text or "").replace("­", "")).strip()
+_norm = paper._norm
 
 
 def _printed_label(label: str = "", caption: str = "") -> str:
@@ -2954,10 +2966,7 @@ def citations(doc: PaperDoc) -> tuple[_Citation, ...]:
     return tuple(found)
 
 
-def _flat_index(offsets: list[int], original_index: int) -> int:
-    """The flattened coordinate for an index into the original text (`locate.flatten`'s
-    inverse, by bisection)."""
-    return bisect.bisect_left(offsets, original_index)
+_flat_index = paper._flat_index
 
 
 def _caption_shaped(quote: str, number: str) -> bool:
@@ -3709,7 +3718,15 @@ def assemble_report(*, pid: str, title: str, doc: PaperDoc, reports: list[LensRe
         targets_summary=_targets_summary(outcomes),
     )
     report.scientific_findings = scientific_findings(report, target_set)
-    report.artifact_state, report.review_path = artifact_axis(probe)
+    inspected = ""
+    if cfg is not None:
+        from . import state
+        route = state.project_dir(cfg, pid) / "artifact" / f"{pid}.route.json"
+        try:           # an unsealed plain overwrite: unreadable means "no snapshot"
+            inspected = ((state.read_json(route).get("snapshot") or {}).get("commit") or "")
+        except (OSError, ValueError, AttributeError):
+            inspected = ""
+    report.artifact_state, report.review_path = artifact_axis(probe, inspected)
     report.document_observations = list(observe(doc))
     surf = surface(doc)
     addressed, examined = coverage_numerators(target_set)
@@ -3867,7 +3884,7 @@ def _self_check_decision() -> None:
     assert "b.py" not in hit and "audited as unsafe for reviewer output" in hit
     body = "\n".join(_reconciliation_block(_rec("FAILED_REPRODUCTION", reproduced_value=64.1,
                                                 delta_error=4.82, seeds_run=[0, 1, 2])))
-    assert "FAILED CODE REPRODUCTION" in body and "0.1000" in body and "4.8200" in body
+    assert "FAILED REPRODUCTION" in body and "0.1000" in body and "4.8200" in body
     print("report/decision self-check ok")
 
 

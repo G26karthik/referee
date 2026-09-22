@@ -173,13 +173,15 @@ def _invoke_fresh(cfg: Config, prompt_text: str, timeout_s: int) -> tuple[str, d
 
 
 def _verification_brief(readiness: ReimplementationReadiness, script: str,
-                        bindings: list[dict]) -> str:
+                        bindings: list[dict], replication: dict | None = None) -> str:
     return f"""{RP.SECURITY}
 
 You are the independent verifier, not the generator. Check the proposed reconstruction
 against every paper-owned required ingredient below. Reject any invented method,
 training, dataset, metric, or comparison detail, and reject a locator whose quoted text
-is not present at that exact implementation location.
+is not present at that exact implementation location. Also reject if the paper states
+how many seeds/trials/runs this experiment used and the proposed replication below is
+absent, smaller, or quotes a sentence that does not state it.
 
 === PAPER INGREDIENTS ===
 {ingredients_table(readiness)}
@@ -191,6 +193,9 @@ is not present at that exact implementation location.
 
 === PROPOSED BINDINGS ===
 {json.dumps(bindings, ensure_ascii=False)}
+
+=== PROPOSED REPLICATION (runs = seeds the harness will execute) ===
+{json.dumps(replication or {"runs": None, "paper_quote": ""}, ensure_ascii=False)}
 
 Print only JSON:
 {{"approved": true_or_false,
@@ -254,6 +259,10 @@ def parse_reimplementation_report(text: str) -> tuple[str, list[dict], str, dict
     if not isinstance(bindings, list):
         bindings = []
     clean_bindings = [b for b in bindings if isinstance(b, dict) and b.get("kind")]
+    rep = data.get("replication") if isinstance(data.get("replication"), dict) else {}
+    runs = rep.get("runs")
+    if isinstance(runs, int) and not isinstance(runs, bool) and 0 < runs <= 1000:
+        meta["replication"] = {"runs": runs, "paper_quote": str(rep.get("paper_quote") or "")}
     return str(data["script"]), clean_bindings, str(data.get("notes") or ""), meta
 
 
@@ -311,6 +320,12 @@ def conformance(readiness: ReimplementationReadiness, script: str,
         independently_verified=independent)
 
 
+def _replication(conf: ReimplementationConformance, meta: dict) -> None:
+    rep = meta.get("replication") or {}
+    conf.replication_runs = int(rep.get("runs") or 0)
+    conf.replication_quote = str(rep.get("paper_quote") or "")
+
+
 def _paths(cfg: Config, pid: str, target_id: str) -> tuple[Path, Path]:
     out = (state.project_dir(cfg, pid) / "runs" / pid / "reimplementation" /
            f"{target_id or 'default'}.json")
@@ -346,9 +361,10 @@ def accept_reimplementation(cfg: Config, pid: str, target_id: str, raw: str,
     manual-acceptance channel `stages.audit.accept_lens` / `grade_stage.accept_grade` /
     `verdict_driver.accept_verdict` already give their phases, completing the set for
     this one."""
-    script, bindings, _notes, _meta = parse_reimplementation_report(raw)
+    script, bindings, _notes, meta = parse_reimplementation_report(raw)
     conf = conformance(readiness, script, bindings, generated_by=generated_by,
                        verified_by=reviewer)
+    _replication(conf, meta)
     prov = delegation.provenance_record(mode=mode, reviewer=reviewer, tool_policy=tool_policy)
     return _seal(cfg, pid, target_id, script, conf, {
         "written_by": prov["written_by"], "delegation_mode": prov["delegation_mode"],
@@ -408,7 +424,8 @@ def run(cfg: Config, prompt_text: str, readiness: ReimplementationReadiness, *,
         return None
 
     checked = _invoke_fresh(
-        cfg, _verification_brief(readiness, script, bindings), timeout_s)
+        cfg, _verification_brief(readiness, script, bindings, meta.get("replication")),
+        timeout_s)
     approved = False
     verifier_note = "independent verifier did not complete"
     verify_record: dict = {}
@@ -418,6 +435,7 @@ def run(cfg: Config, prompt_text: str, readiness: ReimplementationReadiness, *,
     conf = conformance(
         readiness, script, bindings, generated_by="reimplementation_generator",
         verified_by=("reimplementation_verifier" if approved else ""))
+    _replication(conf, meta)
     if pid:
         try:
             _seal(cfg, pid, target_id, script, conf, {

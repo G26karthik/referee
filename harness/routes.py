@@ -711,12 +711,44 @@ def attempt_reimplementation_fallback(
     if sealed is None:
         return None
     script, conf = sealed
+    # Cells of one table share one experiment's protocol (alpha, generator, seeds). If an
+    # independent verifier refused a sibling reconstruction of that table, this one's
+    # approval rests on which verifier ran, not on the paper, so it may not settle a cell.
+    table = re.match(r"T\d+", base_spec.table_ref or "")
+    if conf.established and table:
+        rdir = root / "runs" / pid / "reimplementation"
+        for f in sorted(rdir.glob(f"TGT-*-{table.group()}r*.json")):
+            sib = f.stem
+            if sib == target_id or sib.endswith((".driver", ".spec")):
+                continue
+            other = reimplement_driver.load_accepted(cfg, pid, sib)
+            if other is not None and not other[1].established:
+                conf = conf.model_copy(update={"established": False, "reason": (
+                    f"sibling reconstruction {sib} of the same table was not approved by its "
+                    f"independent verifier; a shared-protocol assumption is unsettled, so no "
+                    f"cell of {table.group()} is reconciled from a reconstruction")})
+                break
+    # The paper's replication count replaces the harness default only once its quote is
+    # re-found in the paper and names that number as a count of seeds/runs/trials
+    # (invariant 1); running fewer seeds than the paper did is the downscaling invariant 6
+    # forbids.
+    seeds = list(base_spec.seeds) or [0, 1, 2]
+    quote = " ".join((conf.replication_quote or "").split())
+    if (conf.replication_runs and re.search(
+            rf"\b{conf.replication_runs}\b.{{0,30}}\b(seed|run|trial|repetition|repeat|time)s?\b"
+            rf"|\b(seed|run|trial|repetition|repeat)s?\b.{{0,30}}\b{conf.replication_runs}\b",
+            quote, re.I)
+            and quote in " ".join(_full_paper_text(doc).split())):
+        seeds = list(range(conf.replication_runs))
     fspec = ProbeSpec(
         paper_id=pid, target_id=target_id, finding_id=base_spec.finding_id,
         claim=base_spec.claim, claim_ref=base_spec.claim_ref, claim_kind=base_spec.claim_kind,
         table_ref=base_spec.table_ref, claimed_cell_value=base_spec.claimed_cell_value,
-        metric=base_spec.metric or "accuracy", seeds=list(base_spec.seeds) or [0, 1, 2],
-        arms=["reproduction"], script=script, provenance="reimpl_exec",
+        # A label only (the value is read from SH_METRIC). Unset means the target named no
+        # metric, and the schema default "accuracy" would mislabel e.g. a set size.
+        metric=(base_spec.metric if "metric" in base_spec.model_fields_set
+                else f"printed value at {base_spec.table_ref or base_spec.claim_ref}"),
+        seeds=seeds, arms=["reproduction"], script=script, provenance="reimpl_exec",
         interpreter=(acq.env_path if acq is not None else "") or "",
         reimplementation_conformance=conf, written_by="harness")
     fspec = establish_comparison(fspec, fallback_plan.route)

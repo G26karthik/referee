@@ -42,24 +42,39 @@ INGREDIENTS: tuple[tuple[str, bool, tuple[str, ...]], ...] = (
     ("dataset", True, ("dataset", "corpus", "benchmark", "we evaluate on", "test set",
                        "training set", "samples", "records")),
     ("metric", True, ("accuracy", "precision", "recall", "f1", "f-score", "auc", "bleu",
-                      "perplexity", "error rate", "mse", "rmse", "map", "iou", "dice")),
+                      "perplexity", "error rate", "mse", "rmse", "map", "iou", "dice",
+                      "set size", "interval width", "cumulative regret", "success rate",
+                      "average reward", "episode return", "hit ratio")),
     ("hyperparameters", False, ("learning rate", "batch size", "weight decay", "dropout",
                                 "momentum", "temperature", "hidden size", "num_layers",
                                 "seed")),
 )
 _ALGORITHM_BLOCK = re.compile(r"\balgorithm\s+\d+\b", re.I)
 _MAX_QUOTE = 200
+# Title page and bibliography describe OTHER work: a cited "Adam Stein" is not an optimizer.
+_NOT_THE_PAPER = ("references", "bibliography", "acknowledg")
+
+
+def _needle(n: str) -> re.Pattern:
+    """Word-start match; a short word needle must also end a word ("map" is not "mapping")."""
+    tail = r"(?![a-z])" if len(n) <= 4 and n[-1].isalpha() else ""
+    return re.compile(r"\b" + re.escape(n) + tail, re.I)
 
 
 def _find(needles: tuple[str, ...], doc: PaperDoc) -> tuple[str, str]:
     """First (locator, quote) matching any needle — the surrounding sentence, so a human
     can check it against the section it names."""
     for s in doc.sections:
+        title = (s.title or "").strip().lower()
+        if title.startswith(_NOT_THE_PAPER) or (
+                not title and s.section_idx == 0 and len(doc.sections) > 1):
+            continue
         low = s.text.lower()
         for n in needles:
-            i = low.find(n)
-            if i < 0:
+            m = _needle(n).search(s.text)
+            if not m:
                 continue
+            i = m.start()
             start = max(0, low.rfind(".", 0, i) + 1)
             end = low.find(".", i)
             end = len(s.text) if end < 0 else end + 1
@@ -741,17 +756,23 @@ def _question_for_every_executable_target(
 
 
 _CONCLUSION = {
-    "REPRODUCTION_SUCCESS": "the paper's stated value was re-derived from the authors' own "
-                            "code; this question is closed in the paper's favour.",
-    "REPRODUCTION_FAILURE": "the authors' own code, run at a verified commit, did not "
-                            "produce the value the paper states.",
+    # Provenance-neutral on purpose: an admissible run is either the authors' code at a
+    # verified commit or a verified independent reimplementation (reimpl_exec); the
+    # target's own reason says which.
+    "REPRODUCTION_SUCCESS": "an admissible run (the authors' code at a verified commit, or a "
+                            "verified independent reimplementation of the stated method) "
+                            "re-derived the paper's stated value; see the target for which.",
+    "REPRODUCTION_FAILURE": "an admissible run (the authors' code at a verified commit, or a "
+                            "verified independent reimplementation of the stated method) did "
+                            "not produce the value the paper states; see the target for which.",
     "PAPER_INTERNAL_EVIDENCE": "settled against the paper's own printed content, with "
                                "nothing executed.",
     "ARTIFACT_EVIDENCE": "settled by reading the released code.",
     "ARTIFACT_LIMITATION": "no usable artifact reached this question. Nothing about the "
                            "paper follows from that.",
-    "ENVIRONMENT_LIMITATION": "this host could not mount the experiment. A fact about the "
-                              "machine, not about the paper.",
+    "ENVIRONMENT_LIMITATION": "the experiment was not run: this host, a harness gate or an "
+                              "unproven precondition refused it. A fact about the run, not "
+                              "about the paper.",
     "SPECIFICATION_LIMITATION": "the paper does not specify enough to build the experiment "
                                 "that would answer this. Reported unresolved rather than "
                                 "answered with an invented one.",

@@ -30,12 +30,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import agent, assessment, decide, discover, routes, state
+from . import agent, assessment, discover, routes, state
 from .audit import (attach, coverage as grade_coverage_fn, load_reports, missing_reading_artifacts,
                     reading_record, run_audit, run_grade)
 from .config import Config
 from .prompts import verdict as verdict_prompts
-from .report import (CATEGORY_ORDER, assemble_report, build_ledger, counted, rank,
+from .report import (CATEGORY_ORDER, assemble_report, counted, rank,
                      render_eval_report, render_reviewer_report)
 from .schema import (CORPUS_STATES, PHASES, CaseState, CorpusEntry, CorpusReport, PaperDoc,
                      PhaseEvent, ProbeResult, ReadingRecord)
@@ -488,8 +488,22 @@ def run_report_stage(cfg: Config, pid: str) -> dict:
                          f"audit/<lens>.json for each, then re-run."}
     state.set_phase(cfg, pid, "report")
 
+    # `routes.run` writes only its FIRST target's result to control/probe_results.json;
+    # every other target's sits under control/targets/<id>/. Surface the most informative
+    # admissible one, so the machine report's Reproduction row cannot hide a failed (or
+    # reproduced) target behind the first target's inconclusive one. Ties keep the first.
+    # Materiality still gates any paper-level consequence inside `claim_status`.
+    from . import provenance as provenance_mod
+    status_rank = {"FAILED_REPRODUCTION": 2, "RESOLVED_VERIFIED": 1}
     probe_path = state.control_dir(root) / "probe_results.json"
-    probe = ProbeResult(**state.read_json(probe_path)) if probe_path.exists() else None
+    paths = [probe_path, *sorted((state.control_dir(root) / "targets").glob("*/probe_results.json"))]
+    probes = [ProbeResult(**state.read_json(p)) for p in paths if p.exists()]
+    probe = max(probes, default=None, key=lambda p: status_rank.get(
+        getattr(p.reconciliation, "status", ""), 0) if provenance_mod.admits(p.provenance) else 0)
+    # Acquisition is per paper and recorded on the first target's result only.
+    if probe is not None and probes and probe is not probes[0] and (
+            getattr(probe.repo, "status", "not_attempted") in ("", "not_attempted")):
+        probe.repo = probes[0].repo
 
     attach(cfg, pid, doc, reports)             # in-place: sets counted_severity etc.
     cov = grade_coverage_fn(cfg, pid)

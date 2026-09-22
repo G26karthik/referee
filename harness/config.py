@@ -264,41 +264,6 @@ class Config:
         PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
         return cls()
 
-    def open_delegation_gates(self, *, auto_audit: bool = False, auto_grade: bool = False,
-                              substantive_verdict: bool = False) -> list[str]:
-        """Widen the three delegation gates from an operator's per-invocation FLAGS.
-        Returns the names of the gates this call actually opened.
-
-        The defect this exists to fix, verbatim from the shipped strings: `run.py review
-        --paper x.pdf --auto-audit --auto-grade` — the command the project's own
-        documentation calls "the entrypoint" — set neither gate, so the operator got back
-        *"auto-audit gate is closed; set SH_ALLOW_AUTO_AUDIT=1 (or pass --auto-audit)"*
-        having just passed `--auto-audit`. The gate and the message that described it
-        disagreed, and the message was the one a human read.
-
-        WIDENING ONLY, and never narrowing: a `False` argument leaves a gate that the
-        environment opened exactly as it was. An operator who exported
-        `SH_ALLOW_GRADING=1` and then ran without `--auto-grade` did not ask for grading
-        to be turned off, and a flag default silently closing a gate the environment
-        opened is the same class of surprise in the other direction.
-
-        THE REJECTED ALTERNATIVE was to read `sys.argv` here, so the flags would work
-        without any caller doing anything. It is one line and it is wrong twice: a
-        library that inspects the process's command line opens a gate in any process
-        whose argv happens to contain the string — a test runner, a subagent, an
-        unrelated tool — and it makes the widening invisible at the call site, which is
-        the one place a security-relevant decision has to be readable. So this is a
-        method the entrypoint must CALL, and `tests/test_delegation_path.py` asserts that
-        the promise the drivers print and the wiring that fulfils it cannot drift apart.
-        """
-        opened: list[str] = []
-        for asked, attr in ((auto_audit, "allow_auto_audit"), (auto_grade, "allow_grading"),
-                            (substantive_verdict, "allow_substantive_verdict")):
-            if asked and not getattr(self, attr):
-                setattr(self, attr, True)
-                opened.append(attr)
-        return opened
-
     def has_gpu(self) -> bool:
         """Cheap check that does not import torch into the harness process."""
         return shutil.which("nvidia-smi") is not None
