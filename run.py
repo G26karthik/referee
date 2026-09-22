@@ -1,14 +1,20 @@
 #!/usr/bin/env python
 """single-harness CLI — an autonomous replication auditor for ML papers.
 
-    python run.py review --paper a.pdf b.pdf c.pdf [--auto-audit] [--auto-grade]
+    python run.py review --paper a.pdf b.pdf c.pdf
+    python run.py tasks <paper-id-or-pdf> [--json]
+    python run.py seal <paper-id> <task-id> <file>
     python run.py dossier [<paper-id> ...]
     python run.py stage <ingest|audit|grade|probe|report> --paper <pdf-or-id>
     python run.py list
     python run.py status <paper-id>
 
-`review` is the entrypoint. Everything else is a way to look at what it did, or to
-re-run one stage by hand while debugging.
+`review` is the entrypoint for a paper that needs no delegated judgement this run (or one
+that already has everything sealed). `tasks`/`seal` are the entrypoint for THE one
+delegation channel this harness has: the controlling Claude Code session dispatches its
+own isolated subagents, one per delegable unit -- see `harness/tasks.py`'s module
+docstring for the full protocol. Everything else is a way to look at what happened, or
+to re-run one stage by hand while debugging.
 
 Exit codes:  0 complete · 2 waiting on lens evidence · 1 error ·
              3 complete but CONTESTED (the independent substantive read disagrees
@@ -25,8 +31,8 @@ import json
 import sys
 from pathlib import Path
 
-from harness import agent, pipeline, routes, state
-from harness.audit import LENSES, accept_grade, accept_lens, run_audit, run_grade
+from harness import agent, pipeline, routes, state, tasks as tasks_mod
+from harness.audit import run_audit, run_grade
 from harness.config import Config
 from harness.stages import ingest as ingest_stage
 
@@ -52,8 +58,7 @@ def cmd_review(args: argparse.Namespace) -> int:
     cfg = Config.load()
     if args.require_grades:
         cfg.require_grades = True
-    opts = dict(force_probe=args.force_probe, skip_probe=args.skip_probe,
-                auto_audit=args.auto_audit, auto_grade=args.auto_grade)
+    opts = dict(force_probe=args.force_probe, skip_probe=args.skip_probe)
 
     if len(args.paper) == 1:
         res = pipeline.review(cfg, args.paper[0], **opts)
@@ -79,9 +84,8 @@ def cmd_review(args: argparse.Namespace) -> int:
         summary = ", ".join(f"{n} {k.replace('_', ' ').lower()}"
                             for k, n in cats.items()) or "no findings survived verification"
         print(f"\n=== {res['title']} ===")
-        # THE DISPOSITION FIRST, because it is the one line a caller acts on — see
-        # `harness/decide.py`. It is a routing description, not an accept/reject score:
-        # it says what happens to the paper now.
+        # THE DISPOSITION FIRST: the one line a caller acts on, a routing description
+        # not an accept/reject score.
         rep = _detail(res, "S4 report")
         if disp := rep.get("disposition"):
             basis = rep.get("disposition_basis") or "NONE"
@@ -89,9 +93,7 @@ def cmd_review(args: argparse.Namespace) -> int:
                                              if basis != "NONE" else ""))
             print(f"              {rep.get('disposition_reason', '')}")
         print(f"{summary}\n")
-        # The REVIEWER report, not the machine trace. The two are separate artifacts and
-        # printing the trace to a terminal is what invariant 19 exists to stop; the trace
-        # is on disk at `report_md` for anyone tracing a line of this.
+        # The REVIEWER report, not the machine trace: the trace is on disk at `report_md`.
         review = res.get("reviewer_report_md") or res.get("report_md")
         print(Path(review).read_text(encoding="utf-8"))
         print(f"machine trace: {res['report_md']}")
@@ -101,28 +103,22 @@ def cmd_review(args: argparse.Namespace) -> int:
 
     out = Path(args.out) if args.out else None
     res = pipeline.review_papers(cfg, args.paper, dossier_out=out, **opts)
-    # A PREFLIGHT REFUSAL (invariant 35) has a different shape than a completed batch --
-    # no "papers"/"complete"/"errors" keys, because nothing was allocated. Printing the
-    # named-files message here is the whole point of refusing before spending anything;
-    # falling through to the success-shaped block below crashed with KeyError: 'papers'
-    # on every refused batch, which hid the message the refusal exists to show.
+    # A PREFLIGHT REFUSAL has a different shape than a completed batch -- no
+    # "papers"/"complete"/"errors" keys, because nothing was allocated.
     if err := res.get("error"):
         print(f"\n=== BATCH REFUSED — nothing was reviewed ===\n{err}")
         return 1
     for r in res["results"]:
         _echo_steps(f"[{r.get('paper_id', r['input'])}] ", r)
 
-    # CORPUS ACCOUNTING FIRST, and by REQUEST rather than by result. "5 papers reviewed"
-    # when six were asked for is the summary shape this block exists to make impossible:
-    # every requested paper appears on exactly one line, and `harness.pipeline.account` has
-    # already asserted that the states sum to the request count.
+    # CORPUS ACCOUNTING FIRST, and by REQUEST rather than by result: every requested
+    # paper appears on exactly one line, and `harness.pipeline.account` has already
+    # asserted the states sum to the request count.
     corpus = res.get("corpus") or {}
     if corpus:
         print(f"\n=== CORPUS: {corpus.get('summary', '')} ===")
         for e in corpus.get("entries", []):
-            # `state` says how the run ended and `disposition` says what happens to the
-            # paper; a batch summary that printed only the first made STOP_MATERIAL_FAILURE
-            # and BLOCKED_ARTIFACT both read as `completed`.
+            # `state` says how the run ended; `disposition` says what happens to the paper.
             extra = e.get("disposition") or e.get("failure_kind") or ""
             note = f" · {e['resume_after']}" if e.get("resume_after") else ""
             print(f"  {e['state']:<13} {(e.get('paper_id') or e['source'])[:34]:<34} "
@@ -162,20 +158,12 @@ def cmd_review(args: argparse.Namespace) -> int:
 
 
 def cmd_accept(args: argparse.Namespace) -> int:
-    """Validate and seal lens files a reviewer produced OUTSIDE the auto-audit path.
-
-    The manual channel has always been first-class — `review` without `--auto-audit`
-    writes `audit/prompts/<lens>.md`, exits 2, and resumes once the lens files exist —
-    but the only way to actually SEAL one was to import `harness.audit.accept_lens` from
-    Python. So the documented path required writing code, and the obvious alternative
-    (drop the JSON straight into `audit/<lens>.json`) is exactly the side-write that
-    `lens_is_accepted` refuses, because it skips `parse_lens_json`'s validation and
-    leaves no provenance record. This is that gate as a command.
-
-    Reads from a staging directory rather than accepting inline JSON: a lens report runs
-    to tens of kilobytes, which does not belong on a command line, and staging-then-
-    promoting is the same discipline `agent.run_lens` already uses.
-    """
+    """Validate and seal a driver-supplied FAITHFUL-REPRODUCTION spec staged OUTSIDE the
+    lens/grade/verdict/reconstruction/artifact-review protocol. Every OTHER role is
+    sealed through `python run.py seal <paper-id> <task-id> <file>` -- see
+    `harness/tasks.py`. This command is what remains for `routes.accept_spec`'s manual
+    channel: a human- or driver-authored mechanism script that carries no
+    lens/grade/verdict shape of its own."""
     cfg = Config.load()
     root = state.project_dir(cfg, args.paper)
     accepted, refused = {}, {}
@@ -184,50 +172,18 @@ def cmd_accept(args: argparse.Namespace) -> int:
         try:
             accepted[label] = fn(src.read_text(encoding="utf-8"))
         except Exception as e:
-            # Kept, not deleted: "the reviewer produced something and it was not a
-            # report" is worth reading — the same reasoning `run_lens` applies to its
-            # own `.rejected.txt`.
+            # Kept, not deleted: "the driver produced something and it was not a spec" is
+            # worth reading.
             refused[label] = str(e)
             src.replace(src.with_suffix(".rejected.txt"))
         else:
-            # Consumed. `run_lens` unlinks its staging file after promotion for the same
-            # reason: a staged file that survives promotion gets re-promoted on the next
-            # invocation, rewriting a sealed artifact's sidecar with a fresh timestamp
-            # and making a re-run look like new work. The promoted copy is the record.
+            # Consumed: a staged file that survives promotion gets re-promoted on the next
+            # invocation, rewriting a sealed artifact's sidecar with a fresh timestamp and
+            # making a re-run look like new work. The promoted copy is the record.
             src.unlink(missing_ok=True)
 
-    lens_dir = Path(args.staged) if args.staged else root / "audit" / ".staged"
-    for lens in sorted(LENSES):
-        if (src := lens_dir / f"{lens}.json").exists():
-            take(src, f"lens:{lens}",
-                 lambda raw, ln=lens: str(accept_lens(
-                     cfg, args.paper, ln, raw, reviewer=args.reviewer,
-                     tool_policy=args.tool_policy,
-                     mode=args.mode)["findings"]) + " finding(s)")
-
-    # A paper long enough to need part-splitting has no `audit/<lens>.json` to stage into
-    # until every one of that lens's units is sealed — `accept_lens` above only ever
-    # targets the composed file. `tools/subagent_accept.py` is the gate for a part or a
-    # synthesis unit; this command does not duplicate it.
-
-    # Grades live one level down, keyed by candidate slug rather than by lens name, so
-    # this takes whatever is there instead of iterating a known vocabulary.
-    grade_dir = root / "audit" / "grade" / ".staged"
-    for src in sorted(grade_dir.glob("*.json")) if grade_dir.is_dir() else []:
-        take(src, f"grade:{src.stem}",
-             lambda raw, s=src.stem: accept_grade(
-                 cfg, args.paper, s, raw, grader=args.reviewer,
-                 tool_policy=args.tool_policy, mode=args.mode)["verdict"])
-
-    # The whole-paper read: one per paper, so a single staged file rather than a directory.
-    if (src := root / "reports" / ".staged" / "substantive.json").exists():
-        take(src, "whole-paper",
-             lambda raw: agent.accept_verdict(
-                 cfg, args.paper, raw, reader=args.reviewer,
-                 tool_policy=args.tool_policy, mode=args.mode)["verdict"])
-
-    # A driver-supplied faithful reproduction: one spec, one staged file.
-    if (src := root / "control" / ".staged" / "spec.json").exists():
+    spec_dir = root / "control" / ".staged"
+    if (src := spec_dir / "spec.json").exists():
         take(src, "spec",
              lambda raw: (
                  f"sealed, sha256={routes.accept_spec(cfg, args.paper, raw, reviewer=args.reviewer, tool_policy=args.tool_policy, mode=args.mode)['content_sha256'][:12]}"
@@ -240,9 +196,47 @@ def cmd_accept(args: argparse.Namespace) -> int:
     for label, why in refused.items():
         print(f"REFUSED  : {label:<34} {why[:140]}")
     if not accepted and not refused:
-        print(f"nothing staged in {lens_dir} or {grade_dir}")
+        print(f"nothing staged in {spec_dir}. For a lens/grade/verdict/reconstruction/"
+              f"artifact-review answer, use `python run.py seal` instead.")
         return 1
     return 1 if refused else 0
+
+
+def cmd_tasks(args: argparse.Namespace) -> int:
+    """Advance the deterministic pipeline as far as it goes, then print what is pending."""
+    cfg = Config.load()
+    res = tasks_mod.advance(cfg, args.paper)
+    if args.json:
+        print(json.dumps(res, indent=2, default=str))
+        return 0
+    print(f"paper   : {res['paper_id']}")
+    print(f"phase   : {res['phase']}   status: {res['status']}")
+    if res.get("blocked_reason"):
+        print(f"blocked : {res['blocked_reason']}")
+    if not res["tasks"]:
+        print("no delegable tasks pending")
+        return 0
+    print(f"\n{len(res['tasks'])} task(s) pending:\n")
+    for t in res["tasks"]:
+        after = f"  after: {', '.join(t['after'])}" if t["after"] else ""
+        print(f"  {t['id']:<28} [{t['role']}] {t['model']}/{t['effort']}{after}")
+        print(f"      read : {t['prompt']}")
+        print(f"      write: {t['out']}")
+    print(f"\nFor each: have an isolated subagent read `prompt`, write its JSON answer to "
+         f"`out`, then run `python run.py seal {args.paper} <task-id> <out-file>`.")
+    return 0
+
+
+def cmd_seal(args: argparse.Namespace) -> int:
+    """Validate and seal one staged task answer — the write half of `harness/tasks.py`."""
+    cfg = Config.load()
+    try:
+        rec = tasks_mod.seal(cfg, args.paper, args.task_id, Path(args.file))
+    except ValueError as e:
+        print(f"REFUSED: {e}")
+        return 1
+    print(f"sealed {args.paper}/{args.task_id}: {json.dumps(rec, default=str)[:300]}")
+    return 0
 
 
 def cmd_dossier(args: argparse.Namespace) -> int:
@@ -256,12 +250,10 @@ def cmd_dossier(args: argparse.Namespace) -> int:
 
 
 def cmd_preflight(args: argparse.Namespace) -> int:
-    """Is every requested paper a distinct document, and which id will each get?
-
-    Runs before a batch, spends nothing, and reviews nothing. Exit 0 when every requested
-    file is a distinct document; exit 2 when the batch is refused, which happens when two
-    requested files are byte-identical or a file cannot be read.
-    """
+    """Is every requested paper a distinct document, and which id will each get? Runs
+    before a batch, spends nothing, and reviews nothing. Exit 0 when every requested file
+    is a distinct document; exit 2 when the batch is refused (two files byte-identical,
+    or a file cannot be read)."""
     from harness.config import BASE_DIR
     cfg = Config.load()
     papers_dir = BASE_DIR / "papers"
@@ -277,12 +269,9 @@ def cmd_preflight(args: argparse.Namespace) -> int:
 
 def cmd_evaluate(args: argparse.Namespace) -> int:
     """System metrics over the reviewed corpus. Counts artifacts; runs no stage.
-
-    Deliberately separate from `dossier`, which is a reader's summary of the papers. This
-    is a summary of the SYSTEM — how much of each paper it could address, how often it
-    judged an experiment necessary, which gate stopped the rest — and it reports nothing
-    it cannot count. See `harness/summarize.LIMITATIONS` for what is absent and why.
-    """
+    Deliberately separate from `dossier`, which is a reader's summary of the papers: this
+    is a summary of the SYSTEM, and it reports nothing it cannot count. See
+    `harness/summarize.LIMITATIONS` for what is absent and why."""
     from harness import summarize
     cfg = Config.load()
     res = summarize.run_evaluate(cfg, args.papers or reviewed_papers(cfg),
@@ -293,25 +282,18 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
 
 
 def reviewed_papers(cfg: Config) -> list[str]:
-    """Every case that has an ingested paper.
-
-    `projects/` also holds directories from an earlier research pipeline that were never
-    papers under review. Listing by `project.json` alone swept those into the dossier as
-    "missing", which is noise about work this harness never did.
-    """
+    """Every case that has an ingested paper. `projects/` also holds directories from an
+    earlier research pipeline that were never papers under review, which listing by
+    `project.json` alone would sweep into the dossier as noise."""
     return [m["id"] for m in state.list_projects(cfg)
             if (state.project_dir(cfg, m["id"]) / "paper" / "doc.json").exists()]
 
 
 def cmd_stage(args: argparse.Namespace) -> int:
-    """Run ONE stage and print its compact result. For debugging, not for review.
-
-    Locked exactly the way `pipeline.step` locks a phase handler —
-    `with state.project_lock(cfg, case.paper_id): ...` — so this debug entrypoint cannot
-    interleave writes to `control/probe_results.json`, `control/targets/<id>/outcome.json`,
-    `artifact/<pid>.route.json`, or any other case-state file with a concurrent `review`
-    run or a second `stage` invocation against the same paper.
-    """
+    """Run ONE stage and print its compact result. For debugging, not for review. Locked
+    exactly the way `pipeline.step` locks a phase handler, so this debug entrypoint
+    cannot interleave writes to any case-state file with a concurrent `review` run or a
+    second `stage` invocation against the same paper."""
     cfg = Config.load()
     pid = args.paper
     if args.name == "ingest" and pipeline.is_new_pdf_source(args.paper):
@@ -356,9 +338,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    # Windows consoles often default to cp1252 while reviewer reports contain Unicode
-    # status badges. Keep the report artifact unchanged, but ensure printing it cannot
-    # turn a completed review into a process error on a legacy console.
+    # Windows consoles often default to cp1252 while reviewer reports contain Unicode.
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -368,17 +348,9 @@ def main() -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     rv = sub.add_parser("review", help="review one or more papers end to end")
-    # `action="extend"` so BOTH shapes work and neither loses a paper: `--paper a --paper b`
-    # and `--paper a b` both arrive as a list.
+    # `action="extend"` so both `--paper a --paper b` and `--paper a b` arrive as a list.
     rv.add_argument("--paper", required=True, action="extend", nargs="+",
                     help="PDF path(s) or case id(s); more than one writes a dossier")
-    rv.add_argument("--auto-audit", action="store_true",
-                    help="delegate the four lenses to a reviewer instead of pausing "
-                         "(needs SH_ALLOW_AUTO_AUDIT=1; spends tokens)")
-    rv.add_argument("--auto-grade", action="store_true",
-                    help="independently grade FATAL/MAJOR findings with a second, blinded "
-                         "reviewer instead of counting them as asserted (needs "
-                         "SH_ALLOW_GRADING=1; spends tokens)")
     rv.add_argument("--require-grades", action="store_true",
                     help="block the report (waiting, not partial) until every in-scope "
                          "candidate is graded, instead of falling back to lens-asserted "
@@ -389,29 +361,35 @@ def main() -> int:
     rv.add_argument("--out", help="directory for the dossier (default: reports/)")
     rv.set_defaults(func=cmd_review)
 
-    ac = sub.add_parser("accept", help="validate + seal lens files written outside --auto-audit")
+    ac = sub.add_parser("accept", help="validate + seal a driver-supplied spec (see "
+                                       "`python run.py seal` for everything else)")
     ac.add_argument("--paper", required=True, help="case id")
-    ac.add_argument("--staged", help="directory holding <lens>.json "
-                                     "(default: projects/<pid>/audit/.staged)")
-    ac.add_argument("--reviewer", default="", help="what produced these, for the sidecar")
+    ac.add_argument("--reviewer", default="", help="what produced this, for the sidecar")
     ac.add_argument("--tool-policy", default="unrecorded",
                     help="what isolation the reviewer actually ran under. Defaults to "
-                         "'unrecorded' rather than to anything reassuring: only the "
-                         "CLI_SUBPROCESS mode can prove a sandbox was enforced, and "
-                         "`harness.agent` forces this back to 'unrecorded' for every "
-                         "other mode rather than trusting what is passed here.")
+                         "'unrecorded' rather than to anything reassuring: no mode this "
+                         "command may claim can prove a sandbox was enforced.")
     ac.add_argument("--mode", default="MANUAL",
-                    choices=["CLI_SUBPROCESS", "SESSION_SUBAGENT", "MANUAL"],
-                    help="HOW these artifacts were produced. MANUAL is the default because "
-                         "it claims the least: a human, or an agent this harness knows "
-                         "nothing about. SESSION_SUBAGENT means an isolated subagent the "
-                         "controlling session dispatched autonomously, one per task — real "
-                         "context isolation, no provable filesystem sandbox. "
-                         "CLI_SUBPROCESS is a reviewer process this harness spawned and "
-                         "confined itself, and is the only mode entitled to report an "
-                         "enforced tool policy. The three are distinct provenance classes "
-                         "and are never pooled.")
+                    choices=["SESSION_SUBAGENT", "MANUAL"],
+                    help="HOW this artifact was produced. MANUAL is the default because it "
+                         "claims the least: a human, or an agent this harness knows nothing "
+                         "about. SESSION_SUBAGENT means an isolated subagent the "
+                         "controlling session dispatched autonomously — real context "
+                         "isolation, no provable filesystem sandbox. (CLI_SUBPROCESS is not "
+                         "offered here: nothing produces it any more, it only remains "
+                         "readable on artifacts sealed before this change.)")
     ac.set_defaults(func=cmd_accept)
+
+    ts = sub.add_parser("tasks", help="list delegable tasks (advances the pipeline first)")
+    ts.add_argument("paper", help="PDF path (first ingest) or case id")
+    ts.add_argument("--json", action="store_true", help="machine-readable output")
+    ts.set_defaults(func=cmd_tasks)
+
+    sl = sub.add_parser("seal", help="validate + seal one staged task answer")
+    sl.add_argument("paper", help="case id")
+    sl.add_argument("task_id", help="a task id from `python run.py tasks <paper>`")
+    sl.add_argument("file", help="path to the delegate's staged JSON answer")
+    sl.set_defaults(func=cmd_seal)
 
     ds = sub.add_parser("dossier", help="consolidate finished reports")
     ds.add_argument("papers", nargs="*", help="case ids (default: every reviewed paper)")

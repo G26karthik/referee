@@ -1,30 +1,13 @@
 """S4 — rank the findings, decide the verdict, and render both reports.
 
-Consolidates the reference implementation's `harness/stages/report.py`, `outcome.py`,
-`guarantees.py`, `coverage.py`, `docintegrity.py`, `selfaudit.py` and the ledger-assembly
-half of `ledger.py` (tag `reference-implementation-2026-09-20`) into one file. Function
-BODIES are unchanged; cross-references were repointed at `decide.py` / `locate.py` /
-`schema.py` (the v4 replacements for `materiality`/`disposition`/`exhaustion`/`planner`/
-`claims`/`artifacts`), duplicate vocabulary already declared in `schema.py` was removed
-rather than re-declared, and narrative docstrings were cut to what a reader needs at the
-call site — see `docs/INVARIANT_MAP.md` for the corpus incidents that shaped each rule.
+Two hard rules: (1) NO LLM DECIDES THE VERDICT — severity ordering and the materiality
+call are a lexicographic sort and a plain-Python table; (2) THE RENDERER COPIES, IT DOES
+NOT WRITE — every render function here is pure over artifacts an earlier stage produced.
 
-Two hard rules carried over unchanged:
-
-  1. NO LLM DECIDES THE VERDICT. Severity ordering and the binary RED/GREEN call are a
-     lexicographic sort and a materiality table in plain Python.
-  2. THE RENDERER COPIES, IT DOES NOT WRITE. Every render function here is pure over
-     artifacts some earlier stage already produced.
-
-**Scope, deliberately narrower than the old `run_report`.** `assemble_report` below takes
-already-produced, already-verified, already-graded artifacts (a `PaperDoc`, a list of
-`LensReport`, a `ProbeResult | None`, a `TargetSet | None`) and does everything from
-`findings = rank(...)` onward — the part that is this stage's own job per CLAUDE.md's phase
-table, and the part that is entirely pure. All file I/O and subprocess dispatch (reading
-`paper/doc.json`, writing the four report files, calling `agent.run_verdict`) is
-`pipeline.run_report_stage`'s job, not this module's — kept apart so this file stays a pure
-function of artifacts a caller already produced, never a place a network or filesystem
-call can smuggle a decision in unverified.
+`assemble_report` takes already-produced, already-verified, already-graded artifacts (a
+`PaperDoc`, `LensReport`s, a `ProbeResult | None`, a `TargetSet | None`) and does everything
+from `findings = rank(...)` onward, staying pure; all file I/O and subprocess dispatch is
+`pipeline.run_report_stage`'s job, never this module's.
 
 `python -m harness.report` runs the self-check.
 """
@@ -48,16 +31,11 @@ from .schema import (
     SubstantiveVerdict, TARGET_DISPOSITIONS, TargetOutcome, TargetSet,
 )
 
-# Nothing inside decide.py itself renders prose -- this is the one module that does, so
-# the materiality-basis gloss table is referenced from its real home rather than
-# duplicated. A second copy of a prose table is exactly the "driver/route duplication"
-# shape this consolidation removes everywhere else.
+# decide.py owns the materiality-basis prose table; referenced here, never duplicated.
 _MATERIALITY_GLOSS: dict[str, str] = decide.BASIS_GLOSS
-
 
 # =============================================================================
 # PART 1 — DECISION: verdict, claim status, disposition, triage
-#   (from stages/report.py)
 # =============================================================================
 
 # Severity -> rank, and the findings table's display order. NOTE ranks below MINOR and is
@@ -69,10 +47,9 @@ _SEVERITY_RANK = {"FATAL": 2, "MAJOR": 1, "MINOR": 0, "NOTE": -1}
 # first kind in seconds.
 _LENS_RANK = {"overclaim": 3, "contradiction": 2, "confound": 1, "protocol": 0}
 
-# THE MATERIALITY TABLE, stated as data (invariant 8, CLAUDE.md). RED iff a material
-# failure was ESTABLISHED — a failed reproduction from an admissible provenance, or the
-# paper's own arithmetic failing — never by accumulating model concerns. The EMPTY TUPLE
-# is the invariant held by the type system: no severity, however asserted, may reach RED.
+# THE MATERIALITY TABLE, stated as data. A material failure is ESTABLISHED — a failed
+# reproduction from admissible provenance, or the paper's own arithmetic failing — never
+# accumulated from model concerns. The empty tuple is enforced by the type, not a comment.
 MATERIAL_SEVERITY: tuple[str, ...] = ()
 CONCERN_SEVERITY = ("FATAL", "MAJOR")
 
@@ -80,8 +57,8 @@ SUPPORT_LANGUAGE = ("verified", "supported", "confirmed", "validated", "corrobor
 EVIDENCED_SUPPORT = ("VERIFIED_SUPPORT",)
 
 ADMISSIBLE_REPRODUCTION_PROVENANCE = provenance_mod.ADMISSIBLE_REPRODUCTION_PROVENANCE
-# Reader vocabulary for what actually ran. Fails closed: an unrecognised provenance reads
-# as a diagnostic, never as author code. THE SAME OBJECT as `provenance.PROVENANCE_LABEL`.
+# Reader vocabulary for what actually ran. Fails closed: an unrecognised provenance reads as a
+# diagnostic, never as author code. THE SAME OBJECT as `provenance.PROVENANCE_LABEL`.
 PROVENANCE_LABEL = provenance_mod.PROVENANCE_LABEL
 
 _CELL_REF = re.compile(r"^T\d+:r\d+:c\d+$")
@@ -93,8 +70,8 @@ MAX_TABLE_ROWS = 14
 MAX_THREAT_BULLETS = 6
 _QUOTE_CHARS = 240
 
-# The two sentences a reader most often gets wrong, spelled out once so every report says
-# them identically.
+# The two sentences a reader most often gets wrong, spelled out once so every report says them
+# identically.
 _DECISION_GLOSS = {
     "VERIFIED_FAILURE": "A material failure was **established**: the evidence below is strong "
                         "enough to reject the claim it addresses. This is not a count of concerns.",
@@ -105,8 +82,8 @@ _DECISION_GLOSS = {
                     "This is not a finding that the paper is correct, and it is not a finding "
                     "that it is wrong.",
 }
-# What positive evidence stands behind the decision — a GREEN can never appear without this
-# row. Only VERIFIED_SUPPORT may use the word "verified" at all; see SUPPORT_LANGUAGE.
+# What positive evidence stands behind the decision — a GREEN can never appear without this row.
+# Only VERIFIED_SUPPORT may use the word "verified" at all; see SUPPORT_LANGUAGE.
 _SUPPORT_ROW = {
     "VERIFIED_FAILURE": "n/a — this decision rests on an established failure, below",
     "VERIFIED_SUPPORT": "yes — an executed metric reconciled with a printed cell",
@@ -123,32 +100,22 @@ _REPRO_GLOSS = {
                      "behind this decision either way.",
 }
 
-
 def support_is_evidenced(claim_status: str) -> bool:
-    """May this report describe the paper as verified/supported/confirmed? True only when
-    something was positively checked and held — absence of an established failure is not
-    support, and this predicate is what keeps the two apart everywhere the report speaks
-    about the paper as a whole."""
+    """May the report call the paper verified/supported/confirmed? True only when
+    something was positively checked and held — absence of a failure is not support."""
     return claim_status in EVIDENCED_SUPPORT
 
-
 def unearned_support_language(text: str, claim_status: str) -> list[str]:
-    """Every support word used in `text` that `claim_status` has not earned. Scoped to
-    DECISION-LEVEL prose (the badge, the reason, the gloss, the Decision table) — legitimate
-    elsewhere ("cell_verified", "confirmed findings" describe an evidence class or a finding
-    bucket, not a claim the PAPER was verified). Empty when support is evidenced.
-
-    Enforced only by `tests/test_guarantees.py` / `tests/test_reimplementation_path.py`
-    reading RENDERED OUTPUT, not by the renderer calling it — a linter over the renderer
-    beats a filter inside it, and that shape is preserved here unchanged.
-    """
+    """Every support word in `text` that `claim_status` has not earned, scoped to
+    DECISION-LEVEL prose only ("cell_verified" etc. describe an evidence class, not a claim
+    the paper was verified). Empty when support is evidenced. Enforced by tests reading
+    RENDERED OUTPUT, not by the renderer calling it."""
     if support_is_evidenced(claim_status):
         return []
     low = text.lower()
     for token in (*CLAIM_STATUSES, *REPRODUCTION_STATUSES):
         low = low.replace(token.lower(), " ")
     return [w for w in SUPPORT_LANGUAGE if re.search(rf"(?<!not ){w}", low)]
-
 
 def parse_magnitude(text: str) -> float:
     if not text:
@@ -161,15 +128,11 @@ def parse_magnitude(text: str) -> float:
     except (TypeError, ValueError):
         return 0.0
 
-
 def counted(f: Finding) -> str:
-    """The severity `claim_status`/`decide.derive_disposition` actually counts for `f` —
-    falls back to the lens's own `severity` when `counted_severity` is empty, which is what
-    makes grading-off
-    reproduce the pre-grading verdict byte for byte. `grading.RANK[counted_severity] <=
-    RANK[severity]` always, so the fallback can never be a promotion in disguise."""
+    """The severity actually counted for `f` — falls back to the lens's own `severity`
+    when `counted_severity` is empty. `RANK[counted_severity] <= RANK[severity]` always,
+    so the fallback can never be a promotion in disguise."""
     return f.counted_severity or f.severity
-
 
 def finding_key(f: Finding) -> tuple:
     """Lexicographic sort key, most-severe-first under `reverse=True`: COUNTED severity,
@@ -185,50 +148,38 @@ def finding_key(f: Finding) -> tuple:
         f.finding_id,
     )
 
-
 def rank(findings: list[Finding]) -> list[Finding]:
     return sorted(findings, key=finding_key, reverse=True)
 
-
 def material_failures(findings: list[Finding]) -> list[Finding]:
-    """Model findings with paper-level rejection authority: intentionally NONE. Dead by
-    construction — invariant 8 as a fact the type system enforces rather than a comment. A
-    finding may propose a dependency and prioritize investigation; it may not establish its
-    own scientific truth. Deterministic paper checks and admissible bound executions enter
-    through `material_target_failure` instead."""
+    """Model findings with paper-level rejection authority: intentionally NONE, dead by
+    construction. A finding may propose a dependency; it may not establish its own
+    scientific truth. Deterministic paper checks and admissible executions enter through
+    `material_target_failure` instead."""
     return []
-
 
 def material_concerns(findings: list[Finding]) -> list[Finding]:
     """Counted FATAL/MAJOR model concerns — prominent, and never rejection authority."""
     return [f for f in findings if counted(f) in CONCERN_SEVERITY]
 
-
 def is_calibration(probe: ProbeResult | None) -> bool:
-    """Did the thing that ran measure this MACHINE rather than the paper? The identical-
-    arms noise-floor template's "measured delta" is this host's seed noise; nothing about
-    any paper follows from it in either direction. Read from the runner's own flag, falling
-    back to the verdict for a result written before that flag existed."""
+    """Did the thing that ran measure this MACHINE, not the paper? Read from the runner's
+    own flag, falling back to the verdict for a result written before that flag existed."""
     if probe is None:
         return False
     if probe.calibration is not None:
         return bool(probe.calibration)
     return probe.verdict == "calibration"
 
-
 def material_target_failure(objects: list | None, outcomes: list | None,
                             reconciliation: Reconciliation | None = None
                             ) -> tuple[object | None, str]:
-    """THE ONE materiality decision on the paper-level path. `(source, kind)`, `kind` is
-    "target" | "reconciliation" | "" — `claim_status` and, through it,
-    `decide.derive_disposition` both depend on THIS and nothing else, which is what makes
-    it impossible for them to disagree about whether a paper failed. Wraps
-    `decide.material_target_failure` (Tier 1: did the
-    target's own route establish a defect; Tier 2: is a CENTRAL claim established to depend
-    on it) and joins the legacy single-reconciliation path the same way, through
-    `Reconciliation.target_id` — a reconciliation carrying no joinable target establishes
-    no materiality, the fail-closed answer required when a caller passes no objects.
-    """
+    """THE ONE materiality decision on the paper-level path: `(source, kind)`, kind is
+    "target" | "reconciliation" | "". `claim_status` and `decide.derive_disposition` both
+    depend on this and nothing else. Wraps `decide.material_target_failure` (Tier 1: did
+    the target's own route establish a defect; Tier 2: is a CENTRAL claim established to
+    depend on it) and joins the single-reconciliation path via `Reconciliation.target_id`
+    — a reconciliation with no joinable target establishes no materiality, fail-closed."""
     hit = decide.material_target_failure(objects, outcomes)
     if hit is not None:
         return hit, "target"
@@ -239,15 +190,13 @@ def material_target_failure(objects: list | None, outcomes: list | None,
         return reconciliation, "reconciliation"
     return None, ""
 
-
 def claim_status(findings: list[Finding], reconciliation: Reconciliation | None = None,
                  *, outcomes: list | None = None, objects: list | None = None,
                  probe: ProbeResult | None = None) -> tuple[str, str]:
-    """The epistemic state underneath the colour. `objects` is the materiality context and
-    is REQUIRED for any established target defect to reach VERIFIED_FAILURE — omitting it
-    does not fall back to "any established failure convicts"; it legitimately yields
-    NOT_VERIFIED, because a paper-level stop may not depend on whether a caller passed an
-    optional argument.
+    """The epistemic state underneath the colour. `objects` is the materiality context,
+    REQUIRED for an established target defect to reach VERIFIED_FAILURE — omitting it
+    yields NOT_VERIFIED rather than "any failure convicts", since a paper-level stop must
+    not depend on whether a caller passed an optional argument.
 
       VERIFIED_FAILURE  a MATERIAL failure was established.
       VERIFIED_SUPPORT  something was positively checked and held (reconciled against a
@@ -256,16 +205,11 @@ def claim_status(findings: list[Finding], reconciliation: Reconciliation | None 
                         most papers.
 
     INCONCLUSIVE is deliberately NOT a failure: a missing dataset, a units mismatch, an
-    unparsed metric, a shut gate and an 8 GiB card facing a 24 GiB demand all land here.
+    unparsed metric, a shut gate and a resource shortfall all land here.
     """
-    # A calibration probe measures this MACHINE, not the paper (invariant 8's "measured
-    # against this host's own noise floor" case) — but that only means ITS OWN reconciliation
-    # carries no evidence either way. It must not suppress a material failure established
-    # through `objects`/`outcomes` on a DIFFERENT target than the one calibration ran on
-    # (that used to short-circuit the whole fold ahead of `material_target_failure`, so an
-    # unrelated calibration probe could silently acquit an established paper-arithmetic
-    # contradiction or a failed repo_exec reproduction elsewhere — invariant 16's "a blocked
-    # target ends that target, never the paper" applies to a CALIBRATED target too).
+    # A calibration probe measures this MACHINE, not the paper — its own reconciliation
+    # carries no evidence either way, but must not suppress a material failure established
+    # through `objects`/`outcomes` on a DIFFERENT target than the one calibration ran on.
     calibration = is_calibration(probe)
     rec = None if calibration else reconciliation
     source, kind = material_target_failure(objects, outcomes, rec)
@@ -277,6 +221,12 @@ def claim_status(findings: list[Finding], reconciliation: Reconciliation | None 
                 f"target {getattr(source, 'target_id', '?')}: the paper's own "
                 f"printed composition does not evaluate to the total it states "
                 f"({getattr(source, 'reason', '') or 'see the ledger'})")
+        if getattr(source, "disposition", "") == "COUNTEREXAMPLE_ESTABLISHED":
+            return "VERIFIED_FAILURE", (
+                f"target {getattr(source, 'target_id', '?')}: an independently verified "
+                f"exact-arithmetic certificate constructed an instance that satisfies the "
+                f"theorem's stated hypotheses and violates its claimed bound "
+                f"({getattr(source, 'reason', '') or 'see the ledger'})")
         return "VERIFIED_FAILURE", (
             f"target {getattr(source, 'target_id', '?')} failed reproduction on "
             f"{getattr(source, 'provenance', '?')} provenance")
@@ -285,14 +235,11 @@ def claim_status(findings: list[Finding], reconciliation: Reconciliation | None 
             "the only thing that ran was the identical-arms noise-floor calibration, which "
             "measures this machine and reconciles nothing about the paper")
     if (rec is not None and rec.status == "RESOLVED_VERIFIED"
-            # THE CEILING, IN THE ACQUITTING DIRECTION TOO (invariant 3 says "either
-            # direction"). Safe today only because `local_exec.reconcile` refuses to emit
-            # RESOLVED_VERIFIED on an inadmissible provenance — checked here as well so a
+            # THE CEILING APPLIES IN THE ACQUITTING DIRECTION TOO: checked again here so a
             # hand-edited artifact cannot unlock "verified"/"supported"/"confirmed".
             and provenance_mod.admits(rec.provenance)):
         return "VERIFIED_SUPPORT", "an executed metric reconciled with the printed cell"
     return "NOT_VERIFIED", "no material failure established, and nothing positively reproduced"
-
 
 def reproduction_status(probe: ProbeResult | None) -> str:
     """REPRODUCED | FAILED_REPRODUCTION | NOT_VERIFIED | NOT_ATTEMPTED, reported beside the
@@ -309,17 +256,14 @@ def reproduction_status(probe: ProbeResult | None) -> str:
         return "FAILED_REPRODUCTION"
     return "NOT_VERIFIED"
 
-
 def provenance_label(provenance: str) -> str:
     """Internal token -> reader vocabulary, failing closed to SYNTHESIZED_DIAGNOSTIC."""
     return provenance_mod.label(provenance)
-
 
 # A central target that was ATTEMPTED and settled nothing — the ONLY non-finding state that
 # colours a paper (invariant 17, CLAUDE.md). Anything less specific measures this harness's
 # own configuration rather than the paper.
 _ATTEMPTED_AND_UNSETTLED = ("INCONCLUSIVE",)
-
 
 def unresolved_central(objects: list | None, outcomes: list | None) -> list:
     """Central, addressable targets pursued ADMISSIBLY and settled nothing — pursued by
@@ -338,7 +282,6 @@ def unresolved_central(objects: list | None, outcomes: list | None) -> list:
             out.append(obj)
     return out
 
-
 def unchecked_central(objects: list | None, outcomes: list | None) -> list:
     """Central, addressable targets nothing was ever run for. Reported, never counted.
     Derived from `taxonomy.claim_was_checked` rather than a hand-written disposition set —
@@ -354,7 +297,6 @@ def unchecked_central(objects: list | None, outcomes: list | None) -> list:
             out.append(obj)
     return out
 
-
 def severity_review(findings: list[Finding]) -> list[str]:
     """Currently-COUNTED FATAL/MAJOR findings whose evidence is not a checkable cell
     citation. Flags only; `harness.grading.derive` is where earning happens, and even a
@@ -365,7 +307,6 @@ def severity_review(findings: list[Finding]) -> list[str]:
             for f in findings
             if counted(f) in ("FATAL", "MAJOR") and f.evidence_class != "cell_verified"]
 
-
 def questions(findings: list[Finding]) -> list[Finding]:
     """Findings that are QUESTIONS rather than defects, from either reader's answer. Held
     to NOTE by `grading.CANDIDATE_CAP`, so nothing here affects a threshold — but they are
@@ -374,14 +315,12 @@ def questions(findings: list[Finding]) -> list[Finding]:
             if f.finding_class == "OPEN_QUESTION"
             or (f.finding_class == "UNGRADED" and f.candidate_class == "OPEN_QUESTION")]
 
-
 def grading_review(findings: list[Finding]) -> list[str]:
     """Every finding where grading actually changed what counts, naming the cap."""
     return [f"{f.finding_id or f.title[:40]} ({f.lens}): lens asserted {f.severity}, "
             f"counted as {counted(f)} — capped by `{f.binding_cap or 'unknown'}` "
             f"({f.finding_class})"
             for f in findings if f.counted_severity and f.counted_severity != f.severity]
-
 
 def claim_status_sensitivity(findings: list[Finding], reconciliation: Reconciliation | None = None,
                              *, outcomes: list | None = None, objects: list | None = None) -> str:
@@ -390,7 +329,6 @@ def claim_status_sensitivity(findings: list[Finding], reconciliation: Reconcilia
     through unchanged, because it is arithmetic against a cell rather than a graded finding."""
     cell_backed = [f for f in findings if f.evidence_class == "cell_verified"]
     return claim_status(cell_backed, reconciliation, outcomes=outcomes, objects=objects)[0]
-
 
 def claim_status_if_lens_severity_only(findings: list[Finding],
                                        reconciliation: Reconciliation | None = None,
@@ -401,7 +339,6 @@ def claim_status_if_lens_severity_only(findings: list[Finding],
     erased."""
     lens_only = [f.model_copy(update={"counted_severity": ""}) for f in findings]
     return claim_status(lens_only, reconciliation, outcomes=outcomes, objects=objects)[0]
-
 
 def build_chain(findings: list[Finding], probe: ProbeResult | None) -> ExperimentalChain | None:
     """Link the reproduction attempt back to the finding it was about. Copies, never
@@ -461,7 +398,6 @@ def build_chain(findings: list[Finding], probe: ProbeResult | None) -> Experimen
             break
     return chain
 
-
 def _chain_block(c: ExperimentalChain) -> list[str]:
     """The experimental chain as a table a reader can walk link by link."""
     rows = [("finding", f"`{c.finding_id}`" if c.finding_id else "— none targeted"),
@@ -498,14 +434,12 @@ def _chain_block(c: ExperimentalChain) -> list[str]:
                     f"did not settle the cell."]
     return out
 
-
 def pick_unasked_question(reports: list[LensReport]) -> str:
     """First non-empty question in lens-priority order. Deterministic, verbatim."""
     for r in sorted(reports, key=lambda r: _LENS_RANK.get(r.lens, 0), reverse=True):
         if r.unasked_question.strip():
             return r.unasked_question.strip()
     return ""
-
 
 def _probe_heading(p: ProbeResult) -> str:
     """Name the section after what actually ran, so the contents are not oversold."""
@@ -514,7 +448,6 @@ def _probe_heading(p: ProbeResult) -> str:
     if p.provenance == "repo_exec":
         return "Measured reproduction (the paper's own code)"
     return "Measured reproduction (local)"
-
 
 def _probe_block(p: ProbeResult) -> list[str]:
     """The measured numbers, stated plainly. Every figure comes from the probe JSON."""
@@ -616,7 +549,6 @@ def _probe_block(p: ProbeResult) -> list[str]:
                     f"be distinguished from run-to-run variation at this seed count."]
     return out
 
-
 _REPO_HEAD = {
     "cloned": "🟢 **Cloned and inspected.**",
     "cached": "🟢 **Inspected from an existing checkout.**",
@@ -634,14 +566,16 @@ _RECONCILE_HEAD = {
                            "the printed cell.",
     "INCONCLUSIVE": "⚪ **Inconclusive** — no reproduction verdict can be drawn.",
     "NOT_ATTEMPTED": "⚪ **Not attempted.**",
+    "COUNTEREXAMPLE_FOUND": "🔴 **COUNTEREXAMPLE FOUND** — an exact-arithmetic instance "
+                            "satisfying every stated hypothesis violates the claimed bound.",
+    "NO_VIOLATION_FOUND": "⚪ **No violation found** — checked, no violation in the tested "
+                          "instances; not a proof.",
 }
 MAX_CODE_ROWS = 12
-
 
 def _head(table: dict[str, str], status: str) -> str:
     """A status-keyed headline, falling back to the bare token bolded rather than KeyError."""
     return table.get(status, f"**{status}**")
-
 
 def _repo_block(a: RepoAcquisition) -> list[str]:
     """Where the code came from. States plainly when the answer is 'we did not look'."""
@@ -683,7 +617,6 @@ def _repo_block(a: RepoAcquisition) -> list[str]:
                     "`INDEPENDENT_REIMPLEMENTATION`, never as the authors' own code."]
     return out
 
-
 def _runtime_block(c: CodeAudit) -> list[str]:
     """What the checkout says it needs — observations with citations, never an accusation:
     none of this gates execution."""
@@ -709,7 +642,6 @@ def _runtime_block(c: CodeAudit) -> list[str]:
             out.append(f"  - _…and {len(rows) - 4} more._")
     return out
 
-
 def _code_audit_block(c: CodeAudit) -> list[str]:
     """Static findings, each with a file, a line and the source line itself. Filtered by
     rule AUTHORITY (`artifact_evidence.RULE_AUTHORITY`), not by severity: only classes A
@@ -719,9 +651,9 @@ def _code_audit_block(c: CodeAudit) -> list[str]:
     shown = [f for f in c.findings if artifact_evidence.reviewer_visible(f.rule_id)]
     hidden = len(c.findings) - len(shown)
     suppressed = ([f"", f"_{hidden} further hit(s) came from detectors this harness has "
-                   f"audited as unsafe for reviewer output — they match substrings of "
-                   f"identifiers and were measured false on the evaluated corpus. They "
-                   f"remain in the machine trace._"] if hidden else [])
+                        f"audited as unsafe for reviewer output — they match substrings of "
+                        f"identifiers and were measured false on the evaluated corpus. They "
+                        f"remain in the machine trace._"] if hidden else [])
     if not shown:
         return [f"🟢 **No cheat patterns matched** across {c.files_scanned} Python file(s) "
                 f"({c.lines_scanned:,} lines). This is the absence of a signature, not a "
@@ -731,7 +663,7 @@ def _code_audit_block(c: CodeAudit) -> list[str]:
            f"({c.lines_scanned:,} lines): "
            + ", ".join(f"{n} {cat.replace('_', ' ')}" for cat, n in sorted(counts.items())) + ".",
            "", "Static hits are suspicions with line numbers, never verdicts — each is "
-           "listed with the counter-explanation that would clear it.", ""]
+               "listed with the counter-explanation that would clear it.", ""]
     for f in shown[:MAX_CODE_ROWS]:
         out.append(f"- **[{f.severity}] {f.title}** — `{f.file}:{f.line}` · `{f.rule_id}`")
         out.append(f"  {f.statement}")
@@ -746,7 +678,6 @@ def _code_audit_block(c: CodeAudit) -> list[str]:
     if c.unparseable:
         out += ["", f"_{len(c.unparseable)} file(s) could not be parsed and were skipped._"]
     return out
-
 
 def _reconciliation_block(r: Reconciliation) -> list[str]:
     """Executed number against the printed cell, with the arithmetic shown."""
@@ -767,16 +698,13 @@ def _reconciliation_block(r: Reconciliation) -> list[str]:
     out += ["", r.reason]
     return out
 
-
 def _cell(s: str, n: int) -> str:
     """One markdown table cell: pipes escaped, newlines flattened, length capped."""
     s = " ".join((s or "").split()).replace("|", "\\|")
     return (s[: n - 1] + "…") if len(s) > n else s
 
-
 def _kv_table(rows: list[tuple[str, str]], headers: tuple[str, str] = ("item", "value")) -> list[str]:
     return [f"| {headers[0]} | {headers[1]} |", "|---|---|"] + [f"| {k} | {v} |" for k, v in rows]
-
 
 def _scientific_block(r: EvalReport) -> list[str]:
     """The primary output, in the machine report's own dense table form. The reviewer
@@ -791,7 +719,6 @@ def _scientific_block(r: EvalReport) -> list[str]:
                  f"| {_cell(sf.title, 60)} | `{sf.claim_ref or '—'}` "
                  f"| {sf.resolution_status} | {sf.evidence_state} |")
     return L + [""]
-
 
 def render_eval_report(r: EvalReport) -> str:
     """EvalReport -> markdown, the complete machine trace. Pure: no LLM, no network."""
@@ -811,9 +738,9 @@ def render_eval_report(r: EvalReport) -> str:
     ]
     if r.verdict_contested:
         L += ["", f"🚩 **CONTESTED** — the independent substantive read below "
-                 f"(`{r.substantive_verdict.verdict if r.substantive_verdict else ''}`) disagrees "
-                 f"sharply with this deterministic disposition. Neither is overruled; this needs a "
-                 f"human look before the disposition above is relied on as-is."]
+                  f"(`{r.substantive_verdict.verdict if r.substantive_verdict else ''}`) disagrees "
+                  f"sharply with this deterministic disposition. Neither is overruled; this needs a "
+                  f"human look before the disposition above is relied on as-is."]
     executed = bool(r.probe and ((r.probe.executions or 0) > 0 or r.probe.seeds_run))
     route_label = "What ran" if executed else "Prepared route"
     route_value = (r.execution_provenance or "SYNTHESIZED_DIAGNOSTIC") if r.probe else "NONE"
@@ -1058,7 +985,6 @@ def render_eval_report(r: EvalReport) -> str:
 
     return "\n".join(L).rstrip() + "\n"
 
-
 # =============================================================================
 # PART 2 — the ONE-TO-TWO PAGE REVIEWER REPORT, bounded BY CONSTRUCTION (invariant 19)
 # =============================================================================
@@ -1072,10 +998,9 @@ _MAX_FINDINGS_SHOWN = 8
 _MAX_TRIGGERED = 3
 _LINE = 240
 
-# What the two reading routes (artifact inspection, now; literature/validation deleted
-# 2026-09-20) ESTABLISHED — the only outcomes of theirs a referee is shown. An inspection
-# that settled nothing, or a concern whose relation is still the reader's own reading, stay
-# in the scope counts and the ledger; only an outcome that established something is news.
+# What the artifact-inspection reading route ESTABLISHED — the only outcomes of it shown
+# to a referee. An inspection that settled nothing, or a concern still the reader's own
+# reading, stays in the scope counts and the ledger; only an established outcome is news.
 _READING_OUTCOMES = {
     "ARTIFACT_MISMATCH_ESTABLISHED":
         "the paper and the released code disagree, with the experiment identity "
@@ -1102,12 +1027,10 @@ _ARTIFACT_GLOSS = {
     "ARTIFACT_UNASSESSED": "acquisition did not run for this review",
 }
 
-
 def _rate(value) -> str:
     """A rate, or the word that must appear where one cannot be computed. `None` is not
     zero and is not one: an empty surface has no denominator."""
     return "not computable" if value is None else f"{value:.0%}"
-
 
 def _targets_summary(outcomes: list | None) -> dict:
     """How many targets ended in each disposition. A paper has a SET of targets and they
@@ -1119,14 +1042,12 @@ def _targets_summary(outcomes: list | None) -> dict:
         out[d] = out.get(d, 0) + 1
     return out
 
-
 def _short(s: str, n: int = _LINE) -> str:
     s = " ".join((s or "").split())
     return s if len(s) <= n else s[:n - 1].rstrip() + "…"
 
-
-# The order a reviewer reads them in: self-contradiction, then overclaim, then design gaps,
-# then artifact/specification failures, then everything still open.
+# The order a reviewer reads them in: self-contradiction, then overclaim, then design gaps, then
+# artifact/specification failures, then everything still open.
 CATEGORY_ORDER = (
     "CONTRADICTION", "OVERSTATED_CLAIM", "CONFOUND", "PROTOCOL_ISSUE",
     "MISSING_CONTROL", "MISSING_VALIDATION", "IMPLEMENTATION_ISSUE",
@@ -1153,7 +1074,6 @@ _RESOLUTION_GLOSS = {
     "UNRESOLVED": "open",
     "NOT_INVESTIGATED": "not investigated",
 }
-
 
 def scientific_findings(report: EvalReport, target_set: TargetSet | None = None) -> list:
     """Join every kept finding to the question it raised and the target that pursued it —
@@ -1207,7 +1127,6 @@ def scientific_findings(report: EvalReport, target_set: TargetSet | None = None)
         ))
     return out
 
-
 def coverage_numerators(target_set: TargetSet | None = None) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """(addressed, examined) as plain ADDRESS STRINGS, for `measure`. Strings, never
     objects: `measure` must not be able to see the harness's own object list, because the
@@ -1226,14 +1145,12 @@ def coverage_numerators(target_set: TargetSet | None = None) -> tuple[tuple[str,
             examined.append(ref)
     return tuple(addressed), tuple(examined)
 
-
 def artifact_axis(probe: ProbeResult | None, inspected_commit: str = "") -> tuple[str, str]:
     """(artifact_state, review_path) — see `taxonomy.artifact_state`. `execution_provenance`
     alone reads SYNTHESIZED_DIAGNOSTIC for a paper with no code, a refused clone, a failed
-    clone, and an unauthorized clone: four opposite facts under one token.
-
-    `inspected_commit` is the ARTIFACT_INSPECTION route's pinned snapshot: that route clones
-    without building a ProbeResult, and without it a checkout on disk read "never ran"."""
+    clone, and an unauthorized clone: four opposite facts under one token. `inspected_commit`
+    is the ARTIFACT_INSPECTION route's pinned snapshot: that route clones without building a
+    ProbeResult, and without it a checkout on disk would read as "never ran"."""
     acq = getattr(probe, "repo", None) if probe is not None else None
     status = getattr(acq, "status", "") or ""
     if status in ("", "not_attempted") and inspected_commit:
@@ -1243,14 +1160,12 @@ def artifact_axis(probe: ProbeResult | None, inspected_commit: str = "") -> tupl
     state = taxonomy.artifact_state(status, capability_established=established)
     return state, taxonomy.review_path(state)
 
-
 def by_category(findings: list) -> dict:
     """`ScientificFinding`s grouped by scientific class, in `CATEGORY_ORDER`."""
     groups: dict[str, list] = {}
     for sf in findings:
         groups.setdefault(sf.scientific_class, []).append(sf)
     return {k: groups[k] for k in CATEGORY_ORDER if k in groups}
-
 
 # THE LENGTH GUARANTEE, ENFORCED. Sections are dropped from the LOWEST priority upward
 # until the text fits, and the report SAYS which ones it dropped. Four sections are never
@@ -1271,7 +1186,6 @@ assert not (set(_UNDROPPABLE) & set(_DROPPABLE_ORDER)), (
     "a load-bearing section was made droppable: "
     f"{sorted(set(_UNDROPPABLE) & set(_DROPPABLE_ORDER))}")
 
-
 def _split_sections(text: str) -> list[tuple[str, str]]:
     """[(heading, body)], preamble under heading ''. Splits on `## ` at line start only,
     so a `##` inside a quoted finding cannot open a section."""
@@ -1285,7 +1199,6 @@ def _split_sections(text: str) -> list[tuple[str, str]]:
             buf.append(line)
     out.append((head, "".join(buf)))
     return out
-
 
 def _bounded(text: str, limit: int = _MAX_REVIEW_CHARS) -> str:
     """Drop whole sections, lowest priority first, until the text fits — and say so."""
@@ -1311,7 +1224,6 @@ def _bounded(text: str, limit: int = _MAX_REVIEW_CHARS) -> str:
         text = text[:anchor] + note + "\n" + text[anchor:] if anchor > 0 else text + note
     return text
 
-
 def _reading_clause(cov: CoverageReport | None) -> str:
     """How much of the paper the readers were carried, and how it was traversed."""
     if cov is None or cov.prose_presented_fraction is None:
@@ -1324,21 +1236,18 @@ def _reading_clause(cov: CoverageReport | None) -> str:
         return clause + " in a single pass"
     overhead = rec.anchor_repeat_fraction
     return (clause + f" in {parts} bounded parts, each repeating the paper's title, "
-            f"abstract, conclusion and section outline"
+                     f"abstract, conclusion and section outline"
             + (f" at a cost of {overhead:.1%} of the prose" if overhead is not None else "")
             + f"; {rec.lens_syntheses_completed} of {rec.lens_syntheses_required} "
               f"cross-part syntheses completed")
 
-
 def render_reviewer_report(report: EvalReport, target_set: TargetSet | None = None) -> str:
     """The one-to-two page report a human reviewer reads. NOT the evidence ledger.
-
     Everything here is selected from artifacts that already exist and capped by the
     constants above; nothing is re-judged. The primary output is a set of scientific
     findings, each with a resolution state — not a colour. The triage level is stated in
     `## Scope of this review`, where it belongs: a routing decision about this review, not
-    a conclusion about the paper.
-    """
+    a conclusion about the paper."""
     ts = target_set
     objects = list(getattr(ts, "objects", []) or [])
     outcomes = list(getattr(ts, "outcomes", []) or [])
@@ -1355,9 +1264,8 @@ def render_reviewer_report(report: EvalReport, target_set: TargetSet | None = No
          f"{len(groups)} scientific categor{'y' if len(groups) == 1 else 'ies'}",
          ""]
 
-    # FIRST, and as four separate rows (`## Review outcome`), so the three readings a
-    # reader used to be invited into — correct / failed / inconclusive — never arrive
-    # before the four disjoint facts they were standing in for.
+    # FIRST, as four separate rows (`## Review outcome`) — the four disjoint facts, never
+    # collapsed into a single correct/failed/inconclusive read.
     outcome_block = report.outcome or derive_outcome(
         report, target_set, unchecked_central=len(unchecked))
     L += render_outcome(outcome_block)
@@ -1384,6 +1292,16 @@ def render_reviewer_report(report: EvalReport, target_set: TargetSet | None = No
                       f"  - why it matters: the paper's own printed composition does not "
                       f"evaluate to the total it states. No code was executed and no "
                       f"artifact was required to reach this conclusion.",
+                      _material_line]
+            elif o.disposition == "COUNTEREXAMPLE_ESTABLISHED":
+                L += ["", f"- **Counterexample to a claimed bound — {o.target_id}**",
+                      f"  - claim: {_short(getattr(obj, 'claim_text', ''))}",
+                      f"  - evidence: {_short(o.reason)}",
+                      "  - why it matters: an independently verified exact-arithmetic "
+                      "certificate constructed a concrete instance that satisfies every "
+                      "hypothesis the paper's theorem states and violates the bound it "
+                      "claims. This is evidence about the paper's STATED THEOREM, never a "
+                      "statement about the authors' own proof or implementation.",
                       _material_line]
             else:
                 L += ["", f"- **Failed reproduction — {o.target_id}**",
@@ -1611,17 +1529,13 @@ def render_reviewer_report(report: EvalReport, target_set: TargetSet | None = No
         L += render_guarantees(report.guarantees)
     return _bounded("\n".join(L))
 
-
 # =============================================================================
 # PART 3 — OUTCOME: the four disjoint-fold reader-facing rows
-#   (from outcome.py; `derive`/`render` renamed `derive_outcome`/`render_outcome` to avoid
-#   colliding with `guarantees.py`'s identically-named functions in this merged module)
 # =============================================================================
-# Four independent folds over DISJOINT inputs (invariant 24, CLAUDE.md — replaces a single
-# colour plus a `## Reproduction status` section that read a verdict where none was meant):
+# Four independent folds over DISJOINT inputs — replaces a single colour plus a verdict
+# section that implied more than was established:
 #
-#     tier 1  FINDING STATE     what this review established — reads claim_status + kept
-#                               findings, NOTHING from tier 3
+#     tier 1  FINDING STATE     what this review established — claim_status + kept findings
 #     tier 2  QUESTION STATE    what became of the questions it raised
 #     tier 3  EXECUTION STATE   what execution was attempted and what it produced
 #     tier 4  SCOPE STATE       how much of the paper this is an assessment of
@@ -1646,15 +1560,16 @@ QUESTION_GLOSS = {
     "NO_QUESTION_SETTLED": "the concerns stand as questions for a human reviewer",
     "NO_QUESTION_RAISED": "no question was raised",
 }
-# WHICH CODE RAN, in the reader's words, keyed on the provenance that ran it — the states
-# below say something about the paper, and what they may say depends entirely on whose
-# program produced the number. An INDEPENDENT REIMPLEMENTATION that disagreed with the
-# paper used to print "the authors' own code ran and did not produce..." unconditionally;
-# the sentence now names the actor.
+# WHICH CODE RAN, in the reader's words, keyed on the provenance that ran it — what these
+# states may say about the paper depends entirely on whose program produced the number, so
+# the sentence always names the actor rather than assuming it was the authors' own code.
 EXECUTION_ACTOR = {
     "repo_exec": "the authors' own code",
     "driver": "an operator-supplied reproduction",
     "reimpl_exec": "an independent reimplementation (not the authors' code)",
+    # Never "the authors' code" and never "reimplementation" — a certificate is a formal
+    # check of the theorem's own statement, not a reproduction of an experiment.
+    "cert_exec": "an independently verified exact-arithmetic certificate",
 }
 _DEFAULT_ACTOR = "code this review's ceiling admits"
 
@@ -1685,12 +1600,10 @@ DISCLAIMER = (
     "They say what was established, what was settled, what execution produced, and how "
     "much was looked at.")
 
-# The exact reason must survive to the reader, but a report is bounded (invariant 19), so
-# it is cut at a SENTENCE boundary — never mid-clause. The old renderer cut at 200
-# characters flat and once took the words "...is evidence about the mechanism, not a
-# reproduction..." off the end of a line that opened with a large delta.
+# The exact reason must survive to the reader, but a report is bounded, so it is cut at a
+# SENTENCE boundary — never mid-clause, which could otherwise strip a disclaimer off the
+# end of a line that opens with a large delta.
 _DETAIL_CHARS = 460
-
 
 def clip(text: str, limit: int = _DETAIL_CHARS) -> str:
     """Whitespace-collapsed, and cut only after a sentence that fits."""
@@ -1703,10 +1616,8 @@ def clip(text: str, limit: int = _DETAIL_CHARS) -> str:
         return head[:cut + 1] + " (full reason in the ledger)"
     return head[:head.rfind(" ") if " " in head else limit] + "… (full reason in the ledger)"
 
-
 def _settled(status: str) -> bool:
     return (status or "").strip().upper().startswith("RESOLVED")
-
 
 def finding_state(*, claim_status: str = "", kept_findings: int = 0) -> str:
     """Tier 1. Reads `claim_status` and a count; reads NOTHING about execution. An
@@ -1716,7 +1627,6 @@ def finding_state(*, claim_status: str = "", kept_findings: int = 0) -> str:
         return "MATERIAL_FAILURE_ESTABLISHED"
     return "CONCERNS_RECORDED" if kept_findings > 0 else "NO_CONCERN_SURVIVED_VERIFICATION"
 
-
 def question_state(*, raised: int = 0, settled: int = 0) -> str:
     """Tier 2. Two counts, both read off the question set."""
     if raised <= 0:
@@ -1724,7 +1634,6 @@ def question_state(*, raised: int = 0, settled: int = 0) -> str:
     if settled >= raised:
         return "ALL_QUESTIONS_SETTLED"
     return "SOME_QUESTIONS_SETTLED" if settled > 0 else "NO_QUESTION_SETTLED"
-
 
 def execution_actor(outcomes: list | None = None) -> str:
     """Whose program produced the evidence the execution row describes. Reads provenance
@@ -1740,7 +1649,6 @@ def execution_actor(outcomes: list | None = None) -> str:
     if len(seen) == 1:
         return EXECUTION_ACTOR.get(seen[0], _DEFAULT_ACTOR)
     return " and ".join(EXECUTION_ACTOR.get(p, _DEFAULT_ACTOR) for p in seen)
-
 
 def execution_state(outcomes: list | None = None, plans: list | None = None) -> tuple[str, str]:
     """Tier 3: (state, exact reason). Ordered by how much each state ESTABLISHES, not by
@@ -1794,14 +1702,12 @@ def execution_state(outcomes: list | None = None, plans: list | None = None) -> 
     return "NO_EXECUTION_WARRANTED", (
         "no target's question turned on anything this system could run and reconcile")
 
-
 def scope_state(*, unchecked_central: int = 0, pursued: int = 0) -> str:
     """Tier 4. The limitation wins when there is one — the fact a reader most needs, and
     the easiest one for a report to let disappear because it changes no decision."""
     if unchecked_central > 0:
         return "CENTRAL_CLAIMS_LEFT_UNCHECKED"
     return "SOME_TARGETS_PURSUED" if pursued > 0 else "NO_TARGET_PURSUED"
-
 
 def derive_outcome(report: EvalReport, target_set: TargetSet | None = None, *,
                    unchecked_central: int = 0) -> ReviewOutcome:
@@ -1844,7 +1750,6 @@ def derive_outcome(report: EvalReport, target_set: TargetSet | None = None, *,
         claim_status=getattr(report, "claim_status", "") or "NOT_VERIFIED",
     )
 
-
 def render_outcome(o: ReviewOutcome) -> list[str]:
     """The `## Review outcome` block: four labelled rows and one disclaimer. A list, not a
     table — the execution row must hold an exact reason, and a markdown table with a
@@ -1863,19 +1768,16 @@ def render_outcome(o: ReviewOutcome) -> list[str]:
         "", DISCLAIMER, "",
     ]
 
-
 # =============================================================================
 # PART 4 — GUARANTEES: what a machine enforced in THIS review, and what it never promises
-#   (from guarantees.py; `derive`/`render` renamed `derive_guarantees`/`render_guarantees`)
 # =============================================================================
-# Three groups, because one list teaches a reader to ignore all of it (invariant 28,
-# CLAUDE.md): PROCESS_GUARANTEES (enforced unconditionally; `holds=False` is a HARNESS
-# DEFECT, the only thing reaching `unmet`), CONDITIONAL_PROPERTIES (true only when a gate
-# was open or a surface reachable — off is a configuration, never a defect), and
-# SCIENTIFIC_NON_GUARANTEES (properties this system cannot acquire by running better;
-# `holds` is False on every input, by an EMPTY membership tuple rather than a comment).
-# Every entry carries `holds` established from a harness-written field plus `evidence`
-# naming it — a guarantee nobody checks per review is a marketing claim with a citation.
+# Three groups, because one list teaches a reader to ignore all of it: PROCESS_GUARANTEES
+# (enforced unconditionally; `holds=False` is a HARNESS DEFECT, the only thing reaching
+# `unmet`), CONDITIONAL_PROPERTIES (true only when a gate was open or a surface reachable —
+# off is a configuration, never a defect), and SCIENTIFIC_NON_GUARANTEES (properties this
+# system cannot acquire by running better; `holds` is False on every input, by an EMPTY
+# membership tuple rather than a comment). Every entry carries `holds` established from a
+# harness-written field plus `evidence` naming it.
 
 PROCESS_GUARANTEES: tuple[str, ...] = (
     "EVERY_EVIDENCE_POINTER_RE_VERIFIED", "PROVENANCE_CEILING_HELD",
@@ -1908,8 +1810,7 @@ STATEMENT: dict[str, str] = {
     "PROVENANCE_CEILING_HELD":
         "Only the authors' own commit-verified checkout, or a human-written reproduction "
         "an operator sealed, may reconcile against a quantity the paper prints - in "
-        "either direction. A probe this harness synthesised can neither convict nor "
-        "acquit.",
+        "either direction. A probe this harness synthesised can neither convict nor " "acquit.",
     "EXECUTION_AUTHORIZED_BY_ONE_CONJUNCTION":
         "Every process this review started was permitted by one conjunctive "
         "authorization over the gate, the backend, the provenance, a verified commit, "
@@ -1977,8 +1878,7 @@ NOT_HELD: dict[str, str] = {
         "a reconciliation settled a printed quantity on a provenance the ceiling does "
         "not admit - a defect in this harness",
     "EXECUTION_AUTHORIZED_BY_ONE_CONJUNCTION":
-        "a process was started without a recorded authorization - a defect in this "
-        "harness",
+        "a process was started without a recorded authorization - a defect in this " "harness",
     "INFRASTRUCTURE_FAILURE_NEVER_CONVICTED":
         "an infrastructure failure was recorded as a failed reproduction - a defect in "
         "this harness",
@@ -1990,8 +1890,7 @@ NOT_HELD: dict[str, str] = {
         "a counted severity is above the severity the asserting lens wrote - a defect in "
         "this harness",
     "NO_MODEL_WROTE_THE_DECISION":
-        "the decision does not project from what was established - a defect in this "
-        "harness",
+        "the decision does not project from what was established - a defect in this " "harness",
     "NO_EXPERIMENT_DOWNSCALED":
         "a resource-blocked target started a process anyway - a defect in this harness",
     "SEVERITY_INDEPENDENTLY_GRADED":
@@ -2078,8 +1977,7 @@ ESTABLISHED_BY: dict[str, str] = {
     "SEVERITY_ONLY_CAPPED":
         "Finding.counted_severity against Finding.severity, ranked by grading.RANK",
     "NO_MODEL_WROTE_THE_DECISION":
-        "EvalReport.disposition against EvalReport.claim_status and its "
-        "machine-checkable cause",
+        "EvalReport.disposition against EvalReport.claim_status and its " "machine-checkable cause",
     "NO_EXPERIMENT_DOWNSCALED":
         "TargetOutcome.launched on every RESOURCE_BLOCKED target",
     "SEVERITY_INDEPENDENTLY_GRADED": "EvalReport.grade_coverage",
@@ -2122,7 +2020,6 @@ _MAX_SECTION_CHARS = 1100
 _MAX_HELD_CHARS = 400
 _MAX_NOT_HELD_CHARS = 620
 
-
 def _clauses(items: list[str], budget: int) -> str:
     """Join short clauses with `·`, stopping at `budget` and saying how many were dropped —
     truncating silently would leave a reader unable to tell a system that guarantees six
@@ -2136,7 +2033,6 @@ def _clauses(items: list[str], budget: int) -> str:
         out.append(clause)
         used += cost
     return " · ".join(out)
-
 
 def assess(*, every_pointer_verified: bool = False, provenance_clean: bool = False,
            execution_authorized: bool = False, infrastructure_isolated: bool = False,
@@ -2176,7 +2072,6 @@ def assess(*, every_pointer_verified: bool = False, provenance_clean: bool = Fal
                   holds=bool(held.get(k, False)), evidence=ESTABLISHED_BY[k])
         for k in ALL_KEYS)
 
-
 # --- reading the artifacts: each `_check_*` returns (holds, the per-review detail) -------
 def _reconciliations(report: EvalReport, outcomes: list) -> list:
     recs = []
@@ -2189,16 +2084,14 @@ def _reconciliations(report: EvalReport, outcomes: list) -> list:
             recs.append(rec)
     return recs
 
-
 def _launched(report: EvalReport, outcomes: list) -> int:
-    """Processes this review actually started (invariant 21), without double-counting.
-    `max` is right for both real shapes: a per-target run has both terms equal, and the
-    legacy single-probe path has only the second."""
+    """Processes this review actually started, without double-counting. `max` is right for
+    both shapes: a per-target run has both terms equal, and a single-probe-only run has
+    only the second."""
     probe = getattr(report, "probe", None)
     per_target = sum(int(getattr(o, "launched", 0) or 0) for o in outcomes)
     probe_runs = int(getattr(probe, "executions", 0) or 0) if probe is not None else 0
     return max(per_target, probe_runs)
-
 
 def _check_pointers(report: EvalReport) -> tuple[bool, str]:
     """EVERY pointer: a cross-section concern carries a side citation of its own, each with
@@ -2220,7 +2113,6 @@ def _check_pointers(report: EvalReport) -> tuple[bool, str]:
     return True, (f"{len(fs)} kept finding(s) carrying {len(fs) + sides} evidence "
                   f"pointer(s), all re-verified; {dropped} discarded")
 
-
 def _check_provenance(report: EvalReport, outcomes: list) -> tuple[bool, str]:
     recs = _reconciliations(report, outcomes)
     settling = [r for r in recs
@@ -2230,18 +2122,14 @@ def _check_provenance(report: EvalReport, outcomes: list) -> tuple[bool, str]:
         return False, (f"{len(bad)} reconciliation(s) settled a printed quantity on an "
                        f"inadmissible provenance")
     if settling:
-        return True, (f"{len(settling)} settling reconciliation(s), all on admitted "
-                      f"provenance")
-    return True, ("no reconciliation settled a printed quantity, so the ceiling was not "
-                  "reached")
-
+        return True, (f"{len(settling)} settling reconciliation(s), all on admitted " f"provenance")
+    return True, ("no reconciliation settled a printed quantity, so the ceiling was not " "reached")
 
 def _check_authorization(report: EvalReport, outcomes: list) -> tuple[bool, str]:
     """Fold EVERY execution record for this paper. Per-target outcomes are checked when
-    they exist; the paper-level probe is the fallback only for the legacy shape that never
-    split targets — reading only `report.probe.authorization` would hold this guarantee
-    whenever THAT execution happened to be fine, even if a different target ran with no
-    authorization at all."""
+    they exist; the paper-level probe is the fallback only when outcomes never split into
+    targets — reading only `report.probe.authorization` would hold this guarantee even if
+    a different, unchecked target ran with no authorization at all."""
     launched = _launched(report, outcomes)
     if launched == 0:
         return True, "no process was started, so this held without being exercised"
@@ -2265,7 +2153,6 @@ def _check_authorization(report: EvalReport, outcomes: list) -> tuple[bool, str]
                        f"authorization, or one that did not allow: {', '.join(bad[:4])}")
     return True, f"{len(checks)} execution record(s), every one authorized"
 
-
 def _check_infrastructure(report: EvalReport, outcomes: list) -> tuple[bool, str]:
     infra = [o for o in outcomes
              if getattr(o, "failure_class", "none") in _INFRASTRUCTURE_FAILURE]
@@ -2277,7 +2164,6 @@ def _check_infrastructure(report: EvalReport, outcomes: list) -> tuple[bool, str
                        f"failure as a failed reproduction")
     return True, (f"{len(infra)} target(s) failed on infrastructure; none contributed a "
                   f"failure of the paper")
-
 
 def _check_refusals(report: EvalReport, outcomes: list) -> tuple[bool, str]:
     unnamed = [getattr(o, "target_id", "?") for o in outcomes
@@ -2291,7 +2177,6 @@ def _check_refusals(report: EvalReport, outcomes: list) -> tuple[bool, str]:
     blocked = sum(1 for o in outcomes
                   if getattr(o, "disposition", "") in BLOCKED_DISPOSITIONS)
     return True, f"{len(outcomes)} target outcome(s), {blocked} of them named refusals"
-
 
 def _check_accounting(report: EvalReport, outcomes: list, objects: list | None = None
                       ) -> tuple[bool, str]:
@@ -2334,7 +2219,6 @@ def _check_accounting(report: EvalReport, outcomes: list, objects: list | None =
     return True, (f"ledger at {ledger}, {len(efficiency)} accounting term(s)"
                   + (f", {logged} execution record(s) logged" if logged else ""))
 
-
 def _check_severity_caps(report: EvalReport) -> tuple[bool, str]:
     fs = list(getattr(report, "findings", None) or [])
     raised = []
@@ -2352,7 +2236,6 @@ def _check_severity_caps(report: EvalReport) -> tuple[bool, str]:
         return False, f"{len(raised)} finding(s) counted above the lens's own severity"
     return True, (f"{len(fs)} finding(s); {capped} capped below the lens's own severity, "
                   f"none above it")
-
 
 def _check_decision(report: EvalReport, outcomes: list) -> tuple[bool, str]:
     disposition = (getattr(report, "disposition", "") or "").strip().upper()
@@ -2379,7 +2262,6 @@ def _check_decision(report: EvalReport, outcomes: list) -> tuple[bool, str]:
     return True, (f"{disposition or 'PASS_TO_HUMAN_CLEAN'} from claim status "
                   f"{claim or 'NOT_VERIFIED'}, with no material failure established")
 
-
 def _check_no_downscale(report: EvalReport, outcomes: list) -> tuple[bool, str]:
     short = [o for o in outcomes if getattr(o, "disposition", "") == "RESOURCE_BLOCKED"
              or getattr(o, "failure_class", "") == "resources_insufficient"]
@@ -2389,8 +2271,7 @@ def _check_no_downscale(report: EvalReport, outcomes: list) -> tuple[bool, str]:
         return False, (f"target(s) {', '.join(ran[:4])} were short of resources and "
                        f"started a process anyway")
     return True, (f"{len(short)} target(s) refused for resources; none was run at a "
-                  f"reduced size")
-
+                                                                                    f"reduced size")
 
 def _check_grading(report: EvalReport) -> tuple[bool, str]:
     cov = dict(getattr(report, "grade_coverage", None) or {})
@@ -2401,7 +2282,6 @@ def _check_grading(report: EvalReport) -> tuple[bool, str]:
         # reader weighed what the verdict counts, and nothing established that here either.
         return False, "no serious candidate was raised, so no independent grade exists"
     return graded >= candidates, f"{graded} of {candidates} serious candidate(s) graded"
-
 
 def _check_coverage(report: EvalReport) -> tuple[tuple[bool, str], tuple[bool, str]]:
     cov = getattr(report, "coverage", None)
@@ -2424,7 +2304,6 @@ def _check_coverage(report: EvalReport) -> tuple[tuple[bool, str], tuple[bool, s
     )
     return surface, prose_item
 
-
 def _check_artifact_executed(report: EvalReport, outcomes: list) -> tuple[bool, str]:
     ran = [o for o in outcomes if int(getattr(o, "launched", 0) or 0) > 0
            and provenance_mod.admits(getattr(o, "provenance", ""))]
@@ -2433,7 +2312,6 @@ def _check_artifact_executed(report: EvalReport, outcomes: list) -> tuple[bool, 
     launched = _launched(report, outcomes)
     return False, (f"{launched} process(es) started, none of them the authors' own "
                    f"commit-verified code")
-
 
 # key -> the `assess` parameter that carries it — a table so `_self_check_guarantees` can
 # assert the two vocabularies match exactly.
@@ -2454,7 +2332,6 @@ _PARAM_FOR_KEY: dict[str, str] = {
     "SURFACE_FULLY_EXAMINED": "surface_fully_examined",
     "PROSE_FULLY_PRESENTED": "prose_fully_presented",
 }
-
 
 def derive_guarantees(report: EvalReport, target_set: TargetSet | None = None, *,
                       lens_policy_enforced: bool = False) -> ReviewGuarantees:
@@ -2512,9 +2389,7 @@ def derive_guarantees(report: EvalReport, target_set: TargetSet | None = None, *
                if not g.holds and getattr(g, "key", "") in PROCESS_GUARANTEES],
     )
 
-
 HEADING = "## What this review guarantees, and what it does not"
-
 
 def render_guarantees(g: ReviewGuarantees) -> list[str]:
     """The bounded markdown section, as lines. Two paragraphs, deliberately NOT a table —
@@ -2549,18 +2424,16 @@ def render_guarantees(g: ReviewGuarantees) -> list[str]:
         return keep
     return lines
 
-
 # =============================================================================
 # PART 5 — COVERAGE: how much of THE PAPER this review could address and examined
-#   (from coverage.py; `claims.*` repointed at `locate.*`, the v4 replacement)
 # =============================================================================
-# Replaces `targets_addressable / targets_discovered` (invariant 27, CLAUDE.md — that rate
-# divides the harness's own object list by itself and RISES when extraction fails; it read
-# 0.93 corpus-wide). The denominator is the paper's own addressable surface, enumerated from
-# a `PaperDoc` and NOTHING the review produced: `surface(doc)` takes a `PaperDoc` and
-# nothing else, `measure(...)` takes its numerators as plain address STRINGS so a numerator
-# cannot reach the denominator's construction. Two numerators, never one: `addressed` (an
-# address was minted) and `examined` (a route was pursued) are different claims.
+# Replaces `targets_addressable / targets_discovered`, a rate that divides the harness's
+# own object list by itself and RISES when extraction fails. The denominator here is the
+# paper's own addressable surface, enumerated from a `PaperDoc` and NOTHING the review
+# produced: `surface(doc)` takes a `PaperDoc` and nothing else, `measure(...)` takes its
+# numerators as plain address STRINGS so a numerator cannot reach the denominator's
+# construction. Two numerators, never one: `addressed` (an address was minted) and
+# `examined` (a route was pursued) are different claims.
 
 _BUDGET_ENV = "SH_AUDIT_BUDGET_CHARS"
 _BUDGET_DEFAULT = 70000
@@ -2577,7 +2450,6 @@ _PROSE = re.compile(r"^P(\d+):(\d+)-(\d+)$")
 # `locate.mint` refuses a quote shorter than this; a shorter one addresses nothing unique.
 _QUOTE_MIN = 8
 
-
 def budget_chars() -> int:
     """The lens prompt's section budget, read at call time — a module-level constant
     would report the budget of whichever process imported first."""
@@ -2586,7 +2458,6 @@ def budget_chars() -> int:
         return int(raw) if raw else _BUDGET_DEFAULT
     except ValueError:
         return _BUDGET_DEFAULT
-
 
 def kind_of(address: str = "") -> str:
     """Which `SURFACE_KINDS` unit a SURFACE address names, or '' for none."""
@@ -2603,7 +2474,6 @@ def kind_of(address: str = "") -> str:
         return "reported_quantity"
     return ""
 
-
 def prose_presented(sections: list, budget: int) -> tuple[int, int, int]:
     """(presented, total, sections_truncated) UNDER THE OLD TRUNCATING RENDERER. Kept as
     the BASELINE that `prose_visible` is measured against — it is `paper.render_sections`,
@@ -2613,14 +2483,12 @@ def prose_presented(sections: list, budget: int) -> tuple[int, int, int]:
     p = section_presentation(list(sections or []), int(budget))
     return p.presented_chars, p.total_chars, p.sections_truncated
 
-
 def prose_visible(doc: PaperDoc, budget: int) -> tuple[int, int, int]:
     """(visible, total, parts) — what a reader was ACTUALLY carried, under the plan.
     Delegates to `reading.plan`, the same call the audit stage makes to build the prompts."""
     from .paper import plan as reading_plan
     cov = reading_plan(doc, int(budget)).coverage
     return cov.part_local_chars, cov.extracted_prose_chars, cov.parts
-
 
 def _prose_quantity_addresses(doc: PaperDoc) -> list[str]:
     """The paper's printed quantities that are NOT already table cells, at their minted
@@ -2647,17 +2515,14 @@ def _prose_quantity_addresses(doc: PaperDoc) -> list[str]:
             out.append(hits[0])
     return out
 
-
 def surface(doc: PaperDoc) -> ReviewSurface:
     """The paper's addressable surface. A `PaperDoc` ONLY — no `TargetSet`, no
-    `DiscoveredObject`, no count derived from a review may reach this function.
-
-    Excluded, each for a stated reason: empty padding cells (never shown to a lens); table
-    header cells (`Table.ref` indexes `rows`, so a header has no address); a figure with no
+    `DiscoveredObject`, no count derived from a review may reach this function. Excluded,
+    each for a stated reason: empty padding cells (never shown to a lens); table header
+    cells (`Table.ref` indexes `rows`, so a header has no address); a figure with no
     caption / an equation with no recovered body (the address resolves but nothing is
     citable); the repository (`IMPLEMENTATION_CLAIM` carries `ref=None` and is a claim
-    about an artifact, not a unit of the paper).
-    """
+    about an artifact, not a unit of the paper)."""
     addresses: dict[str, str] = {}
     cells_total = 0
     for table in doc.tables:
@@ -2694,7 +2559,6 @@ def surface(doc: PaperDoc) -> ReviewSurface:
         surface_empty=not addresses,
     )
 
-
 def _fold(address: str, units: set[str]) -> str:
     """The surface unit an address names, or '' when the surface has no such unit. Exact
     membership first, then a prose span onto the section that contains it: a finding minted
@@ -2710,7 +2574,6 @@ def _fold(address: str, units: set[str]) -> str:
         if section in units:
             return section
     return ""
-
 
 def _fold_all(addresses: tuple[str, ...], units: set[str]) -> tuple[set[str], list[str]]:
     """(units named, addresses that name none). An empty address (the repository's
@@ -2732,7 +2595,6 @@ def _fold_all(addresses: tuple[str, ...], units: set[str]) -> tuple[set[str], li
         elif a not in off:
             off.append(a)
     return named, off
-
 
 def measure(surf: ReviewSurface, *, addressed: tuple[str, ...] = (),
             examined: tuple[str, ...] = (),
@@ -2770,20 +2632,17 @@ def measure(surf: ReviewSurface, *, addressed: tuple[str, ...] = (),
         by_kind_addressed=by_kind_addressed,
     )
 
-
 # =============================================================================
 # PART 6 — DOCUMENT INTEGRITY: OBSERVATIONS about a parsed paper, never conclusions
-#   (from docintegrity.py; `claims.*` repointed at `locate.*`)
 # =============================================================================
-# Prevents the defect in invariant 26 (CLAUDE.md): a naive "referenced but missing" check
-# produced TWELVE false "missing table/equation" claims over the shipped corpus. So `about`
-# is REQUIRED with no default: of the ten checks, eight can only fill it with EXTRACTION,
-# one with PAPER, one (`PROSE_CELL_MISMATCH`) is not computed at all. `TABLE_ARITHMETIC` is
-# the ONE check that may speak about the paper: operands and result are verbatim cells of
-# one recovered row, re-derived operand by operand, refusing unless another row of the SAME
-# table establishes what the column means. Report-only, on the model of `code_audit.py`:
-# `observe` takes a `PaperDoc` and nothing else, and no decision function has a parameter
-# that could receive a severity, confidence or scientific class from it.
+# A naive "referenced but missing" check produces false "missing table/equation" claims
+# whenever extraction, not the paper, dropped the object. So `about` is REQUIRED with no
+# default: of the ten checks, eight can only fill it with EXTRACTION, one with PAPER, one
+# (`PROSE_CELL_MISMATCH`) is not computed at all. `TABLE_ARITHMETIC` is the ONE check that
+# may speak about the paper: operands and result are verbatim cells of one recovered row,
+# re-derived operand by operand, refusing unless another row of the SAME table establishes
+# what the column means. `observe` takes a `PaperDoc` and nothing else, and no decision
+# function has a parameter that could receive a severity, confidence or scientific class.
 
 INTEGRITY_NOT_ATTEMPTED: tuple[tuple[str, str], ...] = (
     ("figure content",
@@ -2844,7 +2703,6 @@ _AVERAGE_HEADER = re.compile(r"^(avg|avg\.|average|mean|overall|all)\b", re.IGNO
 _NUMBER = re.compile(r"^[-+]?\d+(?:\.\d+)?$")
 _norm = paper._norm
 
-
 def _printed_label(label: str = "", caption: str = "") -> str:
     """The number the paper printed for an object, or '' when none was recovered."""
     for source in (label, caption):
@@ -2857,19 +2715,16 @@ def _printed_label(label: str = "", caption: str = "") -> str:
             return m.group(1)
     return ""
 
-
 def _as_number(cell: str) -> float | None:
     """A cell's value, or None when the cell is not exactly one plain number."""
     text = _norm(cell).replace(",", "")
     return float(text) if _NUMBER.match(text) else None
-
 
 def _tolerance(printed: str) -> float:
     """Half of the last place the paper actually printed."""
     text = _norm(printed).replace(",", "")
     decimals = len(text.split(".", 1)[1]) if "." in text else 0
     return 0.5 * (10.0 ** -decimals) + 1e-9
-
 
 class _DocObject:
     """One recovered numbered object, with an address a reader can re-resolve."""
@@ -2880,7 +2735,6 @@ class _DocObject:
                  page: int, caption: str) -> None:
         self.kind, self.idx, self.label = kind, idx, label
         self.ref, self.quote, self.page, self.caption = ref, quote, page, caption
-
 
 def _first_cell(doc: PaperDoc, table) -> tuple[str, str]:
     """(ref, quote) for the first non-empty cell of a table, or ('', ''). A table has no
@@ -2894,7 +2748,6 @@ def _first_cell(doc: PaperDoc, table) -> tuple[str, str]:
             if locate.resolve(doc, ref, cell).resolved:
                 return ref, cell
     return "", ""
-
 
 def doc_objects(doc: PaperDoc) -> tuple[_DocObject, ...]:
     """Every recovered table, figure and equation, in document order, with its label."""
@@ -2913,7 +2766,6 @@ def doc_objects(doc: PaperDoc) -> tuple[_DocObject, ...]:
                               eq.ref(), eq.text, eq.page, _norm(eq.text)))
     return tuple(out)
 
-
 class _Citation:
     """One place the prose cites a numbered object, at a re-resolvable prose address."""
 
@@ -2926,7 +2778,6 @@ class _Citation:
         # "Table 5:" is the object naming ITSELF, not the prose pointing at it — both
         # readings are kept and each check says which it uses.
         self.caption_shaped = caption_shaped
-
 
 def citations(doc: PaperDoc) -> tuple[_Citation, ...]:
     """Where the prose cites a numbered object — WHAT IT CITES, never what exists.
@@ -2965,9 +2816,7 @@ def citations(doc: PaperDoc) -> tuple[_Citation, ...]:
                                    original[m.end():m.end() + 3].lstrip().startswith(":")))
     return tuple(found)
 
-
 _flat_index = paper._flat_index
-
 
 def _caption_shaped(quote: str, number: str) -> bool:
     """Does this citing text name the object as its own caption ("Table 5: ...")?"""
@@ -2975,11 +2824,9 @@ def _caption_shaped(quote: str, number: str) -> bool:
     m = re.search(rf"\b\w+\s*{re.escape(_norm(number))}\s*:", text) if number else None
     return bool(m)
 
-
 def citation_source(doc: PaperDoc) -> str:
     """`crossrefs` when the ingest stage supplied them, `prose_scan` when this module did."""
     return "crossrefs" if doc.crossrefs else "prose_scan"
-
 
 def evidence_floor(check: str = "", input_evidence_class: str = "") -> str:
     """The strongest thing an observation of `check` computed over this input may claim:
@@ -2995,13 +2842,11 @@ def evidence_floor(check: str = "", input_evidence_class: str = "") -> str:
     return "PAPER" if (input_evidence_class or "").strip() in _STRONG_INPUT \
         else "NOT_INVESTIGATED"
 
-
 def determinations(doc: PaperDoc) -> dict[str, str]:
     """Per check, what THIS document permitted it to claim — every check, always present.
     An empty observation list means two opposite things without this map: "clean" and
     "this document does not carry what the check needs" — both answer NOT_INVESTIGATED."""
     return _determine(doc, doc_objects(doc), citations(doc))
-
 
 def _determine(doc: PaperDoc, objs: tuple[_DocObject, ...],
                cites: tuple[_Citation, ...]) -> dict[str, str]:
@@ -3017,6 +2862,9 @@ def _determine(doc: PaperDoc, objs: tuple[_DocObject, ...],
     for check in INTEGRITY_CHECKS:
         out[check] = evidence_floor(
             check, "cell_verified" if check in CLAIMABLE_ABOUT_THE_PAPER else "")
+    for check in INTEGRITY_CHECKS:     # only the sealed vision audit reports these
+        if check.startswith("VISION_"):
+            out[check] = "NOT_INVESTIGATED"
     if not any(labelled.values()) or not cites:
         out["CROSSREF_UNRESOLVED"] = "NOT_INVESTIGATED"
     if not referring_kinds or not any(labelled.values()):
@@ -3039,17 +2887,14 @@ def _determine(doc: PaperDoc, objs: tuple[_DocObject, ...],
         out[check] = "NOT_INVESTIGATED"
     return out
 
-
 def _numbered_headings(doc: PaperDoc) -> frozenset[str]:
     return frozenset(m.group(1) for s in doc.sections
                      if (m := _NUMBERED_HEADING.match(_norm(s.title))))
-
 
 def _integer_labelled(objs: list[_DocObject]) -> list[_DocObject]:
     """Only labels that are a bare integer — an appendix label ("A.1") does not share a
     number line with the main sequence, so it plays no part in ordering or gap arithmetic."""
     return [o for o in objs if _INTEGER_LABEL.match(o.label)]
-
 
 def _average_rows(table) -> list[tuple[int, int, list[float], float, str]]:
     """(row, col, operands, printed, printed_raw) for every checkable average cell."""
@@ -3071,7 +2916,6 @@ def _average_rows(table) -> list[tuple[int, int, list[float], float, str]]:
             out.append((r, col, operands, printed, _norm(row[col])))
     return out
 
-
 def _established_average_columns(doc: PaperDoc) -> dict[tuple[int, int], int]:
     """{(table_idx, col): operand_count} for columns a row of their own table PROVES. A
     column headed "Avg." might average a subset or a weighted mix, so its meaning is
@@ -3085,12 +2929,10 @@ def _established_average_columns(doc: PaperDoc) -> dict[tuple[int, int], int]:
                 established.setdefault((table.table_idx, col), len(operands))
     return established
 
-
 def _obs(check: str, about: str, ref: str, quote: str, page: int,
          detail: str) -> DocumentObservation:
     return DocumentObservation(check=check, about=about, ref=ref, quote=quote,
                                page=page, detail=detail)
-
 
 def observe(doc: PaperDoc) -> tuple[DocumentObservation, ...]:
     """Every document-integrity observation this parsed paper supports. A `PaperDoc` ONLY —
@@ -3251,14 +3093,12 @@ def observe(doc: PaperDoc) -> tuple[DocumentObservation, ...]:
                            f"per-document cap is {_MAX_OBSERVATIONS}.)")
     return tuple(out)
 
-
 def summarise(observations: tuple[DocumentObservation, ...]) -> dict[str, int]:
     """Counts per `about` — two keys rather than a total, because "3 about the paper and 6
     about our own extraction" and "9 observations" say different things and only the first
     is true."""
     return {about: sum(1 for o in observations if o.about == about)
             for about in INTEGRITY_ABOUT}
-
 
 def scope_lines(observations: tuple[DocumentObservation, ...]) -> tuple[str, ...]:
     """The reviewer-facing bullets, minted HERE: "3 broken references" and "3 references
@@ -3281,9 +3121,8 @@ def scope_lines(observations: tuple[DocumentObservation, ...]) -> tuple[str, ...
         "toward any threshold and none of them moved the review's outcome",
     )
 
-
 # =============================================================================
-# PART 7 — SELF-AUDIT: did the review do the work it claims? (from selfaudit.py)
+# PART 7 — SELF-AUDIT: did the review do the work it claims?
 # =============================================================================
 # Pure: artifacts in, verdict per item out — no model, no I/O. Every item is checked
 # against a HARNESS-WRITTEN field, never a model's assessment of its own diligence. A
@@ -3294,10 +3133,8 @@ _NUMERIC = ("ARITHMETIC_ERROR", "DIFFERENT_DENOMINATOR", "GENUINE_CONTRADICTION"
 # What counts as "serious": what the verdict actually COUNTED, not what a lens asserted.
 _SERIOUS = ("FATAL", "MAJOR")
 
-
 def _finding_label(f: Finding) -> str:
     return f.finding_id or (f.title[:40] if f.title else "(unnamed)")
-
 
 def _self_audit_item(key: str, question: str, offenders: list[str], total: int, detail: str,
                      applicable: bool = True) -> SelfAuditItem:
@@ -3311,12 +3148,9 @@ def _self_audit_item(key: str, question: str, offenders: list[str], total: int, 
     return SelfAuditItem(key=key, question=question, state="pass", n_in_scope=total,
                          detail=f"all {total} in scope")
 
-
 def self_audit(report: EvalReport, counted_fn) -> ReviewSelfAudit:
     """The checklist over one finished `EvalReport`. `counted_fn` is passed in (rather than
-    calling `counted` directly) to keep this function's dependency explicit and testable
-    the way the reference implementation's cross-module wiring required; in this merged
-    module it is simply `counted`."""
+    calling `counted` directly) to keep this function's dependency explicit and testable."""
     fs = list(report.findings)
     serious = [f for f in fs if counted_fn(f) in _SERIOUS]
     numeric = [f for f in fs if f.discrepancy_type in _NUMERIC]
@@ -3408,14 +3242,11 @@ def self_audit(report: EvalReport, counted_fn) -> ReviewSelfAudit:
                  + (f"; unmet: {', '.join(failed)}" if failed else "")),
     )
 
-
 # =============================================================================
 # PART 8 — LEDGER: the traceable chain behind every conclusion, and its cost
-#   (from the ledger-assembly half of ledger.py; `exhaustion`/`planner` repointed at
-#   `decide.route_coverage` / `decide.current_plans`)
 # =============================================================================
-# A reviewer-facing report is one to two pages; the trace below is however long it needs to
-# be so any line can be traced to an artifact. Every field is copied — nothing re-reasoned.
+# A reviewer-facing report is one to two pages; the trace below is however long it needs
+# to be, so any line can be traced to an artifact. Every field is copied, nothing re-reasoned.
 
 _LEDGER_ADMISSIBILITY = {
     "repo_exec": "the authors' own checkout at a verified commit — admissible in both "
@@ -3427,6 +3258,9 @@ _LEDGER_ADMISSIBILITY = {
     "template": "the identical-arms noise-floor template — measures this machine, not the "
                 "paper, and reconciles nothing",
     "paper": "settled against the paper's own printed content; nothing was executed",
+    "cert_exec": "an independently verified exact-arithmetic certificate — admissible "
+                 "against a stated theorem/bound (a concrete instance, checked in exact "
+                 "rational arithmetic), never the authors' code and never a printed cell",
 }
 
 # What each disposition means for the paper. Only two of these are statements about the
@@ -3441,9 +3275,9 @@ _LEDGER_IMPLICATION = {
                               "so it cites the paper accurately. Nothing further follows: "
                               "whether the concern is correct was not investigated.",
     "PAPER_ARITHMETIC_CONTRADICTION": "the paper's own printed composition was "
-                              "deterministically recomputed and does not evaluate to the "
-                              "total it states. A material failure, established from the "
-                              "paper alone: no execution, no artifact, no model judgement.",
+                                      "deterministically recomputed and does not evaluate to the "
+                                      "total it states. A material failure, established from the "
+                                      "paper alone: no execution, no artifact, no model judgement.",
     "SPECIFICATION_BLOCKED": "the paper does not specify enough to check this. A limit of "
                              "the specification, not a defect in the result.",
     "ARTIFACT_BLOCKED": "no usable artifact exists for this target. Nothing about the "
@@ -3476,8 +3310,17 @@ _LEDGER_IMPLICATION = {
                        "higher-priority targets first. A limit of this run.",
     "NOT_ATTEMPTED": "not pursued; the review did not consider an experiment justified here.",
     "PENDING": "planned and not yet carried out.",
+    "COUNTEREXAMPLE_ESTABLISHED": "an independently verified exact-arithmetic certificate "
+                                  "constructed an instance that satisfies every hypothesis "
+                                  "the paper's theorem states and violates the bound it "
+                                  "claims. A material failure, established from a concrete "
+                                  "counterexample: no execution of the authors' own code, "
+                                  "no artifact, no model judgement.",
+    "NO_COUNTEREXAMPLE_FOUND": "checked, no violation in the tested instances — not a "
+                               "proof. An exact-arithmetic certificate satisfied the "
+                               "claimed bound on every instance it tried; whether the "
+                               "bound holds in general was not established either way.",
 }
-
 
 def _ledger_entry(idx: int, obj, plan, outcome, probe: ProbeResult | None) -> LedgerEntry:
     ref = getattr(obj, "ref", None)
@@ -3527,7 +3370,6 @@ def _ledger_entry(idx: int, obj, plan, outcome, probe: ProbeResult | None) -> Le
         why_material=getattr(plan, "why_material", ""),
     )
 
-
 def _ledger_question_entry(idx: int, q: ReviewQuestion) -> LedgerEntry:
     """One trace line per REVIEW QUESTION, whether or not a target was ever built for it —
     an entry-per-target ledger silently loses every question with no addressable target,
@@ -3556,7 +3398,6 @@ def _ledger_question_entry(idx: int, q: ReviewQuestion) -> LedgerEntry:
         launched=0,
         why_material=q.why_it_matters,
     )
-
 
 def build_ledger(report: EvalReport, target_set: TargetSet | None,
                  probe: ProbeResult | None = None, *, seconds: float = 0.0) -> CaseLedger:
@@ -3641,18 +3482,14 @@ def build_ledger(report: EvalReport, target_set: TargetSet | None,
     return CaseLedger(paper_id=report.paper_id, entries=entries,
                       route_attempts=list(ts.route_attempts), efficiency=efficiency)
 
-
 # =============================================================================
-# PART 9 — assemble_report: the pure equivalent of the old `run_report`
+# PART 9 — assemble_report: pure assembly; all I/O lives in pipeline.py
 # =============================================================================
 
 def _verdict_agreement(substantive: SubstantiveVerdict | None, claim: str
                        ) -> tuple[str, bool]:
     """Compare the whole-paper model read against the deterministic claim status. Printed,
-    never counted — its only consequence is the CONTESTED flag. `claim != "VERIFIED_FAILURE"`
-    is exactly the old `verdict == "GREEN"` condition; `claim == "VERIFIED_FAILURE"` is
-    exactly the old `verdict == "RED"` condition — `overall_verdict`'s RED/GREEN was always
-    a strict projection of `claim_status`, so this substitution changes no behavior."""
+    never counted — its only consequence is the CONTESTED flag."""
     if substantive is None:
         return "unavailable", False
     established = claim == "VERIFIED_FAILURE"
@@ -3665,7 +3502,6 @@ def _verdict_agreement(substantive: SubstantiveVerdict | None, claim: str
         return "model_harsher", False
     return "agree", False
 
-
 def assemble_report(*, pid: str, title: str, doc: PaperDoc, reports: list[LensReport],
                     dropped_findings: int, probe: ProbeResult | None,
                     target_set: TargetSet | None, grade_coverage: dict,
@@ -3676,13 +3512,11 @@ def assemble_report(*, pid: str, title: str, doc: PaperDoc, reports: list[LensRe
     """The pure assembly a caller runs once ingest, collect (quote-verified `reports`),
     grade (`counted_severity` already attached) and discover/probe (`target_set`) have
     produced their artifacts. Everything here is deterministic; the one optional side
-    channel is `cfg`, passed straight through to `decide.refresh_route_attempts` so a
-    caller that HAS a live `Config` gets gate-aware route accounting and a caller that does
-    not (`cfg=None`) still gets a complete, if slightly less gate-aware, result.
+    channel is `cfg`, passed to `decide.refresh_route_attempts` for gate-aware route
+    accounting when available (`cfg=None` still yields a complete result).
 
     Returns `(report, ledger)`; the caller renders with `render_eval_report` /
-    `render_reviewer_report` and is responsible for all file I/O.
-    """
+    `render_reviewer_report` and is responsible for all file I/O."""
     findings = rank([f for r in reports for f in r.findings])
     lenses_run = [r.lens for r in reports]
 
@@ -3728,6 +3562,10 @@ def assemble_report(*, pid: str, title: str, doc: PaperDoc, reports: list[LensRe
             inspected = ""
     report.artifact_state, report.review_path = artifact_axis(probe, inspected)
     report.document_observations = list(observe(doc))
+    if cfg is not None:                # the parser's own vision audit: a document fact only
+        from . import extraction_audit
+        report.document_observations += [DocumentObservation(**o)
+                                         for o in extraction_audit.observations(cfg, pid)]
     surf = surface(doc)
     addressed, examined = coverage_numerators(target_set)
     report.coverage = measure(surf, addressed=addressed, examined=examined,
@@ -3773,7 +3611,6 @@ def assemble_report(*, pid: str, title: str, doc: PaperDoc, reports: list[LensRe
                                           lens_policy_enforced=lens_policy_enforced)
     return report, case_ledger
 
-
 # =============================================================================
 # SELF-CHECK
 # =============================================================================
@@ -3781,7 +3618,6 @@ def _f(fid, lens, sev, ref="", verifiable=False, **kw):
     return Finding(finding_id=fid, lens=lens, severity=sev, title=f"{fid} title",
                    statement="s", evidence_quote="q", evidence_ref=ref,
                    verifiable_by_experiment=verifiable, **kw)
-
 
 def _self_check_decision() -> None:
     assert parse_magnitude("+3-5% top-1") == 3.0
@@ -3845,13 +3681,22 @@ def _self_check_decision() -> None:
     assert claim_status([], _rec("RESOLVED_VERIFIED"))[0] == "VERIFIED_SUPPORT"
     assert claim_status([_f("a", "overclaim", "FATAL")], _rec("RESOLVED_VERIFIED"))[0] == "VERIFIED_SUPPORT"
 
-    # THE PROVENANCE CEILING, APPLIED A SECOND TIME AT THE REPORTING LAYER. The reconciler
-    # (`local_exec.reconcile`) already refused to let a `synthesized` provenance settle a
-    # printed cell; this asserts the SAME refusal happens again here, independently, if a
-    # FAILED_REPRODUCTION carrying an inadmissible provenance ever reaches this layer
-    # anyway (an edited artifact, an upstream bug) — it must read as a harness defect
-    # (NOT_VERIFIED, never a paper-level conviction), and the matching execution-row state
-    # is EXECUTION_PRODUCED_NO_ADMISSIBLE_EVIDENCE, not EXECUTION_CONTRADICTED_A_PRINTED_QUANTITY.
+    # EXACT_CERTIFICATE: a MATERIAL counterexample is VERIFIED_FAILURE with its own text,
+    # never "reproduction"/"reimplementation" wording — this is a proof, not a run of code.
+    cert_out = TargetOutcome(target_id="T1", disposition="COUNTEREXAMPLE_ESTABLISHED",
+                             provenance="cert_exec", reason="instance t=224 violates the bound")
+    s5, why5 = claim_status([], None, outcomes=[cert_out], objects=material)
+    assert s5 == "VERIFIED_FAILURE" and "exact-arithmetic certificate" in why5, why5
+    clean_out = TargetOutcome(target_id="T1", disposition="NO_COUNTEREXAMPLE_FOUND",
+                              provenance="cert_exec", reason="no violation")
+    s6, why6 = claim_status([], None, outcomes=[clean_out], objects=material)
+    assert s6 == "NOT_VERIFIED", (
+        "a clean certificate checks the tested instances only and must never acquit")
+
+    # THE PROVENANCE CEILING, APPLIED AGAIN AT THE REPORTING LAYER: if a FAILED_REPRODUCTION
+    # carrying an inadmissible provenance reaches this layer anyway, it must read as a
+    # harness defect (NOT_VERIFIED), and as EXECUTION_PRODUCED_NO_ADMISSIBLE_EVIDENCE, not
+    # EXECUTION_CONTRADICTED_A_PRINTED_QUANTITY.
     inadmissible_rec = _rec("FAILED_REPRODUCTION", provenance="synthesized",
                            reproduced_value=1.0, delta_error=99, target_id="T1")
     s4, _ = claim_status([], inadmissible_rec, objects=material)
@@ -3886,7 +3731,6 @@ def _self_check_decision() -> None:
                                                 delta_error=4.82, seeds_run=[0, 1, 2])))
     assert "FAILED REPRODUCTION" in body and "0.1000" in body and "4.8200" in body
     print("report/decision self-check ok")
-
 
 def _self_check_outcome() -> None:
     import inspect
@@ -3943,7 +3787,8 @@ def _self_check_outcome() -> None:
     assert execution_actor([]) == _DEFAULT_ACTOR
     for prov, expect in (("repo_exec", "the authors' own code"),
                          ("reimpl_exec", "an independent reimplementation (not the authors' code)"),
-                         ("driver", "an operator-supplied reproduction")):
+                         ("driver", "an operator-supplied reproduction"),
+                         ("cert_exec", "an independently verified exact-arithmetic certificate")):
         got = execution_actor([TargetOutcome(target_id="T", disposition="FAILED_REPRODUCTION",
                                              provenance=prov, launched=1)])
         assert got == expect, (prov, got)
@@ -3999,7 +3844,6 @@ def _self_check_outcome() -> None:
     assert "evidence about the mechanism." in got
     assert clip("short enough") == "short enough"
     print("outcome self-check ok")
-
 
 def _self_check_guarantees() -> None:
     import inspect
@@ -4131,7 +3975,6 @@ def _self_check_guarantees() -> None:
             assert bad_param not in params, (fn.__name__, bad_param)
     print("guarantees self-check ok")
 
-
 def _self_check_coverage() -> None:
     import inspect
 
@@ -4251,12 +4094,10 @@ def _self_check_coverage() -> None:
             assert banned not in model.model_fields, (model.__name__, banned)
     print("coverage self-check ok")
 
-
 def _doc_fixture(**kw) -> PaperDoc:
     fields: dict = {"paper_id": "selfcheck", "n_pages": 2}
     fields.update(kw)
     return PaperDoc.model_validate(fields)
-
 
 def _self_check_docintegrity() -> None:
     import inspect
@@ -4298,8 +4139,7 @@ def _self_check_docintegrity() -> None:
     assert set(determinations(empty)) == set(INTEGRITY_CHECKS)
     assert set(determinations(empty).values()) == {"NOT_INVESTIGATED"}
 
-    # the twelve measured false positives (12 "missing table/equation" claims, all false,
-    # over the shipped corpus) can only ever be EXTRACTION, never PAPER
+    # a "referenced but missing" hit can only ever be EXTRACTION, never PAPER
     cited = _doc_fixture(sections=[Section(section_idx=0, title="4. Experiments", page_start=1,
                                    text="Table 1 lists the comparison. Table 2 reports the "
                                         "ablation, and Table 3 the transfer results.")],
@@ -4401,11 +4241,11 @@ def _self_check_docintegrity() -> None:
     reachable = {o.check for doc in (cited, gapped, twice, clash, proven, ordered,
                                      uncited, uncaptioned, numbered)
                  for o in observe(doc)}
-    unreachable = set(INTEGRITY_CHECKS) - reachable - set(NOT_COMPUTED)
+    unreachable = {c for c in set(INTEGRITY_CHECKS) - reachable - set(NOT_COMPUTED)
+                   if not c.startswith("VISION_")}   # produced by extraction_audit.py
     assert not unreachable, f"declared but produced by nothing: {sorted(unreachable)}"
     assert len(INTEGRITY_NOT_ATTEMPTED) == 3
     print("docintegrity self-check ok")
-
 
 def _self_check_selfaudit() -> None:
     from .schema import Grade, SubstantiveVerdict as _SV
@@ -4465,7 +4305,6 @@ def _self_check_selfaudit() -> None:
         EvalReport(paper_id="p", findings=[capped],
                   substantive_verdict=_SV(verdict="STRONG")), _counted).failed
     print("selfaudit self-check ok")
-
 
 def _self_check_ledger() -> None:
     ts = TargetSet(
@@ -4534,7 +4373,6 @@ def _self_check_ledger() -> None:
     assert syn.evidence_state == "INCONCLUSIVE_EXECUTION" and not syn.concerns_the_paper
     assert led2.efficiency["targets_resolved"] == 1
     print("ledger self-check ok")
-
 
 def _self_check_render_caps() -> None:
     """Invariant 19, exercised on a synthetic paper deliberately over EVERY cap at once —
@@ -4662,10 +4500,8 @@ def _self_check_render_caps() -> None:
         "the elided count must be stated, not silently dropped")
 
     assert len(review_md) < 40000, (
-        "a synthetic worst case must still be a bounded document, not merely capped in "
-        "theory")
+        "a synthetic worst case must still be a bounded document, not merely capped in " "theory")
     print("render-caps self-check ok (twelve distinct caps confirmed present and triggering)")
-
 
 if __name__ == "__main__":
     _self_check_decision()

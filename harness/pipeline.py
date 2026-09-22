@@ -1,27 +1,25 @@
-"""The orchestration loop, as a program rather than a convention — was controller.py
-(1006 lines) + preflight.py (237) + corpus.py (126).
+"""The orchestration loop: sequence phases, decide what to attempt next from persisted
+state, re-attempt a phase whose failure was transient, and record everything observed.
+That is the whole list.
 
-Before this module, `review()` ran the deterministic stages, hit the audit stage, returned
-`status="needs_audit"`, and the process ended. Resuming depended on an actor outside the
-repository reading prose in CLAUDE.md and re-invoking the CLI. This module is the
-workflow: sequence phases, decide what to attempt next from persisted state, re-attempt a
-phase whose failure was transient, and record everything it observed. That is the whole
-list.
-
-**What it may not do, and cannot.** It cannot authorize an execution, select a backend,
-set an identity state, decide a resource sufficiency, or write a reconciliation status.
-Those live below it in `execute.authorize`/`execute.reconcile`, and this module only ever
+What it may not do, and cannot: authorize an execution, select a backend, set an
+identity state, decide a resource sufficiency, or write a reconciliation status. Those
+live below it in `execute.authorize`/`execute.reconcile`, and this module only ever
 *requests* the phase that consults them and *records the answer it got*.
 
-**Abstention is not failure.** A paper with no repository, an ambiguous experiment, a
+Abstention is not failure. A paper with no repository, an ambiguous experiment, a
 24 GiB requirement on an 8 GiB card, or a backend that cannot be provisioned still gets a
-complete review — the reproduction abstains, `CaseState.reproduction_class` names why, and
-the case reaches `complete` with a report.
+complete review -- the reproduction abstains, `CaseState.reproduction_class` names why,
+and the case reaches `complete` with a report.
 
-**Retries are bounded, recorded, and rare.** Precisely two things are retryable: a lens
-whose reviewer failed, and a grade whose reviewer failed. A timeout or a truncated JSON
-object is transient and the same prompt may well succeed on a second attempt. Nothing else
-is — an identity, resource, commit, capability or authorization refusal is deterministic.
+Delegation is asynchronous. Nothing in this process spawns a reviewer, so nothing here
+can classify or re-attempt its failure. `_phase_audit`/`_phase_grade` render prompts
+(deterministic, no model call), report `waiting` with the pending list whenever something
+has no result yet, and rely on the caller -- `harness/tasks.py`, driven by the
+controlling session's own subagents -- to seal answers and call
+`step`/`drive`/`harness.tasks.advance` again. A phase that is `waiting` never blocks the
+OTHER phases of a different paper in a batch, and a resumed case picks up exactly where
+sealing left off.
 
 `python -m harness.pipeline` runs the self-check.
 """
@@ -41,28 +39,15 @@ from .schema import (CORPUS_STATES, PHASES, CaseState, CorpusEntry, CorpusReport
                      PhaseEvent, ProbeResult, ReadingRecord)
 from .stages import ingest as ingest_stage
 
-# Only these phases may be re-attempted, and only up to their own retry budget
-# (`cfg.audit_retries` / `cfg.grade_retries`). Everything else that can refuse is
-# deterministic, and retrying a deterministic refusal is asking a gate the same question
-# until it changes its mind.
-RETRYABLE = ("audit", "grade")
-# How many dispatch rounds one audit phase may run. Two is what the design needs — the
-# parts, then each lens's synthesis over its own parts — and the third is slack for a
-# reading that failed in the first round and succeeded in the second. Not a budget: the
-# loop already stops the moment a round fills nothing.
-_MAX_AUDIT_ROUNDS = 3
-
 
 @dataclass(frozen=True)
 class PhaseOutcome:
-    """What one attempt at one phase concluded.
+    """What one attempt at one phase concluded. `abstain` is deliberately absent from the
+    ways a CASE can end: a phase may abstain (the probe routinely does) and the pipeline
+    continues to the report regardless, with the abstention travelling on
+    `reproduction_class`, not as a terminal state."""
 
-    `abstain` is deliberately absent from the ways a CASE can end. A phase may abstain —
-    the probe routinely does — and the pipeline continues to the report regardless. The
-    abstention travels on `reproduction_class`, not as a terminal state.
-    """
-
-    outcome: str                       # ok | waiting | retry | abstain | error
+    outcome: str                       # ok | waiting | abstain | error
     reason: str = ""
     detail: dict | None = None
     reproduction_class: str = ""
@@ -93,11 +78,9 @@ def save_case(cfg: Config, case: CaseState) -> CaseState:
 
 def rewind(case: CaseState, phase: str) -> CaseState:
     """Move a finished case back to `phase` so a re-invocation actually re-derives.
-
     Without this a `complete` case is terminal and re-running `review` on it hands back
-    whatever report was on disk — including after the code that produced it has changed.
-    The history is kept: a case re-derived twice should show both runs.
-    """
+    whatever report was on disk, including after the code that produced it has changed.
+    The history is kept: a case re-derived twice should show both runs."""
     if PHASES.index(phase) >= PHASES.index(case.phase) and case.phase != "done":
         return case
     case.phase, case.status, case.blocked_reason = phase, "running", ""
@@ -146,18 +129,10 @@ def _phase_ingest(cfg: Config, case: CaseState, **_) -> PhaseOutcome:
                               f"{res.get('tables', 0)} table(s)", res)
 
 
-def _record_failure(case: CaseState, kinds: dict) -> None:
-    """Persist WHY a delegation failed, worst policy first, onto the case."""
-    if not kinds:
-        return
-    order = {"never": 0, "later": 1, "now": 2}
-    worst = min(kinds.values(), key=lambda k: order.get(k.get("retry", "now"), 3))
-    case.failure_kind = worst.get("kind", "") or case.failure_kind
-    case.retry_policy = worst.get("retry", "") or case.retry_policy
-
-
-def _phase_audit(cfg: Config, case: CaseState, *, auto_audit: bool = False, **_) -> PhaseOutcome:
-    """Render the lens prompts, then fill whatever the configured reviewer can fill."""
+def _phase_audit(cfg: Config, case: CaseState, **_) -> PhaseOutcome:
+    """Render the lens prompts. Filling them is `harness/tasks.py`'s job: a session
+    subagent reads a prompt and `harness.tasks.seal` validates its answer, so this phase
+    only ever reports `ok` (nothing outstanding) or `waiting` (the pending list)."""
     res = run_audit(cfg, case.paper_id)
     if "error" in res:
         return PhaseOutcome("error", res["error"])
@@ -166,84 +141,14 @@ def _phase_audit(cfg: Config, case: CaseState, *, auto_audit: bool = False, **_)
     if not case.awaiting and not deferred:
         return PhaseOutcome("ok", "every reading already has a result",
                             {"complete": res["complete"]})
-
-    if not auto_audit:
-        pending = case.awaiting + deferred
-        return PhaseOutcome(
-            "waiting",
-            f"{len(pending)} reading(s) have no result: {', '.join(pending)}. "
-            f"Prompts are in audit/prompts/; run with --auto-audit to delegate them."
-            + (f" {len(deferred)} of them is a cross-part synthesis whose prompt is written "
-               f"once its own parts are in." if deferred else ""),
-            {"awaiting": case.awaiting, "deferred": deferred, "prompts": res["prompts"]})
-
-    ok, why = agent.available(cfg, "lens")
-    if not ok:
-        return PhaseOutcome("waiting", f"cannot delegate the audit: {why}",
-                            {"awaiting": case.awaiting})
-
-    meta = state.load_meta(cfg, case.paper_id)
-    pdf_path = meta.get("paper_path") or ""
-    pdf_dir = str(Path(pdf_path).resolve().parent) if pdf_path else ""
-
-    filled = {"filled": [], "failed": {}, "rate_limited": {}, "blocked": {}, "kinds": {}}
-    after = res
-    for _ in range(_MAX_AUDIT_ROUNDS):
-        pending = list(after.get("awaiting") or [])
-        if not pending:
-            break
-        round_result = agent.fill_lenses(cfg, case.paper_id, pending, after["prompts"],
-                                         pdf_dir=pdf_dir, units=after.get("units"))
-        filled["filled"] += round_result["filled"]
-        for bucket in ("failed", "rate_limited", "blocked", "kinds"):
-            filled[bucket].update(round_result.get(bucket) or {})
-        after = run_audit(cfg, case.paper_id)
-        if not round_result["filled"]:
-            break
-        done_now = set(after.get("complete") or [])
-        for bucket in ("failed", "rate_limited", "blocked", "kinds"):
-            filled[bucket] = {k: v for k, v in filled[bucket].items() if k not in done_now}
-
-    case.awaiting = list(after.get("awaiting", [])) + list(after.get("deferred") or [])
-    detail = {"filled": filled["filled"], "failed": filled["failed"],
-              "rate_limited": filled["rate_limited"], "blocked": filled.get("blocked", {}),
-              "kinds": filled.get("kinds", {}), "awaiting": case.awaiting,
-              "parts": after.get("parts"),
-              "reader_visible_fraction": after.get("reader_visible_fraction")}
-    _record_failure(case, filled.get("kinds", {}))
-    if not case.awaiting:
-        return PhaseOutcome("ok", f"delegated and filled {len(filled['filled'])} reading(s) "
-                                  f"across {after.get('parts', 1)} part(s) of the paper", detail)
-
-    unretryable = {**filled["rate_limited"], **filled.get("blocked", {})}
-    if not (unretryable or filled["failed"]):
-        return PhaseOutcome("waiting", f"{len(case.awaiting)} reading(s) still to run: "
-                                       f"{', '.join(case.awaiting)}", detail)
-    if unretryable:
-        case.attempts["audit"] = max(0, case.attempts.get("audit", 1) - 1)
-        hints = [v.get("reset_hint", "") for v in filled.get("kinds", {}).values()]
-        case.resume_after = next((h for h in hints if h), "") or case.resume_after
-        why = "; ".join(f"{k}: {v}" for k, v in unretryable.items())
-        later = bool(filled["rate_limited"])
-        return PhaseOutcome(
-            "waiting",
-            f"{len(unretryable)} lens(es) blocked by a {case.failure_kind or 'non-retryable'} "
-            f"failure, not by reviewer quality — "
-            + ("re-run once available" if later else "this needs an operator fix, not a retry")
-            + (f" ({case.resume_after})" if case.resume_after and later else "") + f": {why}",
-            detail)
-
-    attempts = case.attempts.get("audit", 1)
-    why = "; ".join(f"{k}: {v}" for k, v in filled["failed"].items())
-    if attempts <= max(0, cfg.audit_retries):
-        return PhaseOutcome(
-            "retry",
-            f"{len(case.awaiting)} lens(es) still pending after attempt {attempts} of "
-            f"{cfg.audit_retries + 1}: {why}", detail)
+    pending = case.awaiting + deferred
     return PhaseOutcome(
         "waiting",
-        f"{len(case.awaiting)} lens(es) could not be produced in {attempts} attempt(s): {why}",
-        detail)
+        f"{len(pending)} reading(s) have no result: {', '.join(pending)}. Run "
+        f"`python run.py tasks {case.paper_id}` to list them as delegable tasks."
+        + (f" {len(deferred)} of them are cross-part syntheses whose prompt is written "
+           "once its own parts are in." if deferred else ""),
+        {"awaiting": case.awaiting, "deferred": deferred, "prompts": res["prompts"]})
 
 
 def _phase_collect(cfg: Config, case: CaseState, **_) -> PhaseOutcome:
@@ -285,10 +190,10 @@ def _reproduction_class(result: ProbeResult | None) -> str:
     return result.verdict or "inconclusive"
 
 
-def _phase_grade(cfg: Config, case: CaseState, *, auto_grade: bool = False, **_) -> PhaseOutcome:
-    """Independently grade whatever candidates are in scope. An unavailable, exhausted, or
-    never-requested grader returns `ok`, not `waiting` — findings simply count at their
-    lens-asserted severity unless `SH_REQUIRE_GRADES` says otherwise."""
+def _phase_grade(cfg: Config, case: CaseState, **_) -> PhaseOutcome:
+    """Render grade prompts for whatever candidates are in scope. `cfg.require_grades`
+    (default ON; `SH_REQUIRE_GRADES=0` to skip) decides whether an ungraded candidate
+    blocks the report or falls back to its lens-asserted severity."""
     res = run_grade(cfg, case.paper_id)
     if "error" in res:
         return PhaseOutcome("ok", res["error"])
@@ -296,67 +201,24 @@ def _phase_grade(cfg: Config, case: CaseState, *, auto_grade: bool = False, **_)
     if not awaiting:
         return PhaseOutcome("ok", f"{res['candidates']} candidate(s) in scope, all graded",
                             {"complete": res["complete"], "candidates": res["candidates"]})
-
-    if not auto_grade:
-        if cfg.require_grades:
-            return PhaseOutcome(
-                "waiting",
-                f"{len(awaiting)} candidate(s) ungraded and SH_REQUIRE_GRADES is set: run "
-                f"with --auto-grade to delegate them.", {"awaiting": awaiting})
-        return PhaseOutcome(
-            "ok", f"grading not requested; {len(awaiting)} candidate(s) will count at "
-                 f"their lens-asserted severity", {"awaiting": awaiting})
-
-    ok, why = agent.available(cfg, "grade")
-    if not ok:
-        if cfg.require_grades:
-            return PhaseOutcome("waiting", f"cannot delegate grading: {why}", {"awaiting": awaiting})
-        return PhaseOutcome(
-            "ok", f"grader unavailable ({why}); {len(awaiting)} candidate(s) will count "
-                 f"at their lens-asserted severity", {"awaiting": awaiting})
-
-    filled = agent.fill_grades(cfg, case.paper_id, awaiting, res["prompts"])
-    after = run_grade(cfg, case.paper_id)
-    still_awaiting = list(after.get("awaiting", []))
-    detail = {"filled": filled["filled"], "failed": filled["failed"],
-              "rate_limited": filled["rate_limited"], "blocked": filled.get("blocked", {}),
-              "kinds": filled.get("kinds", {}), "awaiting": still_awaiting}
-    _record_failure(case, filled.get("kinds", {}))
-    if not still_awaiting:
-        return PhaseOutcome("ok", f"delegated and graded {len(filled['filled'])} candidate(s)", detail)
-
-    unretryable = {**filled["rate_limited"], **filled.get("blocked", {})}
-    if unretryable:
-        case.attempts["grade"] = max(0, case.attempts.get("grade", 1) - 1)
-        why = "; ".join(f"{k}: {v}" for k, v in unretryable.items())
-        outcome = "waiting" if cfg.require_grades else "ok"
-        return PhaseOutcome(outcome, f"{len(unretryable)} candidate(s) blocked by a "
-                                     f"{case.failure_kind or 'non-retryable'} failure, not by "
-                                     f"grader quality: {why}", detail)
-
-    attempts = case.attempts.get("grade", 1)
-    why = "; ".join(f"{k}: {v}" for k, v in filled["failed"].items())
-    if attempts <= max(0, cfg.grade_retries):
-        return PhaseOutcome(
-            "retry", f"{len(still_awaiting)} candidate(s) still pending after attempt "
-                    f"{attempts} of {cfg.grade_retries + 1}: {why}", detail)
     if cfg.require_grades:
         return PhaseOutcome(
-            "waiting", f"{len(still_awaiting)} candidate(s) could not be graded in "
-                      f"{attempts} attempt(s): {why}", detail)
+            "waiting",
+            f"{len(awaiting)} candidate(s) ungraded. Run `python run.py tasks "
+            f"{case.paper_id}` to list them as delegable tasks (or set SH_REQUIRE_GRADES=0 "
+            f"to proceed without grading; ungraded findings then count at their "
+            f"lens-asserted severity).", {"awaiting": awaiting})
     return PhaseOutcome(
-        "ok", f"{len(still_awaiting)} candidate(s) ungraded after {attempts} attempt(s); "
-             f"they will count at their lens-asserted severity", detail)
+        "ok", f"grading not complete; {len(awaiting)} candidate(s) will count at their "
+             f"lens-asserted severity", {"awaiting": awaiting})
 
 
 def _phase_assess(cfg: Config, case: CaseState, **_) -> PhaseOutcome:
     """Has the paper's own evidence already settled it? Asked BEFORE anything expensive.
-
     Pure and model-free, over the kept findings alone. What a True answer stops is the
-    INVESTIGATION BRANCH — acquisition, static audit, identity, resources, execution. It
-    does not stop the review itself: discovery, the report, the ledger and the four pure
-    layers all still run, because the referee record has to be complete whatever the
-    outcome. See `harness/assessment.py`.
+    INVESTIGATION BRANCH -- acquisition, static audit, identity, resources, execution --
+    not the review itself: discovery, the report and the ledger all still run, because
+    the referee record has to be complete whatever the outcome. See `harness/assessment.py`.
     """
     doc_path = state.project_dir(cfg, case.paper_id) / "paper" / "doc.json"
     if not doc_path.exists():
@@ -382,10 +244,8 @@ def _phase_assess(cfg: Config, case: CaseState, **_) -> PhaseOutcome:
 
 def _phase_discover(cfg: Config, case: CaseState, **_) -> PhaseOutcome:
     """Ask what this paper offers to check, before anything expensive happens.
-
-    Deterministic and model-free. A paper with nothing addressable still produces a target
-    set, whose `extraction_coverage` says how much of the paper was reachable at all.
-    """
+    Deterministic and model-free: a paper with nothing addressable still produces a
+    target set, whose `extraction_coverage` says how much of the paper was reachable."""
     res = discover.run(cfg, case.paper_id,
                        investigation_open=assessment.investigation_open(case.assessment))
     if "error" in res:
@@ -400,10 +260,9 @@ def _phase_discover(cfg: Config, case: CaseState, **_) -> PhaseOutcome:
 
 def _phase_probe(cfg: Config, case: CaseState, *, force_probe: bool = False,
                  skip_probe: bool = False, **_) -> PhaseOutcome:
-    """Request reproduction. Whether anything runs is settled below this function — the
-    controller asks; `routes.plan_execution` and `execute.authorize` decide. Every way this
-    can end short of a measurement is an ABSTENTION, never an error.
-    """
+    """Request reproduction. Whether anything runs is settled below this function: the
+    controller asks; `routes.plan_execution` and `execute.authorize` decide. Every way
+    this can end short of a measurement is an ABSTENTION, never an error."""
     doc_path = state.project_dir(cfg, case.paper_id) / "paper" / "doc.json"
     doc = PaperDoc(**state.read_json(doc_path))
     root = state.project_dir(cfg, case.paper_id)
@@ -469,9 +328,8 @@ def _phase_probe(cfg: Config, case: CaseState, *, force_probe: bool = False,
 
 def run_report_stage(cfg: Config, pid: str) -> dict:
     """Everything `report.assemble_report` needs is an already-produced artifact; this
-    function is the I/O half `assemble_report`'s own docstring says a caller owns —
-    reading those artifacts, dispatching the whole-paper verdict, and writing the four
-    files a finished review consists of."""
+    function is the I/O half a caller owns: reading those artifacts, dispatching the
+    whole-paper verdict, and writing the four files a finished review consists of."""
     root = state.project_dir(cfg, pid)
     doc_path = root / "paper" / "doc.json"
     if not doc_path.exists():
@@ -490,9 +348,7 @@ def run_report_stage(cfg: Config, pid: str) -> dict:
 
     # `routes.run` writes only its FIRST target's result to control/probe_results.json;
     # every other target's sits under control/targets/<id>/. Surface the most informative
-    # admissible one, so the machine report's Reproduction row cannot hide a failed (or
-    # reproduced) target behind the first target's inconclusive one. Ties keep the first.
-    # Materiality still gates any paper-level consequence inside `claim_status`.
+    # admissible one so the report cannot hide a failed target behind an inconclusive one.
     from . import provenance as provenance_mod
     status_rank = {"FAILED_REPRODUCTION": 2, "RESOLVED_VERIFIED": 1}
     probe_path = state.control_dir(root) / "probe_results.json"
@@ -513,8 +369,8 @@ def run_report_stage(cfg: Config, pid: str) -> dict:
     target_set = discover.load(cfg, pid)
 
     # The whole-paper verdict prompt, built the same way regardless of whether anything
-    # can dispatch it — a review with no reachable model still leaves an operator
-    # everything they need, the same discipline `_phase_audit` already applies.
+    # can dispatch it -- a review with no reachable model still leaves an operator
+    # everything they need.
     for_prompt = rank([f for r in reports for f in r.findings])
     findings_summary = "\n".join(
         f"- [{counted(f)}] ({f.lens}) {f.title}: {f.statement}" for f in for_prompt[:30])
@@ -532,10 +388,10 @@ def run_report_stage(cfg: Config, pid: str) -> dict:
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
     prompt_path.write_text(verdict_prompt, encoding="utf-8")
 
+    # Best-effort and never blocking: a substantive verdict is answered asynchronously by
+    # a session subagent through `harness.tasks` and sealed via `agent.accept_verdict`.
+    # This just reads back whatever is sealed so far, if anything.
     substantive = agent.load_verdict(cfg, pid)
-    if substantive is None:
-        substantive = agent.run_verdict(cfg, verdict_prompt, timeout_s=cfg.verdict_timeout_s,
-                                        pid=pid)
 
     reading = ReadingRecord(**reading_record(cfg, pid, doc))
 
@@ -665,12 +521,6 @@ def step(cfg: Config, case: CaseState, **opts) -> CaseState:
             case.status, case.blocked_reason = "error", out.reason
         elif out.outcome == "waiting":
             case.status, case.blocked_reason = "waiting", out.reason
-        elif out.outcome == "retry":
-            case.status, case.blocked_reason = "running", out.reason
-            if case.phase not in RETRYABLE:
-                case.status, case.blocked_reason = "waiting", (
-                    f"{case.phase} asked to retry, but only {', '.join(RETRYABLE)} may be "
-                    f"re-attempted: {out.reason}")
         else:                                        # ok | abstain
             case.blocked_reason = ""
             case.phase = _next_phase(case.phase)
@@ -711,14 +561,14 @@ def drive(cfg: Config, case: CaseState, *, max_steps: int = 40, **opts) -> CaseS
 
 
 def drive_all(cfg: Config, sources: list[str], **opts) -> list[CaseState]:
-    """Advance several papers independently, interleaved — round-robin so a paper that
-    blocks does not hold up the rest of the batch."""
+    """Advance several papers independently, interleaved -- round-robin so a blocked
+    paper does not hold up the rest of the batch."""
     resume_at = "discover" if opts.get("force_probe") else "collect"
     cases = []
     for s in sources:
         case = open_case(cfg, s)
         cases.append(rewind(case, resume_at) if case.status == "complete" else case)
-    for _ in range(len(PHASES) * (2 + max(0, cfg.audit_retries, cfg.grade_retries)) + 4):
+    for _ in range(len(PHASES) * 2 + 4):
         active = [c for c in cases if not c.terminal and c.status != "waiting"]
         if not active:
             break
@@ -730,11 +580,9 @@ def drive_all(cfg: Config, sources: list[str], **opts) -> list[CaseState]:
 
 
 def summarize(cases: list[CaseState]) -> dict:
-    """The batch, as a caller sees it. Pure — reads the cases, decides nothing.
-
-    NOT the authoritative accounting: `account` below is, built from the REQUEST list
-    rather than the cases that happen to exist.
-    """
+    """The batch, as a caller sees it. Pure -- reads the cases, decides nothing. NOT the
+    authoritative accounting: `account` below is, built from the REQUEST list rather than
+    the cases that happen to exist."""
     return {
         "papers": len(cases),
         "complete": [c.paper_id for c in cases if c.status == "complete"],
@@ -783,9 +631,10 @@ def as_result(cfg: Config, case: CaseState) -> dict:
                 "blocked_reason": case.blocked_reason,
                 "failure_kind": case.failure_kind, "retry_policy": case.retry_policy,
                 "resume_after": case.resume_after,
-                "next": (f"Write projects/{case.paper_id}/audit/<lens>.json for each pending "
-                         f"lens, one lens per turn, then re-run. Or pass --auto-audit to let "
-                         f"the pipeline delegate them.")}
+                "next": (f"Run `python run.py tasks {case.paper_id}` for the prompt/out path "
+                         f"of each pending reading, have a session subagent answer it, then "
+                         f"`python run.py seal {case.paper_id} <task-id> <file>`. Or write "
+                         f"projects/{case.paper_id}/audit/<lens>.json by hand and re-run.")}
 
     synth, collected = _detail(case, "report"), _detail(case, "collect")
     return {"status": "complete", "paper_id": case.paper_id, "title": title,
@@ -804,9 +653,8 @@ def review(cfg: Config, paper: str, **opts) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Preflight — was preflight.py. Is this batch N distinct papers, before anything is spent?
+# Preflight — is this batch N distinct papers, before anything is spent?
 # --------------------------------------------------------------------------- #
-PREFLIGHT_STATES = ("NEW", "RESUMES", "DISAMBIGUATED", "DUPLICATE_REQUEST", "UNREADABLE")
 BLOCKING_STATES = ("DUPLICATE_REQUEST", "UNREADABLE")
 
 
@@ -821,7 +669,7 @@ def _recorded_sha(cfg: Config, pid: str) -> str | None:
 
 
 def inspect_paper(cfg: Config, src: Path, seen: dict[str, Path]) -> dict:
-    """What will happen to this one file, without ingesting it. `seen` is mutated so the
+    """What will happen to this one file, without ingesting it. `seen` is mutated so a
     SECOND appearance of one document is reported as a duplicate."""
     try:
         sha = ingest_stage.content_sha(src)
@@ -970,10 +818,10 @@ def review_papers(cfg: Config, papers: list[str], *, dossier_out: Path | None = 
                   **opts) -> dict:
     """Review a batch, interleaved, then consolidate whatever finished into one dossier.
 
-    **THE BATCH IS COUNTED BEFORE IT IS SPENT.** `preflight_check` answers, from the PDFs'
+    THE BATCH IS COUNTED BEFORE IT IS SPENT. `preflight_check` answers, from the PDFs'
     bytes, whether an N-file request is N distinct documents. Only a DUPLICATE DOCUMENT
     blocks here; two different papers that slugify to the same id proceed with their
-    distinct ids, and nothing is spent when it refuses — the check reads bytes and
+    distinct ids, and nothing is spent when it refuses -- the check reads bytes and
     allocates no case.
     """
     from . import summarize as summarize_mod
@@ -1027,7 +875,6 @@ if __name__ == "__main__":  # self-check: python -m harness.pipeline
     assert _next_phase("collect") == "grade" and _next_phase("grade") == "assess"
     assert _next_phase("assess") == "discover"
     assert _next_phase("discover") == "probe"
-    assert RETRYABLE == ("audit", "grade")
 
     # --- reproduction class is READ from the artifact, never decided here -----------
     assert _reproduction_class(None) == "not_attempted"

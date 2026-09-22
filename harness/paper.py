@@ -1,24 +1,10 @@
 """PDF -> `PaperDoc`, and the bounded-part reading plan that traverses it. Pure
 functions: no LLM, no network, no `Config`. This is the only module in the harness that
-opens a PDF.
-
-Consolidates two reference-implementation modules (tag `reference-implementation-
-2026-09-20`) into one:
-  - `harness/pdf.py`       — PyMuPDF for page text, pdfplumber for ruled table structure.
-  - `harness/reading.py`   — splitting a long paper into bounded, blind parts per lens,
-                             with a deterministic anchor packet carried across them.
+opens a PDF (PyMuPDF for page text, pdfplumber for ruled table structure).
 
 Repository URL discovery (`find_repo_urls`/`official_repo_url`) stays in `harness/repo.py`
-alongside acquire/pin/verify_commit, which is the only caller (`stages/ingest.py` reaches
-it through `repo`, not through this module) — an earlier revision of this module carried
-its own duplicate copy of both functions plus a `parse()` entry point that called them;
-neither was ever wired to a caller, and both were removed 2026-09-21.
-
-Same models as the reference (`PaperDoc`, `Section`, `Table`, `Figure`, `Equation`,
-`CrossRef`, `QuantFinding`), now defined once in `harness/schema.py` and imported here
-rather than redefined. `abstract_section_idx`/`conclusion_section_idx` are `harness.decide`'s
-(the v4 home of the old `harness/materiality.py` locators); `flatten`/`resolve` are
-`harness.locate`'s (the v4 home of the old `harness/claims.py`).
+alongside acquire/pin/verify_commit, which is the only caller. `abstract_section_idx`/
+`conclusion_section_idx` are `harness.decide`'s; `flatten`/`resolve` are `harness.locate`'s.
 
 `python -m harness.paper <file.pdf>` runs the self-check; omit the path to run only the
 fixture-based half (reading plan needs no PDF).
@@ -39,17 +25,11 @@ from .schema import CrossRef, Equation, Figure, PaperDoc, QuantFinding, Section,
 # Extraction
 # =========================================================================================
 
-# Bumped whenever a change RENUMBERS or RE-SCOPES an addressable object — `F<n>`,
+# Bumped whenever a change RENUMBERS or RE-SCOPES an addressable object -- `F<n>`,
 # `T<i>:r<r>:c<c>`, `E<n>`, `S<i>`, `P<i>:<a>-<b>`. Stamped onto every `PaperDoc` this
-# module produces, so a reference minted against an older parse can be recognised as
-# stale instead of silently resolving to a different object — the same false-attestation
-# failure `_equation_body` refuses to make, one layer up. A cached `doc.json` is never
+# module produces, so a reference minted against an older parse is recognised as stale
+# instead of silently resolving to a different object. A cached `doc.json` is never
 # re-parsed under a bumped version; see `stages/ingest.py`.
-#
-# 2: cross-references stopped being ingested as captions (`_FIGURE_CAPTION`/
-#    `_TABLE_CAPTION` now require the delimiter), table captions became verbatim, the
-#    geometric table fallback stopped being gated on the ruled path finding nothing, and
-#    bibliography lines stopped being read as appendix headings.
 EXTRACTION_VERSION = 2
 
 # ponytail: bounds sized for conference ML papers (8-10pp + appendix). A long paper is
@@ -71,96 +51,81 @@ _KNOWN_HEADINGS = (
     r"future work|acknowledgements?|acknowledgments?|references|bibliography|"
     r"appendix|broader impact|ethics statement|reproducibility statement"
 )
-# Appendices are lettered ("A Appendix", "B.2 Dataset details") as often as numbered, and
-# appendix content is where evaluation protocol detail usually hides.
+# Appendices are lettered ("A Appendix", "B.2 Dataset details") as often as numbered.
 _SECNO = r"(?:\d+|[A-Z])(?:\.\d+)*"
 _NAMED_HEADING = re.compile(rf"^(?:{_SECNO}\.?\s+)?({_KNOWN_HEADINGS})\b.{{0,40}}$", re.I)
 _NUMBERED_HEADING = re.compile(rf"^({_SECNO})\.?\s+([A-Z][^.!?]{{1,68}})$")
 
 # A caption NAMES an object; a cross-reference MENTIONS one. Both begin a line with
-# "Figure 4", and the delimiter after the number is the only thing that separates them
-# in flattened text: a caption prints "Figure 4." or "Figure 4:", a citation prints
-# "Figure 4 shows" or "Figure 4, this". The delimiter used to be OPTIONAL, and body prose
-# ("Figure 4 shows the visual comparison...") became a fabricated `Figure` object that
-# `verify_evidence` then certified as caption-verified — the `_FIGURE_CAPTION` bug. It can
-# only REMOVE objects, never manufacture provenance; the cost is a sentence-final citation
-# ("...as shown in Figure 3.") and a subfigure caption ("Figure 5a: ..."), neither
-# distinguishable from the other case in flattened text.
+# "Figure 4"; the delimiter after the number is what separates them in flattened text: a
+# caption prints "Figure 4." or "Figure 4:", a citation prints "Figure 4 shows". Requiring
+# the delimiter can only REMOVE objects, never manufacture provenance; the cost is a
+# sentence-final citation ("...as shown in Figure 3.") or a subfigure caption
+# ("Figure 5a: ..."), neither distinguishable from the other case in flattened text.
 _CAPTION_DELIM = r"(?:\s*[:.—-](?=\s|$))"
 _TABLE_CAPTION = re.compile(
     rf"^\s*(?:table|tab\.)\s*([IVXLC]+|\d+){_CAPTION_DELIM}\s*(.{{0,200}})", re.I)
-# The delimiter-OPTIONAL shape, kept for one job: a line beginning "Table 4" is not a row
-# of table data, whether it names a table or merely cites one, so it must not be swallowed
-# into a table body. `is_heading`/`_heading_admitted` is split the same way, one predicate
-# per question.
+# Delimiter-optional: a line beginning "Table 4" is not table-body data whether it names
+# or merely cites a table, so it must not be swallowed into a table body.
 _TABLE_LINE_SHAPED = re.compile(r"^\s*(?:table|tab\.)\s*(?:[IVXLC]+|\d+)\b", re.I)
-# The same strict rule, minus the "delimiter then whitespace" lookahead, for pdfplumber
-# WORD ROWS: a PDF with no space glyph in its font encoding returns a whole visual line as
-# one token, so the lookahead can never hold there and the caption row goes unrecognised —
-# not hypothetical, it silently cost seven captioned tables their bodies on one paper.
+# Same strict rule for pdfplumber WORD ROWS, minus the whitespace lookahead: a PDF with no
+# space glyph returns a whole visual line as one token, so the lookahead can never hold.
 _TABLE_CAPTION_ROW = re.compile(r"^\s*(?:table|tab\.)\s*(?:[IVXLC]+|\d+)\s*[:.—-]", re.I)
-# Mirrors `_TABLE_CAPTION`, substituting "figure"/"fig." — same reasoning, same shape.
+# Mirrors `_TABLE_CAPTION`, substituting "figure"/"fig." -- same reasoning, same shape.
 _FIGURE_CAPTION = re.compile(
     rf"^\s*(?:figure|fig\.)\s*([IVXLC]+|\d+){_CAPTION_DELIM}\s*(.{{0,300}})", re.I)
 
 # A display equation, text-extracted: a line carrying a relational operator, numbered the
-# way LaTeX numbers equations. Deliberately lossy — a text-line heuristic, not layout
+# way LaTeX numbers equations. Deliberately lossy -- a text-line heuristic, not layout
 # geometry; `SOURCE_FIDELITY` in the audit prompt says so.
 #
-# TWO SHAPES, because real PDFs use both. An equation number typeset in the right margin
-# is a SEPARATE text block, so pymupdf's reading order emits it on its own line:
-# `_EQUATION_NUMBER_ONLY` matches that, and the body is the nearest preceding line
-# carrying a relational operator. Requiring both on one line matched a synthetic fixture
-# and zero equations across every real paper in the corpus.
+# TWO SHAPES, because real PDFs use both: a margin-typeset number is a separate text
+# block on its own line (`_EQUATION_NUMBER_ONLY`), whose body is the nearest preceding
+# line carrying a relational operator.
 _EQUATION_LINE = re.compile(r"^(.{1,220}?[=≤≥∝≈<>].{0,220}?)\s*\((\d{1,3}[a-z]?)\)\s*$")
 _EQUATION_NUMBER_ONLY = re.compile(r"^\(\s*(\d{1,3}[a-z]?)\s*\)$")
 _EQUATION_BODY = re.compile(r"[=≤≥∝≈<>]")
-# How far back to look for the body belonging to a lone number. Small on purpose: an
-# equation's own line is normally immediately above its number, and a wide window would
-# attach the number to an unrelated sentence several lines up.
-_EQUATION_LOOKBACK = 3
+_EQUATION_LOOKBACK = 3         # lines to search back for a lone number's body
 # A body line must not be ordinary prose that merely contains a comparison: prose is long
 # and word-dense, a display equation is short and symbol-dense.
 _EQUATION_MAX_WORDS = 24
 MAX_FIGURES = 40
 MAX_EQUATIONS = 60
-# A caption line is kept VERBATIM, so it needs its own bound. Truncation keeps a PREFIX of
-# the printed line, still a substring of the page — a reconstructed string is not.
+# A caption line is kept VERBATIM. Truncation keeps a PREFIX of the printed line, still a
+# substring of the page -- a reconstructed string is not.
 MAX_CAPTION_CHARS = 240
 
-# Where the prose CITES a numbered object. Digits only, deliberately: with `re.I` a
-# roman-numeral alternative matches the "i" in "figures in the appendix" and mints a
-# citation nobody wrote. Only the first number of "Figures 3 and 4" is recovered.
+# Where the prose CITES a numbered object. Digits only: with `re.I` a roman-numeral
+# alternative matches the "i" in "figures in the appendix" and mints a citation nobody
+# wrote. Only the first number of "Figures 3 and 4" is recovered.
 _CROSSREF_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("figure", re.compile(r"\b(?:figures?|figs?\.)\s*(\d+)", re.I)),
     ("table", re.compile(r"\b(?:tables?|tabs?\.)\s*(\d+)", re.I)),
     ("equation", re.compile(r"\b(?:equations?|eqs?\.|eqn\.?)\s*\(?(\d+)", re.I)),
     ("section", re.compile(r"\b(?:sections?|secs?\.|§)\s*(\d+(?:\.\d+)*)", re.I)),
-    # Not `re.I` on the letter: an appendix is lettered with a CAPITAL, and a
-    # case-insensitive group would read "appendix and" as a citation of appendix A.
+    # Not `re.I` on the letter: a case-insensitive group would read "appendix and" as a
+    # citation of appendix A.
     ("appendix", re.compile(r"(?i:appendix)\s*([A-Z](?:\.\d+)*)")),
 )
 MAX_CROSSREFS = 400
-# The citing sentence, in flattened characters. Long enough to carry the claim the
-# citation is embedded in, short enough that a runaway span cannot quote half the paper.
+# The citing sentence, in flattened characters: long enough to carry the claim, short
+# enough that a runaway span cannot quote half the paper.
 MAX_CROSSREF_QUOTE = 400
 _SENTENCE_END = re.compile(r"[.!?]\s")
 
-# A bare known-heading word — `Method`, `Model`, `Training` alone on a line — is what a
-# table's first column header looks like once pymupdf emits each cell on its own line.
-# The corroboration is the line that FOLLOWS: a real heading is followed by a paragraph's
-# first line (>=6 words, measured); a header cell by another cell (1-4 words, measured).
+# A bare known-heading word -- `Method`, `Model` alone on a line -- is what a table's
+# first column header looks like once pymupdf emits each cell on its own line. The
+# corroboration is the line that FOLLOWS: a real heading precedes a paragraph (>=6 words);
+# a header cell precedes another cell (1-4 words).
 _HEADING_FOLLOWED_BY_WORDS = 5
-# Inside the reference range, a section number that is neither a small integer nor a
-# letter continuing an appendix sequence is a year or page number at the start of a
-# bibliography line. Two digits, because no paper has a hundred top-level sections.
+# Inside the reference range, a section number that is neither a small integer nor an
+# appendix letter is a year/page number at the start of a bibliography line.
 _MAX_BARE_SECTION_NUMBER_DIGITS = 2
 _REFERENCES_HEADING = re.compile(r"^(?:\d+|[A-Z])?\.?\s*(?:references|bibliography)\b", re.I)
 _APPENDIX_LETTER = re.compile(r"^[A-Z]$")
 
-# C0 control characters other than tab and newline — real prompts carry them (straight
-# out of PDF text extraction), and an unhardened boundary's failure mode on a reader is
-# "the command exited without writing anything": a silent cause.
+# C0 control characters other than tab and newline -- real prompts carry them (straight
+# out of PDF text extraction) and must be stripped at any boundary leaving the harness.
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 _WS = re.compile(r"\s+")
 
@@ -170,13 +135,9 @@ def _norm(s: str) -> str:
 
 
 def sanitise_controls(s: str, replacement: str = " ") -> str:
-    """Strip C0 control characters, keeping tab and newline.
-
-    A boundary function, not an extraction one: `doc.json` stays byte-faithful to what
-    the PDF gave up; this is applied only where text leaves the harness for another
-    process's stdin. `replacement` is a space, not '', so two words a NUL sat between do
-    not become one word that appears nowhere in the paper.
-    """
+    """Strip C0 control characters, keeping tab and newline. A boundary function: `doc.json`
+    stays byte-faithful; this applies only where text leaves the harness. `replacement` is
+    a space, not '', so two words a NUL sat between do not become one word."""
     return _CONTROL_CHARS.sub(replacement, s or "")
 
 
@@ -194,13 +155,10 @@ _AFFILIATION_MARKER = re.compile(r"[*†‡§]\s*\d")
 
 
 def title_is_plausible(s: str) -> bool:
-    """Could this string be a paper's title? Pure and report-only.
-
-    Four real failures, all measured: a date line, a venue banner, a page range, and an
-    author byline carrying affiliation markers. Deliberately does NOT recognise a byline
-    with no markers — a comma-separated name list is shaped like a subtitle, and guessing
-    would start rejecting real titles, a larger cost than printing one bad one.
-    """
+    """Could this string be a paper's title? Rejects a date line, a venue banner, a page
+    range, and an author byline carrying affiliation markers. Deliberately does NOT
+    recognise a byline with no markers -- a comma-separated name list is shaped like a
+    subtitle, and guessing would start rejecting real titles."""
     line = _norm(s)
     if len(line) < 12 or len(line.split()) < 3:
         return False
@@ -211,17 +169,13 @@ def title_is_plausible(s: str) -> bool:
         return False
     digits = sum(c.isdigit() for c in line)
     letters = sum(c.isalpha() for c in line)
-    # A title carries prose; a date line, a page range and a DOI are mostly digits and
-    # punctuation — the only test here that catches all three without naming any.
+    # A title carries prose; a date line, a page range and a DOI are mostly digits/punctuation.
     return letters > digits * 2 and letters >= 8
 
 
 def is_heading(line: str) -> bool:
-    """Does this line look like a section heading?
-
-    ponytail: tuned for arXiv-style ML PDFs. A paper using unnumbered small-caps headings
-    degrades to one large section — labels are lost, not correctness.
-    """
+    """Does this line look like a section heading? Tuned for arXiv-style ML PDFs: a paper
+    using unnumbered small-caps headings degrades to one large section."""
     s = _norm(line)
     if not s or len(s) > 80 or len(s.split()) > 10:
         return False
@@ -240,9 +194,7 @@ def page_texts(path: str | Path, max_pages: int = MAX_PAGES) -> list[str]:
 
 def _running_boilerplate(pages: list[str]) -> frozenset[str]:
     """Lines repeating verbatim across pages: running headers, footers, venue banners.
-    These describe the VENUE, not the paper, so a title guess landing on one makes two
-    different papers look identical. Detected structurally, never by a venue name list.
-    """
+    Detected structurally, never by a venue name list."""
     if len(pages) < 2:
         return frozenset()
     counts: dict[str, int] = {}
@@ -261,9 +213,8 @@ def guess_title(pages: list[str]) -> str:
                 ("arxiv:", "preprint", "under review", "proceedings of")):
             continue
         # ICML-style templates repeat the TITLE as the running header, so a repeated line
-        # is skipped only when it is not title-shaped (a banner, a `Journal | Vol |` footer,
-        # or anything carrying a year, as venue running headers do).
-        # Measured on 186 corpus PDFs: 47 changed (ACL banner, ICML byline -> title), 0 worse.
+        # is skipped only when it is not title-shaped (a banner, a `Journal | Vol |`
+        # footer, or anything carrying a year, as venue running headers do).
         if line in boilerplate and (not title_is_plausible(line) or "|" in line
                                     or re.search(r"\b(?:19|20)\d\d\b", line)):
             continue
@@ -284,17 +235,11 @@ def _is_bare_known_heading(line: str) -> bool:
 
 def _heading_admitted(line: str, next_line: str, *, in_references: bool,
                       appendix_letter: str) -> bool:
-    """Shape said "heading"; may the DOCUMENT overrule it?
-
-    1. A bare known-heading word needs the next line to look like prose
-       (`_HEADING_FOLLOWED_BY_WORDS`).
-    2. Inside the reference range, a single capital at line start is an author's initial
-       far more often than an appendix letter — the discriminator is SEQUENCE: appendix
-       letters run A, B, C... from A, and a letter before any 'A' has been seen is not one.
-
-    A rejected heading is not dropped: its text joins the preceding section, so the
-    failure direction is a bibliography that stays whole under one label.
-    """
+    """Shape said "heading"; may the DOCUMENT overrule it? (1) A bare known-heading word
+    needs the next line to look like prose. (2) Inside the reference range, a single
+    capital at line start is an author's initial far more often than an appendix letter --
+    the discriminator is SEQUENCE (appendix letters run A, B, C... from A). A rejected
+    heading's text joins the preceding section rather than being dropped."""
     if _is_bare_known_heading(line) and len(next_line.split()) < _HEADING_FOLLOWED_BY_WORDS:
         return False
     m = _NUMBERED_HEADING.match(line)
@@ -309,12 +254,9 @@ def _heading_admitted(line: str, next_line: str, *, in_references: bool,
 
 
 def references_boundary(sections: Sequence[Section]) -> int:
-    """The index of the References/Bibliography heading, or -1.
-
-    A boundary INDEX, not a per-section `is_appendix` flag — the flag would be wrong on
-    exactly the sections a mis-parsed bibliography produces, asserting a fact about the
-    paper that is really a fact about the parse.
-    """
+    """The index of the References/Bibliography heading, or -1. A boundary INDEX, not a
+    per-section `is_appendix` flag -- the flag would be wrong on exactly the sections a
+    mis-parsed bibliography produces."""
     for s in sections:
         if _REFERENCES_HEADING.match(_norm(s.title)):
             return s.section_idx
@@ -322,16 +264,11 @@ def references_boundary(sections: Sequence[Section]) -> int:
 
 
 def split_sections(pages: list[str]) -> list[Section]:
-    """Walk every line, starting a new Section at each ADMITTED heading.
-
-    Text before the first heading becomes the front-matter section, so nothing is ever
-    dropped — a heading the document overrules (`_heading_admitted`) contributes its own
-    line to the section it interrupts rather than opening a new one.
-
-    Lines are flattened across page boundaries first, because the corroboration test
-    looks at the FOLLOWING line and a heading set at the foot of a page has its paragraph
-    on the next one; reading page by page made every such heading fail.
-    """
+    """Walk every line, starting a new Section at each ADMITTED heading. Text before the
+    first heading becomes the front-matter section; a heading the document overrules
+    (`_heading_admitted`) joins the section it interrupts rather than opening a new one.
+    Lines are flattened across page boundaries first, since the corroboration test looks
+    at the FOLLOWING line and a heading at the foot of a page has its paragraph on the next."""
     lines: list[tuple[int, str]] = [
         (pno, _norm(raw))
         for pno, text in enumerate(pages, start=1)
@@ -368,8 +305,8 @@ def split_sections(pages: list[str]) -> list[Section]:
 
 
 def extract_figures(pages: list[str], max_figures: int = MAX_FIGURES) -> list[Figure]:
-    """Every 'Figure N: ...' caption line, in reading order. NOT the figure's plotted
-    content — this harness has no way to read that — only its caption text."""
+    """Every 'Figure N: ...' caption line, in reading order. Only the caption text -- a
+    best-effort PNG crop is a separate, advisory-only step, see `extract_figure_images`."""
     out: list[Figure] = []
     for pno, text in enumerate(pages, start=1):
         for raw in text.splitlines():
@@ -381,6 +318,147 @@ def extract_figures(pages: list[str], max_figures: int = MAX_FIGURES) -> list[Fi
             if len(out) >= max_figures:
                 return out
     return out
+
+
+def _page_object_rects(page) -> list:
+    """Every image placement and vector-drawing cluster on this page, as Rects — the raw
+    material a figure's plotted region is assembled from."""
+    rects = []
+    for xref, *_rest in page.get_images(full=True):
+        rects.extend(page.get_image_rects(xref))
+    try:
+        rects.extend(page.cluster_drawings())
+    except Exception:
+        for d in page.get_drawings():
+            r = d.get("rect")
+            if r:
+                rects.append(r)
+    return rects
+
+
+def _caption_rect(page, fig: Figure):
+    """Where THIS figure's caption sits on its page, or None if it cannot be found."""
+    hits = page.search_for((fig.caption or "")[:40].strip()) if fig.caption else []
+    if not hits and fig.label:
+        hits = page.search_for(fig.label)
+    return hits[0] if hits else None
+
+
+_ROW_TOL = 4.0  # points of caption-baseline slop still counted as "the same row"
+
+
+def _rows(caps: list) -> list[list]:
+    """Group (fig, cap_rect) pairs into visual ROWS, top to bottom -- a multi-panel grid
+    puts two or more captions on the same text line, and treating that line as ONE row
+    keeps a same-row sibling from stealing the NEXT row's plot."""
+    ordered = sorted(caps, key=lambda t: t[1].y0 if t[1] is not None else 1e9)
+    rows: list[list] = []
+    for item in ordered:
+        cap = item[1]
+        prev = rows[-1][-1][1] if rows else None
+        if cap is not None and prev is not None and abs(cap.y0 - prev.y0) <= _ROW_TOL:
+            rows[-1].append(item)
+        else:
+            rows.append([item])
+    return rows
+
+
+def _in_band(rects: list, top: float, bottom: float) -> list:
+    return [r for r in rects if not r.is_empty and r.y1 > top and r.y0 < bottom]
+
+
+def _union(rects: list):
+    band = None
+    for r in rects:
+        band = r if band is None else band | r
+    return band
+
+
+def _nearest_by_x(rects: list, caps_in_row: list) -> dict[int, list]:
+    """Split a ROW's objects across that row's own captions by nearest x-center -- a row
+    with two or more captions (side-by-side grid) routes each object to whichever caption
+    sits closest in x, so neighbouring panels are not unioned into one crop."""
+    centers = [((c.x0 + c.x1) / 2, fig) for fig, c in caps_in_row]
+    out: dict[int, list] = {fig.figure_idx: [] for fig, _ in caps_in_row}
+    for r in rects:
+        cx = (r.x0 + r.x1) / 2
+        _, fig = min(centers, key=lambda t: abs(t[0] - cx))
+        out[fig.figure_idx].append(r)
+    return out
+
+
+def extract_figure_images(pdf_path: str | Path, figures: list[Figure], out_dir: str | Path,
+                          max_figures: int = MAX_FIGURES, dpi: int = 150,
+                          max_bytes: int = 3 * 1024 * 1024) -> None:
+    """Render each figure's plotted region to `out_dir/F<idx>.png`, IN PLACE on
+    `fig.image_path`. ADVISORY ONLY (see `schema.Figure`) -- a geometric crop heuristic,
+    never itself the evidence a finding may cite.
+
+    Captions on one page are grouped into visual ROWS first (`_rows`). For each row, the
+    plotted region is whatever image placements and vector-drawing clusters lie ABOVE it
+    (tried BELOW when nothing is found above), split across that row's own captions by
+    nearest x-position (`_nearest_by_x`). Falls back to the whole page when a figure's
+    caption cannot be found, or its row has no object to crop. Any failure is swallowed
+    for THAT figure only and leaves its `image_path` empty.
+
+    A geometric heuristic tuned on conference ML PDFs with captions adjacent to their
+    figures in a regular grid; an irregular layout may still crop wrong or fall back to
+    the whole page.
+    """
+    import pymupdf
+
+    out = Path(out_dir)
+    rel_dir = f"{out.parent.name}/{out.name}" if out.parent.name else out.name
+    try:
+        doc = pymupdf.open(str(pdf_path))
+    except Exception:
+        return
+    try:
+        by_page: dict[int, list[Figure]] = {}
+        for fig in figures[:max_figures]:
+            by_page.setdefault(fig.page, []).append(fig)
+        if not by_page:
+            return
+        out.mkdir(parents=True, exist_ok=True)
+        for pno, on_page in by_page.items():
+            if not (1 <= pno <= doc.page_count):
+                continue
+            page = doc[pno - 1]
+            rows = _rows([(fig, _caption_rect(page, fig)) for fig in on_page])
+            objects = _page_object_rects(page)
+            top = page.rect.y0
+            for ri, row in enumerate(rows):
+                capped = [(fig, c) for fig, c in row if c is not None]
+                by_fig: dict[int, list] = {}
+                if capped:
+                    row_top = min(c.y0 for _, c in capped)
+                    row_bottom = max(c.y1 for _, c in capped)
+                    nxt = next((c.y0 for fig, c in rows[ri + 1] if c is not None),
+                              page.rect.y1) if ri + 1 < len(rows) else page.rect.y1
+                    in_row = _in_band(objects, top, row_top)
+                    if not in_row:
+                        in_row = _in_band(objects, row_bottom, nxt)
+                    by_fig = _nearest_by_x(in_row, capped)
+                    top = row_bottom
+                for fig, _cap in row:
+                    region = _union(by_fig.get(fig.figure_idx, []))
+                    clip = (region + (-8, -8, 8, 8)) & page.rect if region is not None \
+                        else page.rect
+                    if clip.is_empty:
+                        clip = page.rect
+                    path = out / f"F{fig.figure_idx}.png"
+                    try:
+                        pix = page.get_pixmap(matrix=pymupdf.Matrix(dpi / 72, dpi / 72),
+                                              clip=clip)
+                        pix.save(str(path))
+                        if path.stat().st_size > max_bytes:
+                            path.unlink(missing_ok=True)
+                            continue
+                    except Exception:
+                        continue
+                    fig.image_path = f"{rel_dir}/{path.name}"
+    finally:
+        doc.close()
 
 
 def _sentence_bounds(text: str, start: int, end: int) -> tuple[int, int]:
@@ -395,20 +473,17 @@ def _sentence_bounds(text: str, start: int, end: int) -> tuple[int, int]:
 def extract_crossrefs(sections: Sequence[Section]) -> list[CrossRef]:
     """Every place the prose CITES a numbered object, with a re-verifiable address.
 
-    Takes SECTIONS AND NOTHING ELSE — this function cannot see `doc.figures`,
+    Takes SECTIONS AND NOTHING ELSE -- this function cannot see `doc.figures`,
     `doc.tables` or `doc.equations`, so it cannot compare a citation against a recovered
-    label set and report anything "missing". A naive "cited but not recovered" check on
-    the shipped corpus produced twelve false "missing table/equation" claims, all of them
-    printed in the paper and absent only from what extraction recovered — see
-    `harness.schema.CrossRef`.
+    label set and report anything "missing" (see `harness.schema.CrossRef`).
 
     Each reference carries a `P<i>:<a>-<b>` span in the same flattened coordinates
     `harness.locate` mints, so the citing sentence is itself checkable. `page` is the
-    section's first page — an honest ceiling, not an estimate.
+    section's first page -- an honest ceiling, not an estimate.
 
     A caption occurrence is skipped: 'Figure 3. (a) Spider mamba...' names the figure, it
-    does not cite it. The same test drops a genuine sentence-final citation
-    ('...as shown in Figure 3.'), indistinguishable from a caption opening once flattened.
+    does not cite it -- indistinguishable from a genuine sentence-final citation once
+    flattened, so the same test drops both.
     """
     out: list[CrossRef] = []
     for s in sections:
@@ -440,34 +515,24 @@ def extract_crossrefs(sections: Sequence[Section]) -> list[CrossRef]:
 
 
 def _flat_index(offsets: list[int], original: int) -> int:
-    """How many flattened characters lie before original offset `original`.
-
-    `offsets` is strictly increasing, so one bisect is the correct answer for BOTH ends
-    of a half-open range — computing the two ends by different rules is what would let a
-    span start after it finished on a run of pure whitespace.
-    """
+    """How many flattened characters lie before original offset `original`. `offsets` is
+    strictly increasing, so one bisect is correct for BOTH ends of a half-open range."""
     return bisect.bisect_left(offsets, original)
 
 
 def _verbatim_span(text: str, offsets: list[int], start: int, end: int) -> str:
-    """The original text spanned by flattened [start, end), whitespace included.
-
-    Mirrors `locate._verbatim` so a `CrossRef.quote` is exactly what `locate.resolve`
-    reads back off the same span.
-    """
+    """The original text spanned by flattened [start, end), whitespace included. Mirrors
+    `locate._verbatim` so a `CrossRef.quote` is exactly what `locate.resolve` reads back."""
     if not offsets or start >= end or end > len(offsets):
         return ""
     return text[offsets[start]:offsets[end - 1] + 1]
 
 
 def _equation_body(lines: list[str], at: int) -> str:
-    """The equation body belonging to a lone `(n)` on line `at`, or ''.
-
-    Walks back up to `_EQUATION_LOOKBACK` lines for the nearest short, symbol-bearing
-    line. **Returns '' rather than guessing** when the preceding lines are prose — a
-    wrong body would be worse than no equation, because `verify_evidence` would then
-    certify a quote as `equation_verified` against text that is not the equation.
-    """
+    """The equation body belonging to a lone `(n)` on line `at`, or ''. Walks back up to
+    `_EQUATION_LOOKBACK` lines for the nearest short, symbol-bearing line. Returns ''
+    rather than guessing when the preceding lines are prose -- a wrong body would let
+    `verify_evidence` certify a quote as `equation_verified` against non-equation text."""
     for back in range(1, _EQUATION_LOOKBACK + 1):
         j = at - back
         if j < 0:
@@ -516,17 +581,11 @@ def _clean_rows(raw: Sequence[Sequence[str | None]]) -> list[list[str]]:
 
 
 class _Caption(NamedTuple):
-    """One caption line: the printed number, and the line itself VERBATIM.
-
-    Two fields rather than one reconstructed string — this used to be
-    `f"Table {n}: {rest}"`, which INSERTS a colon the paper does not print (a real line
-    'Table 2 lists the...' became 'Table 2: lists the...'). That string flows into
-    `Table.caption`, `QuantFinding.benchmark` and `DiscoveredObject.experiment`, none of
-    which is re-verified against the document the way `evidence_quote` is — a quotation
-    the paper does not contain is exactly what invariant 1 forbids. Keeping the number
-    separately is also the prerequisite for saying "this extractor could not label this
-    table" instead of giving it its neighbour's number.
-    """
+    """One caption line: the printed number, and the line itself VERBATIM. Two fields
+    rather than one reconstructed string, which would INSERT punctuation the paper does
+    not print into `Table.caption`/`QuantFinding.benchmark` -- neither re-verified against
+    the document the way `evidence_quote` is. Keeping the number separately also lets an
+    extractor say "could not label this table" instead of guessing its neighbour's."""
 
     label: str
     text: str
@@ -536,12 +595,9 @@ _NO_CAPTION = _Caption("", "")
 
 
 def _page_captions(text: str) -> list[_Caption]:
-    """Every 'Table N. …' / 'Table N: …' line on a page, in order of appearance.
-
-    The delimiter is required (`_TABLE_CAPTION`), so an in-text 'Table 10, using fully
-    fine-tuned models...' is no longer collected as a caption and cannot be attached to a
-    table body as its name.
-    """
+    """Every 'Table N. …' / 'Table N: …' line on a page, in order of appearance. The
+    delimiter is required (`_TABLE_CAPTION`), so an in-text 'Table 10, using fully
+    fine-tuned models...' is not collected as a caption."""
     out: list[_Caption] = []
     for raw in text.splitlines():
         line = _norm(raw)
@@ -576,12 +632,9 @@ def _chunks(row: list[dict], gap: float = 6.0) -> list[tuple[float, str]]:
 
 
 def _grid(rows: list[list[tuple[float, str]]], tol: float = 10.0) -> list[list[str]]:
-    """Snap ragged (x0, text) rows onto shared column anchors.
-
-    Column count cannot be read off any single row — a header may run its words together
-    where a data row splits cleanly, and vice versa — so anchors are derived from every
-    row's cell starts at once, and each cell lands in the nearest one.
-    """
+    """Snap ragged (x0, text) rows onto shared column anchors. Column count cannot be read
+    off any single row (a header may run words together where a data row splits cleanly,
+    and vice versa), so anchors are derived from every row's cell starts at once."""
     starts = sorted(x for row in rows for x, _ in row)
     if not starts:
         return []
@@ -597,10 +650,9 @@ def _grid(rows: list[list[tuple[float, str]]], tol: float = 10.0) -> list[list[s
             i = min(range(len(anchors)), key=lambda j: abs(anchors[j] - x))
             cells[i] = f"{cells[i]} {text}".strip()
         grid.append(cells)
-    # Right-aligned numbers under a centred header start a few points apart, which opens
-    # phantom columns. Neighbours that no row (header included) fills together are one
-    # printed column; two columns that each carry a header never merge. Measured on 74
-    # corpus PDFs: 125/406 tables re-aligned, no cell lost or concatenated.
+    # Right-aligned numbers under a centred header start a few points apart, opening
+    # phantom columns. Neighbours no row (header included) fills together are one printed
+    # column; two columns that each carry a header never merge.
     cols = [list(c) for c in zip(*grid)]
     merged = cols[:1]
     for c in cols[1:]:
@@ -614,12 +666,8 @@ def _grid(rows: list[list[tuple[float, str]]], tol: float = 10.0) -> list[list[s
 def _body_runs(gapped: list[bool], excluded: list[bool]) -> list[tuple[int, int]]:
     """Half-open row ranges that look like a table body, found WITHOUT reference to
     captions. `excluded` marks rows that cannot be table data whatever else they are.
-
-    Finding bodies independently is the whole point: anchoring the scan on a caption and
-    reading forward assumes the caption precedes its table, which is false for some
-    venues, and where it is false the scan walks into the NEXT table's rows and drops the
-    first table on the page entirely, shifting every label after it.
-    """
+    Finding bodies independently avoids assuming the caption precedes its table, which is
+    false for some venues (and would walk into the NEXT table's rows there)."""
     runs: list[tuple[int, int]] = []
     i = 0
     while i < len(gapped):
@@ -637,19 +685,13 @@ def _body_runs(gapped: list[bool], excluded: list[bool]) -> list[tuple[int, int]
 
 def _caption_side(run_spans: Sequence[tuple[float, float]],
                   cap_spans: Sequence[tuple[float, float]]) -> str:
-    """Whether this page's captions sit 'above' or 'below' the bodies they name.
-
-    Measured in PAGE COORDINATES, not row indices: tables stacked back to back put a
-    caption directly after one body and directly before the next, so both readings are
-    exactly one row away and the tie is unbreakable by index. Typography breaks it — a
-    caption is set tight against the table it belongs to and separated from the next by a
-    full inter-float gap. Ties resolve to 'above', the more common convention.
-    """
+    """Whether this page's captions sit 'above' or 'below' the bodies they name. Measured
+    in PAGE COORDINATES, not row indices, since stacked tables put a caption exactly one
+    row from both neighbours by index. Typography breaks the tie: a caption is set tight
+    against its own table. Ties resolve to 'above', the more common convention."""
     above = below = 0
     for top, bottom in cap_spans:
-        # `None` means no body on that side at all, which is not a distance of zero —
-        # scoring it as one made a page whose last caption had nothing beneath it vote
-        # for the wrong layout.
+        # `None` (no body on that side) is not a distance of zero.
         d_below = min((t - bottom for t, _ in run_spans if t >= bottom), default=None)
         d_above = min((top - b for _, b in run_spans if b <= top), default=None)
         if d_below is None and d_above is None:
@@ -664,12 +706,9 @@ def _caption_side(run_spans: Sequence[tuple[float, float]],
 def _pair(run_spans: Sequence[tuple[float, float]], cap_spans: Sequence[tuple[float, float]],
           captions: Sequence[_Caption]) -> list[_Caption]:
     """One caption per body, nearest-first on the side this page actually uses.
-
     Nearest-first rather than positional, so a table whose caption sits on the previous
     page leaves a blank label instead of stealing its neighbour's and cascading the error
-    down the page. A body with no caption keeps its cells; only the label is unknown, and
-    an unlabelled table is far less damaging than a mislabelled one.
-    """
+    down the page."""
     side = _caption_side(run_spans, cap_spans)
     labels = [_NO_CAPTION] * len(run_spans)
     taken: set[int] = set()
@@ -692,13 +731,10 @@ def _pair(run_spans: Sequence[tuple[float, float]], cap_spans: Sequence[tuple[fl
 
 
 def _unruled_tables(page, captions: list[_Caption]) -> list[tuple[_Caption, list[list[str]]]]:
-    """Recover LaTeX-style tables that have no ruling lines for pdfplumber to find.
-
-    Column gaps are the signal: a prose line or a wrapped caption has no wide inter-word
-    gap, a table row always does. Bodies are located first, on that signal alone; captions
-    are attached afterwards on measured proximity, so recovery works whether the venue
-    prints captions above its tables or below them.
-    """
+    """Recover LaTeX-style tables that have no ruling lines for pdfplumber to find. Column
+    gaps are the signal: a prose line has no wide inter-word gap, a table row always does.
+    Bodies are located first on that signal alone; captions are attached afterwards on
+    measured proximity, so recovery works whether captions sit above or below."""
     rows = _word_rows(page)
     gapped = [any(b["x0"] - a["x1"] > 12 for a, b in zip(r, r[1:])) for r in rows]
     text = [_norm(" ".join(w["text"] for w in r)) for r in rows]
@@ -715,10 +751,8 @@ def _unruled_tables(page, captions: list[_Caption]) -> list[tuple[_Caption, list
 
     out: list[tuple[_Caption, list[list[str]]]] = []
     for (start, end), label in zip(runs, labels):
-        # An unlabelled run is discarded: requiring a caption is the filter that used to
-        # be done implicitly by the caption-first scan, and it is the honest one to keep —
-        # a table nobody can name is a table nobody can cite, and admitting it would
-        # displace real tables under MAX_TABLES.
+        # An unlabelled run is discarded: a table nobody can name is a table nobody can
+        # cite, and admitting it would displace real tables under MAX_TABLES.
         if not label.text:
             continue
         grid = _grid([_chunks(rows[i]) for i in range(start, end)])
@@ -736,19 +770,11 @@ _DUP_CELL_OVERLAP = 0.6
 
 def _already_extracted(cap: _Caption, rows: Sequence[Sequence[str]],
                        already: Sequence[Table]) -> bool:
-    """Would admitting this candidate give a reviewer two addresses for one table?
-
-    The check that makes running geometric recovery over a page the ruled path already
-    touched safe. That recovery used to be skipped whenever pdfplumber found ANYTHING on
-    the page — cost measured: a page printing two ruled tables kept only the first
-    body, so the second's real printed result was never citable, and a bare "the paper is
-    missing Table N" signal off that is false.
-
-    Two nets. The LABEL is exact: a page prints "Table 1" once, so a second body carrying
-    label 1 is one table extracted twice. The CONTENT overlap catches the same
-    duplication when the ruled body was paired positionally with a different label than
-    the geometric pairing chose.
-    """
+    """Would admitting this candidate give a reviewer two addresses for one table? Makes
+    it safe to run geometric recovery over a page the ruled path already touched. Two
+    nets: the LABEL is exact (a page prints "Table 1" once); the CONTENT overlap catches
+    the same duplication when the ruled body was paired with a different label than the
+    geometric pairing chose."""
     if cap.label and any(t.label == cap.label for t in already):
         return True
     cells = {c for row in rows for c in row if c}
@@ -766,18 +792,17 @@ def extract_tables(path: str | Path, pages: list[str], max_tables: int = MAX_TAB
 
     Ruled tables are read by pdfplumber directly, and word-geometry recovery then runs
     over the same page whenever the page's OWN CAPTION LINES outnumber the bodies the
-    ruled path accounted for. It used to run only when the ruled path found nothing at
-    all, which is why a page printing two tables and yielding one ruled body never had
-    its second body looked for. Candidates that would duplicate a body already recovered
-    are dropped by `_already_extracted`.
+    ruled path accounted for (so a page printing two tables and yielding one ruled body
+    still gets its second body looked for). Candidates duplicating an already-recovered
+    body are dropped by `_already_extracted`.
 
     A table needs >=2 rows and >=2 columns to be worth auditing. Row 0 becomes `header`
     when it contains no digits.
 
-    ponytail: ruled captions are paired positionally — the i-th ruled body on a page gets
-    the i-th caption line on that page — and `caption_source` records that, so a reader
-    can tell a positional guess from the geometric pairing `_pair` performs. An unpaired
-    body keeps its cells and records `label=""`: nameless is safer than mislabelled.
+    Ruled captions are paired positionally -- the i-th ruled body on a page gets the i-th
+    caption line -- and `caption_source` records that, so a reader can tell a positional
+    guess from the geometric pairing `_pair` performs. An unpaired body keeps its cells
+    and records `label=""`: nameless is safer than mislabelled.
     """
     import pdfplumber
 
@@ -837,11 +862,8 @@ def is_numeric_cell(text: str) -> bool:
 
 def table_numbers(tables: list[Table]) -> list[QuantFinding]:
     """Every numeric cell, as a QuantFinding addressed back to its exact coordinates.
-
-    Deterministic by construction: the value IS the cell, so no extraction step can
-    round it, re-unit it, or invent it. Column 0 is the row label (arm/method), the
-    header row the metric names — the near-universal layout for an ML results table.
-    """
+    Deterministic by construction: the value IS the cell. Column 0 is the row label
+    (arm/method), the header row the metric names."""
     out: list[QuantFinding] = []
     for t in tables:
         for r, row in enumerate(t.rows):
@@ -860,9 +882,8 @@ def table_numbers(tables: list[Table]) -> list[QuantFinding]:
 
 
 def prose_numbers(sections: list[Section], limit: int = MAX_NUMBERS) -> list[QuantFinding]:
-    """Numeric claims stated in the running text, each with its whole sentence — the
-    other half of the contradiction lens's job: a narrative "+4.2%" only becomes a
-    finding once it can be set beside the cell it claims to summarize."""
+    """Numeric claims stated in the running text, each with its whole sentence -- a
+    narrative "+4.2%" only becomes a finding once set beside the cell it summarizes."""
     out: list[QuantFinding] = []
     for s in sections:
         for sentence in _SENTENCE.split(s.text):
@@ -896,10 +917,13 @@ def render_tables(tables: list[Table]) -> str:
 
 
 def render_figures(figures: list[Figure]) -> str:
-    """Figure captions as text an auditor can cite by `F<n>` address. Never the plotted
-    content — a caption names a figure, it does not report the values in it."""
-    return "\n".join(f"[F{fig.figure_idx}] page {fig.page} — {fig.label}: {fig.caption}"
-                     for fig in figures)
+    """Figure captions as text an auditor can cite by `F<n>` address. A caption names a
+    figure, it does not report the values in it — `(image: <path>)` is appended when a
+    best-effort PNG crop exists, advisory only (see `schema.Figure`)."""
+    return "\n".join(
+        f"[F{fig.figure_idx}] page {fig.page} — {fig.label}: {fig.caption}"
+        + (f" (image: {fig.image_path})" if fig.image_path else "")
+        for fig in figures)
 
 
 def render_equations(equations: list[Equation]) -> str:
@@ -910,12 +934,9 @@ def render_equations(equations: list[Equation]) -> str:
 
 
 def render_sections(sections: list[Section], budget_chars: int) -> str:
-    """Sections as text, each allotted an equal slice of the context budget.
-
-    Equal slices, not first-N-wins: truncating from the end would silently drop
-    Conclusions and Limitations, exactly where the contradiction lens finds the
-    concession that undercuts the abstract.
-    """
+    """Sections as text, each allotted an equal slice of the context budget. Equal
+    slices, not first-N-wins: truncating from the end would silently drop Conclusions
+    and Limitations, exactly where the contradiction lens finds its concessions."""
     if not sections:
         return ""
     per = max(400, budget_chars // len(sections))
@@ -928,15 +949,11 @@ def render_sections(sections: list[Section], budget_chars: int) -> str:
 
 
 class SectionPresentation(NamedTuple):
-    """How much of the extracted prose a lens was actually shown.
-
-    The ceiling on any recall claim this system makes: `render_sections` divides a
-    character budget equally across sections, so a long paper is TRUNCATED before any
-    lens reads a word of it — measured presented fraction over the corpus: 0.384, 0.411,
-    0.489, 0.589, while the review's scope section said "4 independent lens(es) read the
-    paper". Reported, never enforced — computed by the same arithmetic `render_sections`
-    uses so the two cannot disagree. `plan_reading`/`plan` below is what removes the cut.
-    """
+    """How much of the extracted prose a lens was actually shown -- the ceiling on any
+    recall claim this system makes, since `render_sections` divides a character budget
+    equally across sections and a long paper is TRUNCATED before any lens reads it.
+    Reported, never enforced -- computed by the same arithmetic `render_sections` uses.
+    `plan_reading`/`plan` below is what removes the cut."""
 
     total_chars: int
     presented_chars: int
@@ -945,8 +962,8 @@ class SectionPresentation(NamedTuple):
 
     @property
     def fraction(self) -> float | None:
-        """None when there is no prose at all — never 1.0, which would read as 'all of
-        it was shown' about a document nothing was extracted from."""
+        """None when there is no prose at all -- never 1.0 about a document nothing was
+        extracted from."""
         return (self.presented_chars / self.total_chars) if self.total_chars else None
 
 
@@ -967,32 +984,25 @@ def section_presentation(sections: list[Section], budget_chars: int) -> SectionP
 
 # When a split section's text is cut, this many characters of the previous part are
 # repeated at the start of the next one. A concern whose sentence straddles a cut is
-# otherwise unquotable by either part, and an unquotable concern is a dropped one:
-# `locate.mint` refuses a quotation it cannot relocate. It cannot create a false address —
-# minting searches the PARSED DOCUMENT, not the prompt, so repeated text still occurs
-# exactly as often in `doc` as before, and the uniqueness rule is untouched.
+# otherwise unquotable by either part (`locate.mint` refuses a quotation it cannot
+# relocate). Cannot create a false address: minting searches the PARSED DOCUMENT, not the
+# prompt, so the uniqueness rule is untouched.
 SPLIT_OVERLAP_CHARS = 600
 
 
 class ReadingPart(NamedTuple):
-    """One pass of a paper that fits in a single prompt.
+    """One pass of a paper that fits in a single prompt. A plan of these covers EVERY
+    character of every extracted section, which `render_sections` alone cannot do (it
+    hard-slices each section against one shared budget)."""
 
-    A plan of these covers EVERY character of every extracted section, which
-    `render_sections` alone cannot do (it hard-slices each section against one shared
-    budget). Over the evaluated corpus that showed readers between 34% and 84% of the
-    prose while the scope line still said four lenses read the paper.
-    """
-
-    # 1-based: shown to a reader ("part 2 of 3"); `index` would shadow tuple.index.
-    number: int
+    number: int                # 1-based ("part 2 of 3"); `index` would shadow tuple.index
     total: int                 # parts in this plan
     sections: list             # Section objects, whole or sliced
     chars: int                 # characters of section text in this part
     split_sections: int        # sections in this part that are a slice of a larger one
-    # (section_idx, start, end) per section in this part, as offsets into that section's
-    # ORIGINAL text. A guarantee checked by searching for a slice's text is not checked at
-    # all — a section whose text repeats defeats substring search — so offsets make the
-    # coverage union arithmetic instead.
+    # (section_idx, start, end) per section, as offsets into that section's ORIGINAL text
+    # -- a section whose text repeats defeats substring search, so offsets make the
+    # coverage union checkable arithmetically instead.
     slices: list
 
     @property
@@ -1002,10 +1012,8 @@ class ReadingPart(NamedTuple):
 
 def _split_section(s: Section, budget: int) -> list[tuple[Section, int, int]]:
     """One oversized section as a sequence of slices, cut at whitespace where possible.
-
     Returns each slice with the offsets it was taken from, so a caller can prove the
-    slices tile the original.
-    """
+    slices tile the original."""
     text, out, start = s.text, [], 0
     step = max(1, budget - SPLIT_OVERLAP_CHARS)
     while start < len(text):
@@ -1073,13 +1081,10 @@ def plan_reading(sections: list[Section], budget_chars: int) -> list[ReadingPart
 
 
 def render_part(part: ReadingPart) -> str:
-    """One part's sections as prompt text, with no truncation anywhere.
-
-    Deliberately not `render_sections`: that function fits a budget by cutting, and this
-    one shows what the plan already made fit. Reusing it would reintroduce the slice this
-    exists to remove. Named-argument sibling below (`render_part_with_anchor`) prepends
-    the anchor packet for the case a lens needs the whole-paper comparison too.
-    """
+    """One part's sections as prompt text, with no truncation anywhere. Deliberately not
+    `render_sections`, which fits a budget by cutting -- reusing it would reintroduce the
+    slice this exists to remove. `render_part_with_anchor` below prepends the anchor
+    packet for a lens that needs the whole-paper comparison too."""
     return "\n\n".join(
         f"## {s.title or f'(section {s.section_idx})'}  [p{s.page_start}]\n{s.text}"
         for s in part.sections)
@@ -1088,29 +1093,14 @@ def render_part(part: ReadingPart) -> str:
 # --------------------------------------------------------------------------------------- #
 # Anchors, coverage accounting and within-lens cross-part synthesis
 # --------------------------------------------------------------------------------------- #
-# **Three things, kept apart on purpose.**
-#
-# *Anchors* are a small, deterministic packet repeated identically in every part: title,
-# abstract, conclusion, section outline. They restore the whole-paper comparison ("the
-# abstract says one thing, the conclusion another") that splitting a paper into parts
-# would otherwise take away from the contradiction lens. Extracted, never generated, and
-# carrying NO model output — a part must not inherit another part's findings, or four
-# independent readings become one reading echoed forward.
-#
-# *Parts* are blind to one another: a lens reading part 2 does not see what it wrote
-# about part 1, so a concern is never anchored by an earlier pass's framing.
-#
-# *Synthesis* is where cross-part reasoning happens, once, per lens, after that lens has
-# read every part. Its input is the anchors plus that lens's OWN quotation-grounded
-# candidates — not another lens's output, not hidden reasoning. It may merge, connect,
-# propose, or withdraw; everything it returns passes the same verification, evidence
-# ceiling and grading as a part-local candidate.
-#
-# What independence does NOT mean: that one scientific reader must forget the first half
-# of a paper before reading the second. Independence is BETWEEN lenses (`overclaim` never
-# sees `protocol`'s output, and so on) — a reviewer who cannot reason across sections
-# cannot review a paper, and claiming whole-paper review while forbidding it would be the
-# overclaim this system exists to catch.
+# Three things, kept apart on purpose. ANCHORS are a small, deterministic packet repeated
+# identically in every part (title, abstract, conclusion, outline) that restores the
+# whole-paper comparison splitting would otherwise take from the contradiction lens --
+# extracted, never generated, and carrying NO model output. PARTS are blind to one
+# another: a lens reading part 2 does not see what it wrote about part 1. SYNTHESIS is
+# where cross-part reasoning happens, once per lens, after it has read every part; its
+# input is the anchors plus that lens's OWN quotation-grounded candidates, never another
+# lens's output. Independence is BETWEEN lenses, not within one lens's own parts.
 
 # How much of a part's budget the repeated anchor packet may take. Above this the
 # anchors are trimmed rather than the paper: a packet that crowds out the text it was
@@ -1155,11 +1145,8 @@ def _clip(text: str, limit: int = ANCHOR_SECTION_CHARS) -> str:
 
 
 def anchors(doc: PaperDoc) -> AnchorPacket:
-    """The packet every part carries.
-
-    The abstract/conclusion locators are `harness.decide`'s, deliberately — a second
-    spelling of "which section is the abstract" is how the two drift.
-    """
+    """The packet every part carries. The abstract/conclusion locators are
+    `harness.decide`'s, deliberately -- a second spelling is how the two drift."""
     a_idx = abstract_section_idx(doc)
     c_idx = conclusion_section_idx(doc)
     by_idx = {s.section_idx: s for s in doc.sections}
@@ -1175,12 +1162,9 @@ def anchors(doc: PaperDoc) -> AnchorPacket:
 
 
 class ReadingCoverage(NamedTuple):
-    """Four numbers answering four different questions, reported separately.
-
-    Collapsing them is how "the readers saw the paper" gets printed about a run in which
-    they saw a third of it. `part_local_fraction` replaces the old presented fraction;
-    the anchor figures are a COST, not a coverage claim.
-    """
+    """Four numbers answering four different questions, reported separately -- collapsing
+    them is how "the readers saw the paper" gets printed about a run that saw a third of
+    it. The anchor figures are a COST, not a coverage claim."""
 
     extracted_prose_chars: int          # what extraction recovered
     part_local_chars: int               # of that, what some part carried (union, no double count)
@@ -1211,16 +1195,11 @@ class ReadingPlan(NamedTuple):
 
 
 def plan(doc: PaperDoc, budget_chars: int) -> ReadingPlan:
-    """The whole reading strategy for one paper.
-
-    The anchor packet is charged against the budget before the paper is packed, because
-    every part carries it — not charging it is how a part that measured as fitting
-    arrives over length.
-    """
+    """The whole reading strategy for one paper. The anchor packet is charged against the
+    budget before the paper is packed, since every part carries it."""
     anchor = anchors(doc)
-    # A paper that fits WHOLE is read whole, and pays nothing for the anchor packet: the
-    # packet exists to restore a comparison that splitting takes away, so on a paper
-    # nothing was taken away from it is pure cost.
+    # A paper that fits WHOLE is read whole and pays nothing for the anchor packet: on a
+    # paper nothing was taken away from, restoring the comparison is pure cost.
     parts = plan_reading(list(doc.sections), max(400, budget_chars))
     whole = len(parts) <= 1
     if not whole:
@@ -1244,9 +1223,8 @@ def plan(doc: PaperDoc, budget_chars: int) -> ReadingPlan:
         parts=parts, anchor=anchor,
         coverage=ReadingCoverage(
             extracted_prose_chars=total,
-            # Zero on a paper read whole, because the packet is not sent: `anchor.chars`
-            # is what it WOULD cost, and a cost nobody paid must not appear in an
-            # accounting of what this design cost.
+            # Zero on a paper read whole: the packet is not sent, so a cost nobody paid
+            # must not appear in the accounting.
             anchor_chars=0 if n <= 1 else anchor.chars,
             part_local_chars=covered,
             anchor_repeat_chars=anchor.chars * max(0, n - 1),
@@ -1270,13 +1248,9 @@ SYNTHESIS_TARGETS = (
 
 
 class SynthesisBrief(NamedTuple):
-    """The whole input to one lens's cross-part synthesis. Nothing else reaches it.
-
-    Three exclusions make this a synthesis rather than a second opinion: it sees no
-    other lens's output (cross-lens independence untouched), no hidden reasoning (only
-    candidates that already carry a quotation), and no decision, grade or outcome (so it
-    cannot be steered by what the harness has concluded so far).
-    """
+    """The whole input to one lens's cross-part synthesis. Nothing else reaches it: no
+    other lens's output, no hidden reasoning (only quotation-carrying candidates), and no
+    decision, grade or outcome -- so it cannot be steered by what the harness concluded."""
 
     paper_id: str
     lens: str
@@ -1303,11 +1277,8 @@ class SynthesisBrief(NamedTuple):
 
 def _field(obj, name, default=None):
     """Read one field off a `Finding` or off the plain dict a persisted part artifact is.
-
-    Both shapes are real: the rest of the pipeline passes `Finding` objects around, but a
-    part artifact on disk is JSON, and re-inflating it into a model would mean carrying
-    every harness-written field that has not been computed yet.
-    """
+    Both shapes are real: a part artifact on disk is JSON, and re-inflating it into a
+    model would mean carrying every harness-written field not yet computed."""
     if isinstance(obj, dict):
         return obj.get(name, default)
     return getattr(obj, name, default)
@@ -1316,12 +1287,9 @@ def _field(obj, name, default=None):
 def synthesis_brief(paper_id: str, lens: str, anchor: AnchorPacket,
                     per_part_findings: dict[int, list]) -> SynthesisBrief:
     """Assemble one lens's own grounded observations across its own parts.
-
     `per_part_findings` maps a part number to that part's findings. A finding with no
-    evidence quotation is dropped here rather than passed on: the synthesis reasons over
-    what can be relocated in the paper, and an unquoted observation is exactly the
-    fluent assertion this system refuses everywhere else.
-    """
+    evidence quotation is dropped here: the synthesis reasons over what can be relocated
+    in the paper."""
     out = []
     for part in sorted(per_part_findings):
         for f in per_part_findings[part] or []:
@@ -1344,17 +1312,9 @@ def synthesis_brief(paper_id: str, lens: str, anchor: AnchorPacket,
 
 
 def render_part_with_anchor(part, anchor: AnchorPacket) -> str:
-    """One part's prompt body: the anchors, then this part's own sections.
-
-    Named distinctly from `render_part` above — the reference implementation had these
-    as `pdf.render_part(part)` and `reading.render_part(part, anchor)` in two separate
-    modules, where the module prefix disambiguated them; merged into one namespace here,
-    only one name can be `render_part`, so the anchor-carrying wrapper takes this longer
-    name. Behavior of both is unchanged.
-
-    The order is deliberate: anchors come first so a reader meets the paper's claims
-    before the span it is being asked to examine, the order a referee reads in.
-    """
+    """One part's prompt body: the anchors, then this part's own sections. The order is
+    deliberate: anchors come first so a reader meets the paper's claims before the span
+    it is being asked to examine, the order a referee reads in."""
     head = anchor.render()
     body = render_part(part)
     where = (f"\n\n## The span you are reading now — {part.label}\n"
@@ -1429,17 +1389,14 @@ if __name__ == "__main__":  # self-check: python -m harness.paper [file.pdf]
     assert secs, "no sections extracted"
     assert sum(len(s.text) for s in secs) > 500, "suspiciously little text extracted"
 
-    # A caption must be text the paper actually contains — the property the reconstructed
-    # `f"Table {n}: {rest}"` broke, asserted against the real page text rather than a
-    # fixture, because the injected colon only showed up on a paper with no colon in it.
+    # A caption must be text the paper actually contains.
     flat_pages = [_norm(p) for p in pg]
     for t in tbls:
         assert not t.caption or any(t.caption in fp for fp in flat_pages), \
             f"T{t.table_idx}'s caption is not printed in this paper: {t.caption!r}"
 
-    # A cross-reference must be re-derivable from its own address, or the address is
-    # decoration. `locate.resolve` is the same resolver a finding's evidence goes
-    # through, so this is the real check and not a parallel one.
+    # A cross-reference must be re-derivable from its own address, via the same
+    # resolver a finding's evidence goes through.
     from .locate import resolve as _resolve
     probe_doc = PaperDoc(paper_id="selfcheck", sections=secs)
     for xr in xrefs[:25]:

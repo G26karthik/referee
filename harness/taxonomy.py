@@ -1,45 +1,32 @@
 """What kind of scientific problem a finding is — kept apart from what was done about it.
 
+Three independent axes, each a property of a different thing:
+
+    SCIENTIFIC CLASS   what kind of problem this is (overstated claim, contradiction,
+                       confound...) — a property of the paper's argument.
+    RESOLUTION STATE   whether the question it raises was settled, and by what — a
+                       property of the review process.
+    EVIDENCE STATE     what the evidence route actually produced — a property of the world.
+
+A single label of any kind would collapse two of these: a paper can carry a CONFOUND that
+is RESOLVED_FROM_PAPER with evidence NOT_INVESTIGATED, and another that is UNRESOLVED
+because the artifact was missing.
+
+`classify` is most-specific-first: a finding that classified its own discrepancy or
+missing baseline yields a class derived from that; one that did neither falls through to
+`_BY_LENS`, so its class is little more than a restatement of which lens raised it. That
+ceiling is real and visible in the artifact, and kept because the alternative — an
+unclassified bucket — hides the same fact.
+
+Nothing here is a severity or a verdict: this reads only closed-vocabulary fields the
+harness has already derived or clamped, no prose/number/metric name/paper identity, so a
+paper-specific or threshold-shaped rule is inexpressible here (as in `harness.grading
+.derive` and `harness.priority.score`).
+
 `python -m harness.taxonomy` runs the self-check.
-
-**The three axes this module exists to stop collapsing.** A referee's output has three
-independent dimensions, and a single label of any kind destroys two of them:
-
-    SCIENTIFIC CLASS   what kind of problem this is — an overstated claim, a contradiction,
-                       a confound. A property of the paper's argument.
-    RESOLUTION STATE   whether the question it raises was settled, and by what. A property
-                       of the review process.
-    EVIDENCE STATE     what the evidence route actually produced — an execution that
-                       reproduced, one that failed, an artifact that was missing, an
-                       environment that could not be built. A property of the world.
-
-A paper can carry a CONFOUND that was RESOLVED_FROM_PAPER with evidence state
-NOT_INVESTIGATED; another can carry a CONFOUND that is UNRESOLVED because the artifact was
-missing. Those are different things to tell a referee, and a colour cannot say either.
-
-**What the fallback means, stated rather than hidden.** `classify` is most-specific-first,
-and a finding that classified its own discrepancy or its own missing baseline yields a
-class derived from that self-classification. A finding that did neither falls through to
-`_BY_LENS` — which means its `scientific_class` is, in that case, little more than a
-restatement of WHICH LENS raised it. That is a real ceiling on this axis and it is visible
-in the artifact: over the current corpus the classes come from a mix of both paths, and a
-reader counting CONFOUNDs is partly counting how many findings the confound lens wrote.
-The fallback is kept because the alternative is an unclassified bucket that hides the same
-fact, and it is documented here because a taxonomy whose derivation is not stated invites
-being read as more than it is.
-
-**Nothing here is a severity and nothing here is a verdict.** This module answers "what
-kind of thing did the referee find", and it answers it from fields the harness has already
-derived or clamped — a lens's own closed-vocabulary self-classification, the address shape,
-the grader's outcome. It reads no prose, no number, no metric name and no paper identity,
-so a paper-specific or threshold-shaped rule is inexpressible here exactly as it is in
-`harness.grading.derive` and `harness.priority.score`.
 """
 from __future__ import annotations
 
-# Invariant 3 lives in ONE object; this is the same tuple, not a second copy of the
-# rule. `tests/test_reimplementation_path.py` asserts the identity across every site.
-from .provenance import ADMISSIBLE_REPRODUCTION_PROVENANCE
 from .provenance import admits as _admits
 
 # --- axis 1: what kind of scientific problem -----------------------------------------
@@ -56,12 +43,9 @@ SCIENTIFIC_CLASSES = (
     "IMPLEMENTATION_ISSUE",  # the released artifact conflicts with the paper's method
     "SPECIFICATION_GAP",    # the paper does not say enough for the claim to be checkable
     "UNRESOLVED_QUESTION",  # a scientific question the referee raised and could not close
-    # PAPER-level, and deliberately unreachable from `classify`. A FINDING is by
-    # definition something a lens raised, so no finding can carry it; it describes the
-    # state of a paper for which nothing material was established within the scope
-    # checked. Kept in the vocabulary so a report or an aggregate can say that in one
-    # word, and asserted unreachable in `_self_check` so it cannot quietly become a
-    # bucket that findings fall into.
+    # PAPER-level, deliberately unreachable from `classify` (no finding may carry it; a
+    # finding is by definition something a lens raised). Kept in the vocabulary so a
+    # report/aggregate can say "nothing material" in one word; asserted unreachable below.
     "NO_MATERIAL_ISSUE_FOUND",  # nothing of the above, within what was checked
 )
 
@@ -82,42 +66,34 @@ EVIDENCE_STATES = (
     "REPRODUCTION_FAILURE",     # admissible execution did not, having reached the experiment
     "PAPER_INTERNAL_EVIDENCE",  # settled against the paper's own printed content
     "ARTIFACT_EVIDENCE",        # settled by reading the released code — about the PAPER
-    # A BOUNDED FACT ABOUT THE CHECKOUT, and its own state because ARTIFACT_EVIDENCE is
-    # in EVIDENCE_ABOUT_THE_PAPER and this is not. "The checkout advertises evaluate.py"
-    # settles a question about the artifact and says nothing whatever about the document;
-    # the first version of this route mapped it to ARTIFACT_EVIDENCE and so reported four
-    # papers as having had a claim about their implementation settled by the presence of
-    # a file. The RESOLUTION is real — the narrow question is closed — which is why it
-    # still resolves to RESOLVED_FROM_ARTIFACT.
+    # A bounded fact about the CHECKOUT, not the paper — its own state because
+    # ARTIFACT_EVIDENCE is in EVIDENCE_ABOUT_THE_PAPER and this must not be (e.g.
+    # "the checkout advertises evaluate.py" settles nothing about the document).
     "ARTIFACT_PROPERTY_ESTABLISHED",
-    # BOTH LOCATIONS VERIFIED, THE RELATIONSHIP NOT. The artifact-route analogue of
-    # CITATION_VERIFIED, and its own state for the same reason: the alternatives both lie.
-    # ARTIFACT_EVIDENCE would say the paper had been checked; NOT_INVESTIGATED would say
-    # nobody looked.
+    # Both locations verified, the relationship not — the artifact-route analogue of
+    # CITATION_VERIFIED, for the same reason: ARTIFACT_EVIDENCE would claim the paper was
+    # checked, NOT_INVESTIGATED would claim nobody looked.
     "ARTIFACT_ENDPOINTS_VERIFIED",
-    # The design could not be built from what the paper states. Mapped to
-    # SPECIFICATION_LIMITATION below rather than given its own state, because it is the
-    # same fact `INFEASIBLE_SPECIFICATION` already reports: the paper's method section,
-    # not our method inventory.
     "ARTIFACT_LIMITATION",      # no usable artifact for this question
     "EXTRACTION_LIMITATION",    # this harness could not build an address for the claim
     "REPORTING_LIMITATION",     # the paper prints no unambiguous quantity to compare against
     "NO_ROUTE_AVAILABLE",       # addressed and quantified; no route this system has applies
-    # A route applied and the comparison at the end of it did not. Its own state because
-    # NO_ROUTE_AVAILABLE says the opposite thing: an attribution question that reached a
-    # focused-validation route and could not be given a second arm HAS a route, and
-    # telling a referee otherwise would report a limit of our arithmetic as a limit of
-    # our method inventory. Never a statement about the paper, like every entry below
-    # the first four.
+    # A route applied and its comparison did not — its own state because NO_ROUTE_AVAILABLE
+    # would report a limit of our arithmetic as a limit of our method inventory instead.
     "COMPARISON_LIMITATION",    # a route applied; its result had nothing to be held against
-    # Something was checked and it was the CITATION, not the claim. Its own state because
-    # the alternatives are both wrong: PAPER_INTERNAL_EVIDENCE said the paper had been
-    # checked, and NOT_INVESTIGATED said nothing had been looked at.
+    # The CITATION was checked, not the claim — its own state since PAPER_INTERNAL_EVIDENCE
+    # would overclaim and NOT_INVESTIGATED would underclaim.
     "CITATION_VERIFIED",        # the concern quotes the paper accurately; the concern stands
     "ENVIRONMENT_LIMITATION",   # this host could not mount the experiment
     "SPECIFICATION_LIMITATION",  # the paper does not specify enough to build it
     "INCONCLUSIVE_EXECUTION",   # it ran and settled nothing
     "NOT_INVESTIGATED",         # nothing was pursued
+    # EXACT_CERTIFICATE's own pair. VIOLATION is about the paper — an admissible
+    # counterexample, exactly as REPRODUCTION_FAILURE is for a printed cell.
+    # NO_VIOLATION is checking finitely many instances, never a statement the bound holds,
+    # so it stays out of `EVIDENCE_ABOUT_THE_PAPER` below.
+    "CERTIFICATE_VIOLATION",
+    "CERTIFICATE_NO_VIOLATION",
 )
 
 # A lens's own `discrepancy_type` values that mean "the paper disagrees with itself".
@@ -144,48 +120,29 @@ _EVIDENCE_FOR_DISPOSITION = {
     "REPRODUCED": "REPRODUCTION_SUCCESS",
     "FAILED_REPRODUCTION": "REPRODUCTION_FAILURE",
     "PAPER_ONLY_RESOLVED": "PAPER_INTERNAL_EVIDENCE",
-    # NOT_INVESTIGATED, and for the same reason NO_EXPERIMENT_NEEDED is. Re-verifying the
-    # quotation behind a concern establishes that the concern cites the paper accurately;
-    # it establishes nothing about whether the concern is right. Mapping it to
-    # PAPER_INTERNAL_EVIDENCE — which `EVIDENCE_ABOUT_THE_PAPER` admits — made
-    # `concerns_the_paper` true and `resolution_state` RESOLVED_FROM_PAPER for a route
-    # whose own reason string says it decided nothing, so a paper's disputed sentence was
-    # printed under "What held up" beside the findings disputing it. Invariant 1 already
-    # guarantees every kept finding's quote was re-verified; saying it again per target as
-    # a RESOLUTION double-counted a precondition as a result.
+    # Re-verifying the quotation behind a concern establishes only that it cites the paper
+    # accurately, nothing about whether the concern is right — so CITATION_VERIFIED, not
+    # PAPER_INTERNAL_EVIDENCE (which would double-count invariant 1's precondition as a
+    # resolution).
     "CITATION_VERIFIED_ONLY": "CITATION_VERIFIED",
-    # The paper's own printed composition was recomputed and did not evaluate. This IS
-    # evidence about the paper — deterministic, paper-internal, and settled either way —
-    # so it maps like PAPER_ONLY_RESOLVED above, not like CITATION_VERIFIED_ONLY: the
-    # arithmetic recheck decides something, the quotation recheck does not.
+    # The paper's own printed composition was recomputed and did not evaluate — real
+    # paper-internal evidence, unlike the citation recheck above.
     "PAPER_ARITHMETIC_CONTRADICTION": "PAPER_INTERNAL_EVIDENCE",
-    # FIVE TERMINAL STATES, and only ONE of them is about the paper.
-    #
-    # A bound paper/artifact mismatch IS a statement about the document, so it maps to
-    # ARTIFACT_EVIDENCE, which `EVIDENCE_ABOUT_THE_PAPER` admits — and it is still
-    # deliberately absent from `establishes_failure`, because saying the code disagrees
-    # with the method section is not saying the reported number is false.
+    # A bound paper/artifact mismatch IS a statement about the document (still excluded
+    # from `establishes_failure`: code disagreeing with the method section is not the
+    # reported number being false).
     "ARTIFACT_MISMATCH_ESTABLISHED": "ARTIFACT_EVIDENCE",
-    # A bounded fact about the checkout settles its own bounded question and nothing about
-    # the paper. Its own state so that a review cannot report "settled from the artifact"
-    # about a paper when what was settled was that a file exists.
+    # A bounded fact about the checkout, not the paper (e.g. a file exists).
     "ARTIFACT_FACT_ESTABLISHED": "ARTIFACT_PROPERTY_ESTABLISHED",
-    # Both ends located, the correspondence between them the auditor's reading. Resolves
-    # to UNRESOLVED, exactly as CITATION_VERIFIED does, and for the same reason.
+    # Both ends located, the correspondence the auditor's reading — resolves to
+    # UNRESOLVED, exactly as CITATION_VERIFIED does.
     "ARTIFACT_CONCERN_VERIFIED_ENDPOINTS": "ARTIFACT_ENDPOINTS_VERIFIED",
-    # The route ran and settled nothing. A limit of what reading can establish, reported
-    # as such rather than as a missing artifact.
     "ARTIFACT_INSPECTION_INCONCLUSIVE": "COMPARISON_LIMITATION",
     "SPECIFICATION_BLOCKED": "SPECIFICATION_LIMITATION",
     "ARTIFACT_BLOCKED": "ARTIFACT_LIMITATION",
-    # NOT ARTIFACT_LIMITATION. "We could not build an address for this claim" is a limit
-    # of our own extraction, and reporting it as a missing artifact told readers of a
-    # paper WITH a cloned repository that no usable artifact reached the question.
+    # NOT ARTIFACT_LIMITATION: "could not build an address for this claim" is a limit of
+    # our own extraction, not a missing artifact.
     "ADDRESSING_BLOCKED": "EXTRACTION_LIMITATION",
-    # And the two refusals that used to arrive here wearing EXTRACTION_LIMITATION's label.
-    # "The paper prints no unambiguous quantity" is a limit of the paper's reporting;
-    # "no route this system has applies" is a limit of our method inventory. Neither is a
-    # failure of our extraction, and over the shipped corpus the third was 52 of 52.
     "REPORTING_BLOCKED": "REPORTING_LIMITATION",
     "NO_ROUTE_AVAILABLE": "NO_ROUTE_AVAILABLE",
     "ENVIRONMENT_BLOCKED": "ENVIRONMENT_LIMITATION",
@@ -194,69 +151,52 @@ _EVIDENCE_FOR_DISPOSITION = {
     "COMPARISON_BLOCKED": "COMPARISON_LIMITATION",
     "AUTHORIZATION_BLOCKED": "ENVIRONMENT_LIMITATION",
     "INCONCLUSIVE": "INCONCLUSIVE_EXECUTION",
-    # Both of the following are NOT_INVESTIGATED on purpose. "We judged no experiment
-    # necessary" is a decision about the ROUTE, not evidence about the paper: a missing
-    # control is not settled by our declining to run something, it is settled by the
-    # authors adding one. Mapping it to anything else would let the necessity axis leak
-    # into the evidence axis and quietly resolve questions nobody checked.
+    # A necessity decision ("no experiment needed") is not evidence about the paper — it
+    # must not leak into the evidence axis and quietly resolve a question nobody checked.
     "NO_EXPERIMENT_NEEDED": "NOT_INVESTIGATED",
-    # Same reasoning, one step earlier: the review reached a conclusion from the paper and
-    # the investigation branch stopped. That is a fact about the REVIEW, not evidence
-    # about this target, so it settles nothing on the evidence axis.
     "SUPERSEDED_BY_ESTABLISHED_FAILURE": "NOT_INVESTIGATED",
     "BUDGET_DEFERRED": "NOT_INVESTIGATED",
     "NOT_ATTEMPTED": "NOT_INVESTIGATED",
     "PENDING": "NOT_INVESTIGATED",
+    # An admissible exact-arithmetic counterexample IS evidence about the paper's stated
+    # theorem — maps like FAILED_REPRODUCTION/PAPER_ARITHMETIC_CONTRADICTION above.
+    "COUNTEREXAMPLE_ESTABLISHED": "CERTIFICATE_VIOLATION",
+    # Checked, no violation among tested instances — NEVER support; CITATION_VERIFIED's
+    # analogue, not PAPER_INTERNAL_EVIDENCE's.
+    "NO_COUNTEREXAMPLE_FOUND": "CERTIFICATE_NO_VIOLATION",
 }
 
-# Only these four evidence states are statements ABOUT THE PAPER. Everything else in
+# Only these five evidence states are statements ABOUT THE PAPER; everything else in
 # `EVIDENCE_STATES` describes an artifact, a host, or a gate — invariants 4 to 7.
 # Membership here decides what a review may say it examined, never what it may conclude.
 EVIDENCE_ABOUT_THE_PAPER = ("REPRODUCTION_SUCCESS", "REPRODUCTION_FAILURE",
-                            "PAPER_INTERNAL_EVIDENCE", "ARTIFACT_EVIDENCE")
+                            "PAPER_INTERNAL_EVIDENCE", "ARTIFACT_EVIDENCE",
+                            "CERTIFICATE_VIOLATION")
 
-# WAS THIS TARGET'S CLAIM CHECKED AT ALL? The question `stages/report.unchecked_central`
-# actually asks, derived here rather than kept there as a hand-written set of dispositions
-# — a set like that drifts every time a route is added, and an ESTABLISHED paper/artifact
-# mismatch on a CENTRAL target was once printed under "Central claims this review did not
-# check", three lines below the section reporting what it had established.
-#
-# THE PREDICATE IS `EVIDENCE_ABOUT_THE_PAPER`, PLUS ONE. Producing evidence is not the
-# test, and a first attempt at this used it and was wrong: a citation re-verification
-# produces real evidence about a CONCERN'S QUOTATION and says nothing whatever about the
-# paper, so a central claim carrying one is unchecked and `tests/test_scientific_taxonomy`
-# has said so deliberately since `CITATION_VERIFIED` was split out. The same goes for a
-# bounded fact about the released code — a real result, and not the paper's claim checked.
-#
-# The "plus one" is `INCONCLUSIVE_EXECUTION`: a route that tried to settle a question
-# ABOUT THE PAPER and failed. That target was checked and the check did not conclude,
-# which is a different sentence from "nothing was run for it" and belongs in the scope
-# section's other half. It is what `_ATTEMPTED_AND_UNSETTLED` reports one layer up.
-_CHECKED_EVIDENCE = EVIDENCE_ABOUT_THE_PAPER + ("INCONCLUSIVE_EXECUTION",)
+# WAS THIS TARGET'S CLAIM CHECKED AT ALL? Derived here, rather than kept as a hand-written
+# set of dispositions elsewhere, so it cannot drift as routes are added. The predicate is
+# `EVIDENCE_ABOUT_THE_PAPER` plus `INCONCLUSIVE_EXECUTION`/`CERTIFICATE_NO_VIOLATION`: both
+# are routes that genuinely ran and checked something (a citation's quotation, a
+# certificate's tested instances) without settling anything ABOUT THE PAPER — checked, but
+# not evidence about the paper, which is a different sentence from "nothing was run".
+_CHECKED_EVIDENCE = EVIDENCE_ABOUT_THE_PAPER + ("INCONCLUSIVE_EXECUTION",
+                                                "CERTIFICATE_NO_VIOLATION")
 
 
 def claim_was_checked(evidence: str = "") -> bool:
     """Did anything bear on THE PAPER'S claim here, or is this a target nothing reached?
-
-    Deliberately NOT "was evidence gathered" and NOT "was the question settled". Three
-    routes gather evidence that resolves nothing about the paper, and a review that
-    counted those as checked would be claiming to have looked where it had not.
-    """
+    Deliberately NOT "was evidence gathered" and NOT "was the question settled" — some
+    routes gather evidence that resolves nothing about the paper."""
     return (evidence or "").strip().upper() in _CHECKED_EVIDENCE
 
 
 def classify(*, lens: str = "", discrepancy_type: str = "", baseline_class: str = "",
              candidate_class: str = "", is_artifact_finding: bool = False) -> str:
     """The scientific class of one finding, from its own typed self-classification.
-
-    Vocabulary strings and booleans only, as in `harness.grading.derive` — no count, no
-    number, no metric name, no paper identity, so "if <paper> appears, soften" and "if the
-    delta exceeds 5 points, escalate" are inexpressible rather than merely absent.
-
-    Order is most-specific-first. A finding that classified its own discrepancy has said
-    more about itself than one that only carries a lens name, so that classification wins;
-    the lens is the fallback.
-    """
+    Vocabulary strings and booleans only — no count, number, metric name or paper
+    identity, so a paper-specific or threshold rule is inexpressible. Most-specific-first:
+    a finding that classified its own discrepancy wins over one that only carries a lens
+    name, which is the fallback."""
     if is_artifact_finding:
         return "IMPLEMENTATION_ISSUE"
     if (candidate_class or "") in _QUESTION_CLASSES:
@@ -281,17 +221,12 @@ def classify(*, lens: str = "", discrepancy_type: str = "", baseline_class: str 
 
 
 def evidence_state(disposition: str = "", provenance: str = "") -> str:
-    """What the evidence route produced, from a target's terminal disposition.
-
-    The provenance ceiling is applied HERE as well as at the reconciler, because this is
-    the value a report renders. A FAILED_REPRODUCTION carrying a provenance the ceiling
-    does not admit is not a reproduction failure at all — it is an inconclusive execution,
-    and calling it anything else would let a synthesized diagnostic convict a paper
-    through the reporting layer after being refused by the evidence layer.
-    """
+    """What the evidence route produced, from a target's terminal disposition. The
+    provenance ceiling is applied HERE too, not just at the reconciler: a
+    FAILED_REPRODUCTION on inadmissible provenance is an inconclusive execution."""
     d = (disposition or "").strip().upper()
     state = _EVIDENCE_FOR_DISPOSITION.get(d, "NOT_INVESTIGATED")
-    if state in ("REPRODUCTION_SUCCESS", "REPRODUCTION_FAILURE") \
+    if state in ("REPRODUCTION_SUCCESS", "REPRODUCTION_FAILURE", "CERTIFICATE_VIOLATION") \
             and not _admits(provenance or ""):
         return "INCONCLUSIVE_EXECUTION"
     return state
@@ -304,34 +239,24 @@ def resolution_state(evidence: str = "") -> str:
     of the evidence behind it is a resolution nobody checked.
     """
     e = (evidence or "").strip().upper()
-    if e in ("REPRODUCTION_SUCCESS", "REPRODUCTION_FAILURE"):
+    if e in ("REPRODUCTION_SUCCESS", "REPRODUCTION_FAILURE", "CERTIFICATE_VIOLATION"):
         return "RESOLVED_BY_EXECUTION"
     if e == "PAPER_INTERNAL_EVIDENCE":
         return "RESOLVED_FROM_PAPER"
     if e in ("ARTIFACT_EVIDENCE", "ARTIFACT_PROPERTY_ESTABLISHED"):
-        # BOTH are resolutions — the narrow artifact question really is closed — and they
+        # Both are resolutions — the narrow artifact question really is closed — and
         # differ on the OTHER axis: only ARTIFACT_EVIDENCE is in EVIDENCE_ABOUT_THE_PAPER.
-        # A review that reads only `resolution_status` sees a settled question either way,
-        # which is correct; one that asks what was settled ABOUT THE PAPER gets the truth.
         return "RESOLVED_FROM_ARTIFACT"
     if e == "NOT_INVESTIGATED":
         return "NOT_INVESTIGATED"
-    # CITATION_VERIFIED lands here, on UNRESOLVED, and that is the point of it: the
-    # concern was looked at far enough to confirm it quotes the paper, and it is still
-    # open. NOT_INVESTIGATED would say nobody looked; RESOLVED_* would say it was settled.
+    # CITATION_VERIFIED lands here: looked at far enough to confirm the quote, still open.
     return "UNRESOLVED"
 
 
 # --- the fourth axis: WHICH REVIEW PATH this paper was on ------------------------------
-# A referee's first question about a paper's checkability is whether the authors published
-# anything to check, and the review could not answer it. `execution_provenance` reads
-# SYNTHESIZED_DIAGNOSTIC for a paper that published no code, for a paper whose clone was
-# refused by a gate, for a paper whose clone failed, and for a paper whose cloned repository
-# was never authorized. Four opposite facts, one token — and `render_reviewer_report`
-# mentioned the artifact nowhere at all, so the distinction was buried in a 21 KB trace.
-#
-# Only the FIRST of these is a fact about the paper. The other four are facts about a gate,
-# a network, or this host, and none of them may colour a paper (invariant 17).
+# Whether the authors published anything to check. Only the FIRST state below is a fact
+# about the paper; the other five are facts about a gate, a network, or this host, and
+# none of them may colour a paper (invariant 17).
 ARTIFACT_STATES = (
     "NO_ARTIFACT_ADVERTISED",     # the paper advertises no repository — about the PAPER
     "ARTIFACT_NOT_FETCHED",       # a gate was shut, so we did not look — about this harness
@@ -351,10 +276,8 @@ _ARTIFACT_FOR_ACQUISITION = {
     "failed": "ARTIFACT_UNOBTAINABLE",
     "cloned": "ARTIFACT_PRESENT_UNUSABLE",
     "cached": "ARTIFACT_PRESENT_UNUSABLE",
-    # `synthesized` is NOT an artifact of the authors'. It is this harness's own probe
-    # standing in for one, so the paper is still on the paper-only path however much code
-    # is on disk — and calling it present would let a synthesized probe be reported as the
-    # authors having published something.
+    # `synthesized` is NOT an artifact of the authors' — it is this harness's own probe, so
+    # the paper stays on the paper-only path however much code is on disk.
     "synthesized": "NO_ARTIFACT_ADVERTISED",
     "not_attempted": "ARTIFACT_UNASSESSED",
     "": "ARTIFACT_UNASSESSED",
@@ -363,20 +286,11 @@ _ARTIFACT_FOR_ACQUISITION = {
 
 def artifact_state(acquisition_status: str = "", capability_established: bool = False) -> str:
     """Which review path this paper was on, from the acquisition and the capability.
-
-    Vocabulary strings and a boolean only, as everywhere else in this module. Derived
-    rather than stored, like `resolution_state`, so it cannot drift from the acquisition
-    and capability it describes — a stored artifact state could say a repository was
-    usable beside an acquisition that says it was never fetched.
-
+    Derived rather than stored, so it cannot drift from what it describes.
     `ARTIFACT_PRESENT_USABLE` requires the capability check to have been ESTABLISHED, not
-    merely to have not failed: "we obtained the code" and "the code can be given a fair
-    run here" are different claims, and eleven independent refusals sit between them.
-    """
-    # EXACT lookup, no stripping and no case folding, for the same reason
-    # `provenance.admits` is exact: the answer decides a reader-facing sentence about
-    # whether the authors published code, and a token this table does not recognise must
-    # fall to "we do not know" rather than be repaired into "present".
+    merely to have not failed."""
+    # EXACT lookup, no stripping/case-folding — an unrecognised token falls to "we do not
+    # know" rather than being repaired into "present".
     state = _ARTIFACT_FOR_ACQUISITION.get(acquisition_status or "", "ARTIFACT_UNASSESSED")
     if state == "ARTIFACT_PRESENT_UNUSABLE" and capability_established:
         return "ARTIFACT_PRESENT_USABLE"
@@ -390,14 +304,9 @@ def artifact_concerns_the_paper(state: str) -> bool:
 
 
 def review_path(state: str) -> str:
-    """PAPER_ONLY | PAPER_AND_ARTIFACT — the two paths, named.
-
-    The A/B distinction requirement 2 asks to be explicit. A paper whose artifact was
-    obtained is on a different review path from one whose artifact does not exist or could
-    not be reached, and the difference decides what evidence is reachable at all: only the
-    artifact path can ever produce an admissible reproduction, and only the paper-only path
-    can reach the governed reconstruction route.
-    """
+    """PAPER_ONLY | PAPER_AND_ARTIFACT — the two paths, named. The difference decides what
+    evidence is reachable at all: only the artifact path can produce an admissible
+    reproduction; only the paper-only path can reach the governed reconstruction route."""
     return ("PAPER_AND_ARTIFACT"
             if (state or "") in ("ARTIFACT_PRESENT_USABLE", "ARTIFACT_PRESENT_UNUSABLE")
             else "PAPER_ONLY")
@@ -480,6 +389,23 @@ def _self_check() -> None:
         assert resolution_state(evidence_state("PAPER_ARITHMETIC_CONTRADICTION", prov)) \
             == "RESOLVED_FROM_PAPER", prov
         assert concerns_the_paper(evidence_state("PAPER_ARITHMETIC_CONTRADICTION", prov)), prov
+
+    # --- EXACT_CERTIFICATE: a counterexample gated by the SAME provenance ceiling as a
+    # repo/reimpl reproduction failure; a checked-but-clean certificate never counts as
+    # support, exactly like CITATION_VERIFIED ------------------------------------------
+    assert evidence_state("COUNTEREXAMPLE_ESTABLISHED", "cert_exec") == "CERTIFICATE_VIOLATION"
+    assert concerns_the_paper(evidence_state("COUNTEREXAMPLE_ESTABLISHED", "cert_exec"))
+    assert resolution_state(evidence_state("COUNTEREXAMPLE_ESTABLISHED", "cert_exec")) \
+        == "RESOLVED_BY_EXECUTION"
+    for prov in ("synthesized", "template", "", "paper"):
+        assert evidence_state("COUNTEREXAMPLE_ESTABLISHED", prov) == "INCONCLUSIVE_EXECUTION", prov
+    for prov in ("paper", "", "driver", "repo_exec", "cert_exec"):
+        assert evidence_state("NO_COUNTEREXAMPLE_FOUND", prov) == "CERTIFICATE_NO_VIOLATION", prov
+        assert not concerns_the_paper(evidence_state("NO_COUNTEREXAMPLE_FOUND", prov)), prov
+        assert resolution_state(evidence_state("NO_COUNTEREXAMPLE_FOUND", prov)) == "UNRESOLVED", prov
+        assert claim_was_checked(evidence_state("NO_COUNTEREXAMPLE_FOUND", prov)), (
+            "a certificate that genuinely ran must count as CHECKED even though it is not "
+            "support")
 
     # The three refusals that used to share EXTRACTION_LIMITATION are three states, and
     # only the first is a limit of our own extraction.

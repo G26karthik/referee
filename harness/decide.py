@@ -1,10 +1,5 @@
 """What may be concluded: materiality, disposition, planning, priority, route exhaustion.
 
-Consolidates the reference implementation's `harness/{disposition,planner,priority,
-materiality,exhaustion,comparison}.py` (tag `reference-implementation-2026-09-20`) into
-one file. Function bodies are unchanged; docstrings are cut to what a reader needs at the
-call site — see `docs/INVARIANT_MAP.md` for the corpus incidents that shaped each rule.
-
 `harness/taxonomy.py`, `harness/provenance.py` and `harness/isolation.py` stay SEPARATE
 files rather than joining this one: all three are pure vocabulary/predicate modules with
 NO dependency on `harness.schema`, and merging them here would make this module need
@@ -25,12 +20,9 @@ from .schema import (
     PLAN_ACTIONS, VERIFICATION_ROUTES,
 )
 
-# =============================================================================
-# DISPOSITION — the one action a caller takes on a finished paper
-# =============================================================================
-# Precedence, strongest fact first: (1) the review did not finish, (2) a material failure
-# was established, (3) a CENTRAL question could not be checked at all, (4) one was checked
-# and stayed open, (5) a concern was verified but rejects nothing, (6) neither of the above.
+# === DISPOSITION — the one action a caller takes on a finished paper ===================
+# Precedence, strongest fact first: (1) unfinished, (2) material failure, (3) a CENTRAL
+# question blocked, (4) one stayed open, (5) a concern verified but rejecting nothing.
 
 # ON WHAT a material failure was established. Never a severity, never a colour.
 _BASIS_REASON = {
@@ -43,6 +35,11 @@ _BASIS_REASON = {
         "paper's STATED METHOD and is never a statement about the authors' implementation",
     "PAPER_ARITHMETIC":
         "the paper's own printed composition does not evaluate to the total it states",
+    "INDEPENDENT_CERTIFICATE":
+        "an independently verified exact-arithmetic certificate constructed a concrete "
+        "instance that satisfies every hypothesis the paper's theorem states and violates "
+        "the bound it claims. This is evidence about the paper's STATED THEOREM and is "
+        "never a statement about the authors' own proof or implementation",
     "NONE": "",
 }
 
@@ -71,9 +68,8 @@ BLOCKER_FOR_DISPOSITION: dict[str, str] = {
 }
 
 # Target dispositions DELIBERATELY absent from the table above, with why. Every value in
-# `schema.TARGET_DISPOSITIONS` must appear either here or above — the self-check asserts
-# it — so an added disposition that is never classified fails the suite instead of
-# silently reading PASS_TO_HUMAN_CLEAN on a central target.
+# `schema.TARGET_DISPOSITIONS` must appear either here or above, so an added disposition
+# that is never classified fails the self-check instead of silently reading CLEAN.
 DELIBERATELY_UNCLASSIFIED: dict[str, str] = {
     "AUTHORIZATION_BLOCKED":
         "a gate in THIS RUN refused by configuration, not by an absence of method — turning "
@@ -106,9 +102,12 @@ DELIBERATELY_UNCLASSIFIED: dict[str, str] = {
         "the concern is right. Its question stays open, not blocked.",
     "NO_EXPERIMENT_NEEDED": "declining to run something is a successful review outcome on "
                             "the necessity axis and resolves nothing on the evidence axis.",
+    "COUNTEREXAMPLE_ESTABLISHED": "the target settled: an admissible exact-arithmetic "
+                                  "certificate found a counterexample.",
+    "NO_COUNTEREXAMPLE_FOUND": "the tested instances satisfied the claimed bound; settles "
+                               "nothing about whether it holds in general. Its question "
+                               "stays open, not blocked.",
 }
-
-PAPER_DISPOSITIONS_ = PAPER_DISPOSITIONS  # re-exported for callers importing from here
 
 _REASON = {
     "STOP_MATERIAL_FAILURE":
@@ -154,8 +153,11 @@ def disposition_basis_for(*, failed_target_provenance: str = "",
     """WHICH evidence carried a material failure. Only deterministic arithmetic or an
     admissible execution may — model-assigned severity is deliberately absent."""
     if admits(failed_target_provenance):
-        return ("AUTHOR_CODE_REPRODUCTION" if failed_target_provenance == "repo_exec"
-                else "INDEPENDENT_REIMPLEMENTATION")
+        if failed_target_provenance == "repo_exec":
+            return "AUTHOR_CODE_REPRODUCTION"
+        if failed_target_provenance == "cert_exec":
+            return "INDEPENDENT_CERTIFICATE"
+        return "INDEPENDENT_REIMPLEMENTATION"
     if paper_arithmetic_failed:
         return "PAPER_ARITHMETIC"
     return "NONE"
@@ -181,11 +183,7 @@ def derive_disposition(*, review_complete: bool = True, claim_status: str = "NOT
     """(disposition, basis, reason). Total over its inputs and deterministic.
 
     Precedence: PROVEN (an established defect) outranks OPEN (unresolved central claim)
-    outranks ASSERTED (a counted MAJOR), and every BLOCKED_* outranks all three — see
-    `docs/INVARIANT_MAP.md` for the two shipped-corpus defects this ordering fixes
-    (a central question with no admissible route reading PASS_TO_HUMAN_CLEAN; a proven
-    arithmetic contradiction on a non-central target reading CLEAN because nothing else
-    matched).
+    outranks ASSERTED (a counted MAJOR), and every BLOCKED_* outranks all three.
     """
     if not review_complete:
         return "NOT_REVIEWED", "NONE", _REASON["NOT_REVIEWED"]
@@ -213,13 +211,10 @@ def stops_the_paper(disposition: str = "") -> bool:
     return (disposition or "") == "STOP_MATERIAL_FAILURE"
 
 
-# =============================================================================
-# PLANNER — whether a target is worth an experiment, and which kind, deterministically
-# =============================================================================
-# This module decides whether to TRY. `execute.authorize` decides whether it may RUN.
-# Identity, capability, commit verification and resource sufficiency all live there —
-# only `authorize()` may permit repository execution — and this module never duplicates
-# any of it.
+# === PLANNER — whether a target is worth an experiment, and which kind, deterministically ===
+# This module decides whether to TRY; `execute.authorize` decides whether it may RUN.
+# Identity, capability, commit verification and resource sufficiency all live there, and
+# this module never duplicates any of it.
 
 # Which refusal each named addressing blocker earns.
 _ADDRESSING_REFUSAL = {
@@ -236,19 +231,20 @@ _ADDRESSING_REFUSAL = {
 }
 
 # Routes that CLOSE a question without anything running. ONE route: `PAPER_INTERNAL_CHECK`
-# was here once and should not have been — it re-verifies a QUOTATION and settles nothing,
-# so having it here let a citation check suppress an experiment 100% of the time over the
-# shipped corpus. It is still taken when nothing better exists (`_CITATION_ONLY`), and no
-# longer outranks anything.
+# re-verifies a QUOTATION and settles nothing, so it never belongs here — it is still
+# taken when nothing better exists (`_CITATION_ONLY`), but no longer outranks anything.
 _RESOLVING = ("ARITHMETIC_RECHECK",)
 _CITATION_ONLY = ("PAPER_INTERNAL_CHECK",)
 
 _ACTION_FOR_ROUTE = {
     "AUTHOR_CODE_EXECUTION": "AUTHOR_CODE_REPRODUCTION",
     "INDEPENDENT_RECONSTRUCTION": "INDEPENDENT_RECONSTRUCTION",
+    "EXACT_CERTIFICATE": "EXACT_CERTIFICATE",
 }
-# Most decisive first — the authors' own code is always preferred over a reconstruction.
-_EXECUTABLE_ORDER = ("AUTHOR_CODE_EXECUTION", "INDEPENDENT_RECONSTRUCTION")
+# Most decisive first. EXACT_CERTIFICATE leads: it needs no repository at all, so a target
+# offering it never waits on an artifact the theorem statement does not need. Among the
+# routes that DO need one, the authors' own code is still preferred over a reconstruction.
+_EXECUTABLE_ORDER = ("EXACT_CERTIFICATE", "AUTHOR_CODE_EXECUTION", "INDEPENDENT_RECONSTRUCTION")
 _WORTH_PURSUING = ("CENTRAL", "SUPPORTING")
 
 
@@ -257,9 +253,8 @@ def _necessity(action: str) -> str:
 
 
 def route_that_would_be_taken(routes: tuple[str, ...] = ()) -> str:
-    """The route `plan()` would choose for an object offering `routes`. Pure, no object —
-    exists because scoring on `routes[0]` (the first route discovery happened to append)
-    disagreed systematically with what the planner actually chooses."""
+    """The route `plan()` would choose for an object offering `routes`. Pure, no object:
+    scoring on `routes[0]` disagreed systematically with what the planner chooses."""
     rs = tuple(routes or ())
     for r in _RESOLVING:
         if r in rs:
@@ -276,8 +271,7 @@ def route_that_would_be_taken(routes: tuple[str, ...] = ()) -> str:
 def current_plans(plans: list[PlanDecision]) -> list[PlanDecision]:
     """The plan CURRENTLY IN FORCE for each target — the LAST entry for a repeated
     `target_id`. Read this, never a raw `TargetSet.plans` list, for anything that COUNTS:
-    a re-plan appends a second `PlanDecision` rather than replacing the first, so a naive
-    sum over the raw list double-counts a target that was re-planned."""
+    a re-plan appends a second `PlanDecision` rather than replacing the first."""
     by_id: dict[str, PlanDecision] = {}
     for p in plans:
         by_id[p.target_id] = p
@@ -380,13 +374,9 @@ def plan(obj: DiscoveredObject, *, artifact_available: bool = False,
         investigation_open: bool = True, author_code_exhausted: bool = False,
         attempt: int = 1) -> PlanDecision:
     """The decision for one discovered object: resolve it cheaply, escalate, or refuse.
-
-    Order: (1) a route that can close the question with nothing running -> take it,
-    (2) otherwise the most decisive executable route -> gate it, (3) otherwise -> no
-    experiment. `author_code_exhausted` removes AUTHOR_CODE_EXECUTION from consideration
-    for THIS call only, for the re-plan primitive after identity resolution failed
-    against a real checkout — `obj.routes` itself is never mutated.
-    """
+    Order: (1) a route that can close the question with nothing running -> take it, (2)
+    otherwise the most decisive executable route -> gate it, (3) otherwise -> no
+    experiment. `author_code_exhausted` drops AUTHOR_CODE_EXECUTION for THIS call only."""
     why_material = _why_material(obj)
     paper_only_no, inspection_no = _cheaper_routes_ruled_out(obj)
     executable_order = tuple(
@@ -492,26 +482,24 @@ def plan(obj: DiscoveredObject, *, artifact_available: bool = False,
         target_id=obj.target_id, action=action, route=route, reason=reason, gates=gates,
         blocking_gate=blocking,
         requires_execution=action in ("AUTHOR_CODE_REPRODUCTION", "INDEPENDENT_RECONSTRUCTION",
-                                      "MECHANISM_TEST_ONLY"),
+                                      "MECHANISM_TEST_ONLY", "EXACT_CERTIFICATE"),
         attempt=attempt, necessity=_necessity(action), why_material=why_material,
         paper_only_insufficient_because=paper_only_no,
         inspection_insufficient_because=inspection_no,
         competing_explanations=competing, expected_observation=expected)
 
 
-# =============================================================================
-# PRIORITY — which target to pursue first, as a function, not a display sort
-# =============================================================================
-# Lexicographic, and the order of the keys is the policy: centrality > addressability >
-# decisiveness > identity > artifact-presence > cheapness (tiebreak only). Cheapness sits
-# at the bottom deliberately — putting cost any higher lets the system pick an easy
-# peripheral target over a hard central one.
+# === PRIORITY — which target to pursue first, as a function, not a display sort ========
+# Lexicographic, and the key order is the policy: centrality > addressability >
+# decisiveness > identity > artifact-presence > cheapness (tiebreak only, kept last so
+# cost can never outrank picking a hard central target over an easy peripheral one).
 
 _CENTRALITY = {"CENTRAL": 3, "SUPPORTING": 2, "PERIPHERAL": 1, "UNASSESSED": 0}
-_DECISIVENESS = {"PAPER_INTERNAL_CHECK": 3, "ARITHMETIC_RECHECK": 3,
+_DECISIVENESS = {"PAPER_INTERNAL_CHECK": 3, "ARITHMETIC_RECHECK": 3, "EXACT_CERTIFICATE": 3,
                  "AUTHOR_CODE_EXECUTION": 3, "INDEPENDENT_RECONSTRUCTION": 2,
                  "ARTIFACT_INSPECTION": 1, "NONE": 0}
-_CHEAPNESS = {"PAPER_INTERNAL_CHECK": 3, "ARITHMETIC_RECHECK": 3, "ARTIFACT_INSPECTION": 2,
+_CHEAPNESS = {"PAPER_INTERNAL_CHECK": 3, "ARITHMETIC_RECHECK": 3, "EXACT_CERTIFICATE": 3,
+             "ARTIFACT_INSPECTION": 2,
              "AUTHOR_CODE_EXECUTION": 1, "INDEPENDENT_RECONSTRUCTION": 0, "NONE": 0}
 _IDENTITY_SCORE = {"established": 3, "ambiguous": 1, "unmapped": 0, "": 0}
 _BASE, _FIELDS = 8, 6          # base > any field's max, so the sum is provably lexicographic
@@ -538,9 +526,7 @@ def score(*, centrality: str, addressable: bool, cheapest_route: str,
 
 def order(objects, *, identity_state: str = "", artifact_available: bool = False):
     """Score every discovered object in place, highest priority first. Scores on the
-    route the PLANNER would take (`route_that_would_be_taken`), not `routes[0]` — the
-    first route discovery happened to append, which ranked every corpus target by a
-    route nobody would ever choose."""
+    route the PLANNER would take (`route_that_would_be_taken`), not `routes[0]`."""
     for o in objects:
         o.priority, o.priority_reason = score(
             centrality=o.centrality, addressable=bool(o.harness_addressable),
@@ -549,14 +535,11 @@ def order(objects, *, identity_state: str = "", artifact_available: bool = False
     return sorted(objects, key=lambda o: (-o.priority, o.target_id))
 
 
-# =============================================================================
-# MATERIALITY — is an ESTABLISHED defect material to a CENTRAL scientific claim?
-# =============================================================================
-# A CONSERVATIVE SUFFICIENT CONDITION, not a materiality model. A target is material when
-# it resolves inside the Abstract or Conclusion, or one of those sections explicitly
-# cites its unique printed table/figure/equation/Result identity. Everything else is
-# NONE — "not machine-established as material", never "does not matter". Under-stopping
-# is the accepted direction; over-stopping is not.
+# === MATERIALITY — is an ESTABLISHED defect material to a CENTRAL scientific claim? ====
+# A CONSERVATIVE SUFFICIENT CONDITION, not a materiality model: material when a target
+# resolves inside the Abstract/Conclusion, or one of those sections explicitly cites its
+# unique printed table/figure/equation/Result identity. Everything else is NONE — "not
+# machine-established as material", never "does not matter". Under-stopping is accepted.
 
 _ABSTRACT_HEADING = re.compile(r"^(?:\d+|[A-Z])?\.?\s*abstract\b", re.I)
 _CONCLUSION_HEADING = re.compile(
@@ -744,8 +727,8 @@ def is_material(basis: str = "") -> bool:
 
 
 def basis_for_target(target_id: str, objects) -> str | None:
-    """The stored basis for a target, or None when the target has NO object at all.
-    `None` and `"NONE"` are different answers a caller must be able to tell apart."""
+    """The stored basis for a target, or None when it has NO object at all — `None` and
+    `"NONE"` are different answers a caller must tell apart."""
     if not (target_id or "").strip():
         return None
     for o in (objects or []):
@@ -781,13 +764,10 @@ def unjoinable_established_failures(objects, outcomes) -> list[str]:
             and basis_for_target(getattr(o, "target_id", ""), objects) is None]
 
 
-# =============================================================================
-# COMPARISON — what a result would be held against, and whether that exists
-# =============================================================================
-# The comparison is a property of the ROUTE, not of the question — keeping them apart is
-# what stops "this is an attribution question" silently becoming "so its number may be
-# reconciled against a cell". `RECONCILABLE` is one entry long, which is the honest state
-# of this system: only AGAINST_PRINTED_VALUE has arithmetic behind it.
+# === COMPARISON — what a result would be held against, and whether that exists =========
+# The comparison is a property of the ROUTE, not of the question — keeping them apart stops
+# "this is an attribution question" silently becoming "so its number may be reconciled
+# against a cell".
 
 COMPARISON_FOR_ROUTE = {
     "AUTHOR_CODE_EXECUTION": "AGAINST_PRINTED_VALUE",
@@ -795,9 +775,13 @@ COMPARISON_FOR_ROUTE = {
     "ARITHMETIC_RECHECK": "AGAINST_PRINTED_VALUE",
     "ARTIFACT_INSPECTION": "AGAINST_EXISTENCE",
     "PAPER_INTERNAL_CHECK": "AGAINST_SPECIFICATION",
+    # A theorem/bound's claimed inequality, checked in exact arithmetic on a concrete
+    # instance — never a printed cell (`execute.reconcile`'s own cert_exec branch, never
+    # the arithmetic tail).
+    "EXACT_CERTIFICATE": "AGAINST_CLAIMED_BOUND",
     "NONE": "",
 }
-RECONCILABLE = ("AGAINST_PRINTED_VALUE",)
+RECONCILABLE = ("AGAINST_PRINTED_VALUE", "AGAINST_CLAIMED_BOUND")
 _UNSUPPORTED_DETAIL = {
     "AGAINST_EXISTENCE":
         "this comparison asks whether something the claim requires is present, which is a "
@@ -846,6 +830,13 @@ def derive_comparison(route: str = "", *, printed_value_available: bool = False)
             reason=("the paper prints no single unambiguous quantity at the cited address, "
                     "so a run of this route would produce a number with nothing to "
                     "reconcile it against."))
+    if kind == "AGAINST_CLAIMED_BOUND":
+        # Always established, never gated on `printed_value_available`: the reference is
+        # the theorem's OWN claimed bound, not a table cell, so nothing is "no_reference".
+        return Comparison(
+            kind=kind, state="established",
+            measured="whether any tested exact-arithmetic instance violates the claimed bound",
+            reference="the bound the paper's theorem/lemma states", reason="")
     return Comparison(kind=kind, state="unsupported",
                       measured="what this route would observe",
                       reference="what the claim requires to be there",
@@ -860,24 +851,18 @@ def admits_verdict(comparison: Comparison | None) -> bool:
     return comparison.established and reconcilable(comparison.kind)
 
 
-# =============================================================================
-# EXHAUSTION — which evidence routes were applicable, tried, and genuinely closed
-# =============================================================================
-# Three-way partition, not two, because the naive version is gameable: with
-# SH_ALLOW_REPO_EXEC=0 every authors'-code route is "blocked", and counting a blocked
-# route as discharged would read 1.0 on every paper — a perfect score measuring the
-# operator's .env file.
-#
-#   DISCHARGED     ran and produced admissible evidence, or ended at a blocker that is a
-#                  fact about the PAPER, the ARTIFACT or the WORLD
-#   CONFIGURATION  a gate this harness owns was shut, a budget ran out, or a policy
-#                  demoted it — reported in its own column, never summed into DISCHARGED
+# === EXHAUSTION — which evidence routes were applicable, tried, and genuinely closed ===
+# Three-way partition, not two: with SH_ALLOW_REPO_EXEC=0 every authors'-code route is
+# "blocked", and counting a blocked route as discharged would read 1.0 on every paper.
+#   DISCHARGED     ran and produced admissible evidence, or ended at a fact about the
+#                  PAPER/ARTIFACT/WORLD
+#   CONFIGURATION  a gate/budget/policy this harness owns — its own column, never summed
+#                  into DISCHARGED
 #   OPEN           applicable, affordable, and nothing was done about it
 
 DISCHARGING_STATES = ("DISCHARGED_RAN", "DISCHARGED_COMPLETED",
                       "DISCHARGED_BLOCKED", "COMPLETED_INCONCLUSIVE")
 CONFIGURATION_STATES = ("GATE_CLOSED", "DEFERRED_BUDGET", "DEFERRED_POLICY")
-OPEN_STATES = ("NOT_TRIED",)
 
 DISCHARGING_BLOCKERS = (
     "SPECIFICATION_BLOCKED", "REPORTING_BLOCKED", "ARTIFACT_BLOCKED", "IDENTITY_BLOCKED",
@@ -887,8 +872,7 @@ DISCHARGING_BLOCKERS = (
 NON_DISCHARGING_BLOCKERS = ("AUTHORIZATION_BLOCKED", "BUDGET_DEFERRED",
                            "SUPERSEDED_BY_ESTABLISHED_FAILURE")
 # Routes with no executor. Named rather than silently dropped — the exclusion IS the
-# limitation. The literature-search, focused-validation and claim-link routes are simply
-# gone from VERIFICATION_ROUTES (deleted 2026-09-20), not listed here.
+# limitation.
 UNIMPLEMENTED_ROUTES = ("ARTIFACT_INSPECTION", "NONE")
 
 
@@ -930,9 +914,9 @@ def state_for(*, ran: bool = False, provenance: str = "", blocker: str = "",
 
 
 def route_coverage(attempts: list | None = None, question_ids: tuple[str, ...] = ()) -> dict:
-    """Route-exhaustion coverage, with every denominator printed beside it. A question is
-    EXHAUSTED when every applicable route attached to it is discharged; `rate` is None —
-    never 1.0 — for an empty denominator."""
+    """Route-exhaustion coverage, with every denominator printed beside it. EXHAUSTED
+    means every applicable route attached to a question is discharged; `rate` is None
+    (never 1.0) for an empty denominator."""
     by_q: dict[str, list] = {}
     for a in (attempts or []):
         by_q.setdefault(str(getattr(a, "question_id", "") or ""), []).append(a)
@@ -971,10 +955,9 @@ def route_coverage(attempts: list | None = None, question_ids: tuple[str, ...] =
 
 
 def _material_question_ids(ts: TargetSet) -> tuple[str, ...]:
-    """Questions in scope, provided at least one implemented route applies. The union of
-    `ReviewQuestion.materiality == CENTRAL` (review-priority) and a bound target's own
-    `materiality_basis` (machine-owned) — neither may make a question disappear merely
-    because the other is conservative."""
+    """Questions in scope, provided at least one implemented route applies: the union of
+    `ReviewQuestion.materiality == CENTRAL` and a bound target's own `materiality_basis` —
+    neither may make a question disappear merely because the other is conservative."""
     objects: dict[str, list] = {}
     for obj in ts.objects:
         if obj.question_id:
@@ -998,6 +981,8 @@ def _gate_closed(cfg, route: str) -> bool:
     if route == "INDEPENDENT_RECONSTRUCTION":
         return (not bool(getattr(cfg, "allow_reimplementation_driver", False))
                 or not bool(getattr(cfg, "allow_reimplementation_exec", False)))
+    if route == "EXACT_CERTIFICATE":
+        return not bool(getattr(cfg, "allow_certificate_exec", False))
     return False
 
 
@@ -1059,10 +1044,9 @@ def _attempt_for(q, route: str, objs: list, plans: list, outcomes: list, cfg) ->
             attempted, completed, exhausted = True, True, True
         elif (route == "INDEPENDENT_RECONSTRUCTION" and disposition == "SPECIFICATION_BLOCKED"
               and outcome.launched == 0):
-            # Checked NARROWLY, before the general gate-closed fallback: this disposition
-            # is written by `plan()` at DISCOVER time from the paper's own eligibility,
-            # before ANY execution gate is consulted, so a paper that simply never states
-            # a training procedure must not be attributed to this harness's `.env` file.
+            # Checked NARROWLY, before the general gate-closed fallback: `plan()` wrote
+            # this at DISCOVER time from the paper's own eligibility, before any gate, so
+            # it must not be attributed to this harness's `.env` file.
             state, blocker = "DISCHARGED_BLOCKED", disposition
             attempted, completed, exhausted = True, True, True
         elif (disposition == "AUTHORIZATION_BLOCKED" or _gate_closed(cfg, route)) \
@@ -1104,8 +1088,8 @@ def _attempt_for(q, route: str, objs: list, plans: list, outcomes: list, cfg) ->
 
 
 def refresh_route_attempts(ts: TargetSet, cfg=None) -> TargetSet:
-    """Rebuild the durable route rows from the TargetSet's current artifacts. A fold, so
-    a cached second pass cannot retain a flattering row after the outcome changed."""
+    """Rebuild the durable route rows from the TargetSet's current artifacts. A fold, so a
+    cached second pass cannot retain a flattering row after the outcome changed."""
     qids = _material_question_ids(ts)
     q_by_id = {q.question_id: q for q in ts.questions}
     by_q: dict[str, list] = {}
@@ -1144,6 +1128,7 @@ def _self_check() -> None:
     assert derive_disposition(review_complete=False)[0] == "NOT_REVIEWED"
     assert disposition_basis_for(failed_target_provenance="repo_exec") == "AUTHOR_CODE_REPRODUCTION"
     assert disposition_basis_for(failed_target_provenance="synthesized") == "NONE"
+    assert disposition_basis_for(failed_target_provenance="cert_exec") == "INDEPENDENT_CERTIFICATE"
     assert blockers_from(["NO_ROUTE_AVAILABLE"], ["CENTRAL"]) == ("METHOD",)
 
     # --- planner --------------------------------------------------------------------------
@@ -1167,6 +1152,22 @@ def _self_check() -> None:
     deduped = current_plans([first, fallback])
     assert len(deduped) == 1 and deduped[0] is fallback, (
         "current_plans keeps exactly one entry per target: the LAST one")
+
+    # EXACT_CERTIFICATE: cheap, decisive, no repo — picked even with no artifact and no
+    # specification, unlike AUTHOR_CODE_EXECUTION/INDEPENDENT_RECONSTRUCTION above.
+    bound = DiscoveredObject(target_id="T7", centrality="CENTRAL", harness_addressable=True,
+                             question_kind="MATHEMATICAL_BOUND", routes=["EXACT_CERTIFICATE"])
+    cert_plan = plan(bound, environment_state="ok")
+    assert cert_plan.action == "EXACT_CERTIFICATE" and cert_plan.requires_execution
+    assert not _gate_closed(None, "EXACT_CERTIFICATE")
+
+    class _Cfg:
+        allow_certificate_exec = True
+    assert not _gate_closed(_Cfg(), "EXACT_CERTIFICATE"), "the certificate gate opens it"
+
+    class _CfgClosed:
+        allow_reimplementation_exec = False
+    assert _gate_closed(_CfgClosed(), "EXACT_CERTIFICATE")
 
     # --- priority ---------------------------------------------------------------------
     hard, _ = score(centrality="CENTRAL", addressable=True, cheapest_route="AUTHOR_CODE_EXECUTION")
@@ -1204,6 +1205,10 @@ def _self_check() -> None:
     ok = derive_comparison("AUTHOR_CODE_EXECUTION", printed_value_available=True)
     assert ok.established and admits_verdict(ok)
     assert admits_verdict(None), "a spec built before this layer must behave as it did"
+    cert_cmp = derive_comparison("EXACT_CERTIFICATE")
+    assert cert_cmp.kind == "AGAINST_CLAIMED_BOUND" and cert_cmp.established
+    assert reconcilable("AGAINST_CLAIMED_BOUND") and admits_verdict(cert_cmp)
+    assert not needs_printed_value("EXACT_CERTIFICATE")
 
     # --- exhaustion: THE ANTI-GAMING RULE -----------------------------------------------
     assert state_for(ran=True, provenance="repo_exec") == "DISCHARGED_RAN"

@@ -1,45 +1,42 @@
-"""How this harness asks another agent to do a reasoning task, whatever is driving it.
+"""How this harness asks another agent to do a reasoning task.
 
 `python -m harness.delegation` runs the self-check.
 
-**The defect this exists to fix.** `audit_driver` hard-coded ONE delegation mechanism: a
-fresh `claude -p` subprocess. That mechanism is not always the right one and is sometimes
-not available at all. Its costs land on the ACCOUNT rather than on the controlling
-session, so a controller that already has an isolated-subagent mechanism of its own paid
-twice and hit an account-level session limit that had nothing to do with the review. The
-harness had no way to express "delegate this" without also specifying "by spawning a CLI".
+**Current state: ONE live channel.** The harness never spawns a `claude` CLI subprocess —
+see `harness/tasks.py` for the live protocol. The controlling Claude Code session
+dispatches its own isolated subagents, one per delegable unit (mode `SESSION_SUBAGENT`);
+`harness/tasks.py` builds the work (prompt + output path), and `harness.tasks.seal`
+validates and seals whatever comes back. `CLI_SUBPROCESS` and its `audit_driver` /
+`grade_driver` / `verdict_driver` / `reimplement_driver` / `artifact_review_driver`
+writer tokens remain in the vocabulary below SOLELY so a sidecar sealed before this
+change still reads back as the mode that actually produced it. Nothing in this codebase
+produces that mode any more.
 
-**The separation this module draws.** A reasoning task has two halves and they belong to
-two different owners:
+**The separation this module still draws.** A reasoning task has two halves and they
+belong to two different owners:
 
     THE HARNESS owns the CONTRACT and the PROVENANCE. What prompt, what schema, what
                 isolation is required, where the answer goes, how the answer is validated,
                 and what the artifact must record about how it was produced.
 
-    THE ENVIRONMENT owns the EXECUTION. Whether the delegate is a CLI subprocess, an
-                isolated subagent of the controlling session, or a human at a terminal.
+    THE ENVIRONMENT owns the EXECUTION. Whether the delegate is an isolated subagent of
+                the controlling session or a human at a terminal.
 
-So this module defines modes, capability detection and a WORK ORDER, and it executes
-nothing. `audit_driver` fulfils a work order one way; a controlling session fulfils it
-another; `stages/audit.accept_lens` seals either, recording which.
+**Why the modes are not interchangeable, and why `MANUAL` is not a catch-all.** An
+isolated subagent dispatched autonomously by the controller and a human pasting JSON into
+a file are not the same thing. One is autonomous delegated execution with a fresh context
+per task; the other is a person, with no isolation claim at all and no guarantee the four
+lenses were even independent. A corpus that mixes them and reports one number is
+reporting neither.
 
-**Why the modes are not interchangeable, and why `MANUAL` is not a catch-all.** Before
-this, anything not produced by the CLI was sealed `manual_accept` — so an isolated
-subagent dispatched autonomously by the controller and a human pasting JSON into a file
-were the same provenance token. They are not the same thing. One is autonomous delegated
-execution with a fresh context per lens; the other is a person, with no isolation claim at
-all and no guarantee the four lenses were even independent. A corpus that mixes them and
-reports one number is reporting neither.
-
-What every mode must state honestly is what it CANNOT prove. Only `CLI_SUBPROCESS` can
-demonstrate an enforced tool policy, because only it built the argv. `SESSION_SUBAGENT`
-gets real context isolation and cannot prove a filesystem sandbox. `MANUAL` proves
-nothing. `tool_policy` therefore defaults to `unrecorded` in every mode but the first, and
-`ISOLATION_CLAIM` below is the closed vocabulary of what each mode is entitled to say.
+What every mode must state honestly is what it CANNOT prove. Only `CLI_SUBPROCESS` — read
+from an old seal, never produced now — could ever demonstrate an enforced tool policy,
+because only it built the argv. `SESSION_SUBAGENT` gets real context isolation and cannot
+prove a filesystem sandbox. `MANUAL` proves nothing. `tool_policy` therefore defaults to
+`unrecorded` in every mode but the first, and `ISOLATION_CLAIM` below is the closed
+vocabulary of what each mode is entitled to say.
 """
 from __future__ import annotations
-
-import shutil
 
 # HOW a reasoning task was actually carried out. Closed, and ordered by how much the
 # resulting artifact can prove about its own production.
@@ -85,78 +82,32 @@ ISOLATION_CLAIM = {
 _MAY_PROVE_TOOL_POLICY = ("CLI_SUBPROCESS",)
 
 
-def cli_available(command: str = "") -> tuple[bool, str]:
-    """Is a reviewer CLI reachable from this process?
-
-    `command` is the operator's configured command line, if any. An empty command falls
-    back to looking for `claude` on PATH, which is what `audit_driver.default_cmd` does.
-    """
-    if (command or "").strip():
-        return True, "the operator configured a reviewer command"
-    exe = shutil.which("claude")
-    if exe:
-        return True, f"found a reviewer CLI on PATH at {exe}"
-    return False, "no reviewer command is configured and no `claude` is on PATH"
-
-
 # --------------------------------------------------------------------------- #
-# THE PER-ROLE SKELETON — the part of every driver's `role_model`/`default_cmd`/
-# `available` that is genuinely duplicated, not merely similar
+# THE PER-ROLE SKELETON
 # --------------------------------------------------------------------------- #
-# These three are pure string/`shutil` operations, deliberately: `harness/reviewer_cli.py`
-# holds everything else a delegated CLI call needs (confinement, envelope parsing,
-# kill-tree, failure classification) precisely because those need `os`/`sys`/`subprocess`,
-# which this module's own purity test (see the module docstring above) forbids it from
-# importing. `cli_pipe_command` — the fourth member of the original duplicated skeleton —
-# lives in `reviewer_cli.py` for exactly that reason: it needs `os.name`.
 def resolve_model(override: str, declared_default: str) -> str:
     """An operator's model override, or the role's own declared default. Shared by every
-    driver's `role_model(cfg)`, which reads `override` off its own `Config` field and
+    role's `role_model(cfg)`, which reads `override` off its own `Config` field and
     `declared_default` off its own `prompts.<role>.*_SPEC["model"]`."""
     return (override or "").strip() or str(declared_default or "")
 
 
-def resolve_reviewer_exe(explicit: str = "", cfg_exe: str = "") -> str:
-    """The reviewer executable a built-in command template invokes: an explicit override,
-    else the operator's configured `SH_REVIEWER_EXE`, else `claude` on PATH. Every driver's
-    `default_cmd` resolved this chain independently; `audit_driver.default_cmd` is the one
-    exception that skipped the `cfg_exe` step internally (its caller supplied it instead) —
-    preserve that at the call site, not by weakening this function."""
-    return ((explicit or "").strip() or (cfg_exe or "").strip()
-            or (shutil.which("claude") or ""))
-
-
-def check_command(cmd: str, cmd_field: str) -> tuple[bool, str]:
-    """The empty-command and {prompt}/{out}-placeholder checks every driver's `available()`
-    performs on whatever `resolve_cmd()` returned, once its own gate check has already
-    passed. `cmd_field` is the env var name to name in the refusal (e.g. "SH_GRADE_CMD")."""
-    if not cmd:
-        return False, (f"no reviewer is available: {cmd_field} is empty, SH_REVIEWER_EXE "
-                       f"is empty and the `claude` CLI is not on PATH, so there is nothing "
-                       f"to delegate to")
-    if "{prompt}" not in cmd or "{out}" not in cmd:
-        return False, (f"{cmd_field} must contain both {{prompt}} and {{out}} "
-                       f"placeholders; got: {cmd!r}")
-    return True, ""
-
-
-def modes_available(*, cli_command: str = "", cli_gate_open: bool = False,
-                    session_can_delegate: bool = False) -> tuple[str, ...]:
+def modes_available(*, session_can_delegate: bool = True) -> tuple[str, ...]:
     """Which delegation modes this environment actually offers, most capable first.
 
-    Booleans and strings only. `session_can_delegate` is asserted BY THE CONTROLLER and
-    cannot be detected from inside a Python process: a harness cannot discover whether
-    the thing that launched it is able to dispatch a subagent. That is precisely why it is
-    a parameter — the environment answers it, the harness records the answer, and nothing
-    here guesses.
+    Booleans only. `session_can_delegate` is asserted BY THE CONTROLLER and cannot be
+    detected from inside a Python process: a harness cannot discover whether the thing
+    that launched it is able to dispatch a subagent. That is precisely why it is a
+    parameter — the environment answers it, the harness records the answer, and nothing
+    here guesses. It defaults True because the one live channel — the controlling Claude
+    Code session dispatching its own isolated subagents — is the normal case this harness
+    now runs under; a caller that genuinely has no controller may pass False.
 
     MANUAL is always available because a human is always available. It is last because it
     proves the least, not because it is worst: a careful human beats a rushed agent, and
     the harness has no way to tell which it got.
     """
     out = []
-    if cli_gate_open and cli_available(cli_command)[0]:
-        out.append("CLI_SUBPROCESS")
     if session_can_delegate:
         out.append("SESSION_SUBAGENT")
     out.append("MANUAL")
@@ -167,10 +118,8 @@ def choose(available: tuple[str, ...] = (), *, prefer: str = "") -> str:
     """The mode to use, given what is available and what the operator asked for.
 
     `prefer` wins when it is available, because which mechanism to spend is an operator's
-    decision and not this harness's: one controller pays for a CLI session, another pays
-    for its own subagents, and the harness is not entitled to an opinion about whose
-    budget to spend. Otherwise the most capable available mode wins, since a mode that can
-    prove more about its own production yields a more checkable artifact.
+    decision and not this harness's. Otherwise the most capable available mode wins, since
+    a mode that can prove more about its own production yields a more checkable artifact.
 
     Returns UNAVAILABLE only for an empty list, which `modes_available` never produces —
     so reaching it means a caller built the list itself and got it wrong.
@@ -185,38 +134,6 @@ def choose(available: tuple[str, ...] = (), *, prefer: str = "") -> str:
         if mode in avail:
             return mode
     return "UNAVAILABLE"
-
-
-def work_order(*, task: str, prompt_path: str, output_path: str, mode: str,
-               schema_hint: str = "") -> dict:
-    """What a delegate must be told, in a form any environment can fulfil.
-
-    The harness emits this; something else carries it out. It names the prompt to read,
-    the exact path to write, the isolation the mode claims, and the reading the delegate
-    must NOT do — because for `SESSION_SUBAGENT` and `MANUAL` that last part is the only
-    isolation mechanism there is, and an unstated contract is not a contract.
-
-    Deliberately a plain dict: it crosses a boundary out of Python, into whatever is
-    driving, and a pydantic model would suggest this side validates the answer. It does
-    not. `parse_lens_json` and `accept_lens` validate the answer.
-    """
-    return {
-        "task": task,
-        "mode": mode,
-        "read": prompt_path,
-        "write": output_path,
-        "isolation_required": ISOLATION_CLAIM.get(mode, ISOLATION_CLAIM["MANUAL"]),
-        "must_not_read": [
-            "any other task's prompt or output for this paper",
-            "this harness's own source, tests or working contract",
-            "any other paper's project directory",
-            "any archived earlier review of the same paper",
-        ],
-        "output_contract": (schema_hint
-                            or "exactly one JSON object, no markdown fence, no prose"),
-        "validated_by": "harness.audit_driver.parse_lens_json, then harness.stages.audit"
-                        ".accept_lens — a malformed answer is refused, not repaired",
-    }
 
 
 def provenance_record(*, mode: str, reviewer: str = "",
@@ -299,14 +216,9 @@ def _self_check() -> None:
     assert WRITTEN_BY["SESSION_SUBAGENT"] != WRITTEN_BY["MANUAL"]
 
     # --- signatures admit strings and booleans only ------------------------------------
-    for fn in (modes_available, provenance_record, work_order):
+    for fn in (modes_available, provenance_record):
         for name, p in inspect.signature(fn).parameters.items():
             assert str(p.annotation) in ("str", "bool"), f"{fn.__name__}.{name}"
-
-    # --- capability detection ----------------------------------------------------------
-    assert cli_available("my-reviewer --flag")[0] is True
-    ok, why = cli_available("")
-    assert isinstance(ok, bool) and why
 
     # --- the per-role skeleton: an override wins, a blank falls to the declared default -
     assert resolve_model("haiku", "sonnet") == "haiku"
@@ -314,37 +226,20 @@ def _self_check() -> None:
     assert resolve_model("   ", "sonnet") == "sonnet", "a blank override is not an override"
     assert resolve_model("", "") == ""
 
-    assert resolve_reviewer_exe("/explicit/claude", "/configured/claude") == "/explicit/claude"
-    assert resolve_reviewer_exe("", "/configured/claude") == "/configured/claude"
-    assert resolve_reviewer_exe("  ", "/configured/claude") == "/configured/claude"
-    # falls all the way to PATH discovery only once both overrides are blank
-    assert resolve_reviewer_exe("", "") == (shutil.which("claude") or "")
-
-    # --- the tail every available() shares once its own gate has already passed --------
-    assert check_command("", "SH_GRADE_CMD") == (
-        False, "no reviewer is available: SH_GRADE_CMD is empty, SH_REVIEWER_EXE is empty "
-        "and the `claude` CLI is not on PATH, so there is nothing to delegate to")
-    assert check_command("review --in {prompt}", "SH_GRADE_CMD") == (
-        False, "SH_GRADE_CMD must contain both {prompt} and {out} placeholders; "
-        "got: 'review --in {prompt}'")
-    assert check_command("cp {prompt} {out}", "SH_GRADE_CMD") == (True, "")
-
     # --- what each environment offers --------------------------------------------------
-    assert modes_available() == ("MANUAL",), "a human is always available"
-    assert modes_available(session_can_delegate=True) == ("SESSION_SUBAGENT", "MANUAL")
-    assert modes_available(cli_command="x", cli_gate_open=True) \
-        == ("CLI_SUBPROCESS", "MANUAL")
-    both = modes_available(cli_command="x", cli_gate_open=True, session_can_delegate=True)
-    assert both == ("CLI_SUBPROCESS", "SESSION_SUBAGENT", "MANUAL")
-    # a shut gate removes the CLI even when the command exists
-    assert "CLI_SUBPROCESS" not in modes_available(cli_command="x", cli_gate_open=False)
+    assert modes_available(session_can_delegate=False) == ("MANUAL",), (
+        "a human is always available")
+    assert modes_available() == ("SESSION_SUBAGENT", "MANUAL"), (
+        "the controlling session's own subagents are the default, live channel")
+    both = modes_available(session_can_delegate=True)
+    assert both == ("SESSION_SUBAGENT", "MANUAL")
 
     # --- choosing, and the operator's preference winning -------------------------------
-    assert choose(both) == "CLI_SUBPROCESS", "most capable by default"
-    assert choose(both, prefer="SESSION_SUBAGENT") == "SESSION_SUBAGENT", (
+    assert choose(both) == "SESSION_SUBAGENT", "most capable by default"
+    assert choose(both, prefer="MANUAL") == "MANUAL", (
         "whose budget to spend is the operator's decision, not this harness's")
-    assert choose(both, prefer="session_subagent") == "SESSION_SUBAGENT", "case-folded"
-    assert choose(("MANUAL",), prefer="CLI_SUBPROCESS") == "MANUAL", (
+    assert choose(both, prefer="manual") == "MANUAL", "case-folded"
+    assert choose(("MANUAL",), prefer="SESSION_SUBAGENT") == "MANUAL", (
         "a preference for something unavailable is not honoured silently by inventing it")
     assert choose(()) == "UNAVAILABLE"
     assert choose(("NOT_A_MODE",)) == "UNAVAILABLE"
@@ -383,14 +278,6 @@ def _self_check() -> None:
     assert mixed["total"] == 3 and mixed["tool_policy_provable_for"] == 2
     assert summarise([{"written_by": "audit_driver"}])["homogeneous"] is True
     assert summarise([])["homogeneous"] is True and summarise([])["total"] == 0
-
-    # --- a work order states what must NOT be read ------------------------------------
-    wo = work_order(task="lens:confound", prompt_path="a.md", output_path="b.json",
-                    mode="SESSION_SUBAGENT")
-    assert wo["mode"] == "SESSION_SUBAGENT" and wo["read"] == "a.md"
-    assert "NOT provable" in wo["isolation_required"]
-    assert any("other paper" in x for x in wo["must_not_read"])
-    assert "refused, not repaired" in wo["validated_by"]
     print("harness.delegation self-check ok")
 
 

@@ -1,20 +1,15 @@
 """Addressable references into a parsed paper, and the quantities they report.
 
-Near-verbatim port of the reference implementation's `harness/claims.py` (tag
-`reference-implementation-2026-09-20`) — this module's whole value is in the regex
-grammar and the three safety rules below, none of which the v4 redesign found reason to
-change. Only the import (`.schema` instead of `.artifacts`) and this docstring moved.
-
 `python -m harness.locate` runs the self-check.
 
-**The invariant.** A lens supplies a QUOTE; the harness mints the ADDRESS. `mint()`
-searches the parsed document for the quote and refuses unless it occurs exactly once — an
+THE INVARIANT. A lens supplies a QUOTE; the harness mints the ADDRESS. `mint()` searches
+the parsed document for the quote and refuses unless it occurs exactly once -- an
 ambiguous quote yields no address rather than its first occurrence, because a stable id
 for a span the lens may not have meant is worse than no id. A lens that writes a
 `P<i>:<a>-<b>` address itself gains nothing: `resolve()` re-reads the span off the
 document and returns `span_mismatch` when the text there is not the quote.
 
-**Two coordinate systems, kept apart on purpose.** Addresses are minted in FLATTENED
+TWO COORDINATE SYSTEMS, KEPT APART ON PURPOSE. Addresses are minted in FLATTENED
 coordinates (whitespace removed, lowercased) because a PDF breaks a sentence across lines
 wherever the column happens to end, and an address that moved when the extractor
 re-wrapped a line would not be stable. The `quote` handed back is sliced from the
@@ -22,13 +17,12 @@ ORIGINAL section text through an index map, so what a reader is shown is verbati
 Flattening is per SECTION, never across sections, so a string straddling a section seam
 can never verify.
 
-**The soft-hyphen projection.** A typesetter breaking "generation" across a line leaves
+THE SOFT-HYPHEN PROJECTION. A typesetter breaking "generation" across a line leaves
 "gener-" and "ation"; `flatten` turns that into `gener-ation`, and a reader quoting the
-sentence normally writes `generation` — refused as not present. Measured on one real
-abstract, that refused 8 of 11 correctly-quoted sentences. A soft hyphen is decidable only
-from the ORIGINAL text: a line-break hyphen is the one immediately followed by whitespace.
-Tried only after an exact match fails, so a character-for-character quotation is never
-resolved through a normalisation.
+sentence normally writes `generation` -- refused as not present without this. A soft
+hyphen is decidable only from the ORIGINAL text: a line-break hyphen is the one
+immediately followed by whitespace. Tried only after an exact match fails, so a
+character-for-character quotation is never resolved through a normalisation.
 """
 from __future__ import annotations
 
@@ -82,13 +76,9 @@ def flatten(text: str) -> tuple[str, list[int]]:
 def soft_hyphen_projection(flat: str, offsets: list[int],
                            original: str) -> tuple[str, list[int]]:
     """(text with LINE-BREAK hyphens removed, index of each kept char in `flat`).
-
-    `flatten` itself is deliberately NOT changed — every `P<i>:<a>-<b>` address in this
-    repository is a pair of offsets into its output, so changing it would silently move
-    every stored reference. This is a second projection used for SEARCHING; its offsets
-    are indices back into `flat`, so an address minted through it is in the same
-    coordinate system as one minted before it.
-    """
+    `flatten` itself is deliberately NOT changed -- every `P<i>:<a>-<b>` address in this
+    repository is a pair of offsets into its output. This is a second projection used
+    for SEARCHING; its offsets are indices back into `flat`."""
     kept_chars: list[str] = []
     kept_index: list[int] = []
     for i, ch in enumerate(flat):
@@ -137,13 +127,8 @@ _OBJECT_CITATION = re.compile(
 
 def _magnitude_suffixed(rhs: str, number: str) -> bool:
     """Does the number on this right-hand side carry a magnitude the float does not?
-
-    Measured incident: "58 x 5 x 10 = 2.9K test cases" had its total read as 2.9, the
-    product 2,900 compared against it, and the mismatch published as a paper-arithmetic
-    contradiction — a disposition that bypasses the provenance ceiling entirely, since
-    paper-internal arithmetic needs no execution to check. Only the suffix ON the parsed
-    number counts, so "= 2900 test cases" is untouched.
-    """
+    ("58 x 5 x 10 = 2.9K test cases" must not have its total read as bare 2.9.) Only the
+    suffix ON the parsed number counts, so "= 2900 test cases" is untouched."""
     idx = rhs.find(number)
     if idx < 0:
         return False
@@ -253,13 +238,10 @@ def _composition(lhs: str, total: float | None = None) -> tuple[list[float], str
     """([operands], 'a*b*c') when the left-hand side states a multiplicative composition.
 
     Two tiers. A RECOGNISED operator (`*`, `x`, `×`, `·`, `∗`) is admitted unconditionally
-    — a composition using it that does not evaluate is a finding. An UNRECOGNISED glyph
-    standing alone between numbers (a font-encoding artifact, e.g. FinChain's "58 ϵ 5 ϵ
-    10 = 2,900") is admitted ONLY when the operands actually multiply to the printed
-    total: the operator's identity is being inferred, and the sole evidence for the
-    inference is that the arithmetic then works. Where it does not, a different operator
-    and a genuine error are indistinguishable, and convicting would accuse the paper on
-    the strength of a font encoding.
+    -- a composition using it that does not evaluate is a finding. An UNRECOGNISED glyph
+    standing alone between numbers (a font-encoding artifact) is admitted ONLY when the
+    operands actually multiply to the printed total, since the operator's identity is
+    being inferred and the sole evidence for the inference is that the arithmetic works.
     """
     known = _alternates(_tokens(lhs, separators=False))
     if known is not None:
@@ -362,11 +344,9 @@ def _self_projection(flat_quote: str) -> tuple[str, list[int], str]:
 
 
 def mint(doc: PaperDoc, quote: str) -> ClaimRef:
-    """Find `quote` in the paper and mint the address for it — the harness's half.
-
+    """Find `quote` in the paper and mint the address for it -- the harness's half.
     Refuses on anything but exactly one occurrence. A quote matching a table cell
-    resolves as `table_cell`, not as prose, so cell-verified evidence is unaffected.
-    """
+    resolves as `table_cell`, not as prose."""
     flat_quote = _flat(quote)
     if len(flat_quote) < _QUOTE_MIN:
         return _unresolved("", "", "malformed",
@@ -433,13 +413,9 @@ def mint(doc: PaperDoc, quote: str) -> ClaimRef:
 
 
 def address(doc: PaperDoc, ref: str = "", quote: str = "") -> ClaimRef:
-    """The one entry point the rest of the harness should use.
-
-    A supplied address is re-derived; when it does not resolve — including a `p7`-style
-    page citation, which names a page and not a span — the quote is minted into one
-    instead. A lens that cites loosely still gets a checkable address whenever its
-    quotation earns one, and gets nothing when it does not.
-    """
+    """The one entry point the rest of the harness should use. A supplied address is
+    re-derived; when it does not resolve (including a `p7`-style page citation, which
+    names a page and not a span) the quote is minted into one instead."""
     if ref:
         got = resolve(doc, ref, quote)
         if got.resolved:

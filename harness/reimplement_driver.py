@@ -1,4 +1,4 @@
-"""The fourth driver — writes a GOVERNED RECONSTRUCTION from a paper's own specification,
+"""The fourth role — writes a GOVERNED RECONSTRUCTION from a paper's own specification,
 when `harness.reimplement.assess` has already established that the paper says enough.
 
 WHY THIS EXISTS, and what it replaces. Before this module, the only channel for PATH B
@@ -19,14 +19,17 @@ that is not literally present in the returned script is not bound.
 
 The manual channel (`write_reimplementation_prompt` / `run.py accept`, routing through
 `driver`) is UNCHANGED and still exists for an operator who wants to review and hand-seal a
-reconstruction themselves — this module adds an AUTOMATED, machine-verified path
-alongside it, exactly as `audit_driver`/`grade_driver`/`verdict_driver` sit alongside the
-manual `audit/prompts/<lens>.md` channel for their own phases. It does not touch `driver`,
+reconstruction themselves. What sits alongside it is no longer a CLI subprocess this
+module spawned: `persist_brief` writes the generator's brief to a deterministic path under
+`projects/<pid>/tasks/`, `harness/tasks.py` lists it as a `reimpl_gen` task for the
+controlling session's own subagent to answer, and a SEPARATE subagent answers the
+`reimpl_verify` task built from `_verification_brief` — the same "generator and an
+independently attributed verifier" shape this module always required, now carried out by
+two isolated subagent contexts instead of two CLI processes. It does not touch `driver`,
 `repo_exec`, `backends.authorize`'s repo-execution branch, or `experiment_id` at all.
 
-WRITING is not RUNNING. This module's subprocess only produces TEXT — a script as a JSON
-string, never executed by this module — mirroring `verdict_driver`'s zero-tool, bare
-confinement. Whether the SEALED result may ever actually run is a completely separate
+WRITING is not RUNNING. Nothing here executes a proposed script; it only produces and
+verifies TEXT. Whether the SEALED result may ever actually run is a completely separate
 question, decided by `backends.authorize`'s `reimpl_exec` branch and gated by
 `SH_ALLOW_REIMPLEMENTATION_EXEC` plus the same isolation floor `SH_ALLOW_REPO_EXEC`
 requires (`harness.isolation.sufficient_for_repo_exec`) — decision 10: a model-authored
@@ -37,21 +40,15 @@ code execution lands without that boundary enforced.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import re
-import shutil
-import sys
-import tempfile
-import time
 from pathlib import Path
 
-from . import delegation, reviewer_cli, sealing, state
+from . import delegation, sealing, state
+from .reviewer_cli import envelope_provenance, unwrap_envelope
 from .schema import ReimplementationBinding, ReimplementationConformance, ReimplementationReadiness
 from .config import Config
 from .prompts import reimplement as RP
-from .reviewer_cli import (KNOWN_TOOLS, Confinement, denied_tools,
-                           envelope_provenance, operator_confinement, unwrap_envelope)
 
 # Every writer a validated reconstruction can carry: this module's own subprocess, a human
 # `accept_reimplementation` call, plus every mode `harness.delegation` admits — the same
@@ -105,71 +102,47 @@ def role_model(cfg: Config) -> str:
     return delegation.resolve_model(cfg.reimplementation_model, RP.ROLE_SPEC.get("model", ""))
 
 
-def reimplementation_confinement(cfg: Config, *, settings_sha256: str = "") -> Confinement:
-    """Zero tools, no directories, `--bare`. This call only produces TEXT — see the module
-    docstring — so there is nothing for a tool to do and nothing for a directory to leak;
-    the paper text it needs is entirely inside the prompt, on disk, checkable by a human."""
-    if cfg.reimplementation_cmd.strip():
-        return operator_confinement("reimplementer")
-    allowed = RP.ROLE_SPEC.get("tools", ())
-    return Confinement(
-        role="reimplementer", allowed_tools=allowed, disallowed_tools=denied_tools(allowed),
-        add_dir=(), model=role_model(cfg), restricted=True, strict_mcp=True,
-        bare=RP.ROLE_SPEC.get("bare", True),
-        settings_sha256=settings_sha256, output_format="json",
-    )
-
-
-def default_cmd(cfg: Config | None = None, *, exe: str = "", settings: str = "") -> str:
-    cfg = cfg or Config()
-    exe = delegation.resolve_reviewer_exe(exe, cfg.reviewer_exe)
-    if not exe:
-        return ""
-    extra = reimplementation_confinement(Config(
-        reimplementation_cmd="", reimplementation_model=cfg.reimplementation_model)).flags(settings)
-    return reviewer_cli.cli_pipe_command(exe, extra)
-
-
-def resolve_cmd(cfg: Config, *, settings: str = "") -> str:
-    return cfg.reimplementation_cmd.strip() or default_cmd(cfg, exe=cfg.reviewer_exe, settings=settings)
-
-
 def available(cfg: Config) -> tuple[bool, str]:
+    """Is a reconstruction generation task even in scope for this paper? The only gate
+    left is `allow_reimplementation_driver` — the delegation CHANNEL (a session subagent)
+    is always available from inside a controlling session, so there is no command or
+    executable left to resolve."""
     if not cfg.allow_reimplementation_driver:
         return False, "reimplementation-driver gate is closed; set SH_ALLOW_REIMPLEMENTATION_DRIVER=1"
-    return delegation.check_command(resolve_cmd(cfg), "SH_REIMPLEMENTATION_CMD")
+    return True, ""
 
 
-def _invoke_fresh(cfg: Config, prompt_text: str, timeout_s: int) -> tuple[str, dict] | None:
-    """Run one text-only delegate in a fresh process and empty working directory."""
-    with tempfile.TemporaryDirectory(prefix="sh-reimpl-") as td:
-        prompt, out = Path(td) / "prompt.md", Path(td) / "out.txt"
-        prompt.write_text(prompt_text, encoding="utf-8")
-        policy_dir = Path(tempfile.mkdtemp(prefix="sh-reimpl-policy-"))
-        sandbox = Path(tempfile.mkdtemp(prefix="sh-reimpl-sandbox-"))
-        conf_conn = reimplementation_confinement(cfg)
-        try:
-            conf_conn, settings_path = reviewer_cli.stage_settings(conf_conn, policy_dir)
-            cmd = (resolve_cmd(cfg, settings=settings_path)
-                   .replace("{prompt}", str(prompt)).replace("{out}", str(out)))
-            try:
-                p, timed_out = reviewer_cli.spawn_and_wait(cmd, sandbox, timeout_s)
-            except OSError:
-                return None
-            if timed_out or not out.exists():
-                return None
-            raw = out.read_text(encoding="utf-8")
-            return raw, {
-                "command": cmd, "returncode": p.returncode,
-                "tool_policy": conf_conn.summary(),
-                "tool_policy_detail": conf_conn.policy(),
-                "raw_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
-            }
-        except OSError:
-            return None
-        finally:
-            shutil.rmtree(sandbox, ignore_errors=True)
-            shutil.rmtree(policy_dir, ignore_errors=True)
+def _briefs_dir(cfg: Config, pid: str) -> Path:
+    return state.project_dir(cfg, pid) / "tasks"
+
+
+def persist_brief(cfg: Config, pid: str, target_id: str, brief: str) -> Path:
+    """Write the generator's brief to a deterministic path `harness.tasks.pending` can
+    discover, in place of spawning a CLI process to consume it immediately.
+
+    `routes.attempt_reimplementation_fallback` calls this once per target whenever no
+    accepted reconstruction is sealed yet and the driver gate is open — the SAME moment
+    it used to call this module's own `run()`. Idempotent: the brief is a pure function of
+    the paper and the target, so re-rendering it on every pipeline pass is a cheap
+    overwrite, not a new request.
+    """
+    path = _briefs_dir(cfg, pid) / f"reimpl_gen__{target_id}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(brief, encoding="utf-8")
+    return path
+
+
+def persist_verification_brief(cfg: Config, pid: str, target_id: str,
+                               readiness: ReimplementationReadiness, generated_raw: str) -> Path:
+    """Write the INDEPENDENT verifier's brief once a generator's answer exists. Built from
+    `_verification_brief` against the generator's own proposed script/bindings/replication,
+    so the verifier is shown exactly what was proposed and nothing this harness invented."""
+    script, bindings, _notes, meta = parse_reimplementation_report(generated_raw)
+    brief = _verification_brief(readiness, script, bindings, meta.get("replication"))
+    path = _briefs_dir(cfg, pid) / f"reimpl_verify__{target_id}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(brief, encoding="utf-8")
+    return path
 
 
 def _verification_brief(readiness: ReimplementationReadiness, script: str,
@@ -218,15 +191,17 @@ def _parse_verification(text: str) -> tuple[bool, str]:
 
 
 def ingredients_table(readiness: ReimplementationReadiness) -> str:
-    """The paper's own words for every REQUIRED ingredient, as a markdown table — the same
-    shape `stages.probe.write_reimplementation_prompt` already builds for the manual brief,
-    factored out so both channels show the delegate identical evidence."""
-    rows = ["| ingredient | found at | the paper's own words |", "|---|---|---|"]
+    """The paper's own words for EVERY ingredient it supplies, required and optional alike,
+    as a markdown table — the generator can need an optional one (architecture,
+    preprocessing, hyperparameters) exactly as much as a required one to avoid inventing a
+    detail the paper actually states elsewhere. Same shape
+    `routes.write_reimplementation_prompt` builds for the manual brief, factored out so
+    both channels show the delegate identical evidence."""
+    rows = ["| ingredient | required | found at | the paper's own words |", "|---|---|---|---|"]
     for i in readiness.ingredients:
-        if not i.required:
-            continue
         quote = (i.quote or "").replace("|", "\\|")[:200]
-        rows.append(f"| {i.kind} | {('`' + i.ref + '`') if i.ref else '**MISSING**'} | {quote} |")
+        mark = f"`{i.ref}`" if i.ref else "**MISSING**"
+        rows.append(f"| {i.kind} | {'yes' if i.required else 'no'} | {mark} | {quote} |")
     return "\n".join(rows)
 
 
@@ -400,63 +375,7 @@ def load_accepted(cfg: Config, pid: str, target_id: str, *,
         return None
 
 
-def run(cfg: Config, prompt_text: str, readiness: ReimplementationReadiness, *,
-       timeout_s: int = 0, pid: str = "", target_id: str = "") -> tuple[str, ReimplementationConformance] | None:
-    """Best-effort. Returns None on ANY failure, exactly like `verdict_driver.run` — this
-    driver never blocks a review and its absence never produces a placeholder result.
-
-    Given `pid`, the result is SEALED and attributable, and the next call finds it via
-    `load_accepted` instead of paying for a fresh one.
-    """
-    ok, _why = available(cfg)
-    if not ok:
-        return None
-    timeout_s = timeout_s or cfg.reimplementation_timeout_s
-    prompt_sha = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
-    started = time.time()
-    generated = _invoke_fresh(cfg, prompt_text, timeout_s)
-    if generated is None:
-        return None
-    raw, gen_record = generated
-    try:
-        script, bindings, notes, meta = parse_reimplementation_report(raw)
-    except ReimplementationDriverError:
-        return None
-
-    checked = _invoke_fresh(
-        cfg, _verification_brief(readiness, script, bindings, meta.get("replication")),
-        timeout_s)
-    approved = False
-    verifier_note = "independent verifier did not complete"
-    verify_record: dict = {}
-    if checked is not None:
-        verify_raw, verify_record = checked
-        approved, verifier_note = _parse_verification(verify_raw)
-    conf = conformance(
-        readiness, script, bindings, generated_by="reimplementation_generator",
-        verified_by=("reimplementation_verifier" if approved else ""))
-    _replication(conf, meta)
-    if pid:
-        try:
-            _seal(cfg, pid, target_id, script, conf, {
-                "written_by": "reimplement_driver",
-                "delegation_mode": "CLI_SUBPROCESS",
-                "reviewer": "reimplementation_verifier" if approved else "",
-                "generated_by": "reimplementation_generator",
-                "independent_verification": conf.independently_verified,
-                "generator": gen_record, "verifier": verify_record,
-                "seconds": round(time.time() - started, 1),
-                "prompt_sha256": prompt_sha, "notes": notes,
-                "verifier_notes": verifier_note,
-                "envelope": meta.get("envelope") or {},
-            })
-        except OSError:
-            pass
-    return script, conf
-
-
 if __name__ == "__main__":       # self-check: python -m harness.reimplement_driver
-    import inspect as _inspect
     import tempfile as _tf
 
     from .schema import ReimplementationIngredient
@@ -464,8 +383,7 @@ if __name__ == "__main__":       # self-check: python -m harness.reimplement_dri
     cfg = Config.load()
     closed = Config(allow_reimplementation_driver=False)
     assert available(closed)[0] is False
-    assert run(closed, "prompt", ReimplementationReadiness()) is None, (
-        "gate closed must degrade to None, never raise")
+    assert available(Config(allow_reimplementation_driver=True))[0] is True
 
     def _readiness(established=True) -> ReimplementationReadiness:
         ings = [
@@ -548,6 +466,15 @@ if __name__ == "__main__":       # self-check: python -m harness.reimplement_dri
     incomplete.ingredients[0].present = False
     incomplete.ingredients[0].ref = ""
     assert "**MISSING**" in ingredients_table(incomplete)
+    # optional ingredients (architecture/preprocessing/hyperparameters) are shown too, not
+    # just the five required ones — the generator can need one to avoid inventing a detail
+    # the paper actually states.
+    with_optional = _readiness()
+    with_optional.ingredients.append(ReimplementationIngredient(
+        kind="architecture", required=False, present=True, ref="s2", quote="a 3-layer MLP"))
+    opt_table = ingredients_table(with_optional)
+    assert "architecture" in opt_table and "a 3-layer MLP" in opt_table
+    assert "| architecture | no | `s2` | a 3-layer MLP |" in opt_table
     brief = build_brief(r, paper_title="T", claim="c", table_ref="T0:r0:c0",
                         claimed_cell_value="91.4", paper_text="body")
     assert "T0:r0:c0" in brief and "91.4" in brief and "INDEPENDENT_REIMPLEMENTATION" in brief
@@ -579,26 +506,30 @@ if __name__ == "__main__":       # self-check: python -m harness.reimplement_dri
         state.write_json(out_path, {"script": "tampered", "conformance": {}})
         assert load_accepted(_cfg, "p", "t1") is None
 
-    # --- confinement -------------------------------------------------------------------
-    _EXE = "/nonexistent/claude"
-    _built = default_cmd(Config(), exe=_EXE, settings="/policy/s.json")
-    for _flag in ("--restricted", "--strict-mcp-config", "--settings", "--bare",
-                  "--disallowedTools", "--model", "--output-format json"):
-        assert _flag in _built, (_flag, _built)
-    assert '--allowedTools ""' in _built and "--add-dir" not in _built
-    _c = reimplementation_confinement(Config())
-    assert _c.allowed_tools == () and set(_c.disallowed_tools) == set(KNOWN_TOOLS)
-    assert _c.bare is True and _c.model and _c.enforced is True
-    assert reimplementation_confinement(
-        Config(reimplementation_cmd="x {prompt} {out}")).enforced is False
+    # --- model tier metadata ------------------------------------------------------------
     assert role_model(Config(reimplementation_model="haiku")) == "haiku"
     assert role_model(Config(reimplementation_model="")) == RP.ROLE_SPEC["model"]
 
-    # --- this module WRITES and never RUNS what it writes; never touches the modules
-    # that decide whether a sealed reconstruction may execute ---------------------------
-    import ast as _ast
+    # --- persist_brief / persist_verification_brief: the session-subagent task protocol,
+    # in place of a CLI subprocess this module used to spawn twice per target -----------
+    with _tf.TemporaryDirectory() as _td2:
+        _cfg2 = Config(projects_dir=Path(_td2), allow_reimplementation_driver=True)
+        state.create_project(_cfg2, "", "T", pid="p")
+        gen_path = persist_brief(_cfg2, "p", "t1", "GENERATE THIS")
+        assert gen_path.is_file() and gen_path.read_text(encoding="utf-8") == "GENERATE THIS"
+        assert gen_path == _briefs_dir(_cfg2, "p") / "reimpl_gen__t1.md"
+        verify_path = persist_verification_brief(_cfg2, "p", "t1", r, good)
+        assert verify_path.is_file()
+        verify_text = verify_path.read_text(encoding="utf-8")
+        assert "independent verifier" in verify_text and "SH_METRIC" in verify_text
 
-    _tree = _ast.parse(_inspect.getsource(sys.modules[__name__]))
+    # --- this module WRITES and never RUNS what it writes; never touches the modules
+    # that decide whether a sealed reconstruction may execute, and never spawns a process -
+    import ast as _ast
+    import inspect as _inspect
+    import sys as _sys
+
+    _tree = _ast.parse(_inspect.getsource(_sys.modules[__name__]))
     _imported: set[str] = set()
     for _node in _ast.walk(_tree):
         if isinstance(_node, _ast.ImportFrom):
@@ -606,12 +537,9 @@ if __name__ == "__main__":       # self-check: python -m harness.reimplement_dri
             _imported.update(a.name for a in _node.names)
         elif isinstance(_node, _ast.Import):
             _imported.update(a.name.split(".")[0] for a in _node.names)
-    for _forbidden in ("backends", "local_exec", "stages", "planner", "grading", "taxonomy"):
+    for _forbidden in ("backends", "local_exec", "stages", "planner", "grading", "taxonomy",
+                      "subprocess", "os"):
         assert _forbidden not in _imported, _forbidden
-    # Spawn mechanics (incl. `stdin=DEVNULL`) live in `reviewer_cli.spawn_and_wait` now —
-    # see `audit_driver`'s self-check for the same consolidation.
-    assert "stdin=subprocess.DEVNULL" in _inspect.getsource(reviewer_cli.spawn_and_wait)
-    assert "reviewer_cli.spawn_and_wait" in _inspect.getsource(_invoke_fresh)
 
     print(json.dumps({"self_check": "ok",
                       "gate_default": cfg.allow_reimplementation_driver}, indent=2))

@@ -1,35 +1,18 @@
 """S3a — find the paper's code, get it, and work out how to run it.
 
 Everything here is gated. Cloning a repository and resolving its dependencies means
-fetching code from the internet and, later, executing it; that is a different risk
-class from every other stage in this harness, which is otherwise fully offline. So
-`Config.allow_network` and `Config.allow_install` both default to False and each
-function returns a `blocked` status rather than doing anything when its gate is shut.
-A blocked acquisition is not a finding about the paper — it is a fact about this run,
-and the report says so.
+fetching code from the internet and, later, executing it -- a different risk class from
+every other, otherwise fully offline, stage in this harness. So `Config.allow_network`
+and `Config.allow_install` both default to False and each function returns a `blocked`
+status rather than doing anything when its gate is shut. A blocked acquisition is not a
+finding about the paper -- it is a fact about this run, and the report says so.
 
-URL extraction is deliberately conservative. PDF text mangles links in ways that are
-easy to see once you look at real output:
-
-    "Code is available: https: //github.com/wuyang98/weathergen"   space after the colon
-    "code is available here: https://github.com/HanxunH/LDReg."    sentence-final period
-    "project is available at https: //github.com/.../finchain.git." both, plus .git
-    "2https://github.com/facebookresearch/vissl"                   a FOOTNOTE to someone
-                                                                   else's code
-    "https://github.com/hassan- mahmood/SemanticMLLAttacks.git"    a hyphen the owner
-                                                                   name really contains,
-                                                                   line-broken by the
-                                                                   typesetter into a space
-    "Code is accessible at https://github. com/yankd22/FedSaC/."   the break fell
-                                                                   inside the HOST
-                                                                   literal itself
-
-The last one is why proximity to an availability cue is scored rather than taking the
-first match: a paper's related-work footnotes routinely point at other people's
-repositories, and cloning one of those would audit the wrong project entirely. The
-hyphen-break one is why owner/name matching tolerates a hyphen followed by a SHORT run
-of whitespace: bounded to at most two characters so a stray hyphen deep in unrelated
-prose cannot make the match run on until it finds an unrelated slash.
+URL extraction is deliberately conservative. PDF text mangles links ("Code is available:
+https: //github.com/...", a footnote marker fused onto a citation URL, a typesetter's
+line break landing inside a hyphenated owner name or inside the host literal itself), so
+proximity to an availability cue is scored rather than taking the first match -- a
+related-work footnote routinely points at someone else's repository, and cloning that
+would audit the wrong project entirely.
 """
 from __future__ import annotations
 
@@ -52,13 +35,8 @@ _HOSTS = ("github.com", "gitlab.com", "bitbucket.org", "huggingface.co")
 
 
 def _host_pattern(host: str) -> str:
-    """A host literal that tolerates PDF-inserted whitespace around each dot.
-
-    A line wrap can fall on either side of the dot in "github.com" as easily as
-    anywhere else in a URL ("github. com/owner/repo", measured on a real paper) — the
-    dot itself carries no defense against it that the rest of the URL doesn't already
-    need, so it gets the same treatment as `\\s*` around `://` and `/`.
-    """
+    """A host literal that tolerates PDF-inserted whitespace around each dot, the same
+    treatment as `\\s*` around `://` and `/`."""
     return re.escape(host).replace(r"\.", r"\s*\.\s*")
 
 
@@ -103,13 +81,9 @@ _ENTRY_DIRS = ("", "scripts", "tools", "src", "experiments")
 # URL extraction
 # --------------------------------------------------------------------------- #
 def _normalize(host: str, owner: str, name: str) -> str:
-    """Rebuild a canonical clone URL from the three captured pieces.
-
-    The pieces are captured separately precisely so the whitespace PDF extraction
-    injects (`https: //github .com / owner / repo`) never reaches the output, including
-    whitespace the typesetter inserted mid-identifier by breaking a line at a real hyphen
-    (`hassan- mahmood` -> `hassan-mahmood`).
-    """
+    """Rebuild a canonical clone URL from the three captured pieces, so the whitespace
+    PDF extraction injects never reaches the output (including a typesetter's line break
+    inserted mid-identifier at a real hyphen: `hassan- mahmood` -> `hassan-mahmood`)."""
     host = re.sub(r"\s+", "", host)
     name = re.sub(r"-\s+", "-", name)
     owner = re.sub(r"-\s+", "-", owner)
@@ -130,8 +104,7 @@ def _score(text: str, start: int, host: str, url: str) -> int:
         score += 3
     if host.lower() == "github.com":
         score += 1
-    # "2https://github.com/facebookresearch/vissl" — a footnote marker fused to the
-    # URL is the signature of a citation to someone else's repository.
+    # A footnote marker fused to the URL signs a citation to someone else's repository.
     if start > 0 and text[start - 1].isdigit():
         score -= 2
     if "/blob/" in url or "/tree/" in url:
@@ -145,12 +118,9 @@ def _cued(text: str, start: int) -> bool:
 
 
 def _reference_spans(doc: PaperDoc, joiner: int = 1) -> list[tuple[int, int]]:
-    """Character ranges of the bibliography, in the same concatenation `find_repo_urls` scans.
-
-    A URL inside the reference list is a citation to somebody else's artifact by
-    construction, however official it looks. Locating those spans is what lets the
-    harness tell "the code for THIS paper" from "the code for a model this paper used".
-    """
+    """Character ranges of the bibliography, in the same concatenation `find_repo_urls`
+    scans. A URL inside the reference list is a citation to somebody else's artifact by
+    construction, however official it looks."""
     spans, pos = [], 0
     for s in doc.sections:
         end = pos + len(s.text)
@@ -178,25 +148,14 @@ def find_repo_urls(doc: PaperDoc) -> list[str]:
 def official_repo_url(doc: PaperDoc) -> str:
     """The repository THIS paper advertises as its own, or '' when it advertises none.
 
-    Separate from `find_repo_urls` because the two questions are different. That function
-    answers "what repository URLs appear in this paper", which is a useful diagnostic and
-    should stay complete. This one answers "which repository may the harness clone and
-    audit AS THIS PAPER'S CODE", and the burden of proof runs the other way: absent
-    positive evidence of authorship, the answer is none.
+    Separate from `find_repo_urls`, which answers the diagnostic "what repository URLs
+    appear in this paper" and should stay complete. This one answers "which repository
+    may the harness clone and audit AS THIS PAPER'S CODE", and the burden of proof runs
+    the other way: absent positive evidence of authorship, the answer is none.
 
-    Two requirements, both necessary:
-
-      - an availability cue must precede the URL. A bare link is not a claim of
-        authorship, and treating it as one is how a paper that ships no code acquires a
-        repository belonging to somebody else.
-      - the URL must not sit in the reference list, where every link is a citation.
-
-    The failure this prevents is not hypothetical. A paper whose only GitHub URL was the
-    bibliography entry for the third-party model it evaluated ("Ben Wang and Aran
-    Komatsuzaki. GPT-J-6B ... github.com/kingoflolz/mesh-transformer-jax") had that
-    repository recorded as its own, which would have produced a static code audit of a
-    stranger's codebase filed against these authors — and, with the execution gate open,
-    would have run it.
+    Two requirements, both necessary: an availability cue must precede the URL (a bare
+    link is not a claim of authorship), and the URL must not sit in the reference list
+    (where every link is a citation to someone else's work).
     """
     text = "\n".join(s.text for s in doc.sections)
     refs = _reference_spans(doc)
@@ -233,10 +192,7 @@ def _parse_requirements(text: str) -> list[str]:
 
 def _parse_environment_yml(text: str) -> list[str]:
     """Minimal conda parse: the `dependencies:` list plus its nested `pip:` block.
-
-    Deliberately not a YAML dependency — this only needs the package names, and the
-    harness must not grow a parser it cannot justify for one file.
-    """
+    Deliberately not a YAML dependency -- this only needs the package names."""
     out, in_deps = [], False
     for raw in text.splitlines():
         stripped = raw.strip()
@@ -295,23 +251,15 @@ def inspect_dependencies(repo: Path) -> tuple[list[str], list[str], list[str]]:
 def find_entrypoint(repo: Path) -> str:
     """A repo-relative script this repository could be asked to run, or ''.
 
-    ADVERTISED FIRST, filename convention second. The fixed candidate list below matches
-    a name only when it is spelled exactly as one of eleven conventional filenames, in one
-    of five conventional directories — and two of four real repositories in the current
-    evaluation corpus failed it while advertising their entrypoint plainly in their own
-    README (`python chaineval/evaluate_predictions.py`, and a `main_simclr.py` reached
-    through a scheduler prefix). Both were reported as "no runnable entrypoint", which is
-    a false statement about the repository and, worse, attributes the resulting
-    non-reproduction to the wrong stage: the harness stopped at discovery and never
-    reached the capability and resource questions that actually decide those two papers.
-
-    What a repository TELLS a reader to run is stronger evidence than what its files are
-    called, and it is the same evidence `experiment_id.harvest_candidates` already trusts
-    for command discovery — so this reuses it rather than inventing a second notion of
-    "runnable". Nothing is synthesised: a program named here was named by the repository.
+    ADVERTISED FIRST, filename convention second: the fixed candidate list below matches
+    a name only when spelled exactly as one of eleven conventional filenames in one of
+    five conventional directories, which misses a repository whose README plainly
+    advertises a differently-named entrypoint. What a repository TELLS a reader to run is
+    stronger evidence than what its files are called, and it is the same evidence
+    `experiment_id.harvest_candidates` already trusts for command discovery.
 
     This gate only decides whether the deeper assessment runs at all. It cannot bind a
-    claim to a command, and it does not authorise anything — experiment identity and
+    claim to a command, and it does not authorise anything -- experiment identity and
     `backends.authorize` remain exactly as strict.
     """
     for cmd in _advertised_programs(repo):
@@ -328,11 +276,8 @@ def find_entrypoint(repo: Path) -> str:
 
 def _advertised_programs(repo: Path) -> list[str]:
     """Repo-relative program paths the repository itself advertises, best first.
-
-    Deferred import: `experiment_id` is the module that already knows how to read a
-    repository's own advertised commands, and duplicating that parser here would create a
-    second, divergent answer to the same question.
-    """
+    Deferred import: `experiment_id` already knows how to read these; duplicating that
+    parser here would create a second, divergent answer."""
     from .experiment_id import harvest_candidates
 
     out: list[str] = []
@@ -359,17 +304,9 @@ def _git(args: list[str], cwd: Path | None, timeout: int) -> subprocess.Complete
 
 class GitTree(Protocol):
     """The three reads commit verification needs, over a checkout wherever it lives.
-
-    Extracted so `verify_commit` is written ONCE. Its logic is the fail-closed half of the
-    execution guarantee — a redirected `.git`, an assume-unchanged path, an uninspectable
-    tree and a modified tree each block, each for a stated reason — and a remote backend
-    that reimplemented it would be a second copy of the most safety-critical function in
-    this module, free to drift from the first.
-
-    So the reads are abstracted and the reasoning is shared: the same function certifies a
-    checkout on this disk and a checkout inside a sandbox, and a new backend supplies three
-    methods rather than a second opinion about what 'clean' means.
-    """
+    Extracted so `verify_commit` is written ONCE and a remote backend cannot drift from
+    its fail-closed logic by reimplementing it: a new backend supplies three methods
+    rather than a second opinion about what 'clean' means."""
 
     path: str
 
@@ -431,25 +368,16 @@ class TreeUninspectable(RuntimeError):
 
 
 def dirty_files(repo: Path, tree: GitTree | None = None) -> list[str]:
-    """Paths that differ from HEAD. A clean SHA over a modified tree is not the audited code.
+    """Paths that differ from HEAD. A clean SHA over a modified tree is not the audited
+    code. RAISES rather than returning [] when `git status` fails: a corrupt index, a
+    held lock or a permissions failure must never be read as "no files differ", since
+    that would let `verify_commit` certify a tree nobody actually inspected. Every other
+    unverifiable condition in this module blocks the same way.
 
-    RAISES rather than returning [] when `git status` fails. It used to return the empty
-    list, which reads as "no files differ" — so a corrupt index, a held `index.lock` or a
-    permissions failure produced `verify_commit(...) -> state='verified'` with the sentence
-    "the checkout is exactly the audited commit <sha> with a clean working tree", about a
-    tree that was never inspected. That is not a missing refusal, it is a positive false
-    attestation, and it was persisted into probe_results.json and rendered in the report as
-    a satisfied evidence-chain link. Every other unverifiable condition in this module
-    blocks; this one certified.
-
-    `--untracked-files=no` used to be passed here, on purpose, and it was the hole: a new
-    file added to the checkout — a patched module dropped in beside the real ones, an
-    `__init__.py` that shadows an import — is not a TRACKED file, so it never showed up,
-    and the tree it sat in still reported "clean". `--untracked-files=all` closes that
-    (individual paths inside a new directory, not just the directory name).
-    `--ignore-submodules=none` closes the companion hole: a submodule can carry
-    `submodule.<name>.ignore` in `.gitmodules` or the local config, which makes plain
-    `git status` silently stop reporting that submodule's own modifications.
+    `--untracked-files=all` catches a new file added to the checkout (a patched module
+    dropped in beside the real ones) that a TRACKED-only status would miss.
+    `--ignore-submodules=none` stops a submodule's own `submodule.<name>.ignore` setting
+    from silently hiding that submodule's modifications.
     """
     rc, out, err = _tree(repo, tree).git(
         ["status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"], 60)
@@ -460,27 +388,17 @@ def dirty_files(repo: Path, tree: GitTree | None = None) -> list[str]:
 
 
 def linked_git_dir(repo: Path, tree: GitTree | None = None) -> bool:
-    """True when `repo/.git` is a FILE — a worktree/submodule redirect — not a directory.
-
-    `acquire()` only ever produces a real `git clone`, whose `.git` is always a directory.
-    A `.git` FILE there (`gitdir: <elsewhere>`) means this path is not its own independent
-    checkout: it shares object storage and possibly working-tree state with whatever it
-    points at, which the commands run against `repo` do not account for. Whether that is
-    tampering or an unexpected acquisition path, the tree cannot be certified clean from
-    here, so this counts as uninspectable rather than as evidence either way.
-    """
+    """True when `repo/.git` is a FILE (a worktree/submodule redirect), not a directory.
+    `acquire()` only ever produces a real `git clone`, whose `.git` is always a
+    directory, so a FILE there means this path shares object storage or working-tree
+    state with whatever it points at -- uninspectable rather than evidence either way."""
     return _tree(repo, tree).is_file(".git")
 
 
 def locked_index_paths(repo: Path, tree: GitTree | None = None) -> list[str]:
-    """Tracked paths marked assume-unchanged or skip-worktree.
-
-    Both bits exist to make git STOP reporting a path's modifications in `status` — that
-    is their entire purpose — so a file carrying one can be edited on disk and `dirty_files`
-    will never see it. A commit verification that only reads `git status` is trusting the
-    exact mechanism designed to hide this from it, so their presence at all makes the tree
-    uninspectable rather than clean.
-    """
+    """Tracked paths marked assume-unchanged or skip-worktree -- both exist to make git
+    STOP reporting a path's modifications in `status`, so a commit verification that only
+    reads `git status` is trusting the exact mechanism designed to hide this from it."""
     rc, stdout, _ = _tree(repo, tree).git(["ls-files", "-v"], 30)
     if rc != 0:
         return []
@@ -496,13 +414,10 @@ def locked_index_paths(repo: Path, tree: GitTree | None = None) -> list[str]:
 
 
 def fetch_revision(cfg: Config, dest: Path, url: str, sha: str) -> tuple[bool, str]:
-    """Bring one specific commit into an existing checkout and stand on it.
-
-    A depth-1 clone holds exactly the tip of the default branch, so the audited commit is
-    usually absent from it. `fetch --depth 1 origin <sha>` asks the server for that one
-    object graph, which GitHub and GitLab both allow; failing that there is nothing to
-    check out, and the honest answer is that the audited code could not be obtained.
-    """
+    """Bring one specific commit into an existing checkout and stand on it. A depth-1
+    clone holds only the tip of the default branch, so `fetch --depth 1 origin <sha>`
+    asks the server for that one object graph; failing that the audited code could not
+    be obtained."""
     if not cfg.allow_network:
         return False, ("network gate closed, so the audited commit cannot be fetched; only "
                        "whatever is already on disk is available")
@@ -522,12 +437,9 @@ def fetch_revision(cfg: Config, dest: Path, url: str, sha: str) -> tuple[bool, s
 
 def verify_commit(repo: str | Path, expected: str,
                   tree: GitTree | None = None) -> CommitVerification:
-    """Is the checkout about to run the one that was audited? Fresh, at the point of use.
-
-    Not a comparison of two recorded strings. `acq.commit` says what arrived when git last
-    ran; this reads the disk NOW, because the whole failure being closed is that the two
-    diverge — a default branch moves, a cached checkout is refreshed, and the next run
-    executes different code while still carrying the old commit through its findings.
+    """Is the checkout about to run the one that was audited? Fresh, at the point of use:
+    reads the disk NOW rather than comparing two recorded strings, since a default branch
+    can move or a cached checkout refresh between the audit and this run.
 
     Four outcomes, and only `verified` permits execution:
 
@@ -536,16 +448,12 @@ def verify_commit(repo: str | Path, expected: str,
       dirty      HEAD matches but files have been modified since
       unknown    no audited SHA was recorded, or HEAD could not be read
 
-    `unknown` blocks. "We never wrote down which commit we audited" is not evidence that
-    this is that commit, and the cost of guessing wrong is a reproduction verdict about
-    code the audit never read.
+    `unknown` blocks: "we never wrote down which commit we audited" is not evidence that
+    this is that commit.
 
-    `tree` is how a REMOTE checkout is certified by this same function rather than by a
-    second copy of it. Passing a `GitTree` over a sandbox makes every check below run
-    inside that sandbox — the same four outcomes, the same fail-closed branches, the same
-    sentences — so a remote reproduction rests on the identical guarantee a local one
-    does. `repo` is still carried for the messages, which name the checkout a reader
-    would go and look at.
+    `tree` lets a REMOTE checkout be certified by this same function, running every check
+    inside a sandbox rather than through a second copy of this logic. `repo` is still
+    carried for the messages, which name the checkout a reader would go and look at.
     """
     ver = CommitVerification(expected=(expected or "").strip().lower())
     path = Path(repo) if repo else None
@@ -566,10 +474,9 @@ def verify_commit(repo: str | Path, expected: str,
                       f"{ver.actual[:12]} cannot be shown to be the code that was audited")
         return ver
 
-    # A recorded value may legitimately be abbreviated — artifacts written before full SHAs
-    # were stored hold 12 characters. Git's own abbreviation semantics apply: a prefix of
-    # at least 12 hex characters identifies a commit. Shorter than that is not accepted,
-    # because loosening the comparison is the one way this check is not allowed to pass.
+    # A recorded value may legitimately be abbreviated (older artifacts hold 12 chars).
+    # Git's own abbreviation semantics apply: a prefix of at least 12 hex chars identifies
+    # a commit; shorter than that is not accepted.
     matched = (ver.actual == ver.expected
                or (len(ver.expected) >= 12 and ver.actual.startswith(ver.expected)))
     if not matched:
@@ -582,10 +489,9 @@ def verify_commit(repo: str | Path, expected: str,
                if ver.shallow else "."))
         return ver
 
-    # C5 — a redirected `.git` or a locked index path is not the same failure `dirty_files`
-    # detects (git status running and reporting nothing), so both are checked BEFORE it,
-    # fail-closed, for the same reason: neither leaves this harness able to say the tree it
-    # is about to certify is the tree `git status` actually inspected.
+    # A redirected `.git` or a locked index path is not the same failure `dirty_files`
+    # detects, so both are checked BEFORE it, fail-closed: neither leaves this harness
+    # able to say the tree it is about to certify is the tree `git status` inspected.
     if linked_git_dir(path, checkout):
         ver.state = "unknown"
         ver.reason = (
@@ -607,12 +513,8 @@ def verify_commit(repo: str | Path, expected: str,
     try:
         ver.dirty_files = dirty_files(path, checkout)
     except TreeUninspectable as e:
-        # Fails CLOSED. Not knowing whether the tree is clean is not the same as knowing
-        # it is, and this is the branch that used to certify: `dirty_files` returned [] on
-        # any `git status` failure, so a corrupt index or a held lock produced
-        # state="verified" and the sentence "with a clean working tree" for a tree nobody
-        # had looked at. `unknown` is the state every other unverifiable condition here
-        # already uses.
+        # Fails CLOSED: not knowing whether the tree is clean is not the same as knowing
+        # it is. `unknown` is the state every other unverifiable condition here uses.
         ver.state = "unknown"
         ver.reason = (
             f"HEAD is the audited commit {ver.actual[:12]}, but the working tree could not be "
@@ -639,19 +541,15 @@ def acquire(cfg: Config, root: Path, pid: str, doc: PaperDoc,
 
     Returns a populated `RepoAcquisition` in every path, including the ones where
     nothing happened, because "we did not look" and "we looked and there is nothing"
-    are different facts and the report has to be able to tell them apart.
+    are different facts the report has to be able to tell apart.
 
     `revision` is the audited commit, when a previous run recorded one. Passing it makes
     acquisition a PIN rather than a fetch: the checkout is moved onto that SHA, or the
     acquisition says it could not be. Without it the default branch is taken, which is
     reproducible only until someone pushes.
     """
-    # ONLY the authorship-qualified URL, never the raw candidate list. `repo_urls` holds
-    # every repository link the paper mentions, most of which belong to other people —
-    # falling back to it here reopened the hole that `official_repo_url` exists to close,
-    # because this is the line that decides what gets cloned and handed to the auditor.
-    # Recomputed when the stored field is empty so a document ingested before that rule
-    # existed is judged by it too, rather than inheriting a citation as its own code.
+    # ONLY the authorship-qualified URL, never the raw candidate list -- `repo_urls`
+    # holds every repository link the paper mentions, most belonging to other people.
     url = doc.repo_url or official_repo_url(doc)
     dest = root / "runs" / pid / "repo"
 
@@ -690,9 +588,8 @@ def acquire(cfg: Config, root: Path, pid: str, doc: PaperDoc,
         acq.commit = head_commit(dest)
 
     # --- pin to the audited commit ----------------------------------------------------
-    # Recording what arrived is not pinning. When a revision was asked for and the
-    # checkout is not on it, move onto it or say plainly that the audited code could not
-    # be obtained — never carry on with the default branch under the audited SHA's name.
+    # Recording what arrived is not pinning: move onto the requested revision or say
+    # plainly that the audited code could not be obtained.
     acq.requested_revision = (revision or "").strip().lower()
     acq.shallow = is_shallow(dest)
     if acq.requested_revision and acq.commit != acq.requested_revision:
@@ -722,12 +619,9 @@ def _venv_python(env_dir: Path) -> Path:
 
 
 def build_env(cfg: Config, root: Path, pid: str, acq: RepoAcquisition) -> RepoAcquisition:
-    """Create `runs/<pid>/env` and install the repo's declared stack into it.
-
-    Installing is the second gate, separate from cloning on purpose: reading a
-    repository's dependency list is useful on its own, and is safe, whereas resolving
-    it runs arbitrary setup code from the index.
-    """
+    """Create `runs/<pid>/env` and install the repo's declared stack into it. Installing
+    is the second gate, separate from cloning: reading a dependency list is safe, whereas
+    resolving it runs arbitrary setup code from the index."""
     if acq.status not in ("cloned", "cached") or not acq.path:
         acq.env_status = "not_attempted"
         return acq
@@ -780,12 +674,10 @@ _ENV_DECL_FILES = ("environment.yml", "environment.yaml")
 
 
 def entrypoint_imports(repo: Path, entrypoint: str) -> list[str]:
-    """Top-level module names the entrypoint imports, by PARSING it — never importing it.
-
-    Only the roots of absolute imports are returned, and only from module level: a
-    conditional import inside a function is not a startup requirement, and importing the
-    file to find out would execute the very code this check exists to avoid running.
-    """
+    """Top-level module names the entrypoint imports, by PARSING it, never importing it.
+    Only the roots of absolute imports at module level are returned: a conditional
+    import inside a function is not a startup requirement, and importing the file to
+    find out would execute the very code this check exists to avoid running."""
     path = repo / entrypoint
     if not path.is_file():
         return []
@@ -807,13 +699,10 @@ def entrypoint_imports(repo: Path, entrypoint: str) -> list[str]:
 
 
 def missing_imports(interpreter: str, repo: Path, modules: list[str], timeout: int = 120) -> list[str]:
-    """Which of `modules` the TARGET interpreter cannot resolve.
-
-    Runs `importlib.util.find_spec` in a subprocess of that interpreter. This executes
-    the interpreter's own import machinery, not the repository: `find_spec` locates a
-    module without running it. Modules that live in the checkout itself resolve because
-    the repo root is on the path, which is why `repo` is passed rather than assumed.
-    """
+    """Which of `modules` the TARGET interpreter cannot resolve. Runs
+    `importlib.util.find_spec` in a subprocess of that interpreter, which locates a
+    module without running it. Modules living in the checkout resolve because the repo
+    root is put on the path, which is why `repo` is passed rather than assumed."""
     if not modules:
         return []
     probe = (
@@ -841,15 +730,12 @@ def missing_imports(interpreter: str, repo: Path, modules: list[str], timeout: i
 
 
 def accepts_argument(repo: Path, entrypoint: str, flag: str = "seed") -> bool:
-    """Does the repository plausibly accept `--<flag>` on this entrypoint?
-
-    Statically, and deliberately generously: argparse `add_argument("--seed"...)`, a
-    dataclass/attrs field named `seed`, or a HuggingFace-style argument class. Searched
-    across the entrypoint and the modules it imports from the checkout, because argument
+    """Does the repository plausibly accept `--<flag>` on this entrypoint? Statically,
+    and deliberately generously (argparse `add_argument`, a dataclass/attrs field, or a
+    HuggingFace-style argument class), searched across `.py` files in the checkout since
     definitions are routinely factored into an `args.py`. Generous because a false
-    "invalid" would suppress a legitimate reproduction; the cost of a false "valid" is
-    only that the run fails and lands in `startup_failure`, which is still INCONCLUSIVE.
-    """
+    "invalid" would suppress a legitimate reproduction; a false "valid" only costs a run
+    that fails into `startup_failure`, still INCONCLUSIVE."""
     pattern = re.compile(rf"(--{flag}\b)|(^\s*{flag}\s*:)", re.M)
     candidates = [repo / entrypoint] + sorted(repo.glob("*.py")) + sorted(repo.glob("*/*_args.py"))
     for path in candidates[:60]:
@@ -892,24 +778,18 @@ def assess_capability(acq: RepoAcquisition, interpreter: str, harness_python: st
     cause rather than a downstream symptom: a Linux-only environment explains missing
     dependencies, and missing dependencies explain an import crash.
 
-    `established` False never accuses the paper of anything. It records that this runner
-    could not mount the experiment, which is the fact the reconciliation needs in order
-    to refuse to convict.
+    `established` False never accuses the paper of anything -- it records that this
+    runner could not mount the experiment, which is what reconciliation needs to refuse
+    to convict.
 
-    `resolve_imports` is the one check here that cannot be answered by reading files. The
-    others are static — a declared platform, the entrypoint's module-level imports, the
-    repository's own argument definitions — and read the same bytes wherever the checkout
-    sits. Resolving a module means ASKING an interpreter, and for a remote backend that
-    interpreter is not on this machine: running the default resolver against a Linux venv
-    path from a Windows host fails to start and reports every dependency missing, which
-    would refuse a perfectly capable session as `dependency_missing`. So the question is
-    delegated, and the backend that owns the interpreter answers it.
+    `resolve_imports` is the one check here that cannot be answered by reading files: the
+    others are static and read the same bytes wherever the checkout sits, but resolving a
+    module means ASKING an interpreter, which for a remote backend is not on this
+    machine. So the question is delegated to whichever backend owns that interpreter.
     """
     resolve_imports = resolve_imports or missing_imports
-    # The platform compared against is the one the RUN will see, supplied by the execution
-    # backend, not the one this process happens to be on. They coincide under the local
-    # backend and diverge the moment a Linux container backend exists — at which point a
-    # `linux-64` repository becomes capable there without a line of this function changing.
+    # The platform compared against is the one the RUN will see, supplied by the
+    # execution backend, not the one this process happens to be on.
     platform = platform or sys.platform
     cap = ExecCapability(
         env_status=acq.env_status or "", interpreter=interpreter or "",
@@ -953,13 +833,10 @@ def assess_capability(acq: RepoAcquisition, interpreter: str, harness_python: st
                       + ", ".join(cap.missing_dependencies[:8]))
         return cap
 
-    # The check is about the invocation this harness WILL make, not about a flag it might
-    # have made up. An empty `flag` means the caller has established that no seed will be
-    # passed — the case is a deterministic quantity, a count of what a generator produces,
-    # which has no seed-to-seed distribution and for which `--seed` would be exactly the
-    # invented argument this check exists to refuse. Requiring the repository to accept an
-    # argument nobody is going to send it is checking the wrong invocation, and it blocked
-    # the one shape the prose path was built to reach.
+    # The check is about the invocation this harness WILL make, not a flag it made up. An
+    # empty `flag` means the caller established that no seed will be passed (a
+    # deterministic quantity with no seed-to-seed distribution), for which `--seed` would
+    # be exactly the invented argument this check exists to refuse.
     if flag:
         cap.accepts_seed_argument = accepts_argument(repo_path, acq.entrypoint, flag)
         if not cap.accepts_seed_argument:
@@ -1034,13 +911,10 @@ print(f"SH_METRIC arm={args.arm} seed={args.seed} value={compute(args.seed):.6f}
 
 def synthesize_standalone(root: Path, pid: str, claim: str, cell_ref: str,
                           cell_value: str) -> RepoAcquisition:
-    """Write `runs/<pid>/standalone_probe.py` when there is no repository to clone.
-
-    The scaffold raises rather than returning a plausible number. A file that silently
-    emitted a constant would flow through reconciliation and produce a confident
-    "FAILED_REPRODUCTION" verdict against a paper whose code was never run — which is
-    the same class of error this whole stage exists to catch.
-    """
+    """Write `runs/<pid>/standalone_probe.py` when there is no repository to clone. The
+    scaffold raises rather than returning a plausible number: a file that silently
+    emitted a constant would flow through reconciliation into a confident
+    "FAILED_REPRODUCTION" verdict against a paper whose code was never run."""
     path = root / "runs" / pid / "standalone_probe.py"
     path.parent.mkdir(parents=True, exist_ok=True)
     body = STANDALONE_TEMPLATE

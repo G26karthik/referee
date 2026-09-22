@@ -1,66 +1,31 @@
-"""E1 — does the published experiment FIT, decided before anything is launched.
+"""E1 — does the published experiment FIT, decided before anything is launched, from
+declared numbers rather than by attempting it (an attempted OOM twenty minutes in is
+indistinguishable at the stderr level from the authors' code being broken).
 
-Three preconditions already stand in front of repository execution. Provenance asks whose
-code it is, identity asks whether it answers the cited cell, capability asks whether this
-machine can start it. None of them asks whether the experiment as published fits in the
-hardware present, and that question cannot be answered by attempting it: an attempt
-produces a CUDA OOM twenty minutes in, which is indistinguishable at the stderr level from
-the authors' code being broken.
+A requirement comes from three ranked kinds, each carrying a verbatim quote and a
+re-checkable `source_ref`: `declared_requirement` (the authors state what their method
+costs), `declared_hardware` (the authors state the machine they used — an upper bound on
+what was available, not a statement of need, so never converted into a VRAM requirement),
+and `derived_floor` (computed from a named model scale — a hard lower bound no
+configuration can go under, since the weights have to be somewhere).
+
+Nothing here adapts a requirement downward to fit a backend: no batch-size search, no
+precision fallback, no sequence-length trim, no smaller checkpoint. Any of those would
+make a different experiment run, and a number reconciled from that would be the most
+damaging output this harness could emit.
 
 `python -m harness.resources` runs the self-check.
-
-**Why a launchable process proves nothing.** `evaluate.py --seed 0` starts perfectly well
-on an 8 GB card and dies loading a 7B checkpoint. By then it has printed banners, run for
-minutes, and possibly emitted output lines — which is exactly the evidence
-`reached_experiment` reads as "the experiment began". The resource check therefore has to
-happen before, from declared numbers, or it does not happen at all.
-
-**Where a requirement may come from.** Three kinds, ranked, and every one of them carries
-a verbatim quote and a re-checkable `source_ref`:
-
-  declared_requirement  the authors state what their method costs
-                        "APT costs less than 24GB of memory when pruning 30% parameters"
-  declared_hardware     the authors state the machine they used
-                        "Both training and evaluation are conducted on a single A100 GPU"
-  derived_floor         computed from a model scale the cited cell itself names
-                        "LLaMA 2 7B" -> 7e9 params at fp16 -> ~13 GiB of weights alone
-
-The distinction between the first two matters and is not cosmetic. A stated cost is a
-requirement. A stated machine is an upper bound on what was available, not a statement of
-need — an author with an 80 GB card may have used 6 GB of it. So `declared_hardware` is
-recorded as evidence and is deliberately NOT converted into a VRAM requirement; treating
-it as one would block experiments that fit comfortably, on the strength of the authors
-owning good hardware. `derived_floor` is the opposite: a hard lower bound that no
-configuration can go under, because the weights have to be somewhere.
-
-**What is deliberately absent.** There is no function here that adapts a requirement
-downward to fit a backend. No batch-size search, no precision fallback, no sequence-length
-trim, no seed reduction, no smaller checkpoint. Every one of those makes something run,
-and what runs is a different experiment. A number produced that way, reconciled against
-the paper's cell, would be the most damaging output this harness could emit — a crash is
-visibly wrong, and a confident figure from an altered protocol is not.
 """
 from __future__ import annotations
 
-import ctypes
 import os
 import re
-import shutil
-import subprocess
-import sys
-from pathlib import Path
 
-from .schema import (GIB, PaperDoc, ResourceCapability, ResourceEvidence,
-                     ResourceRequirement)
+from .schema import GIB, PaperDoc, ResourceEvidence, ResourceRequirement
 
-# --------------------------------------------------------------------------- #
-# Reading a demand out of prose
-# --------------------------------------------------------------------------- #
-# There is deliberately no table here mapping "A100" to 40 GB. Such a table exists to
-# convert declared HARDWARE into a VRAM requirement, and that conversion is the error
-# this module is built to avoid: an author with a 40 GB card may have used 6 GB of it,
-# so charging the experiment 40 GB would refuse runs that fit comfortably. The model is
-# recorded as evidence and left as a name.
+# === Reading a demand out of prose =====================================================
+# Deliberately no table mapping "A100" to 40 GB: that conversion is the error this module
+# avoids (a 40 GB card may run at 6 GB). The model is recorded as evidence, left as a name.
 _GPU_NAMES = re.compile(
     r"\b(A100|H100|H200|A6000|A40|V100|P100|T4|L40S?|L4|RTX\s?3090|RTX\s?4090|A10|TITAN\s?\w*)\b",
     re.IGNORECASE)
@@ -82,17 +47,14 @@ _MEM_COST_ALT = re.compile(
     r"(\d+(?:\.\d+)?)\s*(GB|GiB|TB|MB)\b[^.]{0,80}?\bmemor\w+", re.IGNORECASE)
 _UNIT = {"mb": 1024 ** 2, "gb": GIB, "gib": GIB, "tb": 1024 ** 4}
 
-# A sentence that structurally signals "this figure is about a DIFFERENT method" — the
-# paper contrasting its own cost against a baseline's, in either order. Matched by
-# STRUCTURE (a comparison connective), never by any method's name, so it generalizes to
-# every paper rather than the one it was found on.
+# Signals "this figure is about a DIFFERENT method" — matched by comparison STRUCTURE,
+# never by any method's name, so it generalizes across papers.
 _CONTRAST_CUE = re.compile(
     r"\b(in\s+contrast|compared\s+(?:to|with)|by\s+contrast|whereas|unlike|"
     r"on\s+the\s+other\s+hand|while\s+\w+\s+(?:costs?|requires?|uses?|needs?))\b",
     re.IGNORECASE)
-# "30% of the 24GB" or "24GB (12%)" — the number carries a unit, but a percent sign in
-# its immediate context means the sentence is stating a RATIO, not a standalone cost, and
-# reading the absolute figure alone drops exactly the qualifier that made it a ratio.
+# "30% of the 24GB": a percent sign near the number means the sentence states a RATIO,
+# not a standalone cost.
 _PERCENT_NEARBY = re.compile(r"%")
 
 # A model scale named in a caption or a row label. Parameter counts are the published
@@ -112,17 +74,10 @@ _WALLTIME = re.compile(
     r"[^.]{0,80}?\b(\d+(?:\.\d+)?)\s*(GPU-?hours?|hours?|days?|minutes?)\b[^.]{0,80}", re.IGNORECASE)
 _WALLTIME_S = {"minute": 60, "hour": 3600, "gpu-hour": 3600, "gpuhour": 3600, "day": 86400}
 
-# PDF text is soft-hyphenated at line breaks: the real APT paper reads "costs less than
-# 24GB of mem- ory", and a pattern anchored on `memor\w+` misses it entirely. That miss is
-# not cosmetic — with the method's own 24GB sentence invisible, the only remaining match
-# was the CONTRASTED BASELINE's "LLM-Pruner costs about 80GB memory", so the requirement
-# came out as 80 GiB attributed to APT, with the baseline's sentence as its evidence.
-# Exactly the misattribution `declared_memory_cost` documents itself as avoiding.
-#
-# So matching and verification both run on a normalized copy. The normalization is
-# symmetric by construction — the same function produces the stored quote and prepares
-# the corpus it is checked against — which keeps the quote re-verifiable rather than
-# merely plausible.
+# PDF text is soft-hyphenated at line breaks ("mem- ory"), which would otherwise hide a
+# cost sentence from a pattern anchored on `memor\w+`. Matching and verification both run
+# on a normalized copy, produced by the same function, so a stored quote stays
+# re-verifiable rather than merely plausible.
 _SOFT_HYPHEN = re.compile(r"(\w)-\s+(\w)")
 
 
@@ -131,69 +86,8 @@ def normalize(text: str) -> str:
     return " ".join(_SOFT_HYPHEN.sub(lambda m: m.group(1) + m.group(2), text or "").split())
 
 
-# --------------------------------------------------------------------------- #
-# What the backend actually has
-# --------------------------------------------------------------------------- #
-def host_vram_bytes() -> tuple[int | None, str, int]:
-    """(bytes on the largest visible GPU, its name, how many GPUs). Reads nvidia-smi only.
-
-    A query, not a workload: `--query-gpu` prints the driver's own inventory and touches
-    no CUDA context, so it stays safe to call with every execution gate shut.
-    """
-    if shutil.which("nvidia-smi") is None:
-        return None, "", 0
-    try:
-        p = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total",
-                            "--format=csv,noheader,nounits"], capture_output=True,
-                           text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError):
-        return None, "", 0
-    if p.returncode != 0:
-        return None, "", 0
-    best, name, count = 0, "", 0
-    for line in (p.stdout or "").splitlines():
-        parts = [x.strip() for x in line.split(",")]
-        if len(parts) != 2 or not parts[1].replace(".", "").isdigit():
-            continue
-        count += 1
-        mib = int(float(parts[1]))
-        if mib > best:
-            best, name = mib, parts[0]
-    return (best * 1024 * 1024 if best else None), name, count
-
-
-def host_ram_bytes() -> int | None:
-    """Total physical memory. No psutil in this environment, so ask the OS directly."""
-    if sys.platform == "win32":
-        class _Status(ctypes.Structure):
-            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                        ("ullTotalPageFile", ctypes.c_ulonglong),
-                        ("ullAvailPageFile", ctypes.c_ulonglong),
-                        ("ullTotalVirtual", ctypes.c_ulonglong),
-                        ("ullAvailVirtual", ctypes.c_ulonglong),
-                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-        st = _Status()
-        st.dwLength = ctypes.sizeof(_Status)
-        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):   # type: ignore[attr-defined]
-            return int(st.ullTotalPhys)
-        return None
-    try:
-        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-    except (ValueError, OSError, AttributeError):
-        return None
-
-
-def host_disk_bytes(path: str | Path = ".") -> int | None:
-    try:
-        return shutil.disk_usage(str(path)).free
-    except OSError:
-        return None
-
-
-# --------------------------------------------------------------------------- #
-# What the experiment demands
-# --------------------------------------------------------------------------- #
+# === What the experiment demands. Host MEASUREMENT (as opposed to demand EXTRACTION)
+# lives in `harness.execute`'s backends, the only live callers. =========================
 def _section_ref(doc: PaperDoc, needle: str) -> str:
     needle = normalize(needle)
     for sec in doc.sections:
@@ -210,30 +104,12 @@ def _sentence(corpus: str, at: int) -> str:
 
 def declared_memory_cost(doc: PaperDoc) -> tuple[int | None, ResourceEvidence | None]:
     """The smallest memory COST the paper states for its own method, with its sentence.
-
-    Smallest, not largest, because a paper that reports several figures is usually
-    contrasting its own cost against a baseline's — "APT costs less than 24GB ... LLM-Pruner
-    costs about 80GB" — and charging the method with the baseline's number would block on
-    a figure the authors were arguing against.
-
-    Two figures are excluded from consideration entirely, rather than merely risked:
-
-      - a sentence a CONTRAST connective marks as being about a different method
-        ("in contrast", "compared to", "unlike", ...). Smallest-of-everything used to
-        pick whichever number was numerically least, including a contrasted baseline's,
-        when that baseline happened to be cheaper than the method under audit — "smallest"
-        is a tbreak for THIS paper's ordering, not a rule that holds in general.
-      - a figure with a '%' immediately around it: "30% of the 24GB budget" states a
-        RATIO, and reading the absolute number out of it drops exactly the qualifier that
-        made it one. The window is local to the number, not the whole sentence, so an
-        unrelated percentage elsewhere in the same sentence ("... 24GB of memory when
-        pruning 30% parameters ...") does not disqualify a genuine declared cost.
-
-    If every remaining candidate is contrast-flagged — the paper states costs for other
-    methods but never states its own — nothing is returned. Attributing a comparison
-    figure to the method under audit would be the exact misattribution this function
-    exists to avoid; silence is not evidence the true cost is small.
-    """
+    Smallest, not largest: a paper reporting several figures is usually contrasting its own
+    cost against a baseline's. Two figures are excluded entirely: a CONTRAST-marked
+    sentence about a different method, and a figure with a '%' immediately around it
+    ("30% of the 24GB budget" states a RATIO, not an absolute cost). If every remaining
+    candidate is contrast-flagged, nothing is returned: silence is not evidence of a small
+    cost."""
     corpus = normalize("\n".join(s.text or "" for s in doc.sections))
     clean: list[tuple[int, str]] = []
     contrasted: list[tuple[int, str]] = []
@@ -261,11 +137,9 @@ def declared_memory_cost(doc: PaperDoc) -> tuple[int | None, ResourceEvidence | 
 
 
 def declared_hardware(doc: PaperDoc) -> tuple[str, int | None, ResourceEvidence | None]:
-    """(model, count, evidence) for the accelerator the paper says it used.
-
-    Recorded but NOT turned into a VRAM requirement. Owning an A100 is not evidence that
-    the experiment needs 40 GB, and reading it that way would refuse experiments that fit.
-    """
+    """(model, count, evidence) for the accelerator the paper says it used. Recorded but
+    NOT turned into a VRAM requirement: owning an A100 is not evidence the experiment
+    needs 40 GB."""
     corpus = normalize("\n".join(s.text or "" for s in doc.sections))
     m = _GPU_COUNT.search(corpus)
     if m:
@@ -287,12 +161,8 @@ def declared_hardware(doc: PaperDoc) -> tuple[str, int | None, ResourceEvidence 
 
 def model_weight_floor(text: str, source_ref: str) -> tuple[int | None, str, ResourceEvidence | None]:
     """(bytes, scale, evidence) — the least memory the named model's weights can occupy.
-
-    A hard lower bound and the one requirement no configuration can argue with: whatever
-    the batch size, the precision above fp16, or the schedule, the parameters have to be
-    resident. Computed at fp16, which is the floor for a model trained or evaluated in
-    anything wider.
-    """
+    A hard lower bound no configuration can argue with, computed at fp16 (the floor for a
+    model trained or evaluated in anything wider)."""
     if not text:
         return None, "", None
     m = _MODEL_SCALE.search(text)
@@ -335,13 +205,9 @@ def declared_walltime(doc: PaperDoc) -> tuple[int | None, ResourceEvidence | Non
 
 def require_resources(doc: PaperDoc, table_ref: str = "",
                       cell_text: str = "", caption: str = "") -> ResourceRequirement:
-    """What the CITED experiment demands, assembled from evidence and nothing else.
-
-    The cell's own caption is consulted first for a model scale, because the requirement
-    has to be about the experiment under audit rather than about the paper's largest one:
-    a paper reporting both RoBERTa and LLaMA-2-7B has two very different demands, and
-    charging a RoBERTa cell with the 7B floor would block a run that fits.
-    """
+    """What the CITED experiment demands, assembled from evidence and nothing else. The
+    cell's own caption is consulted for a model scale so the requirement is about the
+    experiment under audit, not the paper's largest one."""
     req = ResourceRequirement()
 
     vram, ev = declared_memory_cost(doc)
@@ -357,13 +223,10 @@ def require_resources(doc: PaperDoc, table_ref: str = "",
     if floor_ev:
         req.model_scale = scale
         req.evidence.append(floor_ev)
-        # The floor RAISES a stated cost but never lowers it: a paper claiming 24 GB for a
-        # model whose weights alone are 26 GB has been misread, and the larger figure is
-        # the one that cannot be wrong. But a floor that is the ONLY basis for the number —
-        # no declared cost ever anchored it — is not a requirement, it is a lower bound:
-        # weights only, no activations, no optimizer state, no gradients, no KV cache. That
-        # distinction is recorded so `assess_resources` can refuse to call a floor alone
-        # "satisfied" just because it happens to fit.
+        # The floor RAISES a stated cost but never lowers it. A floor that is the ONLY
+        # basis for the number is not a requirement, only a lower bound (weights only, no
+        # activations/optimizer state/gradients/KV cache) — recorded so `assess_resources`
+        # refuses to call it "satisfied" just because it happens to fit.
         if floor is not None:
             req.vram_bytes = floor if req.vram_bytes is None else max(req.vram_bytes, floor)
             req.vram_is_floor_only = req.vram_bytes == floor
@@ -381,17 +244,11 @@ def require_resources(doc: PaperDoc, table_ref: str = "",
 
 
 def verify_requirement(req: ResourceRequirement, doc: PaperDoc) -> list[ResourceEvidence]:
-    """Evidence whose quote no longer appears in the paper. Empty means every quote holds.
-
-    The same discipline S2 applies to a finding's `evidence_quote`, applied to a
-    requirement: a requirement that blocks execution is an assertion about the paper, and
-    it has to be re-checkable against the parsed corpus rather than trusted.
-
-    Captions and cell contents are part of the searchable corpus, not just section prose.
-    A `derived_floor` is read off the cited table's own caption — "Table 3: LLaMA 2 7B ..."
-    — and a verifier that looked only at `doc.sections` would reject the one requirement
-    anchored most tightly to the cell under audit.
-    """
+    """Evidence whose quote no longer appears in the paper. Empty means every quote holds:
+    a requirement that blocks execution is an assertion about the paper and must be
+    re-checkable against the parsed corpus. Captions and cell contents are part of the
+    searchable corpus, not just section prose, since a `derived_floor` is read off the
+    cited table's own caption."""
     parts = [s.text or "" for s in doc.sections]
     for t in doc.tables:
         parts.append(t.caption or "")
@@ -405,121 +262,19 @@ def verify_requirement(req: ResourceRequirement, doc: PaperDoc) -> list[Resource
     return bad
 
 
-# --------------------------------------------------------------------------- #
-# The comparison
-# --------------------------------------------------------------------------- #
+# === The comparison. `assess_resources` (E1's COMPARISON half) lives in `harness.execute`,
+# the only live caller (via `routes.py`); this module keeps only the EXTRACTION half. =====
 def _gib(n: int | None) -> str:
     return "unknown" if n is None else f"{n / GIB:.1f} GiB"
 
 
-def assess_resources(req: ResourceRequirement | None, resources, backend: str = "",
-                     walltime_budget_s: int | None = None) -> ResourceCapability:
-    """Does the backend satisfy the requirement? `satisfied` is the only permitting state.
-
-    Note what this function does NOT do when a requirement exceeds what is available: it
-    does not look for a configuration that would fit. There is no such path, here or
-    anywhere else in the module. The published experiment is the experiment.
-    """
-    cap = ResourceCapability(backend=backend, requirement=req)
-    cap.available_vram_bytes = getattr(resources, "vram_bytes", None)
-    cap.available_ram_bytes = getattr(resources, "ram_bytes", None)
-    cap.available_disk_bytes = getattr(resources, "disk_bytes", None)
-    cap.available_cpu_count = getattr(resources, "cpu_count", None)
-    cap.available_gpu_count = getattr(resources, "gpu_count", None)
-    cap.available_gpu_model = getattr(resources, "gpu_name", "") or ""
-
-    if req is None:
-        cap.state = "unassessed"
-        cap.reason = "resource requirements were never examined for this experiment"
-        return cap
-    if not req.stated:
-        cap.state = "unknown"
-        cap.reason = (
-            "neither the paper nor the repository states what this experiment costs, so it "
-            "cannot be shown to fit. Silence about a demand is not evidence that the demand "
-            "is small: an unbounded run that OOMs mid-training is indistinguishable, at the "
-            "stderr, from the authors' code being broken.")
-        return cap
-
-    checks = (
-        ("VRAM", req.vram_bytes, cap.available_vram_bytes, _gib),
-        ("RAM", req.ram_bytes, cap.available_ram_bytes, _gib),
-        ("disk", req.disk_bytes, cap.available_disk_bytes, _gib),
-        ("CPU", req.cpu_count, cap.available_cpu_count, str),
-        ("GPU count", req.gpu_count, cap.available_gpu_count, str),
-    )
-    unmeasured = []
-    for label, need, have, fmt in checks:
-        if need is None:
-            continue
-        if have is None:
-            unmeasured.append(f"{label}: the experiment declares {fmt(need)} and the backend "
-                              f"cannot report what it has")
-            continue
-        if need > have:
-            cap.shortfalls.append(
-                f"{label}: the published experiment requires {fmt(need)}, the '{backend}' "
-                f"backend offers {fmt(have)}")
-
-    if walltime_budget_s and req.walltime_s and req.walltime_s > walltime_budget_s:
-        cap.shortfalls.append(
-            f"walltime: the paper declares {req.walltime_s / 3600:.1f}h for this experiment "
-            f"and the execution budget is {walltime_budget_s / 3600:.1f}h")
-
-    if cap.shortfalls:
-        cap.state = "insufficient"
-        cap.reason = (
-            "the experiment as published does not fit this backend: " + "; ".join(cap.shortfalls)
-            + ". No reduced configuration is substituted — shrinking the model, batch, "
-              "precision, sequence length, schedule or seed count would produce a different "
-              "experiment, and its number would not be a reproduction of the cited cell.")
-        return cap
-    if not req.memory_stated:
-        # AFTER the shortfall check on purpose: a demand that provably exceeds the backend
-        # is a definite refusal and names itself, which is more useful than "we could not
-        # establish the memory". This branch catches only the case where nothing ruled the
-        # backend out — and where the reason nothing did is that the deciding quantity was
-        # never established. `stated` was satisfied by some other field, which says
-        # nothing at all about whether the experiment fits in memory.
-        cap.state = "unknown"
-        cap.reason = (
-            "the sources establish some of this experiment's demands but not its memory: "
-            f"{', '.join(n for n in req.unstated if n in ('vram', 'ram')) or 'vram, ram'} "
-            "were never stated. Every other declared quantity fitting is not evidence that "
-            "the experiment fits — an unstated memory demand is not a small one, and it is "
-            "the demand that decides whether a run reaches its own first measurement.")
-        return cap
-    if unmeasured:
-        cap.state = "unknown"
-        cap.reason = ("the backend could not report the resources this experiment declares: "
-                      + "; ".join(unmeasured))
-        return cap
-    if req.vram_bytes is not None and req.vram_is_floor_only:
-        # C7 — a lower bound is not a requirement. The only number established is what the
-        # model's weights occupy at fp16; everything else an actual run needs — activations,
-        # optimizer state, gradients, a KV cache — was never stated, and fitting the floor
-        # proves nothing about fitting THAT. Reported `unknown`, the same state an unstated
-        # memory demand gets, because that is what this effectively is: a demand nobody
-        # measured, with a minimum nobody can go under standing in its place.
-        cap.state = "unknown"
-        cap.reason = (
-            f"only a lower bound was established for VRAM — {_gib(req.vram_bytes)}, the "
-            f"weights of {req.model_scale or 'the cited model'} at fp16 — with no declared "
-            f"cost to anchor it. The backend meeting that floor is not evidence the actual "
-            f"experiment fits: activations, optimizer state, gradients and any KV cache are "
-            f"not counted in it, and are not stated anywhere.")
-        return cap
-
-    cap.state = "satisfied"
-    cap.reason = ("every declared requirement fits the backend: "
-                  + ", ".join(f"{lbl} {fmt(need)} <= {fmt(have)}"
-                              for lbl, need, have, fmt in checks if need is not None)
-                  or "no requirement exceeds the backend")
-    return cap
-
-
 if __name__ == "__main__":  # self-check: python -m harness.resources
+    from . import execute as _execute
     from .schema import Section, Table
+    assess_resources = _execute.assess_resources
+    host_vram_bytes = _execute.host_vram_bytes
+    host_ram_bytes = _execute.host_ram_bytes
+    host_disk_bytes = _execute.host_disk_bytes
 
     # --- host probing -----------------------------------------------------------------
     vram, gpu, n = host_vram_bytes()

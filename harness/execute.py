@@ -1,50 +1,28 @@
-"""Where execution physically happens, whether it may, and what a number may conclude.
-
-Consolidates `backends.py` + `local_exec.py` (3,159 lines) for their core mechanics —
+"""Where execution physically happens, whether it may, and what a number may conclude:
 execution backends, the two ordered ladders (`authorize`, `reconcile`), and the runner
-(`run_probe`) — into this file. `experiment_id.py`, `resources.py`, `repo.py`'s acquisition
-half, `code_audit.py`, `probe_synth.py` and the artifact-inspection route
-(`artifact_evidence.py` + `stages/artifact.py`) are NOT YET folded in here — see the bottom
-of this docstring for exactly what remains and why this increment stops here.
+(`run_probe`).
 
 `python -m harness.execute` runs the self-check.
 
-**Two responsibilities, deliberately separated**, unchanged from the reference: a backend
-is a MECHANISM (it knows how to start a process and what platform it presents, and has no
-opinion about whether it ought to); `authorize()` is the POLICY, the only thing that may
-say yes, and lives as a free function rather than a backend method so a new backend
-inherits the policy by construction instead of re-implementing it.
+Two responsibilities, deliberately separated: a backend is a MECHANISM (starts a process,
+presents a platform, has no opinion on whether it ought to); `authorize()` is the POLICY,
+the only thing that may say yes, and lives as a free function so a new backend inherits it
+by construction. `authorize()` is checked again at the point of execution, not only at
+planning, since a hand-written `spec.json` never passes through the planning-time
+promotion.
 
-**Why `authorize()` is checked again at the point of execution, not only at planning.** A
-hand-written `spec.json` never passes through the planning-time promotion, so the same
-check runs a second time against the artifact about to run rather than the control flow
-that produced it — the two are not redundant, they decide different things (what to plan
-vs. what to run).
-
-**`reconcile()` does not reduce to a pure predicate table.** Its eight labelled blocks
-decompose into: five pure preconditions (authorization, the provenance ceiling, reimpl
-conformance, the comparison, identity), one non-predicate RECORDER (assigns
-experiment/metric/configuration state right after the ceiling and before the other
-preconditions — the fix for an incident where 16 corpus reconciliations flattened three
-different findings into the single word "unmapped" by the order of two blocks), a
+`reconcile()` does not reduce to a pure predicate table: five pure preconditions
+(authorization, the provenance ceiling, reimpl conformance, the comparison, identity), one
+non-predicate RECORDER (assigns experiment/metric/configuration state before the other
+preconditions, so a refused reconciliation still carries what identity actually found), a
 four-rung failure ladder (capability, infrastructure, not-reached, runtime), and an
-imperative arithmetic tail. It is ported close to verbatim rather than tabularized,
-because a table shape here would cost correctness the imperative version does not.
+imperative arithmetic tail — ported close to verbatim rather than tabularized, since a
+table shape here would cost correctness the imperative version does not.
 
-**Remaining for the next increment of this module** (not yet folded in, tracked here so
-the gap is visible rather than silent): `experiment_id.py`'s `resolve_experiment`/
-`resolve_metric`/`resolve_configuration` (the identity RESOLUTION algorithms —
-`identities_established`, the AND-point they feed, IS ported below); `resources.py`'s
-`require_resources` and its declared-cost extraction helpers (`assess_resources`, the
-comparison they feed, IS ported below); `repo.py`'s `acquire`/`build_env`/
-`assess_capability`/`synthesize_standalone` (E2's `verify_commit`/`head_commit` ARE ported
-below, since `authorize()` and `run_probe` depend on them directly); `code_audit.py`
-(now one surviving AST rule); `probe_synth.py` (now one template); and the artifact-
-inspection route (`artifact_evidence.py`'s four-rung authority ladder +
-`stages/artifact.py`'s orchestration), which is large enough to belong in `routes.py`
-instead, as the `ARTIFACT_INSPECTION` route implementation. `stages/probe.py`'s own
-orchestration (`build_spec`/`accept_spec`/`plan_execution`/`outcome_for`) is likewise
-deferred to `routes.py`, which owns dispatch from a `PlanDecision` to a route.
+Not yet folded into this module: `experiment_id.py`'s resolution algorithms
+(`identities_established`, their AND-point, IS ported below); `resources.py`'s extraction
+helpers (`assess_resources` IS ported below); `repo.py`'s acquisition/build/capability
+(E2's `verify_commit`/`head_commit` ARE ported below); and the artifact-inspection route.
 """
 from __future__ import annotations
 
@@ -118,16 +96,14 @@ def _looks_like_host_interpreter(token: str) -> bool:
                or "\\" in token or token.startswith("/"))
 
 
-# Provenances whose code the AUTHORS wrote. Only these may be run as repo execution, and
-# only these may reconcile against a printed cell — the same ceiling `reconcile` enforces,
+# Provenances whose code the AUTHORS wrote — the same ceiling `reconcile` enforces,
 # restated here so an unauthorized command cannot even start.
 _REPO_PROVENANCE = "repo_exec"
 _REIMPL_PROVENANCE = "reimpl_exec"
+_CERT_PROVENANCE = "cert_exec"
 
 
-# ========================================================================================
-# THE UNIT OF WORK, AND WHAT CAME BACK
-# ========================================================================================
+# === THE UNIT OF WORK, AND WHAT CAME BACK ===============================================
 @dataclass(frozen=True)
 class ExecRequest:
     """One process to run. Frozen so a backend cannot edit the command it was handed."""
@@ -140,11 +116,9 @@ class ExecRequest:
 
 @dataclass
 class ExecOutcome:
-    """Three distinguishable endings, not two: launched=False (never existed), launched=
-    True/completed=False (killed by timeout), launched=True/completed=True (ran to an exit
-    code). Collapsing the first two let an unlaunchable command and a cut-short long run
-    read as the same event, when they are opposite evidence about whether the experiment
-    was reached."""
+    """Three distinguishable endings: launched=False (never existed), launched=True/
+    completed=False (killed by timeout), launched=True/completed=True (ran to an exit
+    code) — opposite evidence about whether the experiment was reached."""
     launched: bool
     completed: bool
     returncode: int | None = None
@@ -224,18 +198,14 @@ class BackendSelection:
         return self.chosen is not None and self.reason_code == "selected"
 
 
-# ========================================================================================
-# THE INTERFACE
-# ========================================================================================
+# === THE INTERFACE =======================================================================
 class ExecutionBackend(ABC):
-    """Five operations to implement, three to override. Nothing above this seam changes:
-    the audit, identity and reconciliation layers never import a concrete backend and
-    never branch on `backend.name`."""
+    """Five operations to implement, three to override. The audit, identity and
+    reconciliation layers never import a concrete backend or branch on `backend.name`."""
 
     name: str = "abstract"
     # Declared per class, never derived — no runtime probe can establish confinement
-    # strength; a backend that confines knows that it does. NONE by default so a new
-    # backend that forgets to declare a level is refused repository execution.
+    # strength. NONE by default so a forgotten declaration is refused repo execution.
     isolation: str = "NONE"
 
     def __init__(self, cfg: Config | None = None) -> None:
@@ -289,15 +259,13 @@ class ExecutionBackend(ABC):
 
     def commit_tree(self, cwd: str):
         """The tree `verify_commit` must read to certify what THIS backend will run. None
-        means the local path — a backend that runs elsewhere returns a reader over the
-        checkout it will actually execute."""
+        means the local path."""
         return None
 
     def stage(self, argv: list[str], cwd: str, mount_root: str,
              pid: str = "") -> tuple[list[str], str]:
         """Translate a host-built (argv, cwd) into whatever namespace `execute()` expects.
-        Default: no translation. Only a backend whose `execute()` runs somewhere else than
-        the path this harness wrote files to needs to override this."""
+        Default: no translation."""
         return list(argv), cwd
 
 
@@ -334,8 +302,7 @@ class LocalBackend(ExecutionBackend):
         return repo_mod.build_env(cfg, root, pid, acq)
 
     def execute(self, req: ExecRequest) -> ExecOutcome:
-        """Never raises: a backend that throws turns a runner fault into a crash halfway
-        through a seed loop, and the caller needs every ending as data."""
+        """Never raises: the caller needs every ending as data."""
         started, t0 = _utc(), time.time()
         env = {**os.environ, **req.env} if req.env else None
         stamp: dict = dict(backend=self.name, argv=list(req.argv), cwd=req.cwd,
@@ -412,8 +379,7 @@ class ContainerBackend(ExecutionBackend):
 
     def _resolver(self, acq: RepoAcquisition):
         """An import probe that runs inside the container, not on this host — the venv
-        lives inside the container's filesystem view, so resolving from the host would
-        start nothing and report every dependency missing."""
+        lives inside the container's filesystem view."""
         mount, image = self._mount(acq), self._image(acq)
 
         def resolve(interpreter: str, repo: Path, modules: list[str]) -> list[str]:
@@ -456,8 +422,7 @@ class ContainerBackend(ExecutionBackend):
         """Build the repository's declared stack INSIDE a container, onto the host disk.
         `env_status` becomes "ready" only when something was actually installed OR the
         repository declares no dependencies at all — a bare venv is not the declared
-        stack, and reporting "ready" for one surfaced the real problem later as a
-        `dependency_missing` that read as a fact about the repository."""
+        stack."""
         if acq.status not in ("cloned", "cached") or not acq.path:
             acq.env_status = "not_attempted"
             return acq
@@ -523,13 +488,10 @@ class ContainerBackend(ExecutionBackend):
     def stage(self, argv: list[str], cwd: str, mount_root: str,
              pid: str = "") -> tuple[list[str], str]:
         """Translate a host-built (argv, cwd) into this container's `/work` namespace.
-        Only entries actually rooted at `mount_root` are rewritten
-        (`to_container_path` returns "" for anything else and this leaves those
-        untouched); a host path outside the mount is never silently relayed. `argv[0]`
-        gets special handling: a reconstruction with no environment of its own falls back
-        to `cfg.python`, a host path meaningless inside this image — substituted with the
-        image's own `python3` rather than relayed as a "no such file" the container cannot
-        explain."""
+        Only entries actually rooted at `mount_root` are rewritten; a host path outside
+        the mount is never silently relayed. `argv[0]` gets special handling: a
+        reconstruction with no environment of its own falls back to `cfg.python`, a host
+        path meaningless inside this image, substituted with the image's own `python3`."""
         self._host_mount = mount_root or getattr(self, "_host_mount", "")
         if pid:
             self._pid = pid
@@ -547,8 +509,8 @@ class ContainerBackend(ExecutionBackend):
 
     def execute(self, req: ExecRequest) -> ExecOutcome:
         """Expects `req.argv`/`req.cwd` already in this container's `/work` namespace —
-        `stage()` is the translation step. Anything untranslated is refused rather than
-        rewritten here, which would hide exactly the staging gap `stage()` closes."""
+        `stage()` is the translation step. Anything untranslated is refused, not rewritten
+        here."""
         started, t0 = _utc(), time.time()
         stamp: dict = dict(backend=self.name, argv=list(req.argv), cwd=req.cwd,
                           environment=self.environment(), started_at=started)
@@ -682,8 +644,7 @@ def select_backend(cfg: Config) -> ExecutionBackend:
 
 def local_backend() -> LocalBackend:
     """The backend that runs code THIS harness authored — kept separate from
-    `select_backend`, since a generated probe measures this machine and running it
-    elsewhere would measure a different machine."""
+    `select_backend`, since a generated probe measures this machine."""
     return LocalBackend()
 
 
@@ -710,8 +671,7 @@ def select_for(requirement, cfg: Config, declared_platform: str = "",
               walltime_s: int | None = None) -> BackendSelection:
     """Which registered environment can host THIS experiment. Candidates are ranked so a
     runnable backend always beats a declared one, and among runnable ones the operator's
-    named backend wins, then the smallest sufficient one — never a silent substitution to
-    a "smaller" backend that also happens to fit."""
+    named backend wins, then the smallest sufficient one."""
     if requirement is None or not getattr(requirement, "stated", False):
         return BackendSelection(
             None, "requirement_unknown",
@@ -803,9 +763,7 @@ def select_for(requirement, cfg: Config, declared_platform: str = "",
     return BackendSelection(None, "no_backend", "no execution backend is registered", frozen)
 
 
-# ========================================================================================
-# HOST RESOURCE MEASUREMENT — from resources.py, unchanged
-# ========================================================================================
+# === HOST RESOURCE MEASUREMENT — from resources.py, unchanged ===========================
 def host_vram_bytes() -> tuple[int | None, str, int]:
     """(vram_bytes of the largest GPU, its name, count), via nvidia-smi only."""
     try:
@@ -850,9 +808,7 @@ def host_disk_bytes(path: str | Path = ".") -> int | None:
         return None
 
 
-# ========================================================================================
-# THE COMMIT BOUNDARY (E2) — from repo.py, unchanged
-# ========================================================================================
+# === THE COMMIT BOUNDARY (E2) — from repo.py, unchanged ==================================
 def head_commit(repo: Path, tree=None) -> str:
     from . import repo as repo_mod
     return repo_mod.head_commit(repo, tree)
@@ -868,19 +824,13 @@ def verify_commit(repo: str | Path, expected: str, tree=None) -> CommitVerificat
     return repo_mod.verify_commit(repo, expected, tree=tree)
 
 
-# ========================================================================================
-# ② AUDIT identity — the AND-point `authorize()` and `reconcile()` both consult.
-# `experiment_id.py`'s own resolve_experiment/resolve_metric/resolve_configuration (the
-# resolution algorithms that PRODUCE these identities) are not yet folded in — see the
-# module docstring.
-# ========================================================================================
+# === ② AUDIT identity — the AND-point `authorize()` and `reconcile()` both consult. Not
+# yet folded in here: `experiment_id.py`'s resolve_experiment/resolve_metric/
+# resolve_configuration, the resolution algorithms that PRODUCE these identities. ========
 
-
-# ========================================================================================
-# ① RESOURCE CAPABILITY (E1) — from resources.py, unchanged. `require_resources` (the
-# EXTRACTION half) is not yet folded in; `assess_resources` (the COMPARISON) is, since
-# `authorize()` depends on it directly.
-# ========================================================================================
+# === ① RESOURCE CAPABILITY (E1) — from resources.py. `require_resources` (the EXTRACTION
+# half) is not yet folded in; `assess_resources` (the COMPARISON) is, since `authorize()`
+# depends on it directly. ==================================================================
 def assess_resources(req, resources, backend: str = "",
                      walltime_budget_s: int | None = None):
     """Does the backend satisfy the requirement? `satisfied` is the only permitting
@@ -962,9 +912,7 @@ def assess_resources(req, resources, backend: str = "",
     return cap
 
 
-# ========================================================================================
-# ③ THE FIRST ORDERED LADDER — authorize(). 3 branches, 14 distinct decision strings.
-# ========================================================================================
+# === ③ THE FIRST ORDERED LADDER — authorize(). 3 branches, 14 distinct decision strings. =
 def authorize(cfg: Config, spec: ProbeSpec, backend: ExecutionBackend | None,
              commit: CommitVerification | None = None) -> ExecAuthorization:
     """May this spec execute? Pure function of the spec, the gates, the backend, and a
@@ -974,24 +922,20 @@ def authorize(cfg: Config, spec: ProbeSpec, backend: ExecutionBackend | None,
 
       A. `reimpl_exec` — gated LIKE repository execution, not like our own code: 6 rungs
          (no_backend, backend_cannot_execute, backend_offline, gate_closed,
-         isolation_insufficient, conformance_unproven). Without this branch a governed
-         reconstruction would fall into branch B's free pass and run unconfined — it is a
-         MODEL's output, never reviewed by a human, exactly the third-party-code-execution
-         risk isolation exists to confine.
+         isolation_insufficient, conformance_unproven). It is a MODEL's output, never
+         reviewed by a human, exactly the third-party-code-execution risk isolation exists
+         to confine.
       B. `not spec.command` — our own code, no repo gates apply. Free pass.
       C. repository execution — 11 rungs: no_backend, backend_cannot_execute,
-         backend_offline, gate_closed, isolation_insufficient (undocumented in the
-         reference's own docstring), provenance_insufficient, commit_unverified,
-         identity_unproven, capability_unproven, resources_unproven, backend_mismatch
-         (also undocumented there).
+         backend_offline, gate_closed, isolation_insufficient, provenance_insufficient,
+         commit_unverified, identity_unproven, capability_unproven, resources_unproven,
+         backend_mismatch.
 
-    Provenance and commit sit together, before identity, because they answer the same
-    prior question — is this the right code at all. Identity precedes capability because
-    a capable run of the wrong program is worse than a crash. Resources come last because
-    they are the most expensive fact to be wrong about in the other direction.
+    Provenance and commit sit together, before identity, since they answer the same prior
+    question (is this the right code at all); identity precedes capability since a capable
+    run of the wrong program is worse than a crash; resources come last.
 
-    `commit` defaults to None, which refuses — a caller that forgets must fail closed
-    rather than inherit a verification made against a checkout since replaced.
+    `commit` defaults to None, which refuses — a caller that forgets must fail closed.
     """
     if spec.provenance == _REIMPL_PROVENANCE:
         if backend is None:
@@ -1041,6 +985,56 @@ def authorize(cfg: Config, spec: ProbeSpec, backend: ExecutionBackend | None,
                    "backend confines third-party code to a container or a leased remote "
                    "session")
 
+    if spec.provenance == _CERT_PROVENANCE:
+        # Mirrors the `reimpl_exec` ladder above rung for rung: a model-authored script
+        # nobody has run before, gated LIKE repository execution, not branch B's free pass.
+        if backend is None:
+            return ExecAuthorization(
+                allowed=False, decision="no_backend", backend="",
+                failure_class="backend_unavailable",
+                detail="no execution backend is available for this experiment")
+        name = backend.name
+        if not backend.profile().can_execute:
+            return ExecAuthorization(
+                allowed=False, decision="backend_cannot_execute", backend=name,
+                failure_class="credentials_unavailable" if backend.profile().requires_credentials
+                else "backend_unavailable",
+                detail=f"'{name}' is a declared environment, not a runner: "
+                       f"{backend.available().detail}")
+        if not backend.available().usable:
+            return ExecAuthorization(
+                allowed=False, decision="backend_offline", backend=name,
+                failure_class="backend_unavailable",
+                detail=f"'{name}' can execute but is not reachable now: "
+                       f"{backend.available().detail}")
+        if not getattr(cfg, "allow_certificate_exec", False):
+            return ExecAuthorization(
+                allowed=False, decision="gate_closed", backend=name,
+                failure_class="execution_unauthorized",
+                detail="SH_ALLOW_CERTIFICATE_EXEC is not set; running an exact-arithmetic "
+                       "certificate stays an explicit per-invocation opt-in, separate from "
+                       "SH_ALLOW_REPO_EXEC because this is not the authors' code")
+        if not isolation_mod.sufficient_for_repo_exec(backend.profile().isolation):
+            return ExecAuthorization(
+                allowed=False, decision="isolation_insufficient", backend=name,
+                failure_class="execution_unauthorized",
+                detail=isolation_mod.refusal_detail(name, backend.profile().isolation))
+        conf = spec.certificate_conformance
+        if conf is None or not conf.established:
+            return ExecAuthorization(
+                allowed=False, decision="conformance_unproven", backend=name,
+                failure_class="execution_unauthorized",
+                detail=(conf.reason if conf is not None else
+                        "no CertificateConformance was established for this spec: every "
+                        "required element (hypotheses, claimed_bound, instance) must be "
+                        "bound to a verified paper quote and implementation locator, and "
+                        "independently verified, before a certificate may run"))
+        return ExecAuthorization(
+            allowed=True, decision="authorized", backend=name, failure_class="none",
+            detail="every required element is bound to a verified paper quote and "
+                   "implementation locator, the execution gate is open, and this backend "
+                   "confines third-party code to a container or a leased remote session")
+
     if not spec.command:
         return ExecAuthorization(
             allowed=True, decision="not_repo_execution", backend=local_backend().name,
@@ -1075,8 +1069,7 @@ def authorize(cfg: Config, spec: ProbeSpec, backend: ExecutionBackend | None,
                    "stays an explicit per-invocation opt-in")
 
     # THE ISOLATION BOUNDARY — after the gate, before every scientific condition: "is
-    # running somebody else's code here safe" is prior to "is it the right code". A
-    # TIGHTENING only: nothing previously refused becomes permitted.
+    # running somebody else's code here safe" is prior to "is it the right code".
     if not isolation_mod.sufficient_for_repo_exec(backend.profile().isolation):
         return ExecAuthorization(
             allowed=False, decision="isolation_insufficient", backend=name,
@@ -1137,10 +1130,8 @@ def authorize(cfg: Config, spec: ProbeSpec, backend: ExecutionBackend | None,
                f"provenance is the authors' own checkout, and the execution gate is open")
 
 
-# ========================================================================================
-# METRIC PARSING — from local_exec.py, unchanged. Invariant 18: positional coincidence may
-# never establish a reconciliation.
-# ========================================================================================
+# === METRIC PARSING — invariant 18: positional coincidence may never establish a
+# reconciliation. ==========================================================================
 _CELL_THOUSANDS = re.compile(r"(?<=\d),(?=\d{3}\b)")
 _MERGED_DECIMALS = re.compile(r"\d+\.\d+\.\d+")
 _VALUE_WITH_UNCERTAINTY = re.compile(
@@ -1161,8 +1152,8 @@ def render_default(spec: ProbeSpec) -> str:
 
 
 def write_probe(root: Path, spec: ProbeSpec, out_dir: Path | None = None) -> Path:
-    """Materialize `runs/<paper_id>/probe.py`. When `spec.command` is set the code under
-    test is the paper's own checkout, so nothing is generated."""
+    """Materialize `runs/<paper_id>/probe.py`. When `spec.command` is set, nothing is
+    generated — the code under test is the paper's own checkout."""
     path = (out_dir or (root / "runs" / spec.paper_id)) / "probe.py"
     path.parent.mkdir(parents=True, exist_ok=True)
     if not spec.command:
@@ -1314,9 +1305,7 @@ def _scale_ratio(a: float, b: float) -> float:
     return abs(a / b)
 
 
-# ========================================================================================
-# STARTUP EVIDENCE — from local_exec.py, unchanged.
-# ========================================================================================
+# === STARTUP EVIDENCE ====================================================================
 _SETUP_FAILURE_SIGNATURES = (
     "modulenotfounderror", "importerror", "cannot import name", "unrecognized arguments",
     "the following arguments are required", "invalid choice", "no such file or directory",
@@ -1420,23 +1409,20 @@ def _addressed(spec: ProbeSpec) -> str:
     return f"the {noun} at {ref}"
 
 
-# ========================================================================================
-# ④ THE SECOND ORDERED STRUCTURE — reconcile(). NOT a pure predicate table: 5 pure
+# === ④ THE SECOND ORDERED STRUCTURE — reconcile(). NOT a pure predicate table: 5 pure
 # preconditions + 1 non-predicate RECORDER + a 4-rung failure ladder + an imperative
-# arithmetic tail. Ported close to verbatim — see the module docstring for why.
-# ========================================================================================
+# arithmetic tail. Ported close to verbatim — see the module docstring for why. ===========
 def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
              seeds_run: list[int], failure: str = "",
              evidence: StartupEvidence | None = None,
              authorization: ExecAuthorization | None = None) -> Reconciliation:
     """Executed metric vs the table cell the paper printed. Arithmetic, not judgement.
 
-    Three situations must NOT reach a verdict: nothing parsed, so there is no reproduced
-    number to compare; the noise band is zero, so `<= 2 sigma` degenerates into demanding
-    exactness; the two numbers differ by almost exactly 100x or 0.01x, a units mismatch in
-    this harness rather than a doctored claim. A crash IS a failed reproduction, because
-    the code was run and did not work. A REFUSED run reconciles nothing — a fact about
-    this harness's own gates, never a finding about the paper.
+    Three situations must NOT reach a verdict: nothing parsed; the noise band is zero, so
+    `<= 2 sigma` degenerates into demanding exactness; the two numbers differ by almost
+    exactly 100x or 0.01x, a units mismatch in this harness rather than a doctored claim.
+    A crash IS a failed reproduction (the code was run and did not work); a REFUSED run
+    reconciles nothing (a fact about this harness's own gates, never about the paper).
     """
     evidence = evidence or StartupEvidence()
     rec = Reconciliation(table_ref=spec.table_ref, finding_id=spec.finding_id,
@@ -1466,9 +1452,8 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
         rec.delta_error = round(abs(rec.reproduced_value - rec.claimed_value), 6)
 
     # --- R2: THE RECORDER — assigned before the ceiling can return, so a refused
-    # reconciliation still carries what identity actually found rather than the "unmapped"
-    # field default (the fix for 16 corpus reconciliations that once flattened three
-    # different findings into one word).
+    # reconciliation still carries what identity actually found rather than the
+    # "unmapped" field default.
     rec.experiment_state = spec.experiment.state if spec.experiment else "unmapped"
     rec.metric_state = spec.metric_identity.state if spec.metric_identity else "unmapped"
     rec.configuration_state = spec.configuration.state if spec.configuration else "unmapped"
@@ -1500,6 +1485,53 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
                 f"the reimplementer's own invention, not a finding about the paper's stated method.")
             return rec
 
+    # --- the certificate conformance precondition + verdict (cert_exec) ---------------
+    # A SEPARATE branch, returning early, rather than falling into the shared failure
+    # ladder / arithmetic tail below: those are shaped for a printed-cell reproduction, and
+    # a certificate's crash (a failed hypothesis assertion) means the CONSTRUCTED INSTANCE
+    # was inadmissible under the theorem's own hypotheses — never a counterexample.
+    if spec.provenance == "cert_exec":
+        conf = spec.certificate_conformance
+        if conf is None or not conf.established:
+            rec.status = "INCONCLUSIVE"
+            rec.failure_class = "reimplementation_nonconformant"
+            rec.reason = (
+                f"this certificate is not fully conformant, so no verdict is drawn about "
+                f"{_addressed(spec)}: "
+                f"{(conf.reason if conf is not None else 'no CertificateConformance was recorded for this spec')}. "
+                f"A disagreement from an unbound certificate would be a disagreement with an "
+                f"unverified construction, never a finding about the paper's stated theorem.")
+            return rec
+        rec.comparison_kind = rec.comparison_kind or "AGAINST_CLAIMED_BOUND"
+        if failure:
+            rec.status = "INCONCLUSIVE"
+            rec.reached_experiment = reached_experiment(evidence)
+            rec.reason = (
+                f"the certificate script did not complete cleanly: {failure}. A failed "
+                f"hypothesis assertion means the constructed instance was not admissible "
+                f"under the theorem's own stated hypotheses — never a counterexample — and "
+                f"a crash before any instance completed settles nothing about "
+                f"{_addressed(spec)}.")
+            return rec
+        if not values:
+            rec.status = "INCONCLUSIVE"
+            rec.reason = ("the certificate produced no parseable SH_METRIC value for any "
+                         "instance, so no verdict is drawn")
+            return rec
+        if any(v == 1 for v in values):
+            rec.status = "COUNTEREXAMPLE_FOUND"
+            rec.reason = (
+                f"at least one of {len(values)} exact-arithmetic instance(s) satisfied "
+                f"every hypothesis stated at {_addressed(spec)} and violated the bound it "
+                f"claims — a concrete counterexample, checked in exact rational arithmetic.")
+        else:
+            rec.status = "NO_VIOLATION_FOUND"
+            rec.reason = (
+                f"all {len(values)} exact-arithmetic instance(s) satisfied the bound "
+                f"claimed at {_addressed(spec)}. This checks the tested instances only and "
+                f"is never a proof that the bound holds in general.")
+        return rec
+
     # --- which comparison this is, and whether this system can perform it -------------
     if spec.comparison is not None:
         rec.comparison_kind = spec.comparison.kind
@@ -1518,9 +1550,8 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
     elif spec.provenance:
         rec.comparison_kind = "AGAINST_PRINTED_VALUE"
 
-    # --- the identity precondition ------------------------------------------------
-    # Applies to every provenance the ceiling admits EXCEPT reimpl_exec, whose analogous
-    # gate is the reconformance precondition just above.
+    # --- the identity precondition (every admissible provenance except reimpl_exec,
+    # whose analogous gate is the reconformance precondition just above) --------------
     if spec.provenance != "reimpl_exec":
         proven, failure_class, why = identities_established(
             spec.experiment, spec.metric_identity, spec.configuration)
@@ -1725,8 +1756,8 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
     results_dir = results_dir or out_dir or state.control_dir(root)
 
     # A spec claiming an admissible provenance and containing no program is refused, not
-    # downgraded — running the identical-arms template and reconciling ITS number against
-    # the paper's printed cell would let a calibration run become a reproduction verdict.
+    # downgraded to the identical-arms template — that would let a calibration run become
+    # a reproduction verdict.
     if provenance_mod.admits(spec.provenance) and not (spec.script or "").strip() \
            and not spec.command:
         blocked_auth = ExecAuthorization(
@@ -2008,6 +2039,24 @@ def _self_check() -> None:
     assert authorize(open_cfg, laundered, backend2, commit=good).decision == "provenance_insufficient"
     assert not authorize(open_cfg, repo_spec, None, commit=good).allowed
 
+    # --- authorize(): cert_exec mirrors reimpl_exec's ladder, rung for rung --------------
+    from .schema import ReimplementationConformance
+    cert_spec = ProbeSpec(paper_id="s", script="print('x')", provenance="cert_exec")
+    a = authorize(cfg, cert_spec, backend)
+    assert not a.allowed and a.decision == "gate_closed", a.decision
+    a = authorize(open_cfg, cert_spec, backend)
+    assert not a.allowed and a.decision == "gate_closed", "cert_exec has its own gate"
+    cert_open = Config.load()
+    cert_open.allow_certificate_exec = True
+    a = authorize(cert_open, cert_spec, backend)
+    assert not a.allowed and a.decision == "isolation_insufficient", a.decision
+    a = authorize(cert_open, cert_spec, backend2)
+    assert not a.allowed and a.decision == "conformance_unproven", a.decision
+    cert_spec.certificate_conformance = ReimplementationConformance(
+        established=True, generated_by="g", verified_by="v", independently_verified=True)
+    a = authorize(cert_open, cert_spec, backend2)
+    assert a.allowed and a.decision == "authorized", a.decision
+
     # --- reconcile(): the arithmetic and the ceiling --------------------------------------
     def _spec(cell: str, provenance: str = "repo_exec", identity: bool = True) -> ProbeSpec:
         spec = ProbeSpec(paper_id="r", table_ref="T1:r0:c1", claimed_cell_value=cell,
@@ -2034,6 +2083,28 @@ def _self_check() -> None:
     assert synth_bad.status == "INCONCLUSIVE"
     naive = reconcile(_spec("59.28", "driver", identity=False), [59.30, 59.26], 0.10, [0, 1])
     assert naive.status == "INCONCLUSIVE"
+
+    # --- reconcile(): cert_exec — its own branch, never the printed-cell arithmetic ------
+    def _cert_spec(claim_ref: str = "S3", conformance=None) -> ProbeSpec:
+        return ProbeSpec(paper_id="r", claim_ref=claim_ref, claim_kind="section_span",
+                         provenance="cert_exec", certificate_conformance=conformance)
+
+    unbound_cert = reconcile(_cert_spec(), [0.0, 0.0], 0.0, [0, 1])
+    assert unbound_cert.status == "INCONCLUSIVE", "no conformance recorded => no verdict"
+    conf = ReimplementationConformance(established=True, generated_by="g", verified_by="v",
+                                       independently_verified=True)
+    crashed_cert = reconcile(_cert_spec(conformance=conf), [], 0.0, [],
+                             failure="AssertionError: hypothesis failed",
+                             evidence=StartupEvidence(setup_error="assertionerror"))
+    assert crashed_cert.status == "INCONCLUSIVE", (
+        "a failed hypothesis assertion is inadmissible, never a counterexample")
+    no_values_cert = reconcile(_cert_spec(conformance=conf), [], 0.0, [])
+    assert no_values_cert.status == "INCONCLUSIVE"
+    violated = reconcile(_cert_spec(conformance=conf), [0.0, 1.0, 0.0], 0.0, [0, 1, 2])
+    assert violated.status == "COUNTEREXAMPLE_FOUND", violated.reason
+    assert violated.comparison_kind == "AGAINST_CLAIMED_BOUND"
+    clean = reconcile(_cert_spec(conformance=conf), [0.0, 0.0, 0.0], 0.0, [0, 1, 2])
+    assert clean.status == "NO_VIOLATION_FOUND", clean.reason
 
     # --- parse_metric: no positional coincidence ------------------------------------------
     one = parse_metric('{"eval_accuracy": 0.87}', "eval_accuracy")

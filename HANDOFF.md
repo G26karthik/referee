@@ -116,8 +116,8 @@ stage's own self-check the same way.
 
 ```bash
 # the entrypoint
-PYTHONUTF8=1 ../.venv/Scripts/python.exe run.py review \
-    --paper papers/ICLR.pdf papers/CVPR.pdf --auto-audit --auto-grade
+PYTHONUTF8=1 ../.venv/Scripts/python.exe run.py tasks papers/ICLR.pdf --json
+PYTHONUTF8=1 ../.venv/Scripts/python.exe run.py seal <paper-id> <task-id> <answer.json>
 
 PYTHONUTF8=1 ../.venv/Scripts/python.exe run.py status <paper-id>
 PYTHONUTF8=1 ../.venv/Scripts/python.exe run.py list
@@ -129,11 +129,12 @@ PYTHONUTF8=1 ../.venv/Scripts/python.exe run.py sandbox      # leased remote mac
 Exit codes: `0` complete · `2` waiting on lens evidence · `1` error · `3` complete but
 CONTESTED (the independent whole-paper read disagrees sharply with the threshold table).
 
-**Exit 2 is normal, not a failure.** Without `--auto-audit` the run writes
-`projects/<pid>/audit/prompts/<lens>.md`, stops, and resumes when the lens files exist.
-If you fill them in by hand, **run each lens in a separate session**: four independent
-readings are four pieces of evidence, and one context that remembers the previous three is
-one reading echoed four times.
+**Model work has one channel.** `run.py tasks` lists every pending task (lens
+part/synthesis, grade, verdict, reconstruction and certificate generator/verifier, artifact
+review, extraction audit). Answer each in a SEPARATE isolated subagent — four independent
+lens readings are four pieces of evidence, one context that remembers the previous three is
+one reading echoed four times — then `run.py seal`. `.claude/workflows/referee.js` runs this
+loop autonomously.
 
 ---
 
@@ -340,18 +341,10 @@ are different acts.
 |---|---|---|---|
 | network | `SH_ALLOW_NETWORK` | **on** | `git clone --depth 1` of the URL the paper advertises, read-only |
 | synthesis | `SH_ALLOW_SYNTHESIS` | **on** | `harness/decide.py` authors `runs/<pid>/probe.py` from the paper |
-| auto-audit | `SH_ALLOW_AUTO_AUDIT` | off | shelling out to a reviewer for the four lenses |
-| grading | `SH_ALLOW_GRADING` | off | a second, blinded reviewer per FATAL/MAJOR finding — zero tools, no filesystem |
-| substantive verdict | `SH_ALLOW_SUBSTANTIVE_VERDICT` | off | one whole-paper opinion; printed, counted by nothing |
-| authors' code | `SH_ALLOW_ARTIFACT_REVIEW` | off | one read-only pass over the pinned checkout, `Read`+`Grep` only, every citation relocated |
 | install | `SH_ALLOW_INSTALL` | off | building the repository's declared stack |
 | execute | `SH_ALLOW_REPO_EXEC` | off | running the repository's own entrypoint |
-
-**The artifact-review gate runs to a terminal state with the gate closed**, because it is a
-deterministic half sitting in front of an optional model reading: `stages/artifact.py`
-produces its level-1 facts with `SH_ALLOW_ARTIFACT_REVIEW=0`. That property is what makes
-the model channel MEASURABLE at all: closing the gate removes the one step a model could
-have taken, not the route.
+| reconstruction exec | `SH_ALLOW_REIMPLEMENTATION_EXEC` | off | running a verified independent reimplementation |
+| certificate exec | `SH_ALLOW_CERTIFICATE_EXEC` | off | running a verified exact-arithmetic certificate |
 
 `SH_MAX_TARGETS` (default 3) is a **budget, not a gate**: which targets are worth pursuing
 is `harness/decide.py`'s decision (`classify_plan`) and the order is set alongside it, so

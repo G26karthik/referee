@@ -19,27 +19,22 @@ the checkout implements an experiment at all.
 
 **And it never suppresses an execution.** `planner` reaches `ARTIFACT_INSPECTION_ONLY`
 only where NO executable route applies, so a target that could be run is never diverted
-here. That is the defect `PAPER_INTERNAL_CHECK` had when it sat in `planner._RESOLVING`:
-it was cheap, it settled nothing, and it cancelled 100% of the shipped corpus's
-escalations.
+here — a cheap route that settles nothing must never cancel an escalation.
 
-**The authors'-code auditor is called from HERE, once per paper, and nowhere else.**
-`harness/artifact_review_driver.py` has been a complete, tested, read-only reader since it
-was written, and nothing on the production path ever called `.run()` — every `route.json`
-this stage ever wrote had `"proposed": 0` because the reader was never dispatched, not
-because it ran and found nothing. `_reviewer_facts` below is the missing call: gated on
-`cfg.allow_artifact_review` AND on an AUDITED snapshot existing (no gate, or no clean
-pinned checkout, means no call, exactly as before this existed), it asks the one question
-this route could not ask on its own — does the released code do what the method section
-says — and gets back `ArtifactFact`s that are ALREADY relocated, ALREADY authority-ranked,
-and ALREADY capped at `PAPER_ARTIFACT_MISMATCH` only where the auditor named a
-DETERMINISTIC identity basis that itself relocated. Nothing here re-derives or loosens any
-of that; it only decides WHERE a fact the auditor earned may be counted. A fact whose
-`about_the_paper`/`endpoints_only` reading answers the BROAD implementation-correspondence
-question is folded into a per-target inspection only when that target's OWN scope is
-`IMPLEMENTATION_CORRESPONDENCE` — the scope essentially every real repository-paper
-artifact target carries — and always into the paper-level aggregate, which asks nothing
-narrower. It is never folded into a NARROW bounded per-target question
+**The authors'-code auditor's TASK is persisted from HERE, once per paper, and nowhere
+else.** `_reviewer_facts` below is gated on an AUDITED snapshot existing (no clean pinned
+checkout means no task); when one exists and no valid sealed reading covers it, it persists
+the prompt that asks the one question this route could not ask on its own — does the
+released code do what the method section says — for `harness.tasks.pending` to list as a
+task. Once answered and sealed, it gets back `ArtifactFact`s that are ALREADY relocated,
+ALREADY authority-ranked, and ALREADY capped at `PAPER_ARTIFACT_MISMATCH` only where the
+auditor named a DETERMINISTIC identity basis that itself relocated. Nothing here re-derives
+or loosens any of that; it only decides WHERE a fact the auditor earned may be counted. A
+fact whose `about_the_paper`/`endpoints_only` reading answers the BROAD
+implementation-correspondence question is folded into a per-target inspection only when
+that target's OWN scope is `IMPLEMENTATION_CORRESPONDENCE` — the scope essentially every
+real repository-paper artifact target carries — and always into the paper-level aggregate,
+which asks nothing narrower. It is never folded into a NARROW bounded per-target question
 (`ENTRYPOINT_PRESENCE`, `FILE_PRESENCE`, ...): those stay answered purely by the
 deterministic probes below, so a mismatch found anywhere in the checkout can never be
 mistaken for an answer to an unrelated bounded question a different target asked.
@@ -51,6 +46,7 @@ from pathlib import Path
 
 from .. import artifact_evidence, artifact_review_driver, state
 from .. import locate as claims
+from ..reviewer_cli import prompt_fingerprint
 from ..schema import (ArtifactFact, ArtifactInspection, DiscoveredObject, PaperDoc,
                       PlanDecision, TargetOutcome, TargetSet)
 from ..config import Config
@@ -249,57 +245,62 @@ def _tree_text(root: str | Path) -> str:
     return "\n".join(out)
 
 
+def _reviewer_task_prompt_path(cfg: Config, pid: str) -> Path:
+    return state.project_dir(cfg, pid) / "tasks" / "artifact_review.md"
+
+
 def _reviewer_facts(cfg: Config, pid: str, doc: PaperDoc, root: str | Path, snap,
                     url: str, statements: list[str]) -> list[ArtifactFact]:
-    """The authors'-code auditor's facts for this paper, or `[]` — THE MISSING CALLER.
+    """The authors'-code auditor's facts for this paper, or `[]`.
 
-    Two preconditions, checked HERE rather than left to `artifact_review_driver.available`
-    alone, because that function only knows about the gate and the reader command: a
-    paper with no checkout, or a checkout that is not cleanly pinned, is a reason this call
-    must never happen, and `available()` has no way to know either. `snap.audited`
-    requires a commit, a tree hash and a clean working tree — exactly "there IS a pinned,
-    audited repository checkout" — so a directory that exists but is not a git checkout,
-    or is a dirty one, gets no call, same as no directory at all.
+    One precondition, checked HERE: `snap.audited` requires a commit, a tree hash and a
+    clean working tree — "there IS a pinned, audited repository checkout" — so a directory
+    that exists but is not a cleanly pinned git checkout gets no call, same as none at all.
 
     **A valid sealed inspection for THIS commit and THIS prompt is reused, never
-    re-dispatched.** `artifact_review_driver.load` has done the correct read/verify
-    mechanics — hash, writer, and now the prompt — since it was written, and had zero
-    callers: every rerun of `run.py review` for an unrelated reason silently re-dispatched
-    this live, temperature-bearing model subprocess and overwrote `artifact/<pid>.
-    route.json`, which is exactly how this corpus lost a `PAPER_ARTIFACT_MISMATCH` on
-    `apt-icml` and then a fact on `acl` (see CLAUDE.md's Known limitations). The prompt
-    hash is computed from the SAME `prompt_text` this function already builds, hashed the
-    SAME way `artifact_review_driver.run` hashes it — no second, possibly different hash —
-    so a cache hit requires the pinned commit AND every paper-derived input the model was
-    actually shown (title, method text, tree listing, URL, reported quantities) to still
-    match. `statements` is deliberately NOT part of that hash: it is not shown to the
-    auditor at all (`AP.build`'s signature has no such parameter) — it only shapes what
-    `ArtifactInspection.statements_examined` records — so a target set that changed
-    between runs (a new grade, a different discovery pass) does not by itself force a
-    live model call to re-read code that has not moved.
+    re-requested.** Re-dispatching on every unrelated rerun would overwrite
+    `artifact/<pid>.route.json` with a fresh, possibly different model call — losing an
+    already-established fact for no reason tied to this paper. The prompt hash is computed
+    from the SAME `prompt_text` this function already builds, so a cache hit requires the
+    pinned commit AND every paper-derived input the model was actually shown (title, method
+    text, tree listing, URL, reported quantities) to still match. `statements` is
+    deliberately NOT part of that hash: it is not shown to the auditor at all (`AP.build`'s
+    signature has no such parameter), so a target set that changed between runs (a new
+    grade, a different discovery pass) does not by itself force a fresh reading of code
+    that has not moved.
 
-    One best-effort call per paper, matching `artifact_review_driver.run`'s own contract:
-    it returns `None` on ANY failure (gate closed, no reader, timeout, unusable output) and
-    never raises, so a reviewer that never answers changes nothing about the deterministic
-    facts this route already establishes. What comes back has already been through
-    `artifact_evidence.relocate` for every code citation and `claims` for every paper
-    citation — this function trusts the driver's OWN discipline rather than repeating it,
-    the same way every other stage in this pipeline trusts a lens's finding only after the
-    harness's OWN re-verification has already run, once, inside the thing that produced it.
+    **On a cache miss, this PERSISTS the prompt instead of dispatching anything.** No
+    subprocess this function may spawn any more: the prompt is written to
+    `projects/<pid>/tasks/artifact_review.md`, a deterministic path `harness.tasks.pending`
+    checks on every call, so the controlling session can list it as an `artifact_review`
+    task for one of its own subagents. Writing the file is idempotent, so re-rendering it
+    on every cache-missed pipeline pass is a cheap overwrite, not a new request. Until a
+    subagent answers it and `harness.tasks.seal` calls `artifact_review_driver.accept`,
+    this returns `[]` — "no reviewer answered yet", so nothing downstream needs to know
+    delegation became asynchronous.
     """
-    if not cfg.allow_artifact_review or snap is None or not snap.audited:
+    if snap is None or not snap.audited:
         return []
     prompt_text = AP.build(
         doc.title, _method_text(doc), _tree_text(root), snap.commit,
         repo_url=url, repo_path=str(root), reported_text=_reported_text(doc))
-    prompt_sha = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+    path = _reviewer_task_prompt_path(cfg, pid)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(prompt_text, encoding="utf-8")
+    except OSError:
+        pass
+    # Fingerprinted the SAME way `harness.tasks` fingerprints every other role's prompt
+    # (`reviewer_cli.prompt_fingerprint`, hashing the BYTES ON DISK) rather than the
+    # in-memory string: text-mode newline translation can change what actually landed on
+    # disk, and a subagent — or `harness.tasks.seal` — can only ever hash what is really
+    # there. Hashing the string instead would make a valid answer look permanently stale.
+    prompt_sha = prompt_fingerprint(path)
     cached = artifact_review_driver.load(cfg, pid, commit=snap.commit,
                                          prompt_sha256=prompt_sha)
     if cached is not None:
         return list(cached.facts)
-    insp = artifact_review_driver.run(cfg, pid, doc, root, prompt_text, url=url,
-                                      statements=statements)
-    return list(insp.facts) if insp is not None else []
+    return []
 
 
 def run_route(cfg: Config, pid: str, doc: PaperDoc, target_set: TargetSet | None,
@@ -312,15 +313,13 @@ def run_route(cfg: Config, pid: str, doc: PaperDoc, target_set: TargetSet | None
     targets reading the same checkout at two moments could otherwise disagree about what
     the artifact says, and neither would be wrong.
 
-    **A broad question is DECOMPOSED, not discharged.** The corpus's four artifact targets
-    all ask the same thing — *"the released repository <url> implements the described
-    method"* — and no bounded artifact fact answers it. The first version discharged it
-    anyway, with facts like "the checkout advertises evaluate.py", and reported four papers
-    as having had a claim about their implementation settled by the presence of a file. Now
+    **A broad question is DECOMPOSED, not discharged.** A statement like *"the released
+    repository <url> implements the described method"* is never answered by a bounded
+    artifact fact (a file being present does not settle whether code implements a method):
     the route answers the bounded questions it CAN answer, records each against its own
     scope, and leaves the broad claim open with the reason. A referee reads "these things
-    about the artifact are established, and whether the code implements the method is still
-    open", which is what was true all along.
+    about the artifact are established, and whether the code implements the method is
+    still open", which is what is actually true.
     """
     pairs = planned(target_set)
     if not pairs or not Path(root).is_dir():
@@ -332,11 +331,11 @@ def run_route(cfg: Config, pid: str, doc: PaperDoc, target_set: TargetSet | None
     # so it needs the full statement list up front, and the loop's own `statements.append`
     # would otherwise duplicate exactly this list one entry at a time.
     statements: list[str] = [s for s in ((o.claim_text or "").strip() for o, _ in pairs) if s]
-    # THE AUTHORS'-CODE AUDITOR, ONCE PER PAPER, GATED, BEFORE ANY PER-TARGET INSPECTION.
-    # `_reviewer_facts` is a no-op unless `cfg.allow_artifact_review` is set AND `snap` is
-    # an audited (clean, pinned) checkout — see its own docstring for why both are checked
-    # here rather than left to the driver's own gate alone. What comes back is already
-    # relocated and already authority-ranked; this stage decides only WHERE it may count.
+    # THE AUTHORS'-CODE AUDITOR'S TASK, ONCE PER PAPER, BEFORE ANY PER-TARGET INSPECTION.
+    # `_reviewer_facts` is a no-op (besides persisting the task prompt) unless `snap` is an
+    # audited (clean, pinned) checkout with a valid sealed reading already covering it —
+    # see its own docstring. What comes back is already relocated and already
+    # authority-ranked; this stage decides only WHERE it may count.
     reviewer_facts = _reviewer_facts(cfg, pid, doc, root, snap, url, statements)
 
     outcomes: list[TargetOutcome] = []
@@ -437,6 +436,7 @@ def run_route(cfg: Config, pid: str, doc: PaperDoc, target_set: TargetSet | None
 
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":       # self-check: python -m harness.stages.artifact
+    import json
     import subprocess
     import sys
     import tempfile
@@ -496,9 +496,8 @@ if __name__ == "__main__":       # self-check: python -m harness.stages.artifact
         assert len(outcomes) == 2, outcomes
         broad, refused = outcomes[0], outcomes[1]
 
-        # THE BUG THIS RELEASE FIXES, asserted at the route. "The repository implements
-        # the described method" is a semantic correspondence question and four bounded
-        # facts about the checkout do not answer it.
+        # "The repository implements the described method" is a semantic correspondence
+        # question; bounded facts about the checkout do not answer it.
         assert broad.disposition == "ARTIFACT_INSPECTION_INCONCLUSIVE", broad
         assert broad.evidence_state != "ARTIFACT_EVIDENCE"
         assert broad.resolution_state == "UNRESOLVED"
@@ -535,77 +534,43 @@ if __name__ == "__main__":       # self-check: python -m harness.stages.artifact
         # A checkout that is not there is not a route.
         assert run_route(cfg, "p", doc, ts, Path(td) / "nope") == ([], None)
 
-        # ----------------------------------------------------------------------------- #
-        # THE WIRING THIS RELEASE ADDS: `_reviewer_facts` is the previously-missing call
-        # to `artifact_review_driver.run`, gated exactly like every other reason this route
-        # already declines a checkout it cannot use. A fake stands in for a real reviewer
-        # subprocess so this self-check stays offline; the wiring under test is the GATING
-        # and the FACT-FLOW, not the driver's own subprocess mechanics (that module has its
-        # own self-check for those).
-        # ----------------------------------------------------------------------------- #
-        calls: list[tuple] = []
+        # On a cache miss over an audited checkout, `_reviewer_facts` PERSISTS the prompt
+        # to a deterministic path for `harness.tasks.pending` to list as a task; once an
+        # answer is sealed at that exact prompt hash, the next call reuses it from cache.
+        # Authority/scope capping is proven by `artifact_review_driver.py`'s own
+        # self-check; what is under test here is the GATING and FACT-FLOW between them.
+        task_path = _reviewer_task_prompt_path(cfg, "p")
 
-        def _fake_reviewer(cfg, pid, doc, root, prompt_text, *, url="",
-                           statements=None, facts=None):
-            calls.append((pid, url, bool(prompt_text)))
-            return ArtifactInspection(paper_id=pid, facts=[ArtifactFact(
-                probe="code_review:SUSPICIOUS_IMPLEMENTATION", authority="ARTIFACT_FACT",
-                statement="a code-only observation the auditor located and the harness "
-                          "relocated — UNVERIFIED reading, verified location")])
+        # NO CHECKOUT -> nothing to inspect, whatever else is true.
+        assert run_route(cfg, "p", doc, ts, Path(td) / "nope") == ([], None)
 
-        real_run = artifact_review_driver.run
-        artifact_review_driver.run = _fake_reviewer
-        try:
-            # GATE CLOSED -> never dispatched, whatever else is true.
-            assert cfg.allow_artifact_review is False
-            run_route(cfg, "p", doc, ts, root, url="u")
-            assert calls == [], "the gate is closed; the auditor must not be dispatched"
+        # A REAL AUDITED CHECKOUT, NO SEALED READING YET -> the task prompt is persisted,
+        # and this call's own reviewer facts are empty (nobody has answered it yet).
+        run_route(cfg, "p", doc, ts, root, url="u")
+        assert task_path.is_file(), "a cache miss must persist the artifact_review task prompt"
+        prompt_sha = hashlib.sha256(task_path.read_bytes()).hexdigest()
 
-            gated = Config(projects_dir=Path(td) / "projects-gated",
-                           allow_artifact_review=True)
-            state.create_project(gated, "", "T", pid="p")
+        # A SUBAGENT ANSWERS: `artifact_review_driver.accept` seals a code-only reading at
+        # that exact prompt hash — the same call `harness.tasks.seal` makes for a real
+        # `artifact_review` task.
+        concern_raw = json.dumps({"concerns": [
+            {"kind": "SUSPICIOUS_IMPLEMENTATION", "title": "greeting", "statement": "odd",
+             "file": "train.py", "code_quote": "print('hi')"}], "notes": "n"})
+        artifact_review_driver.accept(
+            cfg, "p", doc, root, concern_raw, url="u", reader="session subagent generator",
+            mode="SESSION_SUBAGENT", prompt_sha256=prompt_sha)
 
-            # GATE OPEN, NO CHECKOUT -> still never dispatched.
-            assert run_route(gated, "p", doc, ts, Path(td) / "nope") == ([], None)
-            assert calls == [], "no audited checkout, whatever the gate says"
+        # THE NEXT CALL REUSES THE SEALED READING FROM CACHE, and its relocated fact
+        # reaches the paper-level aggregate — the broad question a code-only observation
+        # actually bears on.
+        _outs, whole_r = run_route(cfg, "p", doc, ts, root, url="u")
+        assert whole_r is not None and any(
+            f.probe == "code_review:SUSPICIOUS_IMPLEMENTATION" for f in whole_r.facts)
 
-            # GATE OPEN, A REAL AUDITED CHECKOUT -> dispatched exactly once, and its
-            # relocated fact reaches the paper-level aggregate — the broad question a
-            # code-only observation actually bears on.
-            _outs, whole_r = run_route(gated, "p", doc, ts, root, url="u")
-            assert len(calls) == 1, "one best-effort call per paper, not one per target"
-            assert calls[0][0] == "p" and calls[0][2] is True
-            assert whole_r is not None and any(
-                f.probe == "code_review:SUSPICIOUS_IMPLEMENTATION" for f in whole_r.facts)
-
-            # A PROPOSAL THE DRIVER COULD NOT PROMOTE PAST ENDPOINTS-VERIFIED STAYS THERE.
-            # `locate_all`/`bind_mismatch` are what decide authority, unchanged by this
-            # wiring; this only proves the wiring does not itself launder a concern into a
-            # stronger claim on the way through.
-            def _fake_concern(cfg, pid, doc, root, prompt_text, *, url="",
-                              statements=None, facts=None):
-                return ArtifactInspection(paper_id=pid, facts=[ArtifactFact(
-                    probe="code_review:PAPER_CODE_MISMATCH",
-                    authority="ENDPOINTS_VERIFIED_ARTIFACT_CONCERN",
-                    paper_ref="P0:0-10", refusal="experiment_identity_not_deterministic",
-                    statement="BOTH LOCATIONS ARE VERIFIED; the correspondence between "
-                              "them is the auditor's reading")])
-
-            artifact_review_driver.run = _fake_concern
-            capped_out, _whole_c = run_route(gated, "p", doc, ts, root, url="u")
-            broad_c = capped_out[0]
-            assert broad_c.disposition == "ARTIFACT_CONCERN_VERIFIED_ENDPOINTS", broad_c
-            assert broad_c.disposition != "ARTIFACT_MISMATCH_ESTABLISHED"
-            assert broad_c.evidence_state not in taxonomy.EVIDENCE_ABOUT_THE_PAPER
-            assert broad_c.establishes_failure is False
-
-            # AND A NARROW TARGET'S OWN BOUNDED QUESTION IS UNTOUCHED BY A CONCERN THAT
-            # HAS NOTHING TO DO WITH IT — the scope gate above, not just the authority
-            # ceiling, is what keeps a checkout-wide finding from contaminating a target
-            # asking something unrelated.
-            narrow_capped, _ = run_route(gated, "p", doc, narrow_ts, root, url="u")
-            assert narrow_capped[0].disposition == "ARTIFACT_FACT_ESTABLISHED", narrow_capped[0]
-        finally:
-            artifact_review_driver.run = real_run
+        # AND A NARROW TARGET'S OWN BOUNDED QUESTION IS UNTOUCHED BY A CHECKOUT-WIDE
+        # READING THAT HAS NOTHING TO DO WITH IT — the scope gate is what keeps a
+        # checkout-wide finding from contaminating a target asking something unrelated.
+        narrow_out2, _ = run_route(cfg, "p", doc, narrow_ts, root, url="u")
+        assert narrow_out2[0].disposition == "ARTIFACT_FACT_ESTABLISHED", narrow_out2[0]
 
     print("harness.stages.artifact self-check ok")

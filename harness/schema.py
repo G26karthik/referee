@@ -1,39 +1,22 @@
-"""ONE evidence object family for REFEREE v4 — replaces `harness/artifacts.py`.
+"""ONE evidence object family for REFEREE v4.
 
-Same models, same field names, same types, same defaults as the reference implementation
-(tag `reference-implementation-2026-09-20`) — this is a consolidation and a prose cut, not
-a behavior change. Every vocabulary is a named module-level tuple; no field description
-retypes an enumeration as free prose (the exact drift `TargetOutcome.provenance` suffered
-in the reference — see `harness/provenance.py`'s comment on it).
+Every vocabulary is a named module-level tuple; no field description retypes an
+enumeration as free prose.
 
-For WHY each vocabulary has the members it has, and the corpus incidents that shaped it,
-see `docs/INVARIANT_MAP.md` and `docs/HARNESS_ARCHITECTURE.md`. This module states WHAT;
-those state WHY.
-
-**Trust posture: write-side enforcement now lands for the fields that matter.** `_Base`
-still allows `extra` fields (a stage adding a field must not break the pipeline) — that is
-a different concern from a DECLARED field's value being wrong, which is what changed here.
-Nine fields — `ExecAuthorization.decision`/`.failure_class`, `Reconciliation.provenance`/
-`.failure_class`, `ProbeSpec.provenance`, `TargetOutcome.provenance`/`.failure_class`,
-`CaseState.phase`/`.status` — are now enforced via `Vocab(...)`: a real
-membership check against their declared tuple, or against a specific, one-line-noted
-`LEGACY_VALUES` exception. These nine were chosen because they are the fields the v4 plan's
-own trust-boundary review depends on (execution authorization/reconciliation decisions,
-provenance, disposition, phase/status) — a wrong value in one of these is a silent
-trust-boundary failure, not a cosmetic typo. Every OTHER vocabulary-bearing field (the
-~30 "prose-only" scientific/reporting ones a lens or grader writes) stays plain `str`,
-unchanged from the reference: enforcing all 782 originally-annotated fields in one pass
-would convert "drop this one bad field" into "crash the whole review" on a model's typo,
-which is the opposite of `_Base`'s own reason for existing. `CaseState.verdict` — the old
-binary RED|GREEN colour field this list used to include — was removed outright in the
-2026-09-21 de-triage pass rather than kept and enforced; `CaseState.disposition` (a
-`PAPER_DISPOSITIONS` value, never a colour) is what a caller reads for routing now.
+Write-side enforcement: `_Base` still allows `extra` fields (a stage adding a field must
+not break the pipeline) — a different concern from a DECLARED field's value being wrong.
+Nine fields — `ExecAuthorization.decision`/`.failure_class`,
+`Reconciliation.provenance`/`.failure_class`, `ProbeSpec.provenance`,
+`TargetOutcome.provenance`/`.failure_class`, `CaseState.phase`/`.status` — are enforced via
+`Vocab(...)`: a real membership check against their declared tuple, or a one-line-noted
+`LEGACY_VALUES` exception, since a wrong value in one of these is a silent trust-boundary
+failure. Every other vocabulary-bearing field stays plain `str`: enforcing every annotated
+field would convert "drop this one bad field" into "crash the whole review" on a typo.
 
 `LEGACY_VALUES` starts EMPTY, deliberately: a hand-guessed exception is exactly the
-retyping-as-free-prose mistake this whole schema exists to stop. A real one is added only
-after `tools/validate_legacy_json.py` (or equivalent) loads real `projects/*/**.json`
-through these nine fields and a `ValidationError` names a genuine historical value — see
-that script's own output before ever adding an entry here.
+retyping-as-free-prose mistake this schema exists to stop. A real one is added only after
+`tools/validate_legacy_json.py` (or equivalent) loads real `projects/*/**.json` through
+these nine fields and a `ValidationError` names a genuine historical value.
 
 `python -m harness.schema` runs the self-check.
 """
@@ -47,19 +30,15 @@ from .provenance import PROVENANCE_LABELS, PROVENANCE_VALUES
 from .failures import FAILURE_KINDS
 from .taxonomy import EVIDENCE_STATES, RESOLUTION_STATES, SCIENTIFIC_CLASSES
 
-# What happens to a paper once the review completes. Never a severity and never a
-# colour -- moved here (was harness/disposition.py) because decide.py, which derives it,
-# already imports every other vocabulary tuple from this module; disposition.py's own
-# `derive_disposition` logic lives in decide.py now.
+# What happens to a paper once the review completes. Never a severity and never a colour.
 PAPER_DISPOSITIONS: tuple[str, ...] = (
     "STOP_MATERIAL_FAILURE",       # a material failure was established; see `basis`
     "BLOCKED_SPECIFICATION",       # a central question needed detail the paper omits
     "BLOCKED_ARTIFACT",            # a central question needed code that is absent or unbindable
     "BLOCKED_RESOURCES",           # a central question needed hardware not obtainable here
-    # A central question needed a verification approach this system does not implement --
-    # no address, no printed quantity to compare against, no route, or a route with no
-    # arithmetic behind its comparison. Never the paper's fault, never the artifact's,
-    # never the host's: this review's own method inventory ran out.
+    # A central question needed a verification approach this system does not implement:
+    # never the paper's fault, never the artifact's, never the host's — this review's own
+    # method inventory ran out.
     "BLOCKED_METHOD",
     "PASS_TO_HUMAN_UNRESOLVED",    # a central question was pursued admissibly and stayed open
     "PASS_TO_HUMAN_CONCERNS",      # verified concerns that weaken a claim without rejecting it
@@ -67,19 +46,19 @@ PAPER_DISPOSITIONS: tuple[str, ...] = (
     "NOT_REVIEWED",                # the pipeline did not complete
 )
 
-# ON WHAT a material failure was established. Never a severity and never a colour: this
-# says which KIND of evidence carried the decision, because "four lenses agreed and the
-# blinded grader sustained it" and "the authors' own code did not produce the number" are
-# different things to hand a referee.
+# ON WHAT a material failure was established. Never a severity and never a colour: which
+# KIND of evidence carried the decision are different things to hand a referee.
 DISPOSITION_BASIS: tuple[str, ...] = (
     "AUTHOR_CODE_REPRODUCTION",      # the authors' own checkout, at a verified commit
     "INDEPENDENT_REIMPLEMENTATION",  # a reproduction the ceiling admits that is NOT theirs
     "PAPER_ARITHMETIC",              # the paper's own printed composition does not evaluate
+    # A certificate found a concrete instance violating a stated theorem/bound — never
+    # conflated with INDEPENDENT_REIMPLEMENTATION, a reconstruction of an experiment.
+    "INDEPENDENT_CERTIFICATE",
     "NONE",
 )
 
-# Which locator a central-claim dependency was established from -- moved here (was
-# harness/materiality.py) for the same reason as the two tuples above.
+# Which locator a central-claim dependency was established from.
 MATERIALITY_BASES: tuple[str, ...] = (
     "ABSTRACT_CLAIM",   # the address resolves inside the paper's own Abstract
     "CONCLUSION_CLAIM",  # the address resolves inside the paper's own Conclusion
@@ -99,19 +78,12 @@ class _Base(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-# --------------------------------------------------------------------------------------- #
-# Enforced-field machinery — see the module docstring for which ten fields use this and why
-# the other ~772 annotated fields do not.
-# --------------------------------------------------------------------------------------- #
+# === Enforced-field machinery — see the module docstring for which fields use this =====
 LEGACY_VALUES: dict[str, tuple[str, ...]] = {
-    # `CaseState.verdict` — the old binary RED|GREEN colour field — carried "YELLOW" on
-    # multiple real runs (`tools/validate_legacy_json.py` against `projects/acl/controller.json`
-    # and others; CLAUDE.md's Known Limitations documents the sibling case on
-    # `paper4-snri-nullresult`'s report). The 2026-09-21 de-triage pass removed the field
-    # entirely rather than widen its vocabulary — `CaseState.disposition` (a
-    # `decide.PAPER_DISPOSITIONS` value, never a colour) is the field a caller reads for
-    # routing now. `_Base`'s `extra="allow"` means an old controller.json that still carries
-    # a stray `verdict` key reads fine; nothing enforces or interprets that key any more.
+    # `CaseState.verdict`, the old RED|GREEN colour field, was removed entirely rather
+    # than widened; `CaseState.disposition` (a `decide.PAPER_DISPOSITIONS` value, never a
+    # colour) is what a caller reads for routing now. `_Base`'s `extra="allow"` means an
+    # old controller.json with a stray `verdict` key still reads fine, just unenforced.
 }
 
 
@@ -119,9 +91,7 @@ def _vocab_validator(vocab: tuple[str, ...], legacy_key: str):
     """A plain validator CALLABLE (not a type) for one enforced field. Kept separate from
     the `Annotated[...]` construction at each field because pyright rejects a function CALL
     used directly in type-annotation position, even though `Annotated`'s own metadata slot
-    (everything after the first comma) is ordinary runtime data pyright never type-checks —
-    which is why this callable is only ever built here and referenced inside `AfterValidator`
-    at the field, never used as the annotation itself.
+    is ordinary runtime data pyright never type-checks.
     """
     allowed = set(vocab) | set(LEGACY_VALUES.get(legacy_key, ()))
 
@@ -138,9 +108,7 @@ def _vocab_validator(vocab: tuple[str, ...], legacy_key: str):
     return _check
 
 
-# =============================================================================
-# 1. DOCUMENT — the parsed paper, and the only thing evidence is checked against
-# =============================================================================
+# === 1. DOCUMENT — the parsed paper, and the only thing evidence is checked against ====
 
 # What PaperDoc's own addressable units are called. Also CrossRef.kind's vocabulary: a
 # citation names one of these unit kinds, never a different vocabulary from the units
@@ -206,13 +174,16 @@ class Section(_Base):
 
 
 class Figure(_Base):
-    """A figure CAPTION only — never the plotted content. Evidence class `caption_verified`
-    is capped at LOW confidence for exactly that reason."""
+    """A figure CAPTION — never asserted as the plotted content; `caption_verified` is
+    capped at LOW confidence for exactly that reason. `image_path` (when set) is a
+    best-effort PNG crop, ADVISORY ONLY: a lens may `Read` it, but only a caption/table/
+    prose quote the harness can re-verify may settle a finding."""
 
     figure_idx: int
     page: int = 0
     label: str = ""
     caption: str = ""
+    image_path: str = ""
 
     def ref(self) -> str:
         return f"F{self.figure_idx}"
@@ -286,10 +257,8 @@ class ReportedQuantity(_Base):
 class ClaimRef(_Base):
     """One resolvable address into the parsed paper. A lens supplies a QUOTE; the harness
     mints the ADDRESS (`locate.mint`) and re-reads the span off the document
-    (`locate.resolve`) — a lens's own `prose_claim` ref gains nothing.
-
-    Grammar: `T<t>:r<r>:c<c>` table_cell · `F<n>` figure · `E<n>` equation · `S<i>`
-    section_span · `P<i>:<start>-<end>` prose_claim (a char span in section <i>'s text)."""
+    (`locate.resolve`). Grammar: `T<t>:r<r>:c<c>` table_cell · `F<n>` figure · `E<n>`
+    equation · `S<i>` section_span · `P<i>:<start>-<end>` prose_claim."""
 
     ref: str = Field(default="")
     kind: str = Field(default="", description=" | ".join(REFERENCE_KINDS))
@@ -306,9 +275,7 @@ class ClaimRef(_Base):
         return self.resolution == "resolved"
 
 
-# =============================================================================
-# 2. AUDIT — the four scientific lenses, and the second, blinded grader
-# =============================================================================
+# === 2. AUDIT — the four scientific lenses, and the second, blinded grader =============
 
 LENSES = ("overclaim", "protocol", "confound", "contradiction")
 
@@ -455,9 +422,7 @@ class LensReport(_Base):
     merged_duplicates: int = Field(default=0, description="WRITTEN BY THE HARNESS")
 
 
-# =============================================================================
-# 3. REIMPLEMENTATION — governed reconstruction, when no repository is published
-# =============================================================================
+# === 3. REIMPLEMENTATION — governed reconstruction, when no repository is published ====
 
 REIMPL_INGREDIENT_KINDS = ("method", "architecture", "preprocessing", "training", "dataset",
                           "metric", "hyperparameters", "comparison_target")
@@ -514,9 +479,7 @@ class ReimplementationConformance(_Base):
     replication_quote: str = ""
 
 
-# =============================================================================
-# 4. REPO ACQUISITION + STATIC AUDIT — what the checkout is, and what it demands
-# =============================================================================
+# === 4. REPO ACQUISITION + STATIC AUDIT — what the checkout is, and what it demands ====
 
 REPO_ACQUISITION_STATUSES = ("cloned", "cached", "synthesized", "unavailable", "blocked",
                              "failed", "not_attempted")
@@ -606,9 +569,7 @@ class CodeAudit(_Base):
     skipped: str = Field(default="")
 
 
-# =============================================================================
-# 5. STATIC ARTIFACT INSPECTION — what the released code can establish, and its ceiling
-# =============================================================================
+# === 5. STATIC ARTIFACT INSPECTION — what the released code can establish, and its ceiling ===
 
 # THREE LEVELS. Level 3 ("the reported result is false") HAS NO SPELLING here — the
 # encoding of the rule, not a note about it. See INVARIANT_MAP.md.
@@ -715,9 +676,7 @@ class ArtifactInspection(_Base):
         return [f for f in self.facts if f.endpoints_only]
 
 
-# =============================================================================
-# 6. IDENTITY + CAPABILITY — which experiment, which quantity, can this machine run it
-# =============================================================================
+# === 6. IDENTITY + CAPABILITY — which experiment, which quantity, can this machine run it ===
 
 IDENTITY_STATES = ("established", "ambiguous", "no_candidate", "unmapped", "unsupported")
 COMMAND_SOURCES = ("readme", "run_script", "scripts_dir", "makefile")
@@ -813,11 +772,12 @@ class ExecCapability(_Base):
     backend: str = Field(default="")
 
 
-# =============================================================================
-# 7. COMPARISON + RESOURCES — what a result is held against, and whether it fits
-# =============================================================================
+# === 7. COMPARISON + RESOURCES — what a result is held against, and whether it fits ====
 
-COMPARISON_KINDS = ("AGAINST_PRINTED_VALUE", "AGAINST_EXISTENCE", "AGAINST_SPECIFICATION")
+COMPARISON_KINDS = ("AGAINST_PRINTED_VALUE", "AGAINST_EXISTENCE", "AGAINST_SPECIFICATION",
+                    # A theorem/bound's claimed inequality, checked by an exact-arithmetic
+                    # certificate against a concrete instance — never a printed cell.
+                    "AGAINST_CLAIMED_BOUND")
 COMPARISON_STATES = ("established", "no_reference", "unsupported", "unmapped")
 RESOURCE_STATES = ("satisfied", "insufficient", "unknown", "unassessed")
 RESOURCE_EVIDENCE_KINDS = ("declared_requirement", "declared_hardware", "derived_floor")
@@ -896,9 +856,7 @@ class ResourceCapability(_Base):
         return self.state == "satisfied"
 
 
-# =============================================================================
-# 8. EXECUTION — commit identity, the process record, authorization, reconciliation
-# =============================================================================
+# === 8. EXECUTION — commit identity, the process record, authorization, reconciliation ===
 
 COMMIT_STATES = ("verified", "mismatch", "dirty", "unknown", "unassessed")
 
@@ -923,9 +881,11 @@ EXEC_DECISIONS = (
 )
 
 RECONCILIATION_STATUSES = ("RESOLVED_VERIFIED", "FAILED_REPRODUCTION", "INCONCLUSIVE",
-                          "NOT_ATTEMPTED")
-# "not_started" appended: a corpus review of `paper4-snri-nullresult` found this value
-# in production data with no declared home — see INVARIANT_MAP.md's conservation-law note.
+                          "NOT_ATTEMPTED",
+                          # EXACT_CERTIFICATE's own two terminal states, about a claimed
+                          # bound, not a printed cell: "found" is a violating instance;
+                          # "none found" checks tested instances, never proves the bound.
+                          "COUNTEREXAMPLE_FOUND", "NO_VIOLATION_FOUND")
 PROBE_VERDICTS = ("detectable", "within_noise", "calibration", "degenerate", "failed", "single_arm",
                  "not_started")
 
@@ -973,24 +933,14 @@ class ExecutionRecord(_Base):
     metric: float | None = Field(default=None)
 
 
-# `TargetOutcome.provenance` is NOT the reproduction ceiling's domain — it is broader.
-# Confirmed against REAL files, not assumed: `stages/discover.py`'s `_paper_only_outcome`
-# writes `provenance="paper"` for the ARITHMETIC_RECHECK route (nothing executed, the
-# paper's own composition was recomputed — `taxonomy.evidence_state` maps
-# PAPER_ARITHMETIC_CONTRADICTION unconditionally, never consulting the reproduction ceiling:
-# "'paper' provenance is not and must never become a member of the reproduction ceiling",
-# that module's own words); and a real `outcome.json` on disk
-# (`projects/acl/.../TGT-CLM-P181762-1916/outcome.json`) carries `provenance="artifact"` for
-# an `ARTIFACT_INSPECTION_INCONCLUSIVE` disposition — the static-inspection route's own
-# token, distinct from both the paper route and the five execution-ceiling ones. Neither is
-# a historical mistake; both are current, intentional, non-reproduction provenances this
-# field must hold, so they are added to its OWN vocabulary rather than pushed into
-# `LEGACY_VALUES`, which is reserved for genuine past errors.
+# `TargetOutcome.provenance` is broader than the reproduction ceiling's domain: "paper"
+# (the ARITHMETIC_RECHECK route; nothing executed) and "artifact" (the static-inspection
+# route's token) are current, intentional, non-reproduction provenances added to this
+# field's OWN vocabulary rather than `LEGACY_VALUES`, reserved for genuine past errors.
 TARGET_OUTCOME_PROVENANCE_VALUES = PROVENANCE_VALUES + ("paper", "artifact")
 
-# Enforced-field type aliases for the four ladder objects below. Written as literal
-# `Annotated[str, AfterValidator(fn)]` at each name — see `_vocab_validator`'s own
-# docstring for why this cannot be a call returning the type directly.
+# Enforced-field type aliases for the four ladder objects below — see `_vocab_validator`'s
+# own docstring for why each must be a literal `Annotated[...]`, not a call returning one.
 _ExecDecisionField: TypeAlias = Annotated[
     str, AfterValidator(_vocab_validator(EXEC_DECISIONS, "ExecAuthorization.decision"))]
 _ExecFailureClassField: TypeAlias = Annotated[
@@ -1148,11 +1098,14 @@ class ProbeSpec(_Base):
     backend_considered: list[str] = Field(default_factory=list)
     reimplementation_conformance: "ReimplementationConformance | None" = Field(
         default=None, description="set only for provenance 'reimpl_exec'")
+    # EXACT_CERTIFICATE reuses `ReimplementationConformance`'s shape verbatim: the
+    # `cert_exec` gate is structurally identical, every REQUIRED element bound to a
+    # verified locator AND independently verified before a verdict may be drawn.
+    certificate_conformance: "ReimplementationConformance | None" = Field(
+        default=None, description="set only for provenance 'cert_exec'")
 
 
-# =============================================================================
-# 9. REPORT — the reader-facing rows, the verdict, the whole-paper opinion
-# =============================================================================
+# === 9. REPORT — the reader-facing rows, the verdict, the whole-paper opinion ==========
 
 FINDING_STATES = ("MATERIAL_FAILURE_ESTABLISHED", "CONCERNS_RECORDED",
                   "NO_CONCERN_SURVIVED_VERIFICATION")
@@ -1305,9 +1258,7 @@ class ReviewSelfAudit(_Base):
     summary: str = ""
 
 
-# =============================================================================
-# 10. CORPUS ACCOUNTING — every requested paper, in exactly one terminal state
-# =============================================================================
+# === 10. CORPUS ACCOUNTING — every requested paper, in exactly one terminal state ======
 
 CORPUS_STATES = ("requested", "started", "completed", "failed", "inconclusive")
 
@@ -1341,9 +1292,7 @@ class CorpusReport(_Base):
     summary: str = ""
 
 
-# =============================================================================
-# 11. REVIEW-SURFACE COVERAGE — structural, never issue recall
-# =============================================================================
+# === 11. REVIEW-SURFACE COVERAGE — structural, never issue recall ======================
 
 SURFACE_KINDS = ("table_cell", "figure", "equation", "section_span", "reported_quantity")
 
@@ -1405,14 +1354,13 @@ class CoverageReport(_Base):
         description="ALWAYS this value — structural coverage is not issue recall")
 
 
-# =============================================================================
-# 12. DOCUMENT INTEGRITY — observations, never conclusions
-# =============================================================================
+# === 12. DOCUMENT INTEGRITY — observations, never conclusions ==========================
 
 INTEGRITY_CHECKS = ("CROSSREF_UNRESOLVED", "OBJECT_UNCITED", "LABEL_DUPLICATED",
                     "LABEL_OUT_OF_ORDER", "BODY_UNCAPTIONED", "NUMBERING_GAP",
                     "SECTION_REF_UNRESOLVED", "TABLE_ARITHMETIC", "PROSE_CELL_MISMATCH",
-                    "CAPTION_LABEL_CONFLICT")
+                    "CAPTION_LABEL_CONFLICT", "VISION_TABLE_MISMATCH", "VISION_TABLE_UNSURE",
+                    "VISION_TITLE_MISMATCH")
 INTEGRITY_ABOUT = ("PAPER", "EXTRACTION")
 
 
@@ -1428,9 +1376,7 @@ class DocumentObservation(_Base):
     detail: str = Field(default="")
 
 
-# =============================================================================
-# 13. GUARANTEES AND NON-GUARANTEES
-# =============================================================================
+# === 13. GUARANTEES AND NON-GUARANTEES =================================================
 
 GUARANTEE_KINDS = ("PROCESS", "SCIENTIFIC")
 
@@ -1478,9 +1424,7 @@ class ExperimentalChain(_Base):
     broken_link: str = Field(default="", description="the FIRST link not established")
 
 
-# =============================================================================
-# 14. DISCOVERY — targets, questions, plans, and where each target ended
-# =============================================================================
+# === 14. DISCOVERY — targets, questions, plans, and where each target ended ============
 
 DISCOVERY_KINDS = ("SCIENTIFIC_CLAIM", "EXPERIMENTAL_RESULT", "BASELINE_COMPARISON",
                    "ABLATION", "CONTROL", "DATASET_RESULT", "ERROR_ANALYSIS",
@@ -1488,9 +1432,12 @@ DISCOVERY_KINDS = ("SCIENTIFIC_CLAIM", "EXPERIMENTAL_RESULT", "BASELINE_COMPARIS
 CENTRALITY = ("CENTRAL", "SUPPORTING", "PERIPHERAL", "UNASSESSED")
 ADDRESSING_BLOCKERS = ("NONE", "ADDRESS_UNRESOLVED", "QUANTITY_UNPARSED", "NO_ROUTE")
 
-# Cheapest first — the ORDER is load-bearing (`harness.decide` walks it).
-VERIFICATION_ROUTES = ("PAPER_INTERNAL_CHECK", "ARITHMETIC_RECHECK", "ARTIFACT_INSPECTION",
-                       "AUTHOR_CODE_EXECUTION", "INDEPENDENT_RECONSTRUCTION", "NONE")
+# Cheapest first — the ORDER is load-bearing (`harness.decide` walks it). EXACT_CERTIFICATE
+# sits right after ARITHMETIC_RECHECK: cheap and decisive like the paper-internal routes,
+# but needs no repository at all (see `harness.certificate`).
+VERIFICATION_ROUTES = ("PAPER_INTERNAL_CHECK", "ARITHMETIC_RECHECK", "EXACT_CERTIFICATE",
+                       "ARTIFACT_INSPECTION", "AUTHOR_CODE_EXECUTION",
+                       "INDEPENDENT_RECONSTRUCTION", "NONE")
 
 ROUTE_ATTEMPT_STATES = ("DISCHARGED_RAN", "DISCHARGED_COMPLETED", "DISCHARGED_BLOCKED",
                         "COMPLETED_INCONCLUSIVE", "GATE_CLOSED", "DEFERRED_BUDGET",
@@ -1505,6 +1452,10 @@ TARGET_DISPOSITIONS = (
     "ADDRESSING_BLOCKED", "REPORTING_BLOCKED", "NO_ROUTE_AVAILABLE", "IDENTITY_BLOCKED",
     "COMPARISON_BLOCKED", "AUTHORIZATION_BLOCKED", "INCONCLUSIVE", "NO_EXPERIMENT_NEEDED",
     "BUDGET_DEFERRED", "SUPERSEDED_BY_ESTABLISHED_FAILURE", "NOT_ATTEMPTED",
+    # EXACT_CERTIFICATE's own two terminal dispositions. A counterexample is a material
+    # failure like FAILED_REPRODUCTION; the absence of one is NEVER support — it checks
+    # only the instances actually tried, never a proof the bound holds in general.
+    "COUNTEREXAMPLE_ESTABLISHED", "NO_COUNTEREXAMPLE_FOUND",
 )
 # Facts about a gate/artifact/host, never the paper — the two reproduction dispositions
 # are the only exceptions (see `harness.taxonomy`).
@@ -1520,9 +1471,12 @@ PLAN_ACTIONS = (
     "INFEASIBLE_ROUTE", "INFEASIBLE_ARTIFACT", "INFEASIBLE_ENVIRONMENT",
     "DEFERRED_TO_ANOTHER_TARGET", "OUTRANKED_BY_CENTRAL_TARGET",
     "SUPERSEDED_BY_ESTABLISHED_FAILURE",
+    # Named identically to its own route: `decide.implemented_routes`'s `r in PLAN_ACTIONS`
+    # membership test is how a route is recognised as runnable.
+    "EXACT_CERTIFICATE",
 )
 ACTIONS_REQUIRING_EXECUTION = ("AUTHOR_CODE_REPRODUCTION", "INDEPENDENT_RECONSTRUCTION",
-                               "MECHANISM_TEST_ONLY")
+                               "MECHANISM_TEST_ONLY", "EXACT_CERTIFICATE")
 
 NECESSITY_FOR_ACTION = {
     "NO_EXPERIMENT_NEEDED": "NO_EXPERIMENT_NEEDED",
@@ -1558,10 +1512,19 @@ NECESSITY_FOR_DISPOSITION = {
     "PENDING": "EXPERIMENT_WARRANTED",
     "NO_EXPERIMENT_NEEDED": "NO_EXPERIMENT_NEEDED",
     "CITATION_VERIFIED_ONLY": "EXPERIMENT_WARRANTED",
+    # A counterexample resolves the question as conclusively as FAILED_REPRODUCTION does.
+    "COUNTEREXAMPLE_ESTABLISHED": "EXPERIMENT_RESOLVED",
+    # Like CITATION_VERIFIED_ONLY: checking finitely many instances and finding no
+    # violation settles nothing — the underlying question stays warranted.
+    "NO_COUNTEREXAMPLE_FOUND": "EXPERIMENT_WARRANTED",
 }
 
 QUESTION_KINDS = ("PRINTED_QUANTITY", "COMPOSITION", "ATTRIBUTION", "CONTROL_PRESENCE",
-                  "PROTOCOL_CONFORMANCE", "SPECIFICATION", "PRIOR_ART", "UNCLASSIFIED")
+                  "PROTOCOL_CONFORMANCE", "SPECIFICATION", "PRIOR_ART", "UNCLASSIFIED",
+                  # A theorem/lemma/proposition/bound stated with an inequality or
+                  # asymptotic operator — routes to EXACT_CERTIFICATE, never a printed
+                  # table cell. See `harness.discover.is_mathematical_bound`.
+                  "MATHEMATICAL_BOUND")
 
 # Whether an experiment was NECESSARY, and what became of that judgement. Never counted
 # beside "we needed one and could not run it" — see invariant 22 in CLAUDE.md.
@@ -1672,12 +1635,13 @@ class TargetOutcome(_Base):
 
     @property
     def establishes_failure(self) -> bool:
-        """The two structurally separate routes that may contribute a material failure —
-        FAILED_REPRODUCTION (admissible only through the provenance ceiling) and
-        PAPER_ARITHMETIC_CONTRADICTION (unconditional, never gated by the ceiling — its
-        own ceiling already ran inside `locate.parse_quantity`)."""
+        """The three routes that may contribute a material failure: FAILED_REPRODUCTION
+        and COUNTEREXAMPLE_ESTABLISHED (both gated by the provenance ceiling) and
+        PAPER_ARITHMETIC_CONTRADICTION (unconditional; its own ceiling already ran inside
+        `locate.parse_quantity`)."""
         from .provenance import admits
-        return ((self.disposition == "FAILED_REPRODUCTION" and admits(self.provenance))
+        return ((self.disposition in ("FAILED_REPRODUCTION", "COUNTEREXAMPLE_ESTABLISHED")
+                and admits(self.provenance))
                 or self.disposition == "PAPER_ARITHMETIC_CONTRADICTION")
 
     @property
@@ -1735,9 +1699,7 @@ class TargetSet(_Base):
         return next((o for o in self.outcomes if o.target_id == target_id), None)
 
 
-# =============================================================================
-# 15. LEDGER — every traceable line from a paper's words to a scientific implication
-# =============================================================================
+# === 15. LEDGER — every traceable line from a paper's words to a scientific implication ===
 
 class LedgerEntry(_Base):
     entry_id: str = ""
@@ -1775,9 +1737,7 @@ class CaseLedger(_Base):
     efficiency: dict = Field(default_factory=dict)
 
 
-# =============================================================================
-# 16. ASSESSMENT + CONTROLLER — pre-execution gate, and the phase state machine
-# =============================================================================
+# === 16. ASSESSMENT + CONTROLLER — pre-execution gate, and the phase state machine =====
 
 class PaperAssessment(_Base):
     """Whether the paper's own evidence already settles it, asked BEFORE anything runs.
@@ -1874,12 +1834,8 @@ def _self_check() -> None:
     # closed-vocabulary cross-references this module itself declares must stay consistent
     assert set(BLOCKED_DISPOSITIONS) <= set(TARGET_DISPOSITIONS)
     assert set(ACTIONS_REQUIRING_EXECUTION) <= set(PLAN_ACTIONS)
-    # ARTIFACT_INSPECTION_ONLY is the one action absent from this table in the reference
-    # implementation too (verified against `harness.artifacts.NECESSITY_FOR_ACTION`); its
-    # necessity falls back to NO_EXPERIMENT_NEEDED via `planner._necessity`'s `.get()`
-    # default, which is the right answer for an action that ran no experiment. Not fixed
-    # here — porting a behavior change during a structural-equivalence pass would be its
-    # own defect. Any OTHER gap is real and must fail this check.
+    # ARTIFACT_INSPECTION_ONLY is the one action absent from this table (falls back to
+    # NO_EXPERIMENT_NEEDED); any OTHER gap must fail this check.
     assert set(PLAN_ACTIONS) - set(NECESSITY_FOR_ACTION) == {"ARTIFACT_INSPECTION_ONLY"}
     assert set(REIMPL_BINDING_KINDS) <= set(REIMPL_INGREDIENT_KINDS)
 

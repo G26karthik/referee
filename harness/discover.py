@@ -1,10 +1,9 @@
 """What is worth checking in this paper, whether it is checkable, and the plan for each.
 
-Consolidates `discovery.py` + `questions.py` + `reimplement.py` + `stages/discover.py`
-(2,039 lines -> this file). Deterministic and model-free throughout: every judgement here
-is derived from the paper's own structure (`PaperDoc`) and from findings' own closed-
-vocabulary self-classification, never from a number, a metric name or a paper identity —
-the same signature discipline `decide.py`'s pure functions already hold to.
+Deterministic and model-free throughout: every judgement here is derived from the
+paper's own structure (`PaperDoc`) and from findings' own closed-vocabulary
+self-classification, never from a number, a metric name or a paper identity -- the same
+signature discipline `decide.py`'s pure functions already hold to.
 
 `python -m harness.discover` runs the self-check.
 """
@@ -19,12 +18,10 @@ from .schema import (
 )
 
 # ========================================================================================
-# PATH B ELIGIBILITY — was reimplement.py. Pure over the document alone: can this paper be
-# reconstructed well enough to test, when the authors published no code? Never infers a
-# missing ingredient from a present one and never fills a gap with a plausible default —
-# a paper that omits its optimizer does not get Adam. Keyword/structure detection over the
-# parsed text, not a parser and not a model; conservative in the direction of refusing a
-# reimplementation it might have been able to attempt.
+# PATH B ELIGIBILITY — can this paper be reconstructed well enough to test, when the
+# authors published no code? Never infers a missing ingredient from a present one and
+# never fills a gap with a plausible default -- a paper that omits its optimizer does
+# not get Adam. Keyword/structure detection, not a model; conservative toward refusal.
 # ========================================================================================
 INGREDIENTS: tuple[tuple[str, bool, tuple[str, ...]], ...] = (
     ("method", True, ("algorithm", "pseudocode", "we define", "is defined as", "objective",
@@ -33,18 +30,15 @@ INGREDIENTS: tuple[tuple[str, bool, tuple[str, ...]], ...] = (
                              "embedding", "network", "backbone", "kernel", "estimator")),
     ("preprocessing", False, ("preprocess", "normali", "augment", "tokeni", "resize",
                               "standardi", "cleaning", "filtering")),
-    # CONCRETE PROCEDURE ONLY. "We train the model" is the assertion a procedure exists,
-    # not the procedure — accepting it once sent an implementer to invent the very thing
-    # the paper's own protocol lens had found it omits (no optimizer, no LR, no epochs).
+    # CONCRETE PROCEDURE ONLY. "We train the model" asserts a procedure exists, not the
+    # procedure -- an implementer must not be sent to invent it (no optimizer, no LR).
     ("training", True, ("optimizer", "adam", "sgd", "rmsprop", "adagrad", "learning rate",
                         "epoch", "batch size", "weight decay", "momentum", "lr=",
                         "iterations", "training steps")),
     ("dataset", True, ("dataset", "corpus", "benchmark", "we evaluate on", "test set",
                        "training set", "samples", "records")),
     ("metric", True, ("accuracy", "precision", "recall", "f1", "f-score", "auc", "bleu",
-                      "perplexity", "error rate", "mse", "rmse", "map", "iou", "dice",
-                      "set size", "interval width", "cumulative regret", "success rate",
-                      "average reward", "episode return", "hit ratio")),
+                      "perplexity", "error rate", "mse", "rmse", "map", "iou", "dice")),
     ("hyperparameters", False, ("learning rate", "batch size", "weight decay", "dropout",
                                 "momentum", "temperature", "hidden size", "num_layers",
                                 "seed")),
@@ -62,8 +56,7 @@ def _needle(n: str) -> re.Pattern:
 
 
 def _find(needles: tuple[str, ...], doc: PaperDoc) -> tuple[str, str]:
-    """First (locator, quote) matching any needle — the surrounding sentence, so a human
-    can check it against the section it names."""
+    """First (locator, quote) matching any needle -- the surrounding sentence."""
     for s in doc.sections:
         title = (s.title or "").strip().lower()
         if title.startswith(_NOT_THE_PAPER) or (
@@ -99,12 +92,18 @@ def reimplementation_readiness(doc: PaperDoc) -> ReimplementationReadiness:
                         ref = f"s{s.section_idx}"
                         quote = " ".join(s.text.split())[:_MAX_QUOTE]
                         break
+        if name == "metric" and not ref:
+            # A printed results table names its own quantity (header or caption); a word
+            # list cannot enumerate every field's metrics, and the verifier checks the rest.
+            t = next((t for t in doc.tables if t.rows and (t.header or t.caption)), None)
+            if t is not None:
+                ref = f"T{t.table_idx}"
+                quote = (t.caption or " | ".join(t.header))[:_MAX_QUOTE]
         found.append(ReimplementationIngredient(
             kind=name, required=required, present=bool(ref), ref=ref, quote=quote))
 
-    # A comparison target is an ingredient too — without an addressed cell, any run
-    # produces a number in a vacuum. Tables, not prose: the same rule the provenance
-    # ceiling already keeps.
+    # A comparison target is an ingredient too -- without an addressed cell, any run
+    # produces a number in a vacuum. Tables, not prose.
     has_target = any(t.rows for t in doc.tables)
     found.append(ReimplementationIngredient(
         kind="comparison_target", required=True, present=has_target,
@@ -125,10 +124,9 @@ def reimplementation_readiness(doc: PaperDoc) -> ReimplementationReadiness:
 
 
 # ========================================================================================
-# QUESTIONS — was questions.py. A finding says what is wrong; a question says what would
-# settle it. Templated from a finding's own closed-vocabulary self-classification, never
-# from its prose — deterministic, paper-agnostic, and inexpressible as a paper-specific
-# rule for the same reason `decide.plan`/`decide.score` are.
+# QUESTIONS — a finding says what is wrong; a question says what would settle it.
+# Templated from a finding's own closed-vocabulary self-classification, never from its
+# prose -- deterministic and paper-agnostic, like `decide.plan`/`decide.score`.
 # ========================================================================================
 _BY_DISCREPANCY = {
     "ARITHMETIC_ERROR": (
@@ -200,9 +198,8 @@ _KIND_BY_LENS = {
     "confound": "ATTRIBUTION", "protocol": "PROTOCOL_CONFORMANCE",
     "overclaim": "PRINTED_QUANTITY", "contradiction": "PRINTED_QUANTITY",
 }
-# The kind for an object the EXTRACTOR found rather than a lens — so every executable
-# target carries a question_id; without it, printed table results and prose compositions
-# (the two object sources that actually reach execution) had no question to point to.
+# The kind for an object the EXTRACTOR found rather than a lens, so every executable
+# target carries a question_id.
 _KIND_BY_DISCOVERY_KIND = {
     "EXPERIMENTAL_RESULT": "PRINTED_QUANTITY", "DATASET_RESULT": "PRINTED_QUANTITY",
     "REPRODUCTION_TARGET": "COMPOSITION", "BASELINE_COMPARISON": "CONTROL_PRESENCE",
@@ -238,17 +235,47 @@ _MATERIALITY = {"CONFIRMED_FINDING": "CENTRAL", "PLAUSIBLE_CONCERN": "SUPPORTING
                 "OPEN_QUESTION": "PERIPHERAL", "DISMISSED": "PERIPHERAL", "": "UNASSESSED"}
 _MATERIALITY_RANK = {"UNASSESSED": 0, "PERIPHERAL": 1, "SUPPORTING": 2, "CENTRAL": 3}
 
+# MATHEMATICAL_BOUND detection: a theorem/lemma/proposition/corollary/bound/rate NAMED,
+# stated together with an inequality or asymptotic operator. Neither half alone is
+# enough -- "the bound is O(1/T)" alone is an ordinary complexity remark, and "Theorem
+# 3.1 states our main result" alone is just a citation to it.
+_BOUND_KEYWORD = re.compile(r"\b(theorem|lemma|proposition|corollary)\b|\bbound(?:ed|s)?\b"
+                            r"|\brate\b", re.I)
+_BOUND_OPERATOR = re.compile(
+    r"[≤≥⩽⩾≲]|(?<![A-Za-z0-9_])[<>](?!=)|\bO\("
+    r"|\bat most\b|\bbounded by\b|\bconverges at rate\b|\brate of\b", re.I)
+# A finding whose own `evidence_ref` names a table cell ("T2:r3:c4") is about a PRINTED
+# NUMBER, never a theorem statement — EXACT_CERTIFICATE is for prose/section claims only.
+_TABLE_CELL_REF = re.compile(r"^T\d+:")
+
+
+def is_mathematical_bound(*texts: str) -> bool:
+    """Does this text state a theorem/lemma/bound/rate together with an inequality or
+    asymptotic operator? The EXACT_CERTIFICATE trigger. Reads no metric name, no paper
+    identity and no number."""
+    blob = " ".join(t for t in texts if t)
+    return bool(_BOUND_KEYWORD.search(blob) and _BOUND_OPERATOR.search(blob))
+
 
 def kind_for_finding(f: Finding) -> str:
     """Most-specific-first, matching `_template`'s order: a discrepancy type beats a
-    baseline class beats a bare lens name."""
+    baseline class beats a bare lens name. A SPECIFICATION/PRINTED_QUANTITY finding that
+    states a theorem/bound with an inequality, and cites no printed table cell, becomes
+    MATHEMATICAL_BOUND instead -- EXACT_CERTIFICATE checks it in exact arithmetic."""
     d = (f.discrepancy_type or "").strip().upper()
     if d in _KIND_BY_DISCREPANCY:
-        return _KIND_BY_DISCREPANCY[d]
-    b = (f.baseline_class or "").strip().upper()
-    if b in _KIND_BY_BASELINE:
-        return _KIND_BY_BASELINE[b]
-    return _KIND_BY_LENS.get((f.lens or "").strip().lower(), "UNCLASSIFIED")
+        kind = _KIND_BY_DISCREPANCY[d]
+    else:
+        b = (f.baseline_class or "").strip().upper()
+        if b in _KIND_BY_BASELINE:
+            kind = _KIND_BY_BASELINE[b]
+        else:
+            kind = _KIND_BY_LENS.get((f.lens or "").strip().lower(), "UNCLASSIFIED")
+    if (kind in ("SPECIFICATION", "PRINTED_QUANTITY")
+            and not _TABLE_CELL_REF.match((f.evidence_ref or "").strip())
+            and is_mathematical_bound(f.as_claim(), f.statement, f.evidence_quote, f.target)):
+        return "MATHEMATICAL_BOUND"
+    return kind
 
 
 def kind_for_discovery_kind(discovery_kind: str = "") -> str:
@@ -267,8 +294,8 @@ def _template(f: Finding) -> tuple[str, str]:
 
 def question_for_object(obj: DiscoveredObject) -> ReviewQuestion:
     """A question for an object no finding raised, so every target has one. States, in the
-    harness's own words from the object's DISCOVERY_KIND, what checking it would settle —
-    never invents a concern."""
+    harness's own words from the object's DISCOVERY_KIND, what checking it would settle,
+    never inventing a concern."""
     kind = obj.question_kind or kind_for_discovery_kind(obj.kind)
     question, why = _TEMPLATE_BY_DISCOVERY_KIND.get(kind, _DEFAULT)
     return ReviewQuestion(
@@ -281,11 +308,11 @@ def question_for_object(obj: DiscoveredObject) -> ReviewQuestion:
 
 def questions_from_findings(findings: list[Finding], *,
                             minted: dict[str, str] | None = None) -> list[ReviewQuestion]:
-    """One question per questionable finding, MERGED by (question text, minted address) —
-    never by the lens's own `evidence_ref`, which is often a page number ('p7') rather
-    than an address: two findings about different sentences on one page must not merge,
-    and `materiality` takes the maximum its sources asserted, never more (`route` stays
-    NONE — choosing one needs the artifact and the host, neither a property of a finding)."""
+    """One question per questionable finding, MERGED by (question text, minted address),
+    never by the lens's own `evidence_ref` (often a page number, not an address). Two
+    findings about different sentences on one page must not merge; `materiality` takes
+    the maximum its sources asserted, never more. `route` stays NONE -- choosing one
+    needs the artifact and the host, neither a property of a finding."""
     out: list[ReviewQuestion] = []
     by_key: dict[tuple[str, str], ReviewQuestion] = {}
     addresses = dict(minted or {})
@@ -320,7 +347,7 @@ def questions_from_findings(findings: list[Finding], *,
 
 
 # ========================================================================================
-# DISCOVERY — was discovery.py. What is checkable in this paper, from structure alone.
+# DISCOVERY — what is checkable in this paper, from structure alone.
 # ========================================================================================
 _SENTENCE = re.compile(r"(?<=[.;])\s+(?=[A-Z(])")
 _KIND_ABBREV = {
@@ -331,33 +358,31 @@ _KIND_ABBREV = {
 }
 _QUESTION_CLASSES = ("OPEN_QUESTION", "DISMISSED")
 
-# WHICH ROUTES A QUESTION OF EACH KIND CAN REACH, cheapest first — replaces a single
-# has-a-printed-value gate that wrongly required a number for EVERY question kind (an
-# attribution question is not settled by re-deriving a number the paper already
-# published). INDEPENDENT_RECONSTRUCTION is the no-artifact FALLBACK for the three
-# execution-shaped kinds, offered ALONGSIDE AUTHOR_CODE_EXECUTION when the paper's own
-# specification is complete, so a target whose repository identity later fails to bind
-# still has somewhere to fall back to.
+# WHICH ROUTES A QUESTION OF EACH KIND CAN REACH, cheapest first (an attribution
+# question is not settled by re-deriving a number the paper already published).
+# INDEPENDENT_RECONSTRUCTION is the no-artifact FALLBACK for the three execution-shaped
+# kinds, offered ALONGSIDE AUTHOR_CODE_EXECUTION when the paper's own specification is
+# complete, so a target whose repository identity later fails to bind still has a fallback.
 ROUTES_FOR_QUESTION = {
     "PRINTED_QUANTITY": ("ARTIFACT_INSPECTION", "AUTHOR_CODE_EXECUTION", "INDEPENDENT_RECONSTRUCTION"),
     "COMPOSITION": ("ARTIFACT_INSPECTION", "AUTHOR_CODE_EXECUTION", "INDEPENDENT_RECONSTRUCTION"),
     "ATTRIBUTION": ("ARTIFACT_INSPECTION", "INDEPENDENT_RECONSTRUCTION"),
     "CONTROL_PRESENCE": ("ARTIFACT_INSPECTION", "INDEPENDENT_RECONSTRUCTION"),
     "PROTOCOL_CONFORMANCE": ("ARTIFACT_INSPECTION", "INDEPENDENT_RECONSTRUCTION"),
-    # DELIBERATELY NOT EXECUTABLE: re-producing a quantity cannot say it was the right
-    # quantity to produce. Reading the code can say what was computed; running it cannot
-    # say what it should have been.
+    # DELIBERATELY NOT EXECUTABLE: reproducing a quantity cannot say it was the right
+    # quantity to produce. Reading the code can say what was computed; running it cannot.
     "SPECIFICATION": ("ARTIFACT_INSPECTION",),
-    # NO ROUTE — the literature-search route this kind once reached was deleted (0
-    # structurally-bound relations across the whole corpus); honestly NO_ROUTE_AVAILABLE.
-    "PRIOR_ART": (),
+    "PRIOR_ART": (),      # no route — honestly NO_ROUTE_AVAILABLE
     "UNCLASSIFIED": ("ARTIFACT_INSPECTION", "AUTHOR_CODE_EXECUTION", "INDEPENDENT_RECONSTRUCTION"),
+    # A theorem/lemma/bound stated with an inequality — EXACT_CERTIFICATE alone. Reading a
+    # released checkout cannot evaluate a claimed inequality; the exact-arithmetic
+    # certificate is the one route that can.
+    "MATHEMATICAL_BOUND": ("EXACT_CERTIFICATE",),
 }
 _NEEDS_REPO = ("ARTIFACT_INSPECTION", "AUTHOR_CODE_EXECUTION")
 _RECONSTRUCTION_ROUTES = ("INDEPENDENT_RECONSTRUCTION",)
-# Only these three kinds are ABOUT a printed quantity at all — reading the checkout cannot
-# say what a number the paper never printed would have been, so with none parsed the
-# object reaches no route, exactly as the pre-existing single gate decided for every kind.
+# Only these three kinds are ABOUT a printed quantity at all: with none parsed the object
+# reaches no route.
 _QUESTION_NEEDS_PRINTED_VALUE = ("PRINTED_QUANTITY", "COMPOSITION", "UNCLASSIFIED")
 
 
@@ -376,8 +401,8 @@ def _target_id(kind: str, ref: str, n: int, taken: set[str] | None = None) -> st
 
 def _centrality(*, in_abstract: bool, anchored_by_confirmed: bool, anchored_by_any: bool,
                 self_checking: bool, is_reported_result: bool = False) -> str:
-    """From STRUCTURE alone, never a model — a model that could declare its own target
-    central could raise the priority of whatever it happened to find first."""
+    """From STRUCTURE alone, never a model, which could raise the priority of whatever
+    target it happened to find first."""
     if in_abstract or anchored_by_confirmed or self_checking:
         return "CENTRAL"
     if anchored_by_any or is_reported_result:
@@ -388,8 +413,8 @@ def _centrality(*, in_abstract: bool, anchored_by_confirmed: bool, anchored_by_a
 def _routes(kind: str, ref: ClaimRef | None, *, repo_available: bool, has_value: bool,
            arithmetic_broken: bool, lens: str, question_kind: str = "UNCLASSIFIED",
            specification_complete: bool = False) -> list[str]:
-    """Admissible routes, cheapest first — the escalation policy AS DATA, so `decide.plan`
-    stops at the first it can authorize rather than an instruction someone has to remember."""
+    """Admissible routes, cheapest first -- the escalation policy AS DATA, so `decide.plan`
+    stops at the first it can authorize."""
     routes: list[str] = []
     if arithmetic_broken:
         routes.append("ARITHMETIC_RECHECK")
@@ -433,9 +458,8 @@ def _object(kind: str, ref: ClaimRef | None, *, claim_text: str, n: int,
                      question_kind=question_kind, specification_complete=specification_complete)
     resolved = bool(ref and ref.resolved)
 
-    # THREE causes, not one: `harness_addressable` used to collapse into one boolean whose
-    # refusal sentence claimed "no re-derivable address" 39/39 times it was really "no
-    # route applies" — a limit of the method inventory reported as a limit of extraction.
+    # THREE causes, not one collapsed boolean: address unresolved, quantity unparsed, or
+    # no route applies -- distinct limits, reported distinctly.
     requirements: list[str] = []
     blocker = "NONE"
     if not resolved:
@@ -475,9 +499,8 @@ def _add(objects: list, taken: set, obj: DiscoveredObject) -> DiscoveredObject:
 
 
 def prose_compositions(doc: PaperDoc) -> list[ClaimRef]:
-    """Every prose span stating a composition the harness can re-evaluate — the FinChain
-    shape ('58 x 5 x 10 = 2,900'), admitted because the arithmetic is checkable without
-    running anything and the total is re-derivable by producing the things and counting."""
+    """Every prose span stating a composition the harness can re-evaluate, e.g.
+    '58 x 5 x 10 = 2,900': the arithmetic is checkable without running anything."""
     out: list[ClaimRef] = []
     seen: set[str] = set()
     for section in doc.sections:
@@ -522,7 +545,7 @@ def discovered_objects(doc: PaperDoc, findings: list[Finding],
             if f.verifiable_by_experiment:
                 proposed.add(r.ref)
 
-    # ① printed table results the extractor already addressed and parsed a number for
+    # (1) printed table results the extractor already addressed and parsed a number for
     for num in doc.reported_numbers:
         ref_s = (num.table_ref or "").strip()
         if not ref_s or ref_s in claimed_refs:
@@ -540,7 +563,7 @@ def discovered_objects(doc: PaperDoc, findings: list[Finding],
             proposed_by_lens=ref.ref in proposed, material_abstract_idx=material_abstract_idx,
             materiality_doc=doc, specification_complete=specification_complete))
 
-    # ② prose compositions — self-checking, and previously unreachable
+    # (2) prose compositions — self-checking
     for ref in prose_compositions(doc):
         if ref.ref in claimed_refs:
             continue
@@ -551,7 +574,7 @@ def discovered_objects(doc: PaperDoc, findings: list[Finding],
             material_abstract_idx=material_abstract_idx, materiality_doc=doc,
             specification_complete=specification_complete))
 
-    # ③ whatever the lenses argued about, at the address the harness can re-derive
+    # (3) whatever the lenses argued about, at the address the harness can re-derive
     for f in findings:
         ref = locate.address(doc, f.evidence_ref, f.evidence_quote)
         if ref.resolved and ref.ref in claimed_refs and (f.candidate_class or "") == "":
@@ -577,7 +600,7 @@ def discovered_objects(doc: PaperDoc, findings: list[Finding],
         if ref.resolved:
             claimed_refs.add(ref.ref)
 
-    # ④ the artifact itself is a claim the paper makes
+    # (4) the artifact itself is a claim the paper makes
     if repo_available:
         _add(objects, taken, _object(
             "IMPLEMENTATION_CLAIM", None, n=len(objects), repo_available=True, taken=taken,
@@ -603,8 +626,8 @@ def discovered_objects(doc: PaperDoc, findings: list[Finding],
 
 
 # ========================================================================================
-# PIPELINE ORCHESTRATION — was stages/discover.py. Builds the whole target set: questions,
-# objects, priority order, plans, and — for anything settled without execution — outcomes.
+# PIPELINE ORCHESTRATION — builds the whole target set: questions, objects, priority
+# order, plans, and outcomes for anything settled without execution.
 # ========================================================================================
 _DISPOSITION_FOR_ACTION = {
     "PAPER_ONLY_RESOLUTION": "CITATION_VERIFIED_ONLY",
@@ -624,12 +647,11 @@ _SETTLING_DISPOSITIONS = ("PAPER_ONLY_RESOLVED", "PAPER_ARITHMETIC_CONTRADICTION
 
 
 def paper_only_outcome(obj: DiscoveredObject, plan: PlanDecision) -> TargetOutcome:
-    """Pursue a target against the paper's own printed content — nothing runs. Two routes
-    reach here and establish DIFFERENT things: ARITHMETIC_RECHECK re-evaluates a printed
-    composition operand by operand (either disposition is a real resolution);
+    """Pursue a target against the paper's own printed content -- nothing runs. Two
+    routes reach here and establish DIFFERENT things: ARITHMETIC_RECHECK re-evaluates a
+    printed composition operand by operand (either disposition is a real resolution);
     PAPER_INTERNAL_CHECK re-verifies a concern's quotation, which settles nothing about
-    whether the concern is correct — sharing one disposition with the first used to print
-    findings' own disputed sentences under '## What held up'."""
+    whether the concern is correct."""
     q = obj.ref.quantity if (obj.ref and obj.ref.quantity) else None
     if plan.route == "ARITHMETIC_RECHECK" and q and q.expression:
         agrees = q.arithmetic_ok
@@ -651,10 +673,9 @@ def paper_only_outcome(obj: DiscoveredObject, plan: PlanDecision) -> TargetOutco
 
 def _one_per_experiment(objects: list[DiscoveredObject],
                         plans: list[PlanDecision]) -> list[PlanDecision]:
-    """Targets answered by the SAME run are one experiment, not many — grouped by (route,
-    experiment, metric), which is what a run is actually determined by. A target with no
-    declared experiment AND metric groups with nothing (grouping on blanks once collapsed
-    two unrelated claims into one)."""
+    """Targets answered by the SAME run are one experiment, not many -- grouped by
+    (route, experiment, metric), what a run is actually determined by. A target with no
+    declared experiment AND metric groups with nothing."""
     seen: dict[tuple[str, str, str], str] = {}
     out: list[PlanDecision] = []
     for obj, plan in zip(objects, plans):
@@ -682,8 +703,8 @@ def _one_per_experiment(objects: list[DiscoveredObject],
 
 def _demote_when_a_central_target_is_being_pursued(
         objects: list[DiscoveredObject], plans: list[PlanDecision]) -> list[PlanDecision]:
-    """A SUPPORTING target does not earn an execution while a CENTRAL one is available — a
-    SET-level fact `decide.plan` cannot see since it decides one target at a time."""
+    """A SUPPORTING target does not earn an execution while a CENTRAL one is available --
+    a SET-level fact `decide.plan` cannot see since it decides one target at a time."""
     if not any(p.requires_execution and o.centrality == "CENTRAL" for o, p in zip(objects, plans)):
         return plans
     out: list[PlanDecision] = []
@@ -704,8 +725,8 @@ def _undefer_when_the_central_target_did_not_settle(
         objects: list[DiscoveredObject], plans: list[PlanDecision],
         prior_outcomes: dict[str, TargetOutcome] | None) -> list[PlanDecision]:
     """Give a deferred SUPPORTING target its own turn once every CENTRAL sibling's prior
-    attempt is known and none settled — otherwise a resource-ordering heuristic becomes a
-    standing refusal with no scientific content."""
+    attempt is known and none settled -- otherwise a resource-ordering heuristic becomes
+    a standing refusal with no scientific content."""
     if not prior_outcomes:
         return plans
     by_question: dict[str, list[DiscoveredObject]] = {}
@@ -741,10 +762,9 @@ def _undefer_when_the_central_target_did_not_settle(
 
 def _question_for_every_executable_target(
         objects: list[DiscoveredObject], plans: list[PlanDecision], qs: list) -> list:
-    """Mint a ReviewQuestion for every target that will EXECUTE and has none — the two
-    object sources that actually reach execution (a printed table result, a prose
-    composition) come from the extractor, not a lens, so a launch could not name what it
-    was answering. Minted only for targets this run is about to spend on, not all of them."""
+    """Mint a ReviewQuestion for every target that will EXECUTE and has none: printed
+    table results and prose compositions come from the extractor, not a lens, so a
+    launch could not otherwise name what it was answering."""
     out = list(qs)
     for obj, plan in zip(objects, plans):
         if not plan.requires_execution or obj.question_id:
@@ -790,6 +810,13 @@ _CONCLUSION = {
                          "not investigated.",
     "INCONCLUSIVE_EXECUTION": "something ran and settled nothing admissible; the question "
                               "stands open for a human reviewer.",
+    "CERTIFICATE_VIOLATION": "an independently verified exact-arithmetic certificate "
+                             "constructed an instance that satisfies every hypothesis the "
+                             "paper's theorem states and violates the bound it claims.",
+    "CERTIFICATE_NO_VIOLATION": "an independently verified exact-arithmetic certificate "
+                                "found no violation among the tested instances. This "
+                                "checks those instances only and is never a proof that the "
+                                "bound holds in general.",
     "NOT_INVESTIGATED": "",
 }
 
@@ -803,11 +830,11 @@ def _conclusion(out: TargetOutcome) -> str:
 
 
 def sync_questions(ts: TargetSet) -> TargetSet:
-    """Re-derive every ReviewQuestion's harness-written half from the target set — a FOLD,
-    not an accumulation, so a question can never keep a resolution the evidence behind it
-    has since lost. A merged question reports its HIGHEST-PRIORITY target's state (the
-    conservative choice: a question stays open if its central target is blocked even when
-    a supporting one settled) — `evidence_refs` still lists every contributing target."""
+    """Re-derive every ReviewQuestion's harness-written half from the target set -- a
+    FOLD, not an accumulation, so a question never keeps a resolution the evidence behind
+    it has since lost. A merged question reports its HIGHEST-PRIORITY target's state
+    (conservative: stays open if its central target is blocked even when a supporting one
+    settled); `evidence_refs` still lists every contributing target."""
     by_question: dict[str, DiscoveredObject] = {}
     all_targets: dict[str, list[str]] = {}
     for obj in ts.objects:
@@ -852,8 +879,7 @@ def sync_questions(ts: TargetSet) -> TargetSet:
 
 
 def targets_path_in(root):
-    """Where the target set lives inside a project directory. The ONE spelling —
-    `routes.py` and `discover.py` used to spell this three-component path independently."""
+    """Where the target set lives inside a project directory."""
     return root / "discovery" / "targets.json"
 
 
@@ -920,16 +946,13 @@ def run(cfg, pid: str, *, investigation_open: bool = True) -> dict:
 def build(pid: str, doc: PaperDoc, findings: list[Finding], *,
          investigation_open: bool = True,
          prior_outcomes: dict[str, TargetOutcome] | None = None) -> TargetSet:
-    """The whole target set for one paper. Pure with respect to what is on disk — takes
-    `findings` directly rather than loading them, so this module has no dependency on
-    audit.py's file layout. `investigation_open=False` means a material failure is already
-    established from the paper's own evidence, so `decide.plan` refuses every executable
-    route with SUPERSEDED_BY_ESTABLISHED_FAILURE — but questions, addresses, routes,
-    centrality and coverage still compute in full: a paper that stops early is not
-    reviewed less carefully, it is one where the remaining work could not change the answer.
-    `prior_outcomes` is this paper's own previous discover pass, the one piece of history
-    this otherwise-pure rebuild may consult, so `_undefer_...` can tell "nobody tried the
-    central target yet" apart from "it was tried and settled nothing"."""
+    """The whole target set for one paper. Pure with respect to what is on disk -- takes
+    `findings` directly rather than loading them. `investigation_open=False` means a
+    material failure is already established, so `decide.plan` refuses every executable
+    route with SUPERSEDED_BY_ESTABLISHED_FAILURE, but questions, addresses, routes,
+    centrality and coverage still compute in full. `prior_outcomes` is this paper's own
+    previous discover pass, so `_undefer_...` can tell "nobody tried the central target
+    yet" apart from "it was tried and settled nothing"."""
     minted: dict[str, str] = {}
     for f in findings:
         if not f.finding_id:
@@ -1027,6 +1050,24 @@ def _self_check() -> None:
     no_cell = reimplementation_readiness(
         PaperDoc(paper_id="p", sections=[Section(section_idx=0, title="M", text=full)]))
     assert not no_cell.established and "comparison_target" in no_cell.missing
+
+    # --- MATHEMATICAL_BOUND / EXACT_CERTIFICATE detection ---------------------------------
+    assert is_mathematical_bound("Theorem 3.1. The regret is bounded by O(1/sqrt(T)).")
+    assert is_mathematical_bound("Lemma 2 states the error is at most epsilon.")
+    assert not is_mathematical_bound("Theorem 3.1 states our main result.")  # no operator
+    assert not is_mathematical_bound("The value in the table is 59.3.")      # no theorem word
+    bound_finding = Finding(
+        finding_id="p-01", lens="contradiction", discrepancy_type="UNCLEAR_REPORTING",
+        target="Theorem 3.1. The convergence rate is bounded by O(1/T).",
+        evidence_ref="p9", evidence_quote="Theorem 3.1")
+    assert kind_for_finding(bound_finding) == "MATHEMATICAL_BOUND"
+    # a table-cell citation is a PRINTED NUMBER, never routed as a theorem statement
+    cell_finding = bound_finding.model_copy(update={"evidence_ref": "T2:r1:c3"})
+    assert kind_for_finding(cell_finding) != "MATHEMATICAL_BOUND"
+    routes = _routes("SCIENTIFIC_CLAIM", None, repo_available=True, has_value=False,
+                     arithmetic_broken=False, lens="contradiction",
+                     question_kind="MATHEMATICAL_BOUND")
+    assert routes == ["PAPER_INTERNAL_CHECK", "EXACT_CERTIFICATE"], routes
 
     # --- questions -----------------------------------------------------------------------
     fs = [Finding(finding_id="c-01", lens="confound", candidate_class="CONFIRMED_FINDING",

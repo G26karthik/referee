@@ -2,16 +2,7 @@
 
 `python -m harness.artifact_evidence [<checkout>]` runs the self-check.
 
-**The question this route answers is "what can the released artifact itself establish?",
-and the reason it needed building is that the harness already read the code and threw the
-scientific result away.** `harness/code_audit.py` has run on every cloned paper since the
-first version: it parses the checkout, applies its rule(s), and writes `CodeAudit.findings`
-into the machine report under `## Static code audit`. Nothing consumes them. They reach no
-question, no target, no route and no evidence state — `ARTIFACT_EVIDENCE` and its
-resolution `RESOLVED_FROM_ARTIFACT` were in the vocabulary with no disposition mapping to
-them, which is to say the state machine could not reach them from any input.
-
-**THREE LEVELS, AND THE DISTANCE BETWEEN THEM IS THE WHOLE MODULE.**
+THREE LEVELS, AND THE DISTANCE BETWEEN THEM IS THE WHOLE MODULE.
 
     level 1  ARTIFACT_FACT            the checkout contains this, at this span, at this SHA
     level 2  PAPER_ARTIFACT_MISMATCH  the paper states X for experiment E; the pinned
@@ -20,29 +11,23 @@ them, which is to say the state machine could not reach them from any input.
 
 Level 1 is a fact about the ARTIFACT and says nothing about the paper. Level 2 is a
 statement about both, and needs all three of a precisely addressed paper statement, a
-precisely located artifact fact, and an established experiment identity connecting them —
-"some config somewhere says 32" is not a level-2 anything, and the missing third
-requirement is the one that makes it not. **Level 3 has no spelling on any type here.**
-Static inspection alone essentially never establishes that a reported result is false. A
-code or configuration inconsistency may create a verified concern, establish a
-reproducibility defect, trigger execution, trigger focused validation, and become material
-where a central claim provably depends on it — every one of those is a downstream decision
-by a downstream module, and none is reachable by writing a stronger string in here. An AST
-warning may not become RED.
+precisely located artifact fact, and an established experiment identity connecting them --
+"some config somewhere says 32" is not a level-2 anything. Level 3 has no spelling on any
+type here: static inspection alone essentially never establishes that a reported result is
+false, and whether a code/configuration inconsistency becomes material is a downstream
+decision by a downstream module, never reachable by writing a stronger string in here.
 
-**A MODEL STATEMENT ABOUT CODE IS NOT ARTIFACT EVIDENCE.** `relocate` is the
-`claims.mint` of this module: the writer — a rule, or the authors'-code auditor in
-`harness/codereview_driver.py` — supplies a quotation and a file, and the HARNESS finds
-it, refusing a quotation that is absent or that occurs more than once. What survives
-carries the file's own SHA-256 alongside the pinned commit, so a reader can prove the line
-has not moved under the citation.
+A MODEL STATEMENT ABOUT CODE IS NOT ARTIFACT EVIDENCE. `relocate` is the `claims.mint` of
+this module: the writer supplies a quotation and a file, and the HARNESS finds it,
+refusing a quotation that is absent or occurs more than once. What survives carries the
+file's own SHA-256 alongside the pinned commit, so a reader can prove the line has not
+moved under the citation.
 
-**Every fact is tied to an IMMUTABLE SNAPSHOT, and the snapshot fails closed.**
+Every fact is tied to an IMMUTABLE SNAPSHOT, and the snapshot fails closed.
 `ArtifactSnapshot.audited` requires a commit, a tree hash and a clean working tree, and
-`ArtifactSnapshot` defaults to `dirty=True` — an unknown tree is not an audited tree. If a
+`ArtifactSnapshot` defaults to `dirty=True` -- an unknown tree is not an audited tree. If a
 later execution mutates the checkout, the post-run identity check retracts the EXECUTION's
-evidence, as it already did; the pre-run static facts stay tied to the pre-run snapshot and
-are not rewritten. The two are different evidence about different moments.
+evidence; the pre-run static facts stay tied to the pre-run snapshot and are not rewritten.
 """
 from __future__ import annotations
 
@@ -62,27 +47,16 @@ from .schema import (ARTIFACT_QUESTION_SCOPES, SETTLEABLE_BY_ARTIFACT_FACT,
 # --------------------------------------------------------------------------- #
 # §8 — the surviving AST rule, classified by the authority it can carry
 # --------------------------------------------------------------------------- #
-# `code_audit.py` used to carry ten pattern-matching rules across three cheat classes.
-# Nine are deleted outright (not merely reclassified): measured over the four repository
-# papers this corpus ever ran, the ten rules produced six hits and five were false, every
-# one because the rules matched SUBSTRINGS of identifiers rather than a semantic category,
-# and seven of the ten never fired on any real repository at all. `artifact_review_driver`
-# already does the judgment those nine were a noisy substitute for — a full LLM read of the
-# checkout against the paper's method section, with every citation it makes relocated and
-# hashed below before it counts for anything.
-#
-# What is left is classified the same way the ten were, so a rule added later is not
-# automatically trusted:
+# `code_audit.py`'s rules are classified so a rule added later is not automatically
+# trusted:
 #
 #   A  deterministic artifact fact     what it reports is true of the checkout by
 #                                      construction, whatever it means — rendered to a
 #                                      referee as a bounded ARTIFACT observation
 #   D  unsafe for reviewer output      unclassified, or measured false — machine trace only
 RULE_AUTHORITY = {
-    # The call site passes no `random_state`, `seed`, `generator` or `stratify`. That is
-    # a fact about the call, decidable from the AST, and true whatever a global seed does
-    # elsewhere. Fired once on `apt-icml` (`utils/utils.py:600`,
-    # `torch.utils.data.random_split(total_dataset, [n, m])`) and the fact is correct.
+    # The call site passes no `random_state`, `seed`, `generator` or `stratify`: a fact
+    # about the call, decidable from the AST, true whatever a global seed does elsewhere.
     "leak-unseeded-split": "A",
 }
 
@@ -90,11 +64,8 @@ REVIEWER_VISIBLE = ("A",)
 
 
 def rule_authority(rule_id: str) -> str:
-    """The class of a rule, defaulting to D. An unclassified rule is not shown.
-
-    Fail-closed on purpose: a rule added later and not audited here is not automatically
-    reviewer-visible, because the audit — not the rule's existence — is what licenses it.
-    """
+    """The class of a rule, defaulting to D (unclassified, not shown). Fail-closed: a
+    rule added later and not audited here is not automatically reviewer-visible."""
     return RULE_AUTHORITY.get((rule_id or "").strip(), "D")
 
 
@@ -110,12 +81,11 @@ def snapshot(repo_path: str | Path, url: str = "",
              tree: repo_mod.GitTree | None = None) -> ArtifactSnapshot:
     """The pinned identity of a checkout, BEFORE anything runs. Fail-closed throughout.
 
-    Three reads, and any of them failing leaves the snapshot un-audited rather than
-    optimistic: HEAD's SHA, HEAD's TREE sha (which is what actually names the content —
-    two commits with different messages and identical content share it), and whether the
-    working tree differs from HEAD. `repo.dirty_files` RAISES when `git status` could not
-    run, and that raise is caught here and recorded as dirty, because "we could not look"
-    and "we looked and it was clean" must never produce the same artifact.
+    Three reads, and any of them failing leaves the snapshot un-audited: HEAD's SHA,
+    HEAD's TREE sha (two commits with different messages and identical content share
+    it), and whether the working tree differs from HEAD. `repo.dirty_files` RAISES when
+    `git status` could not run, and that raise is caught here and recorded as dirty,
+    because "we could not look" and "we looked and it was clean" must never coincide.
     """
     path = Path(repo_path)
     git = tree if tree is not None else repo_mod.LocalGitTree(path)
@@ -140,10 +110,8 @@ def snapshot(repo_path: str | Path, url: str = "",
 
 def same_snapshot(a: ArtifactSnapshot | None, b: ArtifactSnapshot | None) -> bool:
     """Do two snapshots name the same audited content? Both must be audited to be equal.
-
     Compares the TREE, not only the commit: an amended commit with identical content is
-    the same code, and two commits with the same message and different content are not.
-    """
+    the same code."""
     if a is None or b is None or not (a.audited and b.audited):
         return False
     return a.commit == b.commit and a.tree_sha == b.tree_sha
@@ -175,14 +143,11 @@ def relocate(root: str | Path, rel_file: str, quote: str,
              node_type: str = "") -> SourceSpan | None:
     """Find `quote` in `<root>/<rel_file>` and mint the span for it. None if it will not.
 
-    The harness's half of a code citation, and the same three refusals `claims.mint`
-    makes: a file that is not in the checkout, a quotation that is not in the file, and a
-    quotation that occurs more than once and therefore addresses nothing in particular.
-
-    The search is made twice — once exactly, once with runs of whitespace collapsed — and
-    the SECOND is what makes this usable against a reader that retyped an indented line.
-    The exact search runs FIRST, so a character-for-character citation is never resolved
-    through a normalisation, exactly as `claims.mint` orders its own two searches.
+    The harness's half of a code citation, with the same three refusals `claims.mint`
+    makes: a file not in the checkout, a quotation not in the file, and a quotation that
+    occurs more than once. The search runs twice -- exactly, then with whitespace
+    collapsed -- exact FIRST, so a character-for-character citation is never resolved
+    through a normalisation.
     """
     root = Path(root)
     text = _read(root, rel_file)
@@ -228,12 +193,9 @@ def relocate(root: str | Path, rel_file: str, quote: str,
 
 
 def span_still_holds(root: str | Path, span: SourceSpan | None) -> bool:
-    """Does this span still name what it named? Re-read, never assumed.
-
-    Used to decide whether artifact evidence survives a later mutation of the checkout.
-    The file's hash is what is compared, not the line number: a line that moved is a line
-    whose citation is stale even when the same text still exists elsewhere.
-    """
+    """Does this span still name what it named? Re-read, never assumed. The file's hash
+    is what is compared, not the line number: a line that moved is stale even when the
+    same text still exists elsewhere."""
     if span is None or not span.file_sha256:
         return False
     text = _read(Path(root), span.file)
@@ -247,14 +209,11 @@ def span_still_holds(root: str | Path, span: SourceSpan | None) -> bool:
 # --------------------------------------------------------------------------- #
 def file_fact(root: str | Path, snap: ArtifactSnapshot, rel_file: str,
               *, named_by_paper: str = "") -> ArtifactFact:
-    """Is this file in the pinned checkout? An ARTIFACT_FACT either way — with one caveat.
-
-    **An arbitrary absent file is not a paper defect and is not even reportable.** A file
-    nobody claimed should exist being absent is a fact about a wish, so `named_by_paper`
-    is required for an ABSENCE to carry any authority at all: the paper has to have named
-    the thing. Present-or-absent, what this establishes is a property of the ARTIFACT, and
-    turning it into a statement about the paper needs `bind_mismatch` and its three
-    requirements.
+    """Is this file in the pinned checkout? An ARTIFACT_FACT either way, with one caveat:
+    an arbitrary absent file is not a paper defect and is not even reportable, so
+    `named_by_paper` is required for an ABSENCE to carry any authority -- the paper has
+    to have named the thing. Turning presence/absence into a statement about the paper
+    still needs `bind_mismatch` and its three requirements.
     """
     present = _read(Path(root), rel_file) is not None
     if present:
@@ -297,17 +256,11 @@ _KEY_LINE = re.compile(r"^\s*['\"]?(?P<key>[A-Za-z_][\w.\-]*)['\"]?\s*[:=]\s*"
 
 
 def config_values(root: str | Path, rel_file: str, key: str) -> list[tuple[str, int]]:
-    """Every (value, line) this file assigns to `key`. Text-level, and deliberately so.
-
-    One reader for YAML, JSON, TOML, an argparse default and a plain Python assignment,
-    because what a level-2 mismatch needs is the LITERAL the file prints and the line it
-    prints it on, and five parsers would be five places for "what does this file say" to
-    disagree. Every hit is relocated and quoted, so a reader checks the line rather than
-    trusting the parse.
-
-    Returning a LIST and not a value is the point: a key set in three places has three
-    answers, and `bind_mismatch` refuses `experiment_identity_unbound` rather than picking
-    one. "Some config somewhere says 32" is exactly what this must not collapse into.
+    """Every (value, line) this file assigns to `key`. Text-level, and deliberately so:
+    one reader for YAML/JSON/TOML/argparse/plain-Python, since five parsers would be five
+    places for "what does this file say" to disagree. Returning a LIST and not a value is
+    the point: a key set in three places has three answers, and `bind_mismatch` refuses
+    rather than picking one -- "some config somewhere says 32" must not collapse into it.
     """
     text = _read(Path(root), rel_file)
     if text is None:
@@ -322,13 +275,10 @@ def config_values(root: str | Path, rel_file: str, key: str) -> list[tuple[str, 
 
 
 def argparse_default(root: str | Path, rel_file: str, flag: str) -> list[tuple[str, int]]:
-    """Every `add_argument('--flag', ..., default=X)` in this file, as (X, line).
-
-    An AST read rather than a regex, because a default is a keyword argument and finding
-    it by text would find it inside strings and comments too. The value is `ast.unparse`d
-    so a non-literal default (`default=cfg.batch_size`) comes back as its expression and
-    is visibly not a literal, rather than being silently dropped.
-    """
+    """Every `add_argument('--flag', ..., default=X)` in this file, as (X, line). An AST
+    read rather than a regex, since text search would match inside strings and comments
+    too. `ast.unparse`d so a non-literal default comes back as its expression rather than
+    being silently dropped."""
     text = _read(Path(root), rel_file)
     if text is None:
         return []
@@ -398,31 +348,26 @@ def dependency_fact(root: str | Path, snap: ArtifactSnapshot, name: str) -> Arti
 def classify_identity(root: str | Path, *, experiment_id: str, basis: str,
                       evidence_file: str = "", evidence_quote: str = ""
                       ) -> tuple[str, str, SourceSpan | None]:
-    """(identity_state, basis, the relocated span that establishes it). Never believed.
+    """(identity_state, basis, the relocated span that establishes it). Never believed: a
+    model saying "this looks like the right config" is not an established identity. An
+    identity is ESTABLISHED only when the auditor names a DETERMINISTIC source for the
+    link (the paper printing the command, the README mapping experiment to file, a
+    committed script, an authors' table) AND that source RELOCATES in the pinned tree.
 
-    **A model saying "this looks like the right config" is not an established identity**,
-    and this is the function that says so. An identity is ESTABLISHED only when the auditor
-    names a DETERMINISTIC source for the link — the paper printing the command, the
-    checkout's README mapping the experiment to the file, a committed script that passes
-    the config, an authors' experiment table — AND that source RELOCATES in the pinned tree
-    by the same rule every other code citation goes through.
-
-    The four states are not a confidence scale. PARTIAL means a real source was named and
-    did not relocate, which is a different fact from AMBIGUOUS, where the only thing
-    offered was the auditor's reading, which is in turn different from UNBOUND, where
-    nothing was offered at all. Only ESTABLISHED may support level-2 authority.
+    The four states are not a confidence scale. PARTIAL means a real source was named
+    and did not relocate; AMBIGUOUS means only the auditor's own reading was offered;
+    UNBOUND means nothing was offered at all. Only ESTABLISHED supports level-2 authority.
     """
     basis = (basis or "").strip()
     if not (experiment_id or "").strip():
         return "UNBOUND", "", None
     if basis not in _DETERMINISTIC_BASES:
-        # Includes `auditor_assertion`, deliberately: it is recorded so a human can see
-        # what was claimed, and it classifies as the guess it is.
+        # Includes `auditor_assertion` deliberately: recorded so a human sees the claim,
+        # classified as the guess it is.
         return "AMBIGUOUS", (basis or "auditor_assertion"), None
     if basis == "paper_names_the_command":
-        # The deterministic source is in the PAPER, and the caller has already had it
-        # minted — `bind_mismatch` re-mints the statement itself, so there is nothing
-        # further to relocate in the tree.
+        # The deterministic source is in the PAPER; `bind_mismatch` re-mints the
+        # statement itself, so there is nothing further to relocate in the tree.
         return "ESTABLISHED", basis, None
     span = relocate(root, evidence_file, evidence_quote) if evidence_file else None
     if span is None:
@@ -448,28 +393,23 @@ def bind_mismatch(doc: PaperDoc, snap: ArtifactSnapshot, *, paper_quote: str,
     THREE REQUIREMENTS, each its own named refusal, because they fail for opposite
     reasons and a reader needs to know which:
 
-      * `paper_statement_unaddressed` — the quotation does not mint to an address. Without
-        one there is no statement to disagree with, only a paraphrase.
+      * `paper_statement_unaddressed` — the quotation does not mint to an address.
       * `artifact_fact_unlocated` — the span did not relocate in the pinned tree, or the
-        tree is not audited. A citation into an unknown tree is a citation into nothing.
+        tree is not audited.
       * `experiment_identity_unbound` — both halves are located and nothing establishes
-        that they are about the same experiment. **This is the requirement that separates
-        a mismatch from a coincidence**: a repository sets a batch size in a dozen places,
-        and "some config somewhere says 32" contradicts nothing. The caller supplies the
-        identity; passing an empty one refuses rather than defaulting to "probably".
+        they are about the same experiment. This is the requirement that separates a
+        mismatch from a coincidence: a repository sets a batch size in a dozen places,
+        and "some config somewhere says 32" contradicts nothing.
 
-    And a fourth outcome that is not a refusal: `no_disagreement`, when all three bind and
-    the two values are the same. That is a real result — the artifact CONFIRMS the paper
-    on this point — and collapsing it into "nothing found" would lose it.
+    And a fourth outcome that is not a refusal: `no_disagreement`, when all three bind
+    and the two values are the same -- the artifact CONFIRMS the paper on this point.
     """
     def refuse(reason: str, statement: str, *, authority: str = "NONE",
                identity: str = "UNBOUND", basis: str = "", paper_ref: str = "",
                ident_span: SourceSpan | None = None) -> ArtifactFact:
-        # `paper_ref` IS CARRIED ON A REFUSAL, when the quotation minted. A concern whose
-        # paper half was relocated and whose relationship was not is a different record
-        # from one whose paper half was never found, and the first version reported both
-        # with an empty address — so "paper citations relocated" read 0 across a corpus
-        # where every one of them had relocated.
+        # `paper_ref` IS CARRIED ON A REFUSAL, when the quotation minted: a concern whose
+        # paper half relocated is a different record from one whose paper half was never
+        # found.
         return ArtifactFact(probe=probe, snapshot=snap, span=span, authority=authority,
                             refusal=reason, statement=statement, paper_quote=paper_quote,
                             paper_ref=paper_ref,
@@ -493,10 +433,9 @@ def bind_mismatch(doc: PaperDoc, snap: ArtifactSnapshot, *, paper_quote: str,
         root or "", experiment_id=experiment_id, basis=identity_basis,
         evidence_file=identity_file, evidence_quote=identity_quote)
 
-    # BOTH ENDPOINTS ARE REAL AT THIS POINT, and that is exactly what is worth saying. The
-    # paper statement minted, the code span relocated in an audited tree — so the pairing
-    # is not a guess about where things are. What remains a reading is the RELATIONSHIP,
-    # and an identity that is not ESTABLISHED is precisely a relationship nobody checked.
+    # BOTH ENDPOINTS ARE REAL AT THIS POINT: the paper statement minted, the code span
+    # relocated in an audited tree. What remains a reading is the RELATIONSHIP, and an
+    # identity that is not ESTABLISHED is precisely a relationship nobody checked.
     endpoints = (
         f"The paper states {paper_value!r} at {minted.ref} and `{span.file}:{span.line}` "
         f"in the checkout at {snap.commit[:10]} sets {artifact_value!r}. BOTH LOCATIONS "
@@ -534,16 +473,10 @@ def bind_mismatch(doc: PaperDoc, snap: ArtifactSnapshot, *, paper_quote: str,
             identity=identity, basis=basis, ident_span=ident_span)
 
     if not _derivable_from(span.quote, artifact_value):
-        # THE SAME RULE, ON THE SIDE THAT DID NOT HAVE IT. `paper_value` has been
-        # re-derived from the re-minted paper quotation since the `apt-icml` table case,
-        # and `artifact_value` was taken from the auditor's own JSON: relocating
-        # `code_quote` proves the LINE exists at that commit and proves nothing about the
-        # NUMBER the auditor says it sets. A fabricated or mis-read value beside a
-        # genuinely relocated line therefore reached `PAPER_ARTIFACT_MISMATCH` — the one
-        # artifact authority `EVIDENCE_ABOUT_THE_PAPER` admits — under a statement reading
-        # "BOTH LOCATIONS ARE VERIFIED", which was true of the locations and not of the
-        # values. Verifying one endpoint and believing the other is the shape invariant 2
-        # forbids, and a mismatch is exactly where it costs most.
+        # THE SAME RULE, ON THE SIDE THAT DID NOT HAVE IT: relocating `code_quote` proves
+        # the LINE exists at that commit and proves nothing about the NUMBER the auditor
+        # says it sets. Verifying one endpoint and believing the other is the shape
+        # invariant 2 forbids, and a mismatch is exactly where it costs most.
         return refuse("artifact_value_not_derivable", paper_ref=minted.ref, statement=endpoints + (
             f"the identity is established, and {artifact_value!r} is not re-derivable from "
             f"the relocated span {span.quote!r}: the span either does not set that value "
@@ -579,23 +512,16 @@ def bind_mismatch(doc: PaperDoc, snap: ArtifactSnapshot, *, paper_quote: str,
 
 
 def _derivable_from(span_text: str, value: str) -> bool:
-    """Can the harness itself read `value` out of the quoted span, unambiguously?
+    """Can the harness itself read `value` out of the quoted span, unambiguously? Applied
+    to BOTH sides of a mismatch, because relocating a line proves the line exists and
+    proves nothing about the number somebody says it carries.
 
-    Applied to BOTH sides of a mismatch — the re-minted paper quotation and the relocated
-    source span — because relocating a line proves the line exists and proves nothing
-    about the number somebody says it carries.
-
-    THE RULE THE CORPUS'S FIRST LEVEL-2 MISMATCH NEEDED. The auditor quoted the whole of
-    `apt-icml`'s Table 6 — "Learning rate 2e-4 2e-4 2e-4 1e-4 1e-4 Batch size 32 32 32 16
-    32 Epochs 40 40 40 16 15 Distill epochs 20 20 20 6 -" — and reported the paper value as
-    "Epochs 16 (CNN/DM column)". Every piece of that is true and the span really does say
-    16. It also says 40, 32, 15 and 6, and **which column is CNN/DM's is a reading of a
-    table layout that extraction flattened away**. Accepting it would make a level-2
-    mismatch rest on a number a model picked out of a row of numbers.
-
-    Two ways to satisfy it, and both are the harness's own reading of the span: the span
-    reports exactly one quantity and it is this one, or the number occurs in the span
-    exactly once. Quote the cell and it binds; quote the table and it does not.
+    A span quoting a whole table row ("Epochs 40 40 40 16 15") reporting a value of "16"
+    is not derivable: which column the value belongs to is a reading of a table layout
+    that extraction flattened away, and a level-2 mismatch must not rest on a number a
+    model picked out of a row of numbers. Two ways to satisfy it, both the harness's own
+    reading: the span reports exactly one quantity and it is this one, or the number
+    occurs in the span exactly once. Quote the cell, not the table.
     """
     number = _quantity(value)
     if number is None:
@@ -612,18 +538,11 @@ class _NoRaw:
 
 
 def _quantity(value: str) -> float | None:
-    """The single unambiguous number a stated value reports, or None. The harness's parser.
-
-    `claims.parse_quantity` and not `float()`, for two reasons the live auditor run made
-    concrete on `apt-icml`. It is more PERMISSIVE where it should be: the auditor wrote
-    `'Epochs 16 (CNN/DM column)'` for the paper side, which is one number wearing a label,
-    and `float()` refused it — so a mismatch with an ESTABLISHED identity was thrown away
-    as a category error. And it is more STRICT where it should be: the same auditor wrote
-    `'num_train_epochs=120, distill_epoch=96'` for an artifact side, which states TWO
-    quantities, and `parse_quantity` refuses it rather than picking one. That refusal is
-    the same rule `local_exec.parse_metric` applies to an execution's output and
-    `claims.parse_quantity` applies to a paper's prose: a span reporting two numbers
-    reports no single quantity.
+    """The single unambiguous number a stated value reports, or None. Uses
+    `claims.parse_quantity`, not `float()`: more PERMISSIVE where a value is one number
+    wearing a label ("Epochs 16 (CNN/DM column)"), and more STRICT where a value states
+    TWO quantities ("num_train_epochs=120, distill_epoch=96") -- refused rather than
+    picking one, the same rule `local_exec.parse_metric` applies to execution output.
     """
     parsed = claims.parse_quantity(value or "")
     return None if parsed is None else parsed.value
@@ -637,16 +556,10 @@ def _same_value(a: str, b: str) -> bool:
 
 def _comparable(a: str, b: str) -> bool:
     """May these two sides be held against each other at level 2? Only as QUANTITIES.
-
-    **Both sides must yield one unambiguous number.** A paper saying "AdamW" and a config
-    saying "1e-4" disagree about nothing — that is a category error, not an inconsistency —
-    and, more importantly, two PROSE descriptions that differ are a SEMANTIC judgement.
-    "The paper says real samples come from the matching weather's split; the code always
-    uses snow" is a real concern and it is the auditor's reading of two texts, not a
-    comparison of two stated quantities. Refusing it here is what keeps
-    `PAPER_ARTIFACT_MISMATCH` a deterministic claim: it lands at
-    ENDPOINTS_VERIFIED_ARTIFACT_CONCERN instead, with both locations verified and the
-    correspondence marked as a reading — which is exactly what it is.
+    Both sides must yield one unambiguous number: a paper saying "AdamW" and a config
+    saying "1e-4" disagree about nothing (a category error, not an inconsistency), and
+    two PROSE descriptions that differ are a SEMANTIC judgement, which lands at
+    ENDPOINTS_VERIFIED_ARTIFACT_CONCERN instead of a deterministic mismatch.
     """
     return _quantity(a) is not None and _quantity(b) is not None
 
@@ -657,24 +570,16 @@ def _comparable(a: str, b: str) -> bool:
 def discharge(inspection: ArtifactInspection) -> ArtifactInspection:
     """What this route actually settled, and for which question. Written by the harness.
 
-    **THE BUG THIS REPLACES.** The first version asked three things — an audited snapshot,
-    at least one statement, at least one fact carrying authority — and answered a single
-    boolean. So any fact could settle any statement, and on all four repository papers the
-    target *"the released repository <url> implements the described method"* was discharged
-    by facts like *"the checkout advertises evaluate.py"*. Four papers were reported as
-    having had a claim about their implementation SETTLED by the presence of a file. An
-    entrypoint existing is supporting evidence for that question; it is not its answer, and
-    reporting it as one violates the authority hierarchy this module exists to state.
-
-    **A fact settles a question only when its SCOPE matches.** Every probe declares the
+    A fact settles a question only when its SCOPE matches. Every probe declares the
     bounded question it answers (`ArtifactFact.settles`), and a target carrying a bounded
     question is discharged only by a fact answering THAT question.
     `IMPLEMENTATION_CORRESPONDENCE` — "does this code implement the described method", "is
     the implementation faithful", "does this reproduce the paper" — is excluded from
     `SETTLEABLE_BY_ARTIFACT_FACT` by construction, so no accumulation of level-1 facts can
-    ever reach it. It needs an addressed method statement, an exact artifact location, an
-    established identity, a proposed correspondence, deterministic relocation of both ends,
-    and for behavioural claims a measurement.
+    ever reach it: an entrypoint existing is supporting evidence for that question, not
+    its answer. It needs an addressed method statement, an exact artifact location, an
+    established identity, a proposed correspondence, deterministic relocation of both
+    ends, and for behavioural claims a measurement.
 
     Four outcomes, in descending authority, and each is a different sentence to a referee:
 
@@ -717,7 +622,6 @@ def discharge(inspection: ArtifactInspection) -> ArtifactInspection:
                f"question this route was asked, against the checkout at {snap.commit[:10]}")
         return inspection.model_copy(update={"discharged": True, "reason": why})
 
-    # THE CORRECTED REFUSAL, and the sentence the four corpus papers should have carried.
     if scope == "IMPLEMENTATION_CORRESPONDENCE":
         why = (f"{len(carrying)} bounded fact(s) were established about the checkout and "
                f"none of them answers this question. Whether the released code implements "
@@ -736,13 +640,10 @@ def discharge(inspection: ArtifactInspection) -> ArtifactInspection:
 
 
 def outcome_disposition(inspection: ArtifactInspection) -> str:
-    """The `TARGET_DISPOSITIONS` value this route produced. Never a scientific verdict.
-
-    Five states rather than the one the first version had. Only
-    ARTIFACT_MISMATCH_ESTABLISHED maps to `ARTIFACT_EVIDENCE`, which is the only
+    """The `TARGET_DISPOSITIONS` value this route produced. Never a scientific verdict:
+    only ARTIFACT_MISMATCH_ESTABLISHED maps to `ARTIFACT_EVIDENCE`, the only
     artifact-route state `EVIDENCE_ABOUT_THE_PAPER` admits; a bounded fact about the
-    checkout resolves its own bounded question and says nothing about the document.
-    """
+    checkout resolves its own bounded question and says nothing about the document."""
     snap = inspection.snapshot
     if snap is None or not snap.audited:
         return "ARTIFACT_BLOCKED"
@@ -757,12 +658,9 @@ def outcome_disposition(inspection: ArtifactInspection) -> str:
 
 def question_scope(question_kind: str = "", claim_text: str = "") -> str:
     """Which bounded question a target is asking, or IMPLEMENTATION_CORRESPONDENCE.
-
-    Deliberately conservative: anything this function cannot recognise as one of the
-    bounded scopes is IMPLEMENTATION_CORRESPONDENCE, which no level-1 fact may settle. The
-    default therefore REFUSES rather than admits, which is the opposite of what the first
-    version did by having no notion of scope at all.
-    """
+    Deliberately conservative: anything not recognised as a bounded scope defaults to
+    IMPLEMENTATION_CORRESPONDENCE, which no level-1 fact may settle -- the default
+    REFUSES rather than admits."""
     text = (claim_text or "").lower()
     kind = (question_kind or "").strip().upper()
     if kind in ARTIFACT_QUESTION_SCOPES:
@@ -786,14 +684,9 @@ _SCOPE_PHRASES = (
 
 
 def decompose(claim_text: str, repo_url: str = "") -> list[tuple[str, str]]:
-    """The bounded questions an IMPLEMENTATION_CORRESPONDENCE claim can be broken into.
-
-    (scope, the bounded question in words). This is what replaces discharging the broad
-    claim: the route answers the narrow questions it CAN answer, records each as settling
-    its own scope, and leaves the broad claim open with the reason above. A referee then
-    reads "these four things about the artifact are established, and whether the code
-    implements the method is still open", which is what was true all along.
-    """
+    """The bounded questions an IMPLEMENTATION_CORRESPONDENCE claim can be broken into,
+    as (scope, the bounded question in words): the route answers the narrow questions it
+    CAN answer and leaves the broad claim open with the reason `discharge` gives."""
     where = f" in {repo_url}" if repo_url else " in the released repository"
     return [
         ("ENTRYPOINT_PRESENCE", f"is there a runnable entrypoint{where} that the "
@@ -806,14 +699,9 @@ def decompose(claim_text: str, repo_url: str = "") -> list[tuple[str, str]]:
 
 
 def requires_execution(route_question: str) -> bool:
-    """Can reading the code settle this, or does it need a measured result?
-
-    STATIC INSPECTION MAY NOT RESOLVE A REPRODUCTION QUESTION. "Does the released code
-    produce 91.4?" is not answerable by reading it — the answer is a measurement — and a
-    route that claimed otherwise would let a reading of the source acquit or convict a
-    number. The vocabulary is the question's own kind, so this is a lookup and not a
-    judgement.
-    """
+    """Can reading the code settle this, or does it need a measured result? Static
+    inspection may not resolve a reproduction question: "does the released code produce
+    91.4?" is answerable only by measurement, never by reading."""
     return (route_question or "").strip().upper() in _EXECUTION_ONLY
 
 
@@ -854,14 +742,10 @@ _ESCALATION_FOR_PROBE = {
 
 
 def escalations_from(facts: list[ArtifactFact]) -> list[str]:
-    """What this inspection makes newly possible for a LATER route. Recorded, never acted on.
-
-    **It may not suppress a measurement route**, and the shape of this function is why it
-    cannot: it returns SENTENCES, into `ArtifactInspection.escalations`, which no planner,
-    gate or disposition reads. Narrowing a command is `experiment_id`'s to use and
-    authorising a run is `probe`'s; finding something interesting statically is not a
-    reason to stop measuring, and there is no field here through which it could become one.
-    """
+    """What this inspection makes newly possible for a LATER route. Recorded, never acted
+    on: it returns SENTENCES into `ArtifactInspection.escalations`, which no planner,
+    gate or disposition reads, so finding something interesting statically can never
+    suppress a measurement route."""
     out: list[str] = []
     for fact in facts:
         if fact.authority == "NONE":
@@ -879,13 +763,11 @@ def inspect(doc: PaperDoc, root: str | Path, *, url: str = "", target_id: str = 
             statements: list[str] | None = None, facts: list[ArtifactFact] | None = None,
             scope: str = "", escalations: list[str] | None = None,
             tree: repo_mod.GitTree | None = None) -> ArtifactInspection:
-    """One route attempt over one checkout. Assembles, then asks `discharge`.
-
-    `scope` is the BOUNDED question this attempt was asked. Defaulting it to
-    IMPLEMENTATION_CORRESPONDENCE — the one scope no level-1 fact may settle — is what
-    makes the fix fail closed: an attempt whose caller did not say what it was asking
-    cannot be discharged by whatever fact happened to be established.
-    """
+    """One route attempt over one checkout. Assembles, then asks `discharge`. `scope` is
+    the BOUNDED question this attempt was asked; defaulting it to
+    IMPLEMENTATION_CORRESPONDENCE (the one scope no level-1 fact may settle) fails
+    closed: an attempt whose caller did not say what it was asking cannot be discharged
+    by whatever fact happened to be established."""
     snap = snapshot(root, url, tree)
     supplied = list(facts or [])
     inspection = ArtifactInspection(

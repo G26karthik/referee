@@ -1,15 +1,13 @@
 """Run what the review decided to run, and record how each target ended.
 
-Consolidates `stages/probe.py` (1,744 lines) — the S3 orchestration that decides the spec
-for each target, acquires and audits the repository, plans execution (author code or a
-governed reconstruction), dispatches to `execute.py`'s runner, and folds every target's
-`TargetOutcome` back onto the `TargetSet` — into this file. Ported close to verbatim
-rather than forced into a clean "one route, one implementation" shape: the primary-target
-and secondary-target flows share roughly a dozen interacting special cases (direct
-reconstruction vs. a fallback from author code, comparable vs. not, admissible vs. not,
-the dynamic early stop, the artifact route that never competes with execution budget), and
-a from-scratch protocol abstraction over that risks losing correctness for cosmetic
-uniformity — the same argument the plan itself makes against tabularizing `reconcile()`.
+The S3 orchestration: decides the spec for each target, acquires and audits the
+repository, plans execution (author code or a governed reconstruction), dispatches to
+`execute.py`'s runner, and folds every target's `TargetOutcome` back onto the
+`TargetSet`. The primary-target and secondary-target flows share roughly a dozen
+interacting special cases (direct reconstruction vs. a fallback from author code,
+comparable vs. not, admissible vs. not, the dynamic early stop, the artifact route that
+never competes with execution budget), so this stays close to that shape rather than a
+from-scratch protocol abstraction that would risk losing correctness for uniformity.
 
 What decides the TARGETS is `discover.py`, before this module is reached: it discovers
 what is addressable, orders it, and decides which of it justifies an execution. This
@@ -32,17 +30,11 @@ from .schema import (
     ReimplementationReadiness, RepoAcquisition, TargetOutcome,
 )
 
-# These remain their OWN files, unchanged — pure leaf modules the fork's own reconnaissance
-# confirmed have no cross-file duplication with each other or with execute.py's core:
-# experiment_id.py (identity resolution), resources.py (requirement extraction), repo.py
-# (acquisition/build_env/capability/synthesize_standalone — E2's verify_commit/head_commit
-# are the only pieces `execute.py` needed directly and are ported there), code_audit.py,
-# probe_synth.py, reimplement_driver.py (governed-reconstruction generation, distinct from
-# `discover.reimplementation_readiness`'s pure eligibility check), and the artifact-
-# inspection route (artifact_evidence.py + stages/artifact.py). Keeping them separate is
-# the same "reuse when genuinely simpler than rewriting" argument `container.py`/
-# `isolation.py` already follow from `execute.py` — these six are lean and single-purpose,
-# and inlining them would add risk without reducing duplication that does not exist.
+# These remain their OWN files, unchanged — pure leaf modules with no cross-file
+# duplication with execute.py's core: experiment_id.py, resources.py, repo.py,
+# code_audit.py, probe_synth.py, reimplement_driver.py, and the artifact-inspection
+# route (artifact_evidence.py + stages/artifact.py).
+from . import certificate
 from . import code_audit
 from . import experiment_id
 from . import probe_synth
@@ -95,9 +87,8 @@ def _strip_to_allowed_fields(data: dict) -> dict:
 
 def _spec_accepted_writers() -> tuple[str, ...]:
     """Every token a real delegation mode can seal with, plus the two fixed extras this
-    channel uses: "harness" marks `build_spec`'s own generated output (never sidecar-
-    sealed, kept only for symmetry) and "driver_accept" is the one token `accept_spec`
-    ever stamps, regardless of which delegation mode produced the proposal."""
+    channel uses: "harness" marks `build_spec`'s own generated output, and
+    "driver_accept" is the one token `accept_spec` ever stamps."""
     from . import agent as agent_mod
     return tuple(agent_mod.WRITTEN_BY.values()) + ("harness", "driver_accept")
 
@@ -114,12 +105,12 @@ def spec_is_accepted(root: Path) -> tuple[bool, str]:
 
 def accept_spec(cfg: Config, pid: str, raw: str, *, reviewer: str = "",
                tool_policy: str = "", mode: str = "MANUAL") -> dict:
-    """Validate and seal a hand-authored `spec.json` proposal — the "driver" provenance
+    """Validate and seal a hand-authored `spec.json` proposal -- the "driver" provenance
     path. Every field NOT in `_SPEC_PROPOSAL_ALLOWED_FIELDS` is stripped before anything
     else, so `provenance`/`command`/every `.established` block can never be supplied by a
-    hand file, sealed or not. A `command` in the raw proposal refuses outright: `driver`
-    provenance is a hand-written script, never the paper's own repository entrypoint,
-    which only `plan_execution`'s own real-audit-gated promotion may ever attribute."""
+    hand file. A `command` in the raw proposal refuses outright: `driver` provenance is a
+    hand-written script, never the paper's own repository entrypoint, which only
+    `plan_execution`'s own real-audit-gated promotion may ever attribute."""
     import json
 
     from . import agent as agent_mod
@@ -297,7 +288,7 @@ def write_reimplementation_prompt(root: Path, pid: str, doc: PaperDoc, spec: Pro
     reconstruction before sealing it stages a `script` at `control/.staged/spec.json` and
     seals it with `run.py accept` under `driver` provenance. The AUTOMATED channel
     (`reimplement_driver`) machine-verifies every ingredient's binding before sealing as
-    `reimpl_exec` — the two are deliberately unmerged."""
+    `reimpl_exec`."""
     lines = [
         f"# Independent reimplementation brief — `{pid}`", "",
         "The paper below advertises no public implementation. This harness has checked that",
@@ -328,10 +319,11 @@ def write_reimplementation_prompt(root: Path, pid: str, doc: PaperDoc, spec: Pro
         f"Stage it at `control/.staged/spec.json` under this case's project directory, then seal it with:",
         "", f"    python run.py accept --paper {pid} --reviewer \"<who wrote this>\"", "",
         "## The paper", "",
+        _scoped_paper_text(
+            doc, table_ref=spec.table_ref, claim_ref=spec.claim_ref,
+            ingredient_refs=tuple(i.ref for i in readiness.ingredients)),
+        "",
     ]
-    for s in doc.sections:
-        lines += [f"### {s.title or f'section {s.section_idx}'}  [s{s.section_idx}]", "",
-                 " ".join(s.text.split()), ""]
     path = root / "reports" / "reimplementation_prompt.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -458,6 +450,10 @@ def plan_execution(cfg: Config, spec: ProbeSpec, acq: RepoAcquisition,
 _DISPOSITION_FOR_RECONCILIATION = {
     "RESOLVED_VERIFIED": "REPRODUCED", "FAILED_REPRODUCTION": "FAILED_REPRODUCTION",
     "NOT_ATTEMPTED": "NOT_ATTEMPTED",
+    # EXACT_CERTIFICATE's own pair — never folded into REPRODUCED/FAILED_REPRODUCTION,
+    # which are about a printed cell (`execute.reconcile`'s cert_exec branch).
+    "COUNTEREXAMPLE_FOUND": "COUNTEREXAMPLE_ESTABLISHED",
+    "NO_VIOLATION_FOUND": "NO_COUNTEREXAMPLE_FOUND",
 }
 _DISPOSITION_FOR_FAILURE_CLASS = {
     "resources_insufficient": "RESOURCE_BLOCKED", "execution_unauthorized": "AUTHORIZATION_BLOCKED",
@@ -682,14 +678,155 @@ def _full_paper_text(doc: PaperDoc) -> str:
     return "\n\n".join(parts)
 
 
+_TABLE_IDX_REF = re.compile(r"^T(\d+)")
+_SECTION_NAMED_REF = re.compile(r"^[SsPp](\d+)")
+
+
+def _table_label_sections(doc: PaperDoc, table_idx: int | None) -> set[int]:
+    """Sections whose text mentions this table's own printed label ("Table 8") — a
+    generator's synthetic-data-generator constants and similar details can live only in an
+    appendix section that never does anything but refer to the table by number."""
+    if table_idx is None:
+        return set()
+    table = next((t for t in doc.tables if t.table_idx == table_idx), None)
+    label = (table.label if table else "") or ""
+    if not label:
+        return set()
+    pat = re.compile(rf"\bTable\s+{re.escape(label)}\b", re.IGNORECASE)
+    return {s.section_idx for s in doc.sections if pat.search(s.text or "")}
+
+
+def _ref_table_idx(ref: str) -> int | None:
+    m = _TABLE_IDX_REF.match((ref or "").strip())
+    return int(m.group(1)) if m else None
+
+
+def _ref_section_idx(ref: str) -> int | None:
+    """The section a locator names directly — 's12'/'S12' (section_span), 'P12:a-b'
+    (prose_claim). A table/figure/equation ref names no section directly and resolves
+    through `_table_label_sections` instead."""
+    m = _SECTION_NAMED_REF.match((ref or "").strip())
+    return int(m.group(1)) if m else None
+
+
+def _scoped_paper_text(doc: PaperDoc, *, table_ref: str = "", claim_ref: str = "",
+                       ingredient_refs: tuple[str, ...] = (), cap: int = 40_000) -> str:
+    """The paper text a reconstruction generator brief actually needs -- never the whole
+    paper (`_full_paper_text` renders EVERY section, mostly irrelevant to any one
+    target). Scopes by RELEVANCE: every section mentioning the target table's own
+    printed label ("Table 8"), every section a readiness ingredient was found in, the
+    section the claim under test cites, and the abstract -- deduped, kept in paper
+    order, capped at `cap` characters with an explicit note naming what was left out.
+    """
+    wanted: set[int] = set()
+    wanted |= _table_label_sections(doc, _ref_table_idx(table_ref))
+    for ref in ingredient_refs:
+        idx = _ref_section_idx(ref)
+        wanted.add(idx) if idx is not None else wanted.update(
+            _table_label_sections(doc, _ref_table_idx(ref)))
+    claim_idx = _ref_section_idx(claim_ref)
+    if claim_idx is not None:
+        wanted.add(claim_idx)
+    else:
+        wanted |= _table_label_sections(doc, _ref_table_idx(claim_ref))
+    abstract_idx = decide.abstract_section_idx(doc)
+    wanted.add(abstract_idx if abstract_idx >= 0 else
+              (doc.sections[0].section_idx if doc.sections else -1))
+    wanted.discard(-1)
+
+    parts, used, omitted = [], 0, []
+    for s in doc.sections:
+        if s.section_idx not in wanted:
+            continue
+        body = (f"### {s.title or f'section {s.section_idx}'}  [s{s.section_idx}]\n"
+               + " ".join(s.text.split()))
+        if used + len(body) > cap and parts:
+            omitted.append(s)
+            continue
+        parts.append(body)
+        used += len(body)
+    omitted += [s for s in doc.sections if s.section_idx not in wanted]
+    if omitted:
+        titles = ", ".join(f"s{s.section_idx}"
+                           for s in sorted(omitted, key=lambda s: s.section_idx))
+        parts.append(f"[... sections omitted: {titles} ...]")
+    return "\n\n".join(parts)
+
+
+def attempt_certificate_check(
+        cfg: Config, root: Path, pid: str, doc: PaperDoc, base_spec: ProbeSpec,
+        plan_: PlanDecision | None, out_dir: Path | None = None) -> ProbeResult | None:
+    """Execute a sealed EXACT_CERTIFICATE check. Returns None -- never a placeholder --
+    whenever no CONFORMANT sealed certificate exists for this target yet: the target
+    stays NOT_ATTEMPTED, awaiting one from the controlling session's task list
+    (`certificate_targets` below lists exactly these targets). Modelled on
+    `attempt_reimplementation_fallback` MINUS the repo/seed/sibling-table logic -- a
+    certificate answers ONE theorem, not a shared experimental protocol.
+    """
+    if plan_ is None or not plan_.requires_execution:
+        return None
+    target_id = base_spec.target_id or "default"
+    sealed = certificate.load_accepted(cfg, pid, target_id)
+    if sealed is None:
+        return None
+    script, conf, instance_count = sealed
+    if not conf.established:
+        return None
+    cspec = ProbeSpec(
+        paper_id=pid, target_id=target_id, finding_id=base_spec.finding_id,
+        claim=base_spec.claim, claim_ref=base_spec.claim_ref, claim_kind=base_spec.claim_kind,
+        # A label only (value read from SH_METRIC). No table_ref: a theorem's bound is
+        # never a printed cell.
+        metric="certificate", seeds=list(range(max(1, instance_count))), arms=["certificate"],
+        script=script, provenance="cert_exec", certificate_conformance=conf,
+        written_by="harness")
+    cspec = establish_comparison(cspec, plan_.route)
+    cdir = out_dir or (root / "runs" / pid / "certificates")
+    cdir.mkdir(parents=True, exist_ok=True)
+    state.write_json(cdir / f"{target_id}.spec.json", cspec.model_dump())
+    return execute.run_probe(cfg, root, cspec, out_dir=cdir)
+
+
+def certificate_targets(cfg: Config, pid: str) -> list[tuple[str, str]]:
+    """(target_id, generator_brief) for every EXACT_CERTIFICATE-routed target that has no
+    sealed certificate yet -- the pure, read-only helper a controlling session's task
+    protocol consults. Spends no model call and writes nothing."""
+    from . import discover as discover_stage
+
+    root = state.project_dir(cfg, pid)
+    doc_path = root / "paper" / "doc.json"
+    if not doc_path.exists():
+        return []
+    doc = PaperDoc(**state.read_json(doc_path))
+    ts = discover_stage.load(cfg, pid)
+    if ts is None:
+        return []
+    routed = {p.target_id for p in ts.plans if p.route == "EXACT_CERTIFICATE"}
+    out: list[tuple[str, str]] = []
+    for obj in ts.objects:
+        if obj.target_id not in routed:
+            continue
+        if certificate.load_accepted(cfg, pid, obj.target_id) is not None:
+            continue
+        brief = certificate.build_brief(doc, claim=obj.claim_text, ref=obj.ref)
+        out.append((obj.target_id, brief))
+    return out
+
+
 def attempt_reimplementation_fallback(
         cfg: Config, root: Path, pid: str, doc: PaperDoc, base_spec: ProbeSpec,
         fallback_plan: PlanDecision | None, out_dir: Path | None = None,
         acq: RepoAcquisition | None = None) -> ProbeResult | None:
-    """Execute the governed-reconstruction fallback. Returns None — never a placeholder —
-    whenever no CONFORMANT sealed reconstruction exists to run, so every caller's
-    refusal/deferral path is exactly what it falls back to. The eventual run still goes
-    through the ordinary `execute.authorize` path (`reimpl_exec` branch)."""
+    """Execute the governed-reconstruction fallback. Returns None -- never a placeholder
+    -- whenever no CONFORMANT sealed reconstruction exists to run. The eventual run still
+    goes through the ordinary `execute.authorize` path (`reimpl_exec` branch).
+
+    Generation is asynchronous: with no accepted reconstruction sealed yet, this persists
+    the generator's brief (`reimplement_driver.persist_brief`) for `harness.tasks.pending`
+    to list as a `reimpl_gen` task, and returns None. The next pipeline pass that reaches
+    here finds the sealed reconstruction (once a generator AND a separately-attributed
+    verifier subagent have both answered) via `load_accepted` above and proceeds.
+    """
     from . import discover as discover_stage
 
     if fallback_plan is None or not fallback_plan.requires_execution:
@@ -701,19 +838,18 @@ def attempt_reimplementation_fallback(
     sealed = reimplement_driver.load_accepted(cfg, pid, target_id)
     if sealed is None:
         ok, _why = reimplement_driver.available(cfg)
-        if not ok:
-            return None
-        brief = reimplement_driver.build_brief(
-            readiness, paper_title=doc.title, claim=base_spec.claim,
-            table_ref=base_spec.table_ref, claimed_cell_value=base_spec.claimed_cell_value,
-            paper_text=_full_paper_text(doc))
-        sealed = reimplement_driver.run(cfg, brief, readiness, pid=pid, target_id=target_id)
-    if sealed is None:
+        if ok:
+            brief = reimplement_driver.build_brief(
+                readiness, paper_title=doc.title, claim=base_spec.claim,
+                table_ref=base_spec.table_ref, claimed_cell_value=base_spec.claimed_cell_value,
+                paper_text=_scoped_paper_text(
+                    doc, table_ref=base_spec.table_ref, claim_ref=base_spec.claim_ref,
+                    ingredient_refs=tuple(i.ref for i in readiness.ingredients)))
+            reimplement_driver.persist_brief(cfg, pid, target_id, brief)
         return None
     script, conf = sealed
-    # Cells of one table share one experiment's protocol (alpha, generator, seeds). If an
-    # independent verifier refused a sibling reconstruction of that table, this one's
-    # approval rests on which verifier ran, not on the paper, so it may not settle a cell.
+    # Cells of one table share one experiment's protocol. If an independent verifier
+    # refused a sibling reconstruction of that table, this one may not settle a cell.
     table = re.match(r"T\d+", base_spec.table_ref or "")
     if conf.established and table:
         rdir = root / "runs" / pid / "reimplementation"
@@ -729,9 +865,7 @@ def attempt_reimplementation_fallback(
                     f"cell of {table.group()} is reconciled from a reconstruction")})
                 break
     # The paper's replication count replaces the harness default only once its quote is
-    # re-found in the paper and names that number as a count of seeds/runs/trials
-    # (invariant 1); running fewer seeds than the paper did is the downscaling invariant 6
-    # forbids.
+    # re-found in the paper and names that number as a count of seeds/runs/trials.
     seeds = list(base_spec.seeds) or [0, 1, 2]
     quote = " ".join((conf.replication_quote or "").split())
     if (conf.replication_runs and re.search(
@@ -843,16 +977,33 @@ def _review(cfg: Config, pid: str) -> dict:
     original_plan = pairs[0][1] if pairs else None
     direct_reconstruction = bool(
         original_plan is not None and original_plan.route == "INDEPENDENT_RECONSTRUCTION")
-    fallback_plan = replan_after_author_code_exhausted(
-        pairs[0][0], original_plan, spec) if pairs else None
+    # EXACT_CERTIFICATE is its OWN third branch, dispatched separately below: its script
+    # comes from a SEALED subagent artifact, never from `synthesize_probe`/`plan_execution`.
+    direct_certificate = bool(
+        original_plan is not None and original_plan.route == "EXACT_CERTIFICATE")
+    fallback_plan = (replan_after_author_code_exhausted(pairs[0][0], original_plan, spec)
+                     if pairs and not direct_certificate else None)
     if fallback_plan is not None and target_set is not None:
         target_set.plans.append(fallback_plan)
     reconstruction_plan = original_plan if direct_reconstruction else fallback_plan
     reconstruction_result = None
-    if comparable and (direct_reconstruction or not may_run or fallback_plan is not None):
+    if not direct_certificate and comparable and (
+            direct_reconstruction or not may_run or fallback_plan is not None):
         reconstruction_result = attempt_reimplementation_fallback(
             cfg, root, pid, doc, spec, reconstruction_plan, acq=acq)
-    if direct_reconstruction and reconstruction_result is not None:
+    certificate_result = (attempt_certificate_check(cfg, root, pid, doc, spec, original_plan)
+                          if direct_certificate else None)
+    if direct_certificate and certificate_result is not None:
+        result = certificate_result
+    elif direct_certificate:
+        result = ProbeResult(
+            paper_id=pid, verdict="not_started", provenance="cert_exec",
+            reason=("no sealed, conformant EXACT_CERTIFICATE exists yet for this target; "
+                   "awaiting one from the controlling session's task list (see "
+                   "`routes.certificate_targets`). This target was not refused and was "
+                   "not attempted."),
+            executions=0, script_path="")
+    elif direct_reconstruction and reconstruction_result is not None:
         result = reconstruction_result
     elif direct_reconstruction:
         result = ProbeResult(
@@ -877,7 +1028,16 @@ def _review(cfg: Config, pid: str) -> dict:
 
     outcomes: list[TargetOutcome] = []
     if target_set is not None and pairs:
-        if reconstruction_result is not None and reconstruction_plan is not None:
+        if direct_certificate and certificate_result is not None:
+            outcomes.append(outcome_for(pairs[0][0].target_id, certificate_result,
+                                        original_plan.action, original_plan.route))
+        elif direct_certificate:
+            outcomes.append(_not_started(
+                pairs[0][0], pairs[0][1],
+                "no sealed, conformant EXACT_CERTIFICATE exists yet for this target; "
+                "awaiting one from the controlling session's task list.",
+                "NOT_ATTEMPTED"))
+        elif reconstruction_result is not None and reconstruction_plan is not None:
             outcomes.append(outcome_for(pairs[0][0].target_id, reconstruction_result,
                                         reconstruction_plan.action, reconstruction_plan.route))
         elif may_run and not direct_reconstruction:
@@ -917,6 +1077,25 @@ def _review(cfg: Config, pid: str) -> dict:
                 outcomes.append(_superseded_by_established_failure(obj, plan, stopper))
                 continue
             try:
+                if plan.route == "EXACT_CERTIFICATE":
+                    # Its OWN dispatch, like the primary target above: a sealed subagent
+                    # artifact or nothing.
+                    other_base = build_spec(cfg, pid, doc, obj)
+                    tdir = root / "runs" / pid / "targets" / obj.target_id
+                    ctdir = state.control_dir(root) / "targets" / obj.target_id
+                    cert_result = attempt_certificate_check(
+                        cfg, root, pid, doc, other_base, plan, out_dir=tdir / "certificates")
+                    if cert_result is not None:
+                        state.write_json(ctdir / "probe_results.json", cert_result.model_dump())
+                        outcomes.append(outcome_for(obj.target_id, cert_result,
+                                                    plan.action, plan.route))
+                    else:
+                        outcomes.append(_not_started(
+                            obj, plan,
+                            "no sealed, conformant EXACT_CERTIFICATE exists yet for this "
+                            "target; awaiting one from the controlling session's task list.",
+                            "NOT_ATTEMPTED"))
+                    continue
                 other = build_spec(cfg, pid, doc, obj)
                 other.written_by = "harness"
                 other = synthesize_probe(cfg, doc, other, acq)
@@ -1050,9 +1229,9 @@ def _review(cfg: Config, pid: str) -> dict:
 
 
 def resync_cached_outcomes(cfg: Config, pid: str) -> dict:
-    """Re-attach already-produced `TargetOutcome`s onto a freshly discovered target set —
-    the recovery mechanism for the incident where a cached second pass lost every prior
-    execution's outcome from the funnel. Spends no execution; repairs bookkeeping only."""
+    """Re-attach already-produced `TargetOutcome`s onto a freshly discovered target set --
+    recovers a cached second pass that would otherwise lose every prior execution's
+    outcome. Spends no execution; repairs bookkeeping only."""
     from . import discover as discover_stage
 
     root = state.project_dir(cfg, pid)
@@ -1138,6 +1317,113 @@ def _self_check() -> None:
 
     assert not admissible_if_it_succeeds(Config.load(), ProbeSpec(paper_id="p", provenance="synthesized"))[0]
     assert admissible_if_it_succeeds(Config.load(), ProbeSpec(paper_id="p", provenance="repo_exec"))[0]
+
+    # --- EXACT_CERTIFICATE: no sealed certificate => None, never a placeholder ------------
+    import json
+    import tempfile
+
+    from .schema import PlanDecision as _PlanDecision
+
+    no_plan = attempt_certificate_check(Config.load(), Path("."), "p", doc, ProbeSpec(paper_id="p"), None)
+    assert no_plan is None
+    unwarranted = attempt_certificate_check(
+        Config.load(), Path("."), "p", doc, ProbeSpec(paper_id="p"),
+        _PlanDecision(target_id="T", requires_execution=False))
+    assert unwarranted is None, "a plan that does not require execution must never run one"
+
+    with tempfile.TemporaryDirectory() as td:
+        cert_cfg = Config(projects_dir=Path(td), allow_certificate_exec=True)
+        bound_doc = PaperDoc(paper_id="fw", title="A Frank-Wolfe paper", sections=[
+            Section(section_idx=0, title="Setup", text="Let the objective be convex."),
+            Section(section_idx=1, title="Convergence",
+                   text="Theorem 3.1. Under the above hypotheses, the optimality gap "
+                        "satisfies gap(t) <= 2/(t+2) for all t >= 1."),
+        ])
+        root2 = state.project_dir(cert_cfg, "fw")
+        (root2 / "paper").mkdir(parents=True)
+        state.write_json(root2 / "paper" / "doc.json", bound_doc.model_dump())
+
+        base = ProbeSpec(paper_id="fw", target_id="TGT-CLM-1", claim="Theorem 3.1",
+                         claim_ref="S1", claim_kind="section_span")
+        plan_ = _PlanDecision(target_id="TGT-CLM-1", action="EXACT_CERTIFICATE",
+                              route="EXACT_CERTIFICATE", requires_execution=True)
+
+        assert attempt_certificate_check(cert_cfg, root2, "fw", bound_doc, base, plan_) is None, (
+            "no sealed certificate yet => None, target stays NOT_ATTEMPTED"
+        )
+
+        script = ("print('SH_METRIC arm=certificate seed=0 value=1')\n"
+                 "print('SH_AUX key=lhs arm=certificate seed=0 value=2.0')\n")
+        raw = json.dumps({
+            "script": script, "instance_count": 1,
+            "bindings": [
+                {"kind": "hypotheses", "impl_ref": "line 1",
+                 "impl_quote": "print('SH_METRIC arm=certificate seed=0 value=1')"},
+                {"kind": "claimed_bound", "impl_ref": "line 1",
+                 "impl_quote": "print('SH_METRIC arm=certificate seed=0 value=1')"},
+                {"kind": "instance", "impl_ref": "line 2",
+                 "impl_quote": "print('SH_AUX key=lhs arm=certificate seed=0 value=2.0')"},
+            ],
+            "paper_quotes": {"hypotheses": "Let the objective be convex.",
+                            "claimed_bound": "gap(t) <= 2/(t+2) for all t >= 1"},
+            "notes": "",
+        })
+        verdict = json.dumps({"approved": True,
+                              "approved_kinds": ["hypotheses", "claimed_bound", "instance"],
+                              "notes": "checked"})
+        sealed = certificate.accept(cert_cfg, "fw", "TGT-CLM-1", raw, verdict,
+                                    generated_by="gen", reviewer="ver")
+        assert sealed["established"] is True
+
+        result = attempt_certificate_check(cert_cfg, root2, "fw", bound_doc, base, plan_)
+        # Once sealed, the wiring must reach `execute.authorize`'s cert_exec rung ladder,
+        # proven by the provenance tag and a non-None result.
+        assert result is not None and result.provenance == "cert_exec"
+        assert result.reconciliation is not None
+        assert result.reconciliation.status in ("INCONCLUSIVE", "COUNTEREXAMPLE_FOUND"), (
+            result.reconciliation.status)
+
+        # `outcome_for` / `_DISPOSITION_FOR_RECONCILIATION`: the reconciliation-status ->
+        # disposition mapping this route adds, tested directly and deterministically.
+        from .schema import Reconciliation as _Reconciliation
+        won = ProbeResult(paper_id="fw", provenance="cert_exec",
+                          reconciliation=_Reconciliation(status="COUNTEREXAMPLE_FOUND",
+                                                         provenance="cert_exec"))
+        clean = ProbeResult(paper_id="fw", provenance="cert_exec",
+                            reconciliation=_Reconciliation(status="NO_VIOLATION_FOUND",
+                                                           provenance="cert_exec"))
+        out = outcome_for("TGT-CLM-1", won, plan_.action, plan_.route)
+        assert out.disposition == "COUNTEREXAMPLE_ESTABLISHED", out.disposition
+        assert out.establishes_failure, "an admissible cert_exec counterexample must establish"
+        clean_out = outcome_for("TGT-CLM-1", clean, plan_.action, plan_.route)
+        assert clean_out.disposition == "NO_COUNTEREXAMPLE_FOUND", clean_out.disposition
+        assert not clean_out.establishes_failure, "checked-clean must never establish a failure"
+
+        # certificate_targets: nothing to list once this target's own sealed certificate
+        # exists.
+        assert certificate_targets(cert_cfg, "fw") == []
+
+    # --- _scoped_paper_text: relevance-scoped, never the whole paper, and covers every
+    # cited section plus the abstract, with an omission note for the rest --------------
+    from .schema import Table as _Table
+
+    scope_doc = PaperDoc(paper_id="scope", sections=[
+        Section(section_idx=0, title="Abstract", text="We propose a method."),
+        Section(section_idx=1, title="Method", text="The method does X."),
+        Section(section_idx=2, title="Appendix A: Generator",
+               text="The synthetic generator uses alpha=0.3, as used in Table 8."),
+        Section(section_idx=3, title="Unrelated", text="Nothing relevant here."),
+    ], tables=[_Table(table_idx=8, page=5, label="8", caption="Results")])
+    scoped = _scoped_paper_text(scope_doc, table_ref="T8:r0:c0", claim_ref="s1",
+                                ingredient_refs=("s1", "T8"))
+    assert "alpha=0.3" in scoped, "the section mentioning the table's own label must be kept"
+    assert "does X" in scoped, "the claim's own section must be kept"
+    assert "We propose a method" in scoped, "the abstract must always be kept"
+    assert "Nothing relevant here" not in scoped
+    assert "sections omitted: s3" in scoped
+    tiny = _scoped_paper_text(scope_doc, table_ref="T8:r0:c0", claim_ref="s1",
+                              ingredient_refs=("s1",), cap=10)
+    assert "sections omitted" in tiny, "a tight cap still omits explicitly, never silently"
 
     print("harness.routes self-check ok")
 

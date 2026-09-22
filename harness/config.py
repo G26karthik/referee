@@ -1,14 +1,13 @@
 """Paths and execution settings.
 
-No credentials are REQUIRED. Nothing in the review pipeline calls a hosted model: the
-deterministic stages are plain Python, and the judgement stages are driven by whatever
-reviewer the operator configures (see `stages/audit.py`).
+No credentials are REQUIRED, and this process never holds one: the deterministic stages
+are plain Python, and every judgement stage (a lens, a grade, the substantive verdict, a
+governed reconstruction, an authors'-code reading) is answered by a subagent the
+CONTROLLING Claude Code session dispatches -- see `harness/tasks.py`. This harness only
+ever writes a prompt file and validates a JSON answer against one.
 
-`Config.load()` therefore cannot fail for want of a token — the only thing it does is
-make sure the cases directory exists. Only one subsystem can *use* credentials when the
-operator supplies them, and it is off by default: the audit/grade/verdict drivers. A
-missing token is never an error here; it makes a capability unavailable and is reported
-as such.
+`Config.load()` therefore cannot fail for want of a token -- the only thing it does is
+make sure the cases directory exists.
 """
 from __future__ import annotations
 
@@ -31,12 +30,7 @@ def _flag(name: str, default: bool = False) -> bool:
 @dataclass
 class Config:
     # WHERE a run's artifacts live, and therefore WHICH RUN this is. Overridable because
-    # a new evaluation must not overwrite the one it is compared against: every paper
-    # `preflight` reports as RESUMES would resume its existing project and rewrite it in
-    # place, which is right per paper and destroys the historical record in aggregate.
-    # `cfg.projects_dir.parent / "reports"` is where the corpus and evaluation artifacts
-    # land, so pointing this at a fresh directory yields a self-contained run identity
-    # rather than a half-separated one.
+    # a new evaluation must not overwrite the one it is compared against.
     projects_dir: pathlib.Path = field(
         default_factory=lambda: pathlib.Path(os.environ["SH_PROJECTS_DIR"]).resolve()
         if os.environ.get("SH_PROJECTS_DIR") else PROJECTS_DIR)
@@ -45,162 +39,59 @@ class Config:
     probe_timeout_s: int = field(default_factory=lambda: int(os.environ.get("SH_PROBE_TIMEOUT", "1800")))
     # How many targets one paper may pursue to execution. A budget, not a policy: which
     # targets are worth pursuing is `harness.planner`'s decision and the ORDER is
-    # `harness.priority`'s, so lowering this drops the least useful targets first rather
-    # than an arbitrary subset. Raising it costs compute and changes no rule.
+    # `harness.priority`'s, so lowering this drops the least useful targets first.
     max_targets: int = field(default_factory=lambda: int(os.environ.get("SH_MAX_TARGETS", "3")))
 
-    # --- S3 code-reproduction gates -------------------------------------------------
-    # These are graded by risk, not bundled, because fetching code and running code are
-    # different acts.
+    # --- S3 code-reproduction gates, graded by risk since fetching and running code are
+    # different acts: network (clone, read-only, for the static audit), install (resolves
+    # a stranger's dependency list, arbitrary setup code), exec (runs the repo's own
+    # entrypoint). `synthesis` is not a risk gate: the probe planner writes a script from
+    # the paper's own published formulation, readable at `runs/<pid>/probe.py` before it
+    # runs, so it carries none of the third-party risk the other gates hold back.
     #
-    #   network  ON  by default. `git clone --depth 1` of a URL the paper itself
-    #                advertises, read-only, so the static AST audit has something to
-    #                read. Nothing fetched is imported or executed by that audit.
-    #   install  OFF by default. Resolving a stranger's dependency list runs arbitrary
-    #                setup.py/build hooks, which is execution wearing a package manager
-    #                as a hat.
-    #   exec     OFF by default. Running the repository's own entrypoint is running
-    #                third-party code, and it stays an explicit, per-invocation opt-in.
-    #
-    # `synthesis` is a fourth thing and deliberately not a risk gate: the probe planner
-    # writes a script from the PAPER'S OWN published formulation and runs THAT. The code
-    # executed is generated here and readable at `runs/<pid>/probe.py` before it runs, so
-    # it carries none of the third-party risk the other gates exist to hold back.
-    # --- S2 autonomy -------------------------------------------------------------------
-    # OFF by default, and the default stays off on purpose. S2 is the judgement stage;
-    # this harness has no model of its own to call, so "autonomous" here can only mean
-    # "shell out to whatever reviewer the operator configures". That is a real capability
-    # and a real risk: the findings it produces are authored by an external process, so
-    # every lens filled this way is recorded in `audit/<lens>.driver.json` with the exact
-    # command that wrote it. Provenance for a machine-written audit is the same
-    # requirement as provenance for a machine-written probe.
-    #
-    # `SH_AUDIT_CMD` is a command template with two placeholders:
-    #     {prompt}  the lens prompt file to read
-    #     {out}     the path the command must write valid lens JSON to
-    # e.g.  SH_AUDIT_CMD='claude -p --output-format text "$(cat {prompt})" > {out}'
-    #
-    # Nothing about this weakens verification: `load_reports` re-checks every quote
-    # against the parsed PDF regardless of who wrote the JSON, so an auto-filled lens
-    # that invents evidence has its findings dropped exactly like a human's would.
-    allow_auto_audit: bool = field(default_factory=lambda: _flag("SH_ALLOW_AUTO_AUDIT"))
-    audit_cmd: str = field(default_factory=lambda: os.environ.get("SH_AUDIT_CMD", ""))
-    # WHICH executable the built-in delegation template invokes, instead of discovering
-    # `claude` on PATH. Not a convenience: without it, every assertion about the argv the
-    # harness builds — the deny flags, the pinned settings, the per-role model — was
-    # guarded by `if default_cmd():` and therefore skipped on any host without the CLI,
-    # which is every CI box. The isolation guarantees were asserted nowhere. With this,
-    # `tests/test_delegation_path.py` drives the whole built-in path against a scripted
-    # reviewer double, the way `tests/test_sandbox_backend.py` drives the cloud provider.
-    #
-    # It grants nothing. The gate is still `allow_auto_audit`, and a double named here
-    # produces output that `parse_lens_json` and then `stages.audit.load_reports` check
-    # exactly as they check a real reviewer's.
-    reviewer_exe: str = field(default_factory=lambda: (os.environ.get("SH_REVIEWER_EXE") or "").strip())
-    audit_timeout_s: int = field(default_factory=lambda: int(os.environ.get("SH_AUDIT_TIMEOUT", "900")))
-    # How many times the controller may re-attempt ONE lens whose reviewer failed. A
-    # timeout or a truncated JSON object is transient; the same prompt run again may well
-    # succeed. Bounded, and every attempt is recorded in the case history — a retry that
-    # is not visible is indistinguishable from a stage that never ran.
-    #
-    # Nothing else in the pipeline is retryable. An identity, resource, commit or
-    # authorization refusal is deterministic, and re-running one would be an attempt to
-    # get a different answer out of a gate that is doing its job.
-    audit_retries: int = field(default_factory=lambda: int(os.environ.get("SH_AUDIT_RETRIES", "2")))
-    # How many lens/part units may be in flight at once. Each is an isolated subprocess —
-    # its own sandboxed cwd, its own pinned settings, its own prompt and output file — so
-    # running several at once is STRONGER isolation than one operator terminal running them
-    # one after another, not weaker. 4 covers a single-pass paper's four lenses in one
-    # round; a multi-part paper still bounds the burst.
-    audit_concurrency: int = field(default_factory=lambda: int(os.environ.get("SH_AUDIT_CONCURRENCY", "4")))
+    # --- S2 autonomy: one delegation channel. The controlling Claude Code session
+    # dispatches its own isolated subagents, one per delegable unit (`harness/tasks.py`);
+    # this harness never shells out to a model CLI of its own. `load_reports` re-checks
+    # every quote against the parsed PDF regardless of who wrote the JSON.
 
-    # --- S2.5 independent grading --------------------------------------------------
-    # OFF by default, same reasoning as `allow_auto_audit`: a second external process,
-    # a second command an operator must opt into. Unlike a lens, the grader runs with
-    # ZERO tools and no filesystem access at all — see `harness/grade_driver.py` — so it
-    # cannot read the severity or any other finding it is deliberately not shown.
+    # --- S2.5 independent grading: the grader is shown ZERO tools and no filesystem
+    # access (see `harness/prompts/grade.py`), so it cannot read the finding it is
+    # deliberately not shown. Grading changes what is ELIGIBLE to be counted at each
+    # severity, not what thresholds mean; ungraded, `Finding.counted_severity` stays
+    # empty and falls back to the lens's own `severity`.
     #
-    # Grading does not change what THRESHOLDS mean (`RED_FATAL` etc. in
-    # `stages/report.py` are untouched); it changes what is ELIGIBLE to be counted at
-    # each severity. With the gate closed, `Finding.counted_severity` stays empty and
-    # `stages.report.counted()` falls back to the lens's own `severity` — the verdict is
-    # byte-identical to what it was before this subsystem existed.
-    allow_grading: bool = field(default_factory=lambda: _flag("SH_ALLOW_GRADING"))
-    grade_cmd: str = field(default_factory=lambda: os.environ.get("SH_GRADE_CMD", ""))
-    # WHICH model grades. Empty means the role's declared default in
-    # `harness.prompts.grade.ROLE_SPEC`, never the CLI's ambient default — that was the real
-    # state and it was invisible: `grade_driver.default_cmd()` emitted no `--model` at
-    # all, so the "independent second reader" ran on whatever the operator's
-    # `~/.claude/settings.json` said, which on the development host was the same model
-    # family as the `overclaim` lens it was meant to check independently. A grader whose
-    # identity is a property of the operator's ambient config is not a recorded fact.
+    # Empty means the role's declared default in `harness.prompts.grade.ROLE_SPEC`.
     grade_model: str = field(default_factory=lambda: (os.environ.get("SH_GRADE_MODEL") or "").strip())
-    grade_timeout_s: int = field(default_factory=lambda: int(os.environ.get("SH_GRADE_TIMEOUT", "600")))
-    grade_retries: int = field(default_factory=lambda: int(os.environ.get("SH_GRADE_RETRIES", "2")))
-    # How many candidates may be graded at once. Graders are blinded from each other by
-    # design (zero tools, no shared context), so nothing about running several at once
-    # weakens the independence the stage exists to guarantee.
-    grade_concurrency: int = field(default_factory=lambda: int(os.environ.get("SH_GRADE_CONCURRENCY", "4")))
-    # "serious": only FATAL/MAJOR candidates are graded — justified by threshold
-    # reachability, not cost: a MINOR cannot cross any RED branch on its own, so grading
-    # it can only ever move a verdict toward GREEN, the direction a false negative there
-    # is cheapest. "all" grades every substantiated candidate, for evaluation runs.
+    # "serious": only FATAL/MAJOR candidates are graded (a MINOR cannot cross any
+    # threshold on its own). "all" grades every substantiated candidate, for evaluation.
     grade_scope: str = field(default_factory=lambda: os.environ.get("SH_GRADE_SCOPE", "serious"))
     grade_budget_chars: int = field(
         default_factory=lambda: int(os.environ.get("SH_GRADE_BUDGET_CHARS", "45000")))
-    # If set, an incomplete grading pass blocks the report (`waiting`, not a partial
-    # report) instead of the default — proceed with whatever graded, everything else
-    # ungraded and falling back to its lens severity. Off by default: abstention is not
-    # failure, and a paper must still reach a complete report when the grader available
-    # this run could not cover everything, exactly as the audit lenses already work.
-    require_grades: bool = field(default_factory=lambda: _flag("SH_REQUIRE_GRADES"))
+    # Defaults ON: an incomplete grading pass blocks the report (`waiting`) until every
+    # in-scope candidate is graded. SH_REQUIRE_GRADES=0 falls back to lens-asserted
+    # severity for whatever is not graded this run.
+    require_grades: bool = field(default_factory=lambda: _flag("SH_REQUIRE_GRADES", True))
 
-    # --- the authors'-code auditor ---------------------------------------------------
-    # "Did the authors actually implement the code correctly?" — one read-only pass over
-    # the PINNED checkout, proposing code-level scientific concerns. OFF by default and
-    # for the same reason as every other model channel: with it closed the artifact route
-    # still runs, on deterministic probes alone, and a reviewer sees exactly what the
-    # harness could establish without a model.
-    #
-    # It has NO EXECUTION AUTHORITY and NO DECISION AUTHORITY, and neither is enforced by
-    # this flag — the confinement grants `Read` and `Grep` and nothing else, and every
-    # code citation it writes is relocated by `artifact_evidence.relocate` before it can
-    # survive. A model statement about code is not artifact evidence.
-    allow_artifact_review: bool = field(
-        default_factory=lambda: _flag("SH_ALLOW_ARTIFACT_REVIEW"))
-    artifact_review_cmd: str = field(
-        default_factory=lambda: os.environ.get("SH_ARTIFACT_REVIEW_CMD", ""))
+    # --- the authors'-code auditor: one read-only pass over the PINNED checkout,
+    # proposing code-level scientific concerns. NO EXECUTION AUTHORITY and NO DECISION
+    # AUTHORITY -- every code citation it writes is relocated by
+    # `artifact_evidence.relocate` before it can survive. A model statement about code is
+    # not artifact evidence.
     artifact_review_model: str = field(
         default_factory=lambda: (os.environ.get("SH_ARTIFACT_REVIEW_MODEL") or "").strip())
-    artifact_review_timeout_s: int = field(
-        default_factory=lambda: int(os.environ.get("SH_ARTIFACT_REVIEW_TIMEOUT", "900")))
 
-    # --- the substantive verdict -----------------------------------------------------
-    # A single, best-effort, never-retried, whole-paper opinion — see
-    # `harness/prompts/verdict.py`. OFF by default: a third external process an operator
-    # must opt into, same reasoning as the two gates above it. Its failure NEVER blocks
-    # a report; only `verdict`/`verdict_reason` (the deterministic ones) do that.
-    allow_substantive_verdict: bool = field(
-        default_factory=lambda: _flag("SH_ALLOW_SUBSTANTIVE_VERDICT"))
-    verdict_cmd: str = field(default_factory=lambda: os.environ.get("SH_VERDICT_CMD", ""))
-    # Same reasoning as `grade_model`. Empty means the default declared in
-    # `harness.prompts.verdict.ROLE_SPEC`, and the model that answered is recorded on the
-    # sidecar either way.
+    # --- the substantive verdict: a single, best-effort, whole-paper opinion (see
+    # `harness/prompts/verdict.py`). Its absence NEVER blocks a report; only
+    # `verdict`/`verdict_reason` (the deterministic ones) do that.
     verdict_model: str = field(default_factory=lambda: (os.environ.get("SH_VERDICT_MODEL") or "").strip())
-    verdict_timeout_s: int = field(
-        default_factory=lambda: int(os.environ.get("SH_VERDICT_TIMEOUT", "300")))
 
-    # Which execution backend runs THIRD-PARTY repository code. Not a gate, and selecting
-    # one grants nothing on its own: the repo-exec gate, the identity chain, the commit
-    # verification and the capability check all still apply, and `authorize()` is the only
-    # thing that may say yes. An unknown name is refused rather than substituted (see
-    # backends.select_backend).
+    # Which execution backend runs THIRD-PARTY repository code. Not a gate on its own:
+    # the repo-exec gate, identity chain, commit verification and capability check all
+    # still apply, and `authorize()` is the only thing that may say yes. An unknown name
+    # is refused rather than substituted.
     #
-    #   local     this machine, subprocesses. The default, and the only backend that runs
-    #             code THIS harness authored (see backends.local_backend).
-    #   container a local container with its own filesystem namespace — the only
-    #             registered backend whose isolation is sufficient to run a paper's own
-    #             repository (see backends.ContainerBackend, harness.isolation).
+    #   local     this machine, subprocesses. The default.
+    #   container a local container with its own filesystem namespace.
     #   kaggle
     #   colab     declarations of published hardware. Never runners.
     exec_backend: str = field(default_factory=lambda: os.environ.get("SH_EXEC_BACKEND", "local"))
@@ -210,50 +101,32 @@ class Config:
     allow_repo_exec: bool = field(default_factory=lambda: _flag("SH_ALLOW_REPO_EXEC"))
     allow_synthesis: bool = field(default_factory=lambda: _flag("SH_ALLOW_SYNTHESIS", True))
 
-    # --- PATH B, governed reconstruction (Step 8) --------------------------------------
-    # TWO gates, because WRITING a reconstruction and RUNNING it are different acts with
-    # different risk — the same separation `allow_install` (build the environment) and
-    # `allow_repo_exec` (run) already make for a real repository.
+    # --- PATH B, governed reconstruction: TWO gates, because WRITING a reconstruction and
+    # RUNNING it are different acts, the same separation `allow_install`/`allow_repo_exec`
+    # already make for a real repository.
     #
-    #   driver  OFF by default. Delegates to an external reviewer to WRITE a
-    #           reconstruction script from the paper's own specification — a fourth
-    #           external process, same reasoning as `allow_auto_audit`/`allow_grading`/
-    #           `allow_substantive_verdict`. Nothing it writes is executed by this gate;
-    #           it only produces text this harness then verifies (`reimplement_driver.
-    #           conformance`) before persisting it.
-    #   exec    OFF by default, and separate from `allow_repo_exec` on purpose: a governed
-    #           reconstruction is code a MODEL wrote, not the authors' own published
-    #           artifact, so granting the one never grants the other. `backends.authorize`
-    #           additionally requires the SAME isolation floor `allow_repo_exec` requires
-    #           (`harness.isolation.sufficient_for_repo_exec` — CONTAINER or
-    #           REMOTE_SESSION) — decision 10: no capability that increases third-party
-    #           code execution lands without that boundary enforced, and a model-authored
-    #           script nobody reviewed is exactly such a capability.
+    #   driver  Delegates to a session subagent to WRITE a reconstruction script from the
+    #           paper's own specification. Nothing it writes is executed by this gate; it
+    #           only produces text this harness then verifies before persisting it.
+    #   exec    OFF by default, separate from `allow_repo_exec`: a governed reconstruction
+    #           is code a MODEL wrote, not the authors' own published artifact, so
+    #           granting the one never grants the other. `backends.authorize` additionally
+    #           requires the same isolation floor `allow_repo_exec` requires.
     allow_reimplementation_driver: bool = field(
-        default_factory=lambda: _flag("SH_ALLOW_REIMPLEMENTATION_DRIVER"))
-    reimplementation_cmd: str = field(
-        default_factory=lambda: os.environ.get("SH_REIMPLEMENTATION_CMD", ""))
+        default_factory=lambda: _flag("SH_ALLOW_REIMPLEMENTATION_DRIVER", True))
     reimplementation_model: str = field(
         default_factory=lambda: (os.environ.get("SH_REIMPLEMENTATION_MODEL") or "").strip())
-    reimplementation_timeout_s: int = field(
-        default_factory=lambda: int(os.environ.get("SH_REIMPLEMENTATION_TIMEOUT", "600")))
     allow_reimplementation_exec: bool = field(
         default_factory=lambda: _flag("SH_ALLOW_REIMPLEMENTATION_EXEC"))
-    # DIAGNOSTIC MODE — off by default, and the default is the whole point.
-    #
-    # A harness-authored probe can never settle a printed quantity: `provenance.admits`
-    # refuses `synthesized` and `template` in both directions. Until now the probe stage
-    # ran one anyway whenever identity failed, which is exactly when it was already known
-    # that nothing admissible could come of it. Over the eight-paper corpus that was 160
-    # processes across 16 targets, every one of them refused at the reconciler afterwards.
-    # Spending compute on a run whose result is inadmissible before it starts is not
-    # conservatism, it is waste — and it produced the table of sixteen plausible-looking
-    # deltas that the admissibility rule then had to catch.
-    #
-    # With this ON, a diagnostic still runs, and it is written to `runs/<pid>/diagnostics/`
-    # as a `DiagnosticRun` rather than a `TargetOutcome`: invisible to the funnel, to
-    # `claim_status`, to `overall_verdict`, to `triage` and to the four reader-facing rows.
-    # It informs a reader and it decides nothing.
+    allow_certificate_exec: bool = field(
+        default_factory=lambda: _flag("SH_ALLOW_CERTIFICATE_EXEC"))
+    # DIAGNOSTIC MODE -- off by default. A harness-authored probe can never settle a
+    # printed quantity (`provenance.admits` refuses `synthesized`/`template` both ways),
+    # so running one when identity fails is spending compute on a result inadmissible
+    # before it starts. With this ON, a diagnostic still runs, written to
+    # `runs/<pid>/diagnostics/` as a `DiagnosticRun` rather than a `TargetOutcome`:
+    # invisible to the funnel and every reader-facing row. It informs a reader and
+    # decides nothing.
     diagnostic_mode: bool = field(default_factory=lambda: _flag("SH_DIAGNOSTIC_MODE"))
     clone_timeout_s: int = field(default_factory=lambda: int(os.environ.get("SH_CLONE_TIMEOUT", "600")))
     install_timeout_s: int = field(default_factory=lambda: int(os.environ.get("SH_INSTALL_TIMEOUT", "1800")))

@@ -157,6 +157,17 @@ def run_ingest(cfg: Config, paper_path: str) -> dict:
     state.save_meta(cfg, pid, meta)
     state.set_phase(cfg, pid, "ingest")
 
+    # ADVISORY ONLY, and never allowed to fail ingest: a rendering problem here is a
+    # scaffolding gap for a lens to Read, never a scientific fact about the paper — see
+    # `schema.Figure` and `paper.extract_figure_images`. Runs AFTER `create_project`
+    # deliberately: it writes `root/paper/figures/`, and creating that path first would
+    # make `root` exist before `create_project` gets to (with its own SUBDIRS/meta/
+    # research_log), so `if not root.exists()` above would wrongly skip it.
+    try:
+        pdf.extract_figure_images(src, figures, root / "paper" / "figures")
+    except Exception:
+        pass
+
     doc = PaperDoc(paper_id=pid, title=title, source_path=str(src), content_sha=sha,
                    n_pages=len(pages),
                    sections=sections, tables=tables, figures=figures, equations=equations,

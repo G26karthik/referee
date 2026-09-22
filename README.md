@@ -112,14 +112,16 @@ proposal that the harness independently re-verifies before anything downstream m
 ## Usage
 
 ```bash
-# the normal invocation
-PYTHONUTF8=1 ../.venv/Scripts/python.exe run.py review \
-    --paper papers/ICLR.pdf papers/CVPR.pdf papers/ACL.pdf --auto-audit --auto-grade
+# one paper, step by step (every model answer comes from an isolated session subagent)
+PYTHONUTF8=1 ../.venv/Scripts/python.exe run.py tasks papers/ICLR.pdf --json
+PYTHONUTF8=1 ../.venv/Scripts/python.exe run.py seal <paper-id> <task-id> <answer.json>
+# or fully autonomous, from a Claude Code session: the saved workflow `referee`
+# (.claude/workflows/referee.js) loops tasks -> isolated Sonnet workers -> seal until done.
 ```
 
-`--auto-audit` and `--auto-grade` select a delegation mode; they do **not** open the gate
-that permits it. Add `SH_ALLOW_AUTO_AUDIT=1` and `SH_ALLOW_GRADING=1` (or the run stops at
-`waiting` and says so). Exit codes: `0` every paper complete · `2` some paper waits on lens
+The harness never spawns a model process. `run.py tasks` advances every deterministic stage
+and lists what still needs an answer (prompt path, output path, model tier); `run.py seal`
+validates and seals one answer, or exits 1 with an actionable refusal. Exit codes: `0` every paper complete · `2` some paper waits on lens
 evidence · `3` a whole-paper opinion disagreed sharply enough with the deterministic
 decision to be flagged contested · `1` error.
 

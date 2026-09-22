@@ -1,19 +1,20 @@
-"""Delegating the authors'-code reading, and relocating every citation it returns.
+"""Validating and relocating the authors'-code reading a session subagent returns.
 
 `python -m harness.artifact_review_driver` runs the self-check.
 
-One best-effort call per paper with a checkout, never retried, and its failure changes
-nothing: with the gate closed — or with the CLI unreachable, or the response malformed —
-the artifact route still runs on `artifact_evidence`'s deterministic probes alone, and a
-reviewer sees exactly what the harness could establish without a model. That is the same
-property `allow_grading` and `allow_claim_links` have, and it is what makes a model channel
-on the always-on path assessable: a channel nobody can turn off cannot be measured.
+**One best-effort task per paper with a checkout, never retried, and its absence changes
+nothing.** With no reading sealed yet — the gate closed, or the response malformed — the
+artifact route still runs on `artifact_evidence`'s deterministic probes alone, and a
+reviewer sees exactly what the harness could establish without a model. `stages/artifact.py`
+persists the prompt (`harness.stages.artifact._reviewer_facts`) that `harness/tasks.py`
+lists as an `artifact_review` task for the controlling session's own subagent to answer;
+this module never spawns anything to answer it itself any more.
 
-**What the reader gets is read-only, and what it says is relocated.** The confinement
-grants `Read` and `Grep` over the checkout and nothing else — no `Bash`, no `Write`, no
-network — so it can read the authors' code and cannot run it. Then every concern it returns
-is put through `artifact_evidence.relocate`: the file must be in the pinned checkout, the
-quoted text must be in that file, and it must occur exactly once. What does not relocate is
+**What the reader is asked for is read-only, and what it says is relocated.** The task is
+built to ask for `Read`/`Grep` over the checkout only — no `Bash`, no `Write`, no network —
+so it can read the authors' code and cannot run it. Then every concern it returns is put
+through `artifact_evidence.relocate`: the file must be in the pinned checkout, the quoted
+text must be in that file, and it must occur exactly once. What does not relocate is
 DROPPED and counted, exactly as `stages.audit.load_reports` drops a finding whose quotation
 is not in the paper.
 
@@ -24,23 +25,16 @@ three requirements and not this module's.
 """
 from __future__ import annotations
 
-import hashlib
 import json
-import shutil
-import subprocess
-import sys
-import tempfile
-import time
 from pathlib import Path
 
-from . import artifact_evidence, delegation, reviewer_cli, sealing, state
+from . import artifact_evidence, delegation, sealing, state
+from .reviewer_cli import envelope_provenance, unwrap_envelope
 from .schema import (ARTIFACT_IDENTITY_BASES, ARTIFACT_IDENTITY_STATES,
                      ArtifactFact,
                      ArtifactInspection, ArtifactSnapshot, PaperDoc)
 from .config import Config
 from .prompts import artifact_review as AP
-from .reviewer_cli import (Confinement, denied_tools, envelope_provenance,
-                           operator_confinement, unwrap_envelope)
 
 WRITERS = ("artifact_review_driver",) + tuple(delegation.WRITTEN_BY.values())
 
@@ -67,55 +61,12 @@ class ArtifactReviewDriverError(RuntimeError):
 
 
 def role_model(cfg: Config) -> str:
+    """WHICH model tier an `artifact_review` task should request — metadata
+    `harness.tasks.pending` attaches to the task dict. No gate any more: there is no
+    external process to spawn, so the only precondition for dispatching this task is
+    `harness.stages.artifact._reviewer_facts`'s own (an audited checkout exists and no
+    valid sealed reading covers it yet)."""
     return delegation.resolve_model(cfg.artifact_review_model, AP.ROLE_SPEC.get("model", ""))
-
-
-def review_confinement(cfg: Config, *, settings_sha256: str = "",
-                       repo_dir: str = "") -> Confinement:
-    """Read-only over the CHECKOUT, and nothing else. No execution, by construction.
-
-    `Read` and `Grep` are the minimum for reading a repository nobody has mapped, and they
-    are the maximum this role may ever have: an auditor that could run the code would be
-    an execution path with none of `authorize()`'s preconditions in front of it — no
-    verified commit, no experiment identity, no resource check, no provenance. The
-    denied-tool list is written to a pinned settings file and enforced by the CLI, which
-    is what lets this mode report a tool policy at all.
-    """
-    if cfg.artifact_review_cmd.strip():
-        return operator_confinement("authors'-code auditor")
-    allowed = ("Read", "Grep")
-    return Confinement(
-        role="artifact_review", allowed_tools=allowed,
-        disallowed_tools=denied_tools(allowed),
-        add_dir=((repo_dir,) if repo_dir else ()), model=role_model(cfg),
-        restricted=True, strict_mcp=True, bare=False,
-        settings_sha256=settings_sha256, output_format="json",
-    )
-
-
-def default_cmd(cfg: Config | None = None, *, exe: str = "", settings: str = "",
-                repo_dir: str = "") -> str:
-    cfg = cfg or Config()
-    exe = delegation.resolve_reviewer_exe(exe, cfg.reviewer_exe)
-    if not exe:
-        return ""
-    extra = review_confinement(
-        Config(artifact_review_cmd="", artifact_review_model=cfg.artifact_review_model),
-        repo_dir=repo_dir).flags(settings)
-    return reviewer_cli.cli_pipe_command(exe, extra)
-
-
-def resolve_cmd(cfg: Config, *, settings: str = "", repo_dir: str = "") -> str:
-    return cfg.artifact_review_cmd.strip() or default_cmd(
-        cfg, exe=cfg.reviewer_exe, settings=settings, repo_dir=repo_dir)
-
-
-def available(cfg: Config) -> tuple[bool, str]:
-    if not cfg.allow_artifact_review:
-        return False, ("authors'-code audit gate is closed: SH_ALLOW_ARTIFACT_REVIEW is "
-                       "not set. With it closed the artifact route still runs on "
-                       "deterministic probes alone")
-    return delegation.check_command(resolve_cmd(cfg), "SH_ARTIFACT_REVIEW_CMD")
 
 
 def parse_concerns(text: str) -> tuple[list[dict], str, dict]:
@@ -191,9 +142,8 @@ def _reread_config(root: str | Path, rel_file: str, key: str,
                    claimed: str) -> tuple[str, str]:
     """(the value the FILE states for `key`, how it was read). Never the auditor's copy.
 
-    §8 of the brief, and the reason `config_values` and `argparse_default` existed with no
-    caller: once the auditor names a key, the harness can stop trusting the value it was
-    handed and read the file itself. Two readers, tried in order, because a default in an
+    Once the auditor names a key, the harness can stop trusting the value it was handed
+    and read the file itself. Two readers, tried in order, because a default in an
     `argparse` call is not a `key: value` line and a YAML entry is not an `add_argument`.
 
     AMBIGUITY REFUSES rather than picks. A key set in three places has three answers and
@@ -293,11 +243,10 @@ def _paths(cfg: Config, pid: str) -> tuple[Path, Path]:
 
 
 def seal(cfg: Config, pid: str, inspection: ArtifactInspection, record: dict) -> dict:
-    """`record` already carries whatever `delegation.provenance_record` produced —
-    `accept` builds it explicitly, and `run()`'s own inline record states its mode
-    directly, since it IS a `CLI_SUBPROCESS` call. See `verdict_driver._seal` for why
-    `mode`/`reviewer`/`tool_policy` are re-derived FROM `record` rather than recomputed a
-    second, independent time."""
+    """`record` already carries whatever `delegation.provenance_record` produced --
+    `accept` builds it explicitly. `mode`/`reviewer`/`tool_policy` are re-derived FROM
+    `record` rather than recomputed a second, independent time (see `agent._seal_role`
+    for the same shape shared by every other role)."""
     out, _sidecar = _paths(cfg, pid)
     return sealing.seal(
         out, inspection.model_dump(),
@@ -312,8 +261,16 @@ def seal(cfg: Config, pid: str, inspection: ArtifactInspection, record: dict) ->
 def accept(cfg: Config, pid: str, doc: PaperDoc, root: str | Path, raw: str, *,
            url: str = "", statements: list[str] | None = None, reader: str = "",
            tool_policy: str = "unrecorded", mode: str = "MANUAL",
-           facts: list[ArtifactFact] | None = None) -> ArtifactInspection:
-    """Relocate and seal a reading produced OUTSIDE this module's subprocess."""
+           facts: list[ArtifactFact] | None = None, prompt_sha256: str = "") -> ArtifactInspection:
+    """Relocate and seal a reading produced by a delegate -- a human, or (the live path,
+    via `harness.tasks.seal`) a session subagent answering the `artifact_review` task
+    `harness.stages.artifact._reviewer_facts` persisted.
+
+    `prompt_sha256`, when given, is recorded on the sidecar so a LATER call to `load()`
+    (or `harness.stages.artifact._reviewer_facts`'s own cache check) can tell whether this
+    reading still answers the prompt currently on disk -- the same pinning
+    `agent.accept_verdict` and every lens/grade seal already do.
+    """
     proposals, notes, meta = parse_concerns(raw)
     snap = artifact_evidence.snapshot(root, url)
     located, lmeta = locate_all(doc, root, snap, proposals)
@@ -323,7 +280,7 @@ def accept(cfg: Config, pid: str, doc: PaperDoc, root: str | Path, raw: str, *,
     inspection = inspection.model_copy(update={
         "proposed": lmeta["proposed"], "relocated": lmeta["relocated"]})
     prov = delegation.provenance_record(mode=mode, reviewer=reader, tool_policy=tool_policy)
-    seal(cfg, pid, inspection, {
+    record = {
         "written_by": prov["written_by"], "delegation_mode": prov["delegation_mode"],
         "reader": prov["reviewer"], "tool_policy": prov["tool_policy"],
         "isolation_claim": prov["isolation_claim"],
@@ -331,7 +288,10 @@ def accept(cfg: Config, pid: str, doc: PaperDoc, root: str | Path, raw: str, *,
         "notes": notes, **{k: v for k, v in lmeta.items()},
         "harness_keys_stripped": meta.get("harness_keys_stripped", 0),
         "unknown_keys_dropped": meta.get("unknown_keys_dropped", 0),
-    })
+    }
+    if prompt_sha256:
+        record["prompt_sha256"] = prompt_sha256
+    seal(cfg, pid, inspection, record)
     return inspection
 
 
@@ -345,11 +305,10 @@ def load(cfg: Config, pid: str, *, commit: str = "",
     nobody looked at, which is the failure `extraction_version` describes for the paper
     side and this one enforces.
 
-    `prompt_sha256`, when given, must match what the sidecar recorded — the same shape
-    `verdict_driver.load_accepted` already uses: an absent value on
+    `prompt_sha256`, when given, must match what the sidecar recorded: an absent value on
     EITHER side is never treated as a mismatch, so a sidecar sealed before this parameter
     existed (or a caller not yet passing one) is not refused over a field that did not
-    exist then. `run()`'s prompt is a function of the paper's title, its method text, the
+    exist then. The prompt is a function of the paper's title, its method text, the
     checkout's file tree, the pinned commit, the advertised URL and the paper's own
     reported quantities (`stages.artifact._reviewer_facts`, via `prompts.artifact_review.
     build`); a changed hash means one of those moved, and a cached reading against the OLD
@@ -373,128 +332,17 @@ def load(cfg: Config, pid: str, *, commit: str = "",
         return None
 
 
-def _record_failure(cfg: Config, pid: str, why: str, **extra) -> None:
-    """Why the auditor produced nothing. A silent None is not an acceptable record.
-
-    Every early return below writes this. A pass that fails and leaves no trace is
-    indistinguishable from a pass that ran and found nothing, and those are opposite facts
-    about a repository — the same reason `ClaimLinkSet` keeps its refusals and
-    `load_reports` counts its drops rather than discarding them.
-    """
-    try:
-        _out, sidecar = _paths(cfg, pid)
-        state.write_json(sidecar, {"written_by": "artifact_review_driver",
-                                   "paper_id": pid, "ran": False, "failure": why,
-                                   "ts": state.now(), **extra})
-    except OSError:
-        pass
-
-
-def run(cfg: Config, pid: str, doc: PaperDoc, root: str | Path, prompt_text: str, *,
-        url: str = "", statements: list[str] | None = None,
-        facts: list[ArtifactFact] | None = None) -> ArtifactInspection | None:
-    """One best-effort call. Returns None on ANY failure, and never raises.
-
-    Every failure path records WHY in the sidecar before returning, so "the auditor found
-    nothing" and "the auditor never answered" are distinguishable afterwards.
-    """
-    ok, why = available(cfg)
-    if not ok:
-        _record_failure(cfg, pid, why)
-        return None
-    prompt_sha = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
-    started = time.time()
-    with tempfile.TemporaryDirectory(prefix="sh-artreview-") as td:
-        prompt, out = Path(td) / "prompt.md", Path(td) / "out.txt"
-        prompt.write_text(prompt_text, encoding="utf-8")
-        policy_dir = Path(tempfile.mkdtemp(prefix="sh-artreview-policy-"))
-        conf = review_confinement(cfg, repo_dir=str(root))
-        try:
-            conf, settings_path = reviewer_cli.stage_settings(conf, policy_dir)
-        except OSError as e:
-            shutil.rmtree(policy_dir, ignore_errors=True)
-            _record_failure(cfg, pid, f"the pinned tool policy could not be written: {e}")
-            return None
-        cmd = (resolve_cmd(cfg, settings=settings_path, repo_dir=str(root))
-               .replace("{prompt}", str(prompt)).replace("{out}", str(out)))
-        sandbox = Path(tempfile.mkdtemp(prefix="sh-artreview-sandbox-"))
-        try:
-            try:
-                p, timed_out = reviewer_cli.spawn_and_wait(
-                    cmd, sandbox, cfg.artifact_review_timeout_s)
-            except OSError as e:
-                _record_failure(cfg, pid, f"the reader could not be started: {e}",
-                                command=cmd)
-                return None
-            if timed_out:
-                _record_failure(
-                    cfg, pid,
-                    f"the reader did not answer within "
-                    f"{cfg.artifact_review_timeout_s}s and was killed",
-                    command=cmd, seconds=round(time.time() - started, 1))
-                return None
-            if not out.exists():
-                _record_failure(
-                    cfg, pid, "the reader exited without writing the output file",
-                    command=cmd, returncode=p.returncode,
-                    stderr=(p.stderr or "")[-1200:], stdout=(p.stdout or "")[-1200:],
-                    seconds=round(time.time() - started, 1))
-                return None
-            raw = ""
-            try:
-                raw = out.read_text(encoding="utf-8")
-                proposals, notes, meta = parse_concerns(raw)
-            except (OSError, ArtifactReviewDriverError) as e:
-                _record_failure(cfg, pid, f"the reader's output was unusable: {e}",
-                                command=cmd, returncode=p.returncode,
-                                raw_head=(raw if isinstance(raw, str) else "")[:1500],
-                                seconds=round(time.time() - started, 1))
-                return None
-            snap = artifact_evidence.snapshot(root, url)
-            located, lmeta = locate_all(doc, root, snap, proposals)
-            inspection = artifact_evidence.inspect(
-                doc, root, url=url, statements=statements,
-                facts=list(facts or []) + located).model_copy(
-                    update={"proposed": lmeta["proposed"],
-                            "relocated": lmeta["relocated"]})
-            try:
-                seal(cfg, pid, inspection, {
-                    "written_by": "artifact_review_driver", "reader": "",
-                    "delegation_mode": "CLI_SUBPROCESS",
-                    "command": cmd, "returncode": p.returncode,
-                    "seconds": round(time.time() - started, 1),
-                    "tool_policy": conf.summary(), "tool_policy_detail": conf.policy(),
-                    "prompt_sha256": prompt_sha, "notes": notes,
-                    "raw_sha256": hashlib.sha256(out.read_bytes()).hexdigest(),
-                    "envelope": meta.get("envelope") or {}, **lmeta,
-                    "harness_keys_stripped": meta.get("harness_keys_stripped", 0),
-                    "unknown_keys_dropped": meta.get("unknown_keys_dropped", 0),
-                })
-            except OSError:
-                pass
-            return inspection
-        finally:
-            shutil.rmtree(sandbox, ignore_errors=True)
-            shutil.rmtree(policy_dir, ignore_errors=True)
-
-
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":       # self-check: python -m harness.artifact_review_driver
+    import subprocess
+    import sys
+    import tempfile
+
     from .schema import Section
 
-    assert available(Config(allow_artifact_review=False))[0] is False
-    assert "SH_ALLOW_ARTIFACT_REVIEW" in available(Config(allow_artifact_review=False))[1]
-    bad = Config(allow_artifact_review=True, artifact_review_cmd="reader --in {prompt}")
-    assert available(bad)[0] is False, "a template with no {out} must be refused"
-    assert available(Config(allow_artifact_review=True,
-                            artifact_review_cmd="cp {prompt} {out}")) == (True, "")
-
-    # READ-ONLY, AND NO EXECUTION. The confinement is the enforcement, not the prompt.
-    conf = review_confinement(Config(allow_artifact_review=True))
-    assert set(conf.allowed_tools) == {"Read", "Grep"}, conf.allowed_tools
-    for forbidden in ("Bash", "Write", "Edit", "WebFetch", "WebSearch"):
-        assert forbidden in conf.disallowed_tools, forbidden
-    assert conf.model == "sonnet" and conf.enforced is True
+    # Model tier metadata, no gate, no command -- there is nothing left to resolve.
+    assert role_model(Config(artifact_review_model="haiku")) == "haiku"
+    assert role_model(Config()) == AP.ROLE_SPEC["model"]
 
     # A reader's own verdict on its own concern is stripped before anything is located.
     proposals, notes, meta = parse_concerns(json.dumps({
@@ -538,7 +386,7 @@ if __name__ == "__main__":       # self-check: python -m harness.artifact_review
             print("harness.artifact_review_driver self-check skipped: git unavailable")
             sys.exit(0)
 
-        cfg = Config(projects_dir=Path(td) / "projects", allow_artifact_review=True)
+        cfg = Config(projects_dir=Path(td) / "projects")
         state.create_project(cfg, "", "T", pid="p")
         doc = PaperDoc(paper_id="p", title="T", n_pages=1, sections=[
             Section(section_idx=0, title="Method", page_start=1,
@@ -613,9 +461,8 @@ if __name__ == "__main__":       # self-check: python -m harness.artifact_review
             "an inspection is about ONE tree and may not be served for another"
 
         # `prompt_sha256`: an ABSENT value on either side is never a mismatch. This
-        # fixture was sealed through `accept()`, whose sidecar never records one (only
-        # `run()`'s own live-subprocess path does) — so a caller supplying one here must
-        # still get the inspection back, exactly like `verdict_driver.load_accepted` does.
+        # fixture was sealed through `accept()`, whose sidecar never records one — so a
+        # caller supplying one here must still get the inspection back.
         assert load(cfg, "p", prompt_sha256="c" * 64) is not None
 
         # A REAL prompt-hash mismatch — the sidecar recorded one, the caller asks for a

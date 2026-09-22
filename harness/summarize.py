@@ -1,9 +1,8 @@
 """Consolidate finished reviews: the executive dossier, and system-wide evaluation metrics.
 
-Consolidates `dossier.py` (631 lines) + `evaluation.py` (608) into this file. Both read
-ONLY the persisted `reports/<pid>.json` / `.ledger.json` artifacts S4 already wrote — they
-re-derive nothing and re-judge nothing, so neither has any dependency on `report.py`'s
-internal functions, only on the stable JSON shape `schema.EvalReport`/`CaseLedger` define.
+Reads ONLY the persisted `reports/<pid>.json` / `.ledger.json` artifacts S4 already wrote
+— re-derives and re-judges nothing, so this module depends only on the stable JSON shape
+`schema.EvalReport`/`CaseLedger` define, never on `report.py`'s internals.
 
 `python -m harness.summarize` runs the self-check.
 """
@@ -20,27 +19,23 @@ from .config import Config
 from .schema import PAPER_DISPOSITIONS, CaseLedger, EvalReport
 
 # ========================================================================================
-# DOSSIER — was dossier.py. Two outputs from the same content: a markdown dossier
-# (canonical, diffable) and a best-effort PDF rendered with PyMuPDF's Story API.
+# DOSSIER: two outputs from the same content — a markdown dossier (canonical, diffable) and a best-
+# effort PDF rendered with PyMuPDF's Story API.
 # ========================================================================================
 SEVERITIES = ("FATAL", "MAJOR", "MINOR")
 VENUES = {"acl": "ACL", "iclr": "ICLR", "cvpr": "CVPR", "neurips": "NeurIPS",
          "emnlp": "EMNLP", "icml": "ICML"}
 CRITICAL_LIMIT = 6
 
-
 def disposition_heading(report: dict) -> str:
-    """The heading a per-paper section is headed with: the disposition, plain — not a
-    colour, not an accept/reject score. Falls closed to an explicit STALE marker rather
-    than passing an unrecognised string through — a retired vocabulary value left on disk
-    must not render as live."""
+    """The heading a per-paper section is headed with: the disposition, plain — never a
+    colour or accept/reject score. Falls closed to an explicit STALE marker rather than
+    passing an unrecognised string through."""
     d = (report.get("disposition") or "").strip()
     return f"`{d}`" if d else "`NOT_REVIEWED` — STALE, re-run this paper"
 
-
 def venue_of(pid: str) -> str:
     return VENUES.get(pid.split("-")[0].lower(), "")
-
 
 def load(cfg: Config, pid: str) -> dict | None:
     path = state.project_dir(cfg, pid) / "reports" / f"{pid}.json"
@@ -48,18 +43,15 @@ def load(cfg: Config, pid: str) -> dict | None:
         return None
     return json.loads(path.read_text(encoding="utf-8"))
 
-
 def counted_severity(f: dict) -> str:
     """The severity `report.counted()` actually counted — falls back to the lens's own
     `severity` when `counted_severity` is unset, mirroring that function exactly rather
     than re-deriving it (this module copies and never classifies)."""
     return f.get("counted_severity") or f.get("severity") or ""
 
-
 def counts(report: dict) -> dict[str, int]:
     findings = report.get("findings") or []
     return {s: sum(1 for f in findings if counted_severity(f) == s) for s in SEVERITIES}
-
 
 def probe_status(report: dict) -> str:
     """`verdict` alone is not enough: 'detectable' from a synthesized probe and from the
@@ -75,7 +67,6 @@ def probe_status(report: dict) -> str:
         bits.append(rec)
     return " · ".join(bits)
 
-
 def repo_status(report: dict) -> str:
     p = report.get("probe") or {}
     repo = p.get("repo") or {}
@@ -83,7 +74,6 @@ def repo_status(report: dict) -> str:
     audit = p.get("code_audit") or {}
     n = len(audit.get("findings") or [])
     return f"{status}" + (f", {n} static finding(s)" if n else "")
-
 
 def calibration_line(report: dict) -> str:
     p = report.get("probe") or {}
@@ -110,7 +100,6 @@ def calibration_line(report: dict) -> str:
         bits.append(f"{p['seconds']:.0f}s wall clock")
     return ", ".join(bits) + "."
 
-
 def provenance_caveat(report: dict) -> str:
     """The standing caveat for a probe not entitled to a reproduction verdict — provenance
     alone says WHOSE code would be entitled to one, never whether a process actually ran
@@ -121,34 +110,33 @@ def provenance_caveat(report: dict) -> str:
     executed = bool(p.get("seeds_run")) or int(p.get("executions") or 0) > 0
     if not executed:
         return ("⚠️ A probe/reimplementation route was prepared but no process "
-               "executed. It produced no measurement and cannot support a conclusion "
-               "about the paper.")
+                "executed. It produced no measurement and cannot support a conclusion "
+                "about the paper.")
     resolved = rec_status in ("RESOLVED_VERIFIED", "FAILED_REPRODUCTION")
     if provenance_mod.admits(prov) and executed and resolved:
         whose = ("the authors' own checkout (AUTHOR_REPOSITORY)" if prov == "repo_exec"
                 else "an INDEPENDENT_REIMPLEMENTATION of the paper's method — not "
                      "the authors' code")
         return (f"This probe ran {whose}, so its reconciliation against "
-               f"the cited cell is a real reproduction verdict.")
+                f"the cited cell is a real reproduction verdict.")
     if provenance_mod.admits(prov):
         why = f"reconciliation `{rec_status or 'not recorded'}`"
         return (f"⚠️ This probe's provenance ({prov}) would admit a real "
-               f"reproduction verdict, but none was reached ({why}). Nothing about the "
-               f"paper's own code follows from this.")
+                f"reproduction verdict, but none was reached ({why}). Nothing about the "
+                f"paper's own code follows from this.")
     if prov == "synthesized":
         if p.get("mechanism") == "placebo":
             return ("⚠️ This probe is a generic, paper-independent placebo "
-                   "control — it was NOT derived from this paper's formulation. It "
-                   "measures how much an auxiliary term with no hypothesis moves the "
-                   "metric, and it may neither convict nor acquit a printed cell, and it "
-                   "cannot drive this paper's verdict.")
+                    "control — it was NOT derived from this paper's formulation. It "
+                    "measures how much an auxiliary term with no hypothesis moves the "
+                    "metric, and it may neither convict nor acquit a printed cell, and it "
+                    "cannot drive this paper's verdict.")
         return ("⚠️ This probe was written by the harness from the paper's own "
-               "published formulation and run at toy scale. It is evidence about the "
-               "MECHANISM, not about the paper's tables.")
+                "published formulation and run at toy scale. It is evidence about the "
+                "MECHANISM, not about the paper's tables.")
     return ("⚠️ This probe used the identical-arms template, which measures "
-           "this machine's seed-noise floor and nothing about the paper. It reproduces "
-           "no claim.")
-
+            "this machine's seed-noise floor and nothing about the paper. It reproduces "
+            "no claim.")
 
 def category_counts(report: dict) -> dict[str, int]:
     out: dict[str, int] = {}
@@ -158,7 +146,6 @@ def category_counts(report: dict) -> dict[str, int]:
             out[k] = out.get(k, 0) + 1
     return out
 
-
 def resolution_counts(report: dict) -> dict[str, int]:
     out: dict[str, int] = {}
     for sf in report.get("scientific_findings") or []:
@@ -166,13 +153,11 @@ def resolution_counts(report: dict) -> dict[str, int]:
         out[k] = out.get(k, 0) + 1
     return out
 
-
 def _abbrev(counter: dict[str, int]) -> str:
     if not counter:
         return "—"
     return ", ".join(f"{n} {k.replace('_', ' ').lower()}"
                      for k, n in sorted(counter.items(), key=lambda kv: (-kv[1], kv[0])))
-
 
 def matrix(reports: list[dict]) -> list[list[str]]:
     """The multi-paper evaluation matrix. Leads with SCIENTIFIC CATEGORIES — what the
@@ -190,13 +175,11 @@ def matrix(reports: list[dict]) -> list[list[str]]:
             disposition_heading(r)])
     return rows
 
-
 def _md_table(rows: list[list[str]]) -> list[str]:
     head, body = rows[0], rows[1:]
     out = ["| " + " | ".join(head) + " |", "|" + "|".join("---" for _ in head) + "|"]
     out += ["| " + " | ".join(cell.replace("|", "\\|") for cell in row) + " |" for row in body]
     return out
-
 
 def _finding_lines(report: dict) -> list[str]:
     critical = [f for f in (report.get("findings") or [])
@@ -218,7 +201,6 @@ def _finding_lines(report: dict) -> list[str]:
         out.append("")
     return out
 
-
 def render_markdown(reports: list[dict], missing: list[str]) -> str:
     L = ["# Executive Review Dossier", "",
         f"{len(reports)} paper(s) reviewed by single-harness. Every disposition below is "
@@ -234,8 +216,8 @@ def render_markdown(reports: list[dict], missing: list[str]) -> str:
     total = {s: sum(counts(r)[s] for r in reports) for s in SEVERITIES}
     dropped = sum(r.get("dropped_findings", 0) for r in reports)
     L += [f"Corpus totals: **{total['FATAL']} FATAL**, **{total['MAJOR']} MAJOR**, "
-         f"**{total['MINOR']} MINOR** across {len(reports)} paper(s); "
-         f"**{dropped}** finding(s) dropped as unsubstantiated.", "", "---", ""]
+          f"**{total['MINOR']} MINOR** across {len(reports)} paper(s); "
+          f"**{dropped}** finding(s) dropped as unsubstantiated.", "", "---", ""]
     for r in reports:
         c = counts(r)
         L += [f"## {disposition_heading(r)} — `{r['paper_id']}`", "",
@@ -257,26 +239,22 @@ def render_markdown(reports: list[dict], missing: list[str]) -> str:
              provenance_caveat(r), "", "---", ""]
     return "\n".join(L)
 
-
 _INLINE = [(re.compile(r"`([^`]+)`"), r"<code>\1</code>"),
           (re.compile(r"\*\*([^*]+)\*\*"), r"<b>\1</b>")]
 _PDF_GLYPHS = {"⚠️": "(!)", "⚠": "(!)", "“": '"', "”": '"',
               "’": "'", "—": "-", "σ": "sigma", "Δ": "delta",
               "±": "+/-", "…": "..."}
 
-
 def _ascii_for_pdf(text: str) -> str:
     for bad, good in _PDF_GLYPHS.items():
         text = text.replace(bad, good)
     return text
-
 
 def _inline_html(text: str) -> str:
     out = html.escape(_ascii_for_pdf(text))
     for pattern, repl in _INLINE:
         out = pattern.sub(repl, out)
     return out
-
 
 def markdown_to_html(md: str) -> str:
     """A deliberately small renderer for the subset of markdown `render_markdown` emits —
@@ -324,14 +302,13 @@ def markdown_to_html(md: str) -> str:
             body.append(f"<p>{_inline_html(line)}</p>")
     flush_table()
     css = ("body{font-family:sans-serif;font-size:9.5pt;line-height:1.45}"
-          "h1{font-size:19pt;margin:0 0 6pt 0}h2{font-size:13pt;margin:14pt 0 4pt 0}"
-          "h3{font-size:10.5pt;margin:10pt 0 3pt 0}p{margin:0 0 5pt 0}"
-          "p.quote{font-style:italic;margin-left:10pt}p.item{margin-left:8pt}"
-          "p.sub{margin-left:18pt}code{font-family:monospace;font-size:9pt}"
-          "table{width:100%}th{text-align:left;font-weight:bold;font-size:8.5pt}"
-          "td{font-size:8.5pt}")
+           "h1{font-size:19pt;margin:0 0 6pt 0}h2{font-size:13pt;margin:14pt 0 4pt 0}"
+           "h3{font-size:10.5pt;margin:10pt 0 3pt 0}p{margin:0 0 5pt 0}"
+           "p.quote{font-style:italic;margin-left:10pt}p.item{margin-left:8pt}"
+           "p.sub{margin-left:18pt}code{font-family:monospace;font-size:9pt}"
+           "table{width:100%}th{text-align:left;font-weight:bold;font-size:8.5pt}"
+           "td{font-size:8.5pt}")
     return f"<html><head><style>{css}</style></head><body>{''.join(body)}</body></html>"
-
 
 def write_pdf(md: str, out: Path) -> str:
     """Render with PyMuPDF's Story. Returns '' on success, else why not — a rendering
@@ -356,13 +333,11 @@ def write_pdf(md: str, out: Path) -> str:
         return f"{type(e).__name__}: {e}"
     return ""
 
-
 def build_dossier(cfg: Config, pids: list[str], out_dir: Path | None = None,
                   stem: str = "Executive_Review_Dossier") -> dict:
     """Write the dossier for `pids`. Papers without a finished report are listed, not
-    faked — and an EMPTY dossier is refused outright rather than overwriting a real one:
-    a batch that stopped early must not silently replace a prior finished dossier with
-    'no findings'."""
+    faked, and an EMPTY dossier is refused outright: a batch that stopped early must not
+    silently replace a prior finished dossier with 'no findings'."""
     reports: list[dict] = []
     missing: list[str] = []
     for pid in pids:
@@ -391,11 +366,10 @@ def build_dossier(cfg: Config, pids: list[str], out_dir: Path | None = None,
            "totals": {s: sum(counts(r)[s] for r in reports) for s in SEVERITIES},
            "dropped": sum(r.get("dropped_findings", 0) for r in reports)}
 
-
 # ========================================================================================
-# EVALUATION — was evaluation.py. System metrics over a reviewed corpus, counted from
-# artifacts, never asserted. No adjudicated ground truth exists for this corpus, so
-# accuracy/recall/agreement-with-humans are absent here rather than estimated.
+# EVALUATION: system metrics over a reviewed corpus, counted from artifacts, never asserted.
+# No adjudicated ground truth exists for this corpus, so accuracy/recall/agreement-with-humans are
+# absent here rather than estimated.
 # ========================================================================================
 LIMITATIONS = [
     "No paper in this corpus carries adjudicated ground truth for its findings, so "
@@ -422,14 +396,11 @@ LIMITATIONS = [
     "nothing and count toward no threshold.",
 ]
 
-
 def _ratio(num: int, den: int) -> float | None:
     return round(num / den, 4) if den else None
 
-
 def _pct(value) -> str:
     return "not computable" if value is None else f"{value:.0%}"
-
 
 def _surface_totals(papers: list[dict]) -> dict:
     """Corpus coverage from the SUMS, never averaged per-paper rates — averaging weights
@@ -453,7 +424,6 @@ def _surface_totals(papers: list[dict]) -> dict:
             "prose_presented_fraction_max": max(fractions) if fractions else None,
             "semantic_coverage": "not_machine_detectable"}
 
-
 def merge_states(papers: list[dict], key: str) -> dict[str, int]:
     out: dict[str, int] = {}
     for x in papers:
@@ -462,11 +432,10 @@ def merge_states(papers: list[dict], key: str) -> dict[str, int]:
             out[v] = out.get(v, 0) + 1
     return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
 
-
 def assert_conservation(summary: dict) -> list[str]:
     """Every requested paper counted exactly once, no total exceeding its own term.
-    Returns violations rather than raising: a broken accounting must appear IN the
-    artifact, where a reader of the JSON meets it."""
+    Returns violations rather than raising, so a broken accounting appears IN the
+    artifact."""
     bad: list[str] = []
     measured = int(summary.get("papers_measured") or 0)
     for field in ("triage", "binary_verdict", "review_paths"):
@@ -499,7 +468,6 @@ def assert_conservation(summary: dict) -> list[str]:
     if int(rex.get("routes_exhausted") or 0) > int(rex.get("routes_applicable") or 0):
         bad.append("route exhaustion: exhausted routes exceed applicable routes")
     return bad
-
 
 def per_paper(cfg: Config, pid: str) -> dict | None:
     root = cfg.projects_dir / pid / "reports"
@@ -584,7 +552,6 @@ def per_paper(cfg: Config, pid: str) -> dict | None:
         "targets_summary": report.targets_summary,
     }
 
-
 def corpus(cfg: Config, pids: list[str]) -> dict:
     papers = [p for p in (per_paper(cfg, pid) for pid in pids) if p is not None]
     missing = [pid for pid in pids if per_paper(cfg, pid) is None]
@@ -667,7 +634,6 @@ def corpus(cfg: Config, pids: list[str]) -> dict:
     summary["conservation_violations"] = assert_conservation(summary)
     return summary
 
-
 def render_evaluation(summary: dict) -> str:
     L = ["# System evaluation", "",
         f"{summary['papers_measured']} of {summary['papers_requested']} requested paper(s) "
@@ -677,10 +643,10 @@ def render_evaluation(summary: dict) -> str:
         "|---|---:|---:|---:|---:|---:|---:|---|"]
     for p in summary["per_paper"]:
         L.append(f"| `{p['paper_id']}` | {p['questions_generated']} | "
-                f"{p['targets_discovered']} | {p['targets_addressable']} | "
-                f"{p['targets_requiring_execution']} | "
-                f"{p['targets_resolved_without_execution']} | "
-                f"{p['targets_blocked_before_execution']} | {p.get('disposition') or '—'} |")
+                 f"{p['targets_discovered']} | {p['targets_addressable']} | "
+                 f"{p['targets_requiring_execution']} | "
+                 f"{p['targets_resolved_without_execution']} | "
+                 f"{p['targets_blocked_before_execution']} | {p.get('disposition') or '—'} |")
     f = summary.get("funnel") or {}
     L += ["", "## From discovery to a settled question", "",
          "Six terms, each read off a different artifact and none interchangeable.", "",
@@ -717,7 +683,7 @@ def render_evaluation(summary: dict) -> str:
         lo, hi = cov.get("prose_presented_fraction_min"), cov.get("prose_presented_fraction_max")
         if lo is not None:
             L += ["", f"Lenses were shown between {lo:.0%} and {hi:.0%} of each paper's "
-                     f"extracted section text — the ceiling on any recall claim."]
+                      f"extracted section text — the ceiling on any recall claim."]
     paths = summary.get("review_paths") or {}
     if any(paths.values()):
         L += ["", "## Which review path each paper was on", "", "| Path | Papers |", "|---|---:|"]
@@ -757,7 +723,6 @@ def render_evaluation(summary: dict) -> str:
     L.append("")
     return "\n".join(L)
 
-
 def run_evaluate(cfg: Config, pids: list[str], out: Path | None = None) -> dict:
     summary = corpus(cfg, pids)
     out = out or (cfg.projects_dir.parent / "reports")
@@ -768,7 +733,6 @@ def run_evaluate(cfg: Config, pids: list[str], out: Path | None = None) -> dict:
     summary["paths"] = {"json": str(out / "system_evaluation.json"),
                         "md": str(out / "system_evaluation.md")}
     return summary
-
 
 # --------------------------------------------------------------------------------------- #
 def _self_check() -> None:
@@ -838,7 +802,6 @@ def _self_check() -> None:
         assert "| `p` |" in text and "Not measured" in text
 
     print("harness.summarize self-check ok")
-
 
 if __name__ == "__main__":
     _self_check()

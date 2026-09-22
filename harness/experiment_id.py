@@ -1,31 +1,15 @@
 """S3 identity resolution — WHICH experiment, WHICH quantity, WHICH configuration.
 
-`ExecCapability` asks whether this machine can run the repository. It does not ask
-whether the repository is being asked the right question, and a capable run of the wrong
+`ExecCapability` asks whether this machine can run the repository; it does not ask
+whether the repository is being asked the right question. A capable run of the wrong
 program is more dangerous than a crash: a crash is visible, a confident irrelevant number
-is not.
+is not (e.g. an entrypoint heuristic selecting a FLOPs/latency profiler and reconciling
+its output against a cell that holds a baseline's relative training memory).
 
-The concrete failure this module exists to prevent was found on a real paper. The
-entrypoint heuristic preferred `eval.py`, then `evaluate.py`, and selected APT's
-`evaluate.py` — which is a DeepSpeed FLOPs/latency profiler emitting `model_flops`,
-`model_macs`, `latency` and `peak_memory_stats`. The cell it would have been reconciled
-against, `T2:r3:c11`, holds `253.6% 114.8% 74.2%`: relative training memory for the
-LLMPruner BASELINE row, normalised to LoRA = 100%. Three separate things are wrong there,
-and none of them is an environment problem:
-
-  * the program is an efficiency profiler, not the pruning experiment;
-  * FLOPs is not memory, and megabytes are not a ratio to a baseline;
-  * LLMPruner is a third-party method this repository does not implement at all, so no
-    command in it can produce that row.
-
-Three identities, each categorical. There is deliberately no confidence score: a number
-invites a threshold, and a threshold silently converts "we are unsure which experiment
-this is" into an execution authorization. Abstention has to be a state.
-
-Every established identity carries `IdentityEvidence` with a `source_ref` — a file and
-line in the checkout, or a cell address — so the mapping can be re-checked the way S2
-evidence is re-checked. A mapping nobody can audit would be an oracle sitting upstream of
-every reproduction verdict.
+Three identities, each categorical, with deliberately no confidence score: a threshold
+would silently convert "we are unsure which experiment this is" into an execution
+authorization. Every established identity carries `IdentityEvidence` with a `source_ref`
+(a file/line in the checkout, or a cell address) so the mapping can be re-checked.
 """
 from __future__ import annotations
 
@@ -77,35 +61,21 @@ _COUNT_WORDS = ("case", "cases", "instance", "instances", "example", "examples",
 
 
 def prose_quantity(text: str) -> str:
-    """'count' when a prose span states how many of something there are, else ''.
-
-    A count is the one quantity a composition claim can carry, and a composition claim is
-    the one prose shape `harness.claims.parse_quantity` will admit — so this is narrow by
-    construction rather than by restraint. A sentence naming an accuracy is NOT read here:
-    an accuracy stated in prose has no column header, no basis and no baseline row, and
-    binding an executed number to it would be exactly the unearned identity this layer
-    exists to refuse.
-    """
+    """'count' when a prose span states how many of something there are, else ''. Narrow
+    by construction: a composition claim (the one prose shape `harness.claims
+    .parse_quantity` admits) can only carry a count. An accuracy stated in prose has no
+    column header, basis or baseline row, and is never read here."""
     low = (text or "").lower()
     return "count" if any(re.search(rf"\b{re.escape(w)}\b", low) for w in _COUNT_WORDS) else ""
-# ANY info string, not only the four shell-ish ones. A README that opens a ```python
-# block before its ```-only command block used to shift every fence boundary by one:
-# the pattern could not open on ```python, so it opened on that block's CLOSING fence
-# instead and the command block was read as the text BETWEEN blocks. The commands were
-# then invisible even though they sit in a fenced block, plainly, in the repository's own
-# README. Admitting every info string keeps fence pairing aligned; a non-shell block is
-# harmless because its lines still have to look like a command to be picked up.
+# ANY info string, not only the four shell-ish ones: a README opening a ```python block
+# before its ```-only command block would otherwise shift every fence boundary by one,
+# hiding the command block between fences. A non-shell block is harmless since its lines
+# still have to look like a command to be picked up.
 _FENCE = re.compile(r"```[A-Za-z0-9_+-]*[ \t]*\n(.*?)```", re.S)
-# Launchers a repository puts IN FRONT of the command it is actually advertising.
-# `srun python3 main_simclr.py --ddp` and `accelerate launch --mixed_precision fp16
-# train.py` are the same kind of statement as `python train.py` — the repository is
-# telling a reader what to run — but an anchored `python|bash|make` pattern sees neither,
-# so a repository whose README advertises only launcher-prefixed commands read as
-# advertising nothing at all, and identity resolution refused with "no command was
-# identified" about a repository that names its commands plainly. Recognising the
-# launcher is discovery, not invention: the argv kept is still verbatim what the
-# repository wrote, minus a scheduler/multi-GPU wrapper this harness cannot honour on a
-# single local machine anyway.
+# Launchers a repository puts IN FRONT of the command it is actually advertising
+# ("srun python3 main.py", "accelerate launch train.py") — recognised as discovery, not
+# invention: the argv kept is still verbatim what the repository wrote, minus the
+# scheduler/multi-GPU wrapper this harness cannot honour on a single local machine.
 _LAUNCHERS = ("srun", "torchrun", "accelerate launch", "deepspeed", "mpirun", "horovodrun")
 _CMD_LINE = re.compile(r"^\s*(?:\$\s*)?((?:bash|sh|python|python3|make)\s+\S.*)$", re.M)
 _LAUNCHED = re.compile(
@@ -117,11 +87,8 @@ _PROGRAM = re.compile(r"(?:^|\s)((?:python3?|bash|sh)\s+\S+\.(?:py|sh)|\S+\.(?:p
 
 def _advertised_line(raw: str) -> str:
     """The command a line advertises, or '' — direct form first, then launcher-prefixed.
-
-    Returns the command VERBATIM where it is already plain, and for a launched line
-    returns the program invocation the launcher was wrapping. Nothing is synthesised: a
-    line that names no runnable program yields nothing.
-    """
+    Returns the command VERBATIM where already plain, or the program invocation a
+    launcher was wrapping. Nothing is synthesised."""
     if m := _CMD_LINE.match(raw):
         return m.group(1)
     if m := _LAUNCHED.match(raw):
@@ -145,12 +112,8 @@ def _quantity_of(text: str) -> str:
 
 def cell_basis(table: Table, col: int) -> tuple[str, str]:
     """Is this column absolute, or normalised to a baseline row? Returns (basis, unit).
-
     Structural rather than lexical: a column of ratios contains its own normaliser, a row
-    reading exactly 100%. That is far more reliable than hunting for the word "relative"
-    in a caption, and it is what distinguishes `253.6%` (a ratio to LoRA) from `86.4%`
-    (an absolute percentage).
-    """
+    reading exactly 100% — far more reliable than hunting for "relative" in a caption."""
     values = [table.cell(r, col) for r in range(len(table.rows))]
     if any(_HUNDRED.match(v or "") for v in values):
         return "relative_to_baseline", "%"
@@ -165,15 +128,11 @@ def _header_for(table: Table, col: int) -> str:
     return table.caption or ""
 
 
-# --------------------------------------------------------------------------- #
-# Candidate discovery — from what the repository advertises, never from filenames
-# --------------------------------------------------------------------------- #
+# === Candidate discovery — from what the repository advertises, never from filenames ===
 def harvest_candidates(repo: Path, limit: int = 400) -> list[CandidateCommand]:
     """Every command the repository tells a reader to run, with its source location.
-
-    Filenames are not evidence. `evaluate.py` existing says nothing about what it does;
-    a README line saying "to finetune X, run Y" does.
-    """
+    Filenames are not evidence: `evaluate.py` existing says nothing about what it does; a
+    README line saying "to finetune X, run Y" does."""
     out: list[CandidateCommand] = []
 
     readme = repo / "README.md"
@@ -216,13 +175,9 @@ def harvest_candidates(repo: Path, limit: int = 400) -> list[CandidateCommand]:
 
 
 def target_file(repo: Path, cmd: CandidateCommand) -> Path | None:
-    """The file on disk a candidate command actually invokes, or None.
-
-    Public because `harness.alignment` needs the same lookup — a script's declared
-    configuration (`--sparsity 0.5`, a referenced config file) lives in the FILE this
-    resolves to, not in `cmd.argv`, which for a `scripts_dir` candidate is only
-    `["bash", "scripts/prune_0.5.sh"]`.
-    """
+    """The file on disk a candidate command actually invokes, or None. Public because
+    `harness.alignment` needs the same lookup — a script's declared configuration lives
+    in the FILE this resolves to, not in `cmd.argv`."""
     for token in cmd.argv[1:]:
         candidate = repo / token
         if candidate.is_file():
@@ -231,11 +186,8 @@ def target_file(repo: Path, cmd: CandidateCommand) -> Path | None:
 
 
 def describe_command(repo: Path, cmd: CandidateCommand, depth: int = 2) -> CandidateCommand:
-    """Label a command by the output keys its code actually writes.
-
-    Follows one hop from a shell script into the python it invokes, because a script's
-    own text says little and the module it calls says everything.
-    """
+    """Label a command by the output keys its code actually writes. Follows one hop from
+    a shell script into the python it invokes, since a script's own text says little."""
     path = target_file(repo, cmd)
     if path is None:
         return cmd
@@ -265,12 +217,9 @@ def describe_command(repo: Path, cmd: CandidateCommand, depth: int = 2) -> Candi
     quantities = sorted({q for k, q in _OUTPUT_QUANTITY if k in cmd.emits})
     cmd.label = ", ".join(quantities) or "unknown"
 
-    # Step 7 — two additive passes over the SAME candidate, corroboration first so
-    # `declared_configuration`'s Tier-1 script-text read and `corroborate`'s own file
-    # read are not the reason for import ordering here (they read independently).
-    # Deferred: `harness.alignment` reads `target_file` from this module, so importing
-    # it at module load time would be circular; by the time `describe_command` is ever
-    # CALLED, both modules have finished loading.
+    # Two additive passes over the SAME candidate; import deferred because
+    # `harness.alignment` reads `target_file` from this module, so importing it at module
+    # load time would be circular.
     from .alignment import candidates as alignment_candidates
     from .alignment import evaluator as alignment_evaluator
     alignment_evaluator.corroborate(repo, cmd)
@@ -282,17 +231,10 @@ _STRING_LITERAL = re.compile(r"'''.*?'''|\"\"\".*?\"\"\"|'[^'\n]*'|\"[^\"\n]*\""
 
 
 def repo_implements(repo: Path, method: str) -> bool:
-    """Does the repository CONTAIN an implementation of the named method?
-
-    Code and scripts only, and string literals are stripped before searching. Both
-    exclusions were forced by real data. A method named in the README's results table is
-    a citation of somebody else's baseline — LLMPruner appears once in APT's README and
-    in zero .py/.sh files. And it appears twice more as a matplotlib LABEL in
-    `plot/plot_tradeoff.py`, beside hardcoded literals (`42.9/53.4*100`) that are simply
-    the paper's own printed numbers replotted. A name that occurs only inside quoted text
-    is something the code TALKS ABOUT; a name in a path or an identifier is something the
-    code IS. Only the second is an implementation.
-    """
+    """Does the repository CONTAIN an implementation of the named method? Code and
+    scripts only, string literals stripped before searching: a name occurring only inside
+    quoted text (e.g. a matplotlib label, a citation of a baseline) is something the code
+    TALKS ABOUT; a name in a path or identifier is something the code IS."""
     token = re.sub(r"[^a-z0-9]", "", (method or "").lower())
     if len(token) < 3:
         return False
@@ -309,19 +251,12 @@ def repo_implements(repo: Path, method: str) -> bool:
     return False
 
 
-# --------------------------------------------------------------------------- #
-# Resolution
-# --------------------------------------------------------------------------- #
+# === Resolution ========================================================================
 def _prose_metric(quote: str, cmd: CandidateCommand | None, ref: str) -> MetricIdentity:
-    """Bind an executed COUNT to a prose-stated total, or refuse for a named reason.
-
-    The prose analogue of the cell path below, and no weaker than it. A cell earns its
-    quantity from a column header and its basis from whether the column contains a 100%
-    row; a prose composition earns its quantity from what the sentence says it counts and
-    its basis from the fact that a count has no baseline to be normalised against. Both
-    then require a command that emits the SAME quantity, from the same table of output
-    keys, and refuse identically when none does.
-    """
+    """Bind an executed COUNT to a prose-stated total, or refuse for a named reason. The
+    prose analogue of the cell path below and no weaker: both require a command emitting
+    the SAME quantity from the same table of output keys, and refuse identically when
+    none does."""
     ident = MetricIdentity(cell_basis="absolute")
     ident.cell_quantity = prose_quantity(quote)
     ident.evidence.append(IdentityEvidence(
@@ -424,18 +359,10 @@ def resolve_metric(doc: PaperDoc, table_ref: str, cmd: CandidateCommand | None,
 
 
 def _prose_experiment(repo: Path, quote: str, ref: str, finding_id: str) -> ExperimentIdentity:
-    """Which advertised command produces a prose-stated COUNT — or that none does.
-
-    Structurally the same refusal ladder as the cell path: harvest what the repository
-    advertises, keep only what emits the right quantity, and refuse when none does or when
-    more than one could, because choosing between two commands that both fit is a guess.
-
-    What has no analogue here is the ROW METHOD check. A cited table row names a method,
-    and a repository that does not implement that method cannot produce the row; a prose
-    total names a population instead, so there is no method to look for. That is a real
-    difference in what the paper stated, not a check being skipped — and it is why a prose
-    target still has to clear metric identity and configuration identity below.
-    """
+    """Which advertised command produces a prose-stated COUNT — or that none does. The
+    same refusal ladder as the cell path (harvest, keep only what emits the right
+    quantity, refuse on none or ambiguity), minus the ROW METHOD check: a prose total
+    names a population, not a method, so there is no method to look for."""
     ident = ExperimentIdentity(finding_id=finding_id, table_ref=ref)
     if not prose_quantity(quote):
         ident.state, ident.reason = "unmapped", (
@@ -568,15 +495,11 @@ def resolve_experiment(doc: PaperDoc, repo: Path, table_ref: str,
 
 def _prose_configuration(quote: str, cmd: CandidateCommand | None,
                          ref: str) -> ConfigurationIdentity:
-    """The configuration a prose-stated COUNT is produced under.
-
-    The seed-policy question, which dominates the cell path below, has no purchase here
-    and saying so is more honest than inventing an answer: a count of the items a
-    generator produces is not a measurement with seed-to-seed variance, so there is no
-    protocol to match and `seed_policy_match` stays None rather than True. What IS
-    required is the composition itself — the operands the paper multiplied are the
-    configuration, and they are already re-verified by `harness.claims.parse_quantity`.
-    """
+    """The configuration a prose-stated COUNT is produced under. The seed-policy question
+    that dominates the cell path below has no purchase here: a count has no seed-to-seed
+    variance, so there is no protocol to match and `seed_policy_match` stays None rather
+    than True. What IS required is the composition itself, already re-verified by
+    `harness.claims.parse_quantity`."""
     ident = ConfigurationIdentity()
     if cmd is None or not prose_quantity(quote):
         ident.state = "unmapped"
@@ -619,11 +542,8 @@ def resolve_configuration(doc: PaperDoc, table_ref: str, cmd: CandidateCommand |
             ident.matched[field] = hit.group(1)
             ident.evidence.append(IdentityEvidence(quote=hit.group(1), source_ref=table_ref,
                                                    note=f"{field} recovered from the caption"))
-    # `sparsity` is REPORTED when the caption states it and never REQUIRED. It exists
-    # only in pruning papers, and requiring it made every paper outside that domain
-    # `unmapped` on a field its caption could not possibly carry — a domain vocabulary
-    # promoted into a universal gate. Model and dataset are what identify a configuration
-    # in general; a sparsity that IS stated still lands in `matched` as evidence.
+    # `sparsity` is REPORTED when the caption states it, never REQUIRED (it exists only
+    # in pruning papers). Model and dataset identify a configuration in general.
     for field in ("model", "dataset"):
         if field not in ident.matched:
             ident.unrecoverable.append(field)
@@ -666,14 +586,8 @@ def resolve(doc: PaperDoc, repo: Path, table_ref: str, finding_id: str = "",
             claim_quote: str = "") -> tuple[ExperimentIdentity, MetricIdentity,
                                             ConfigurationIdentity]:
     """The whole chain. Each link is independent and each may abstain on its own.
-
-    `claim_ref`/`claim_quote` open the PROSE path — a `P<i>:<a>-<b>` address minted by
-    `harness.claims`, whose span states a composition. Each of the three links takes that
-    path only when there is no cell address, and each refuses on its own terms there; a
-    prose target that cannot bind a command is `no_candidate` exactly as a cell target
-    would be, and `identities_established` below ANDs the three the same way regardless of
-    which path produced them.
-    """
+    `claim_ref`/`claim_quote` open the PROSE path (a `P<i>:<a>-<b>` address minted by
+    `harness.claims`); each link takes that path only when there is no cell address."""
     experiment = resolve_experiment(doc, repo, table_ref, finding_id, claim_ref, claim_quote)
     metric = resolve_metric(doc, table_ref, experiment.command, claim_ref, claim_quote)
     configuration = resolve_configuration(doc, table_ref, experiment.command, harness_seeds,

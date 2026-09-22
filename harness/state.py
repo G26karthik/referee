@@ -23,24 +23,13 @@ if sys.platform == "win32":
     import time as _time
 
     def _lock_file(f) -> None:
-        # msvcrt.locking's LK_LOCK only retries internally for ~10s before raising
-        # OSError (errno 36 / EDEADLK, "Resource deadlock avoided") — it does NOT block
-        # indefinitely the way POSIX fcntl.flock(LOCK_EX) does. Retry-wrap it so a
-        # longer-held lock (a slow phase handler) is waited out rather than crashing
-        # the waiter, matching fcntl.flock's blocking contract.
-        #
-        # EDEADLK is NOT a reliable signal of a genuine same-thread self-deadlock on
-        # this platform: msvcrt raises the identical errno 36 once its own internal
-        # retry budget (~10 attempts) is exhausted, whether the conflicting lock is
-        # held by another thread in this same process, another process, or (the real
-        # bug this would otherwise indicate) this same thread. Measured directly against
-        # this CRT: two threads in the same process legitimately contending for this
-        # lock for longer than ~9s reproduce errno 36 with no distinguishing attribute
-        # (`winerror` is None) from a true self-deadlock — so narrowing this except to
-        # re-raise on EDEADLK was tried and reverted; it turned ordinary contention
-        # (`test_project_lock_serializes_concurrent_add_cost`) into a spurious failure.
-        # The real fix for self-deadlock is reentrancy in `project_lock` itself, below,
-        # which never reaches this function a second time on the same thread/case.
+        # msvcrt.locking's LK_LOCK only retries internally for ~10s before raising OSError
+        # (errno 36 / EDEADLK) -- it does NOT block indefinitely like POSIX
+        # fcntl.flock(LOCK_EX). Retry-wrap it so a longer-held lock is waited out rather
+        # than crashing the waiter. EDEADLK here is not a reliable same-thread deadlock
+        # signal (ordinary cross-thread contention past ~9s raises the identical errno),
+        # so re-raising on it would misreport ordinary contention as a bug; the real fix
+        # for self-deadlock is the reentrancy in `project_lock` below.
         while True:
             f.seek(0)
             try:
@@ -70,11 +59,7 @@ SUBDIRS = [
 
 
 def now() -> str:
-    """The one UTC timestamp in this harness.
-
-    Nine sites formatted this string independently, two of them as identically
-    bodied private functions in different modules. One format, one source of time.
-    """
+    """The one UTC timestamp in this harness. One format, one source of time."""
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
@@ -89,15 +74,9 @@ def project_dir(cfg: Config, pid: str) -> Path:
 
 def control_dir(root: Path) -> Path:
     """The trusted control-state directory for one case: `<project_root>/control/`.
-
-    Structurally separate from `runs/<pid>/`, which IS bind-mounted — in whole, by
-    `ContainerBackend` — into every execution that runs a paper's own (or a driver's,
-    or a reconstruction's) code. A file under `control/` must never be reachable from
-    inside a container or a subprocess running untrusted code; that separation is what
-    makes it safe for a LATER harness invocation to read a file here back as
-    pre-verified state, rather than as something the code it just ran could have
-    overwritten.
-    """
+    Structurally separate from `runs/<pid>/`, which IS bind-mounted into every execution
+    that runs untrusted code -- `control/` must never be reachable from inside a
+    container or subprocess, so a later invocation can trust what it reads back here."""
     return Path(root) / "control"
 
 
@@ -129,34 +108,28 @@ def create_project(cfg: Config, repo_url: str, direction: str, pid: str | None =
     return pid
 
 
-# Per-thread re-entrancy depth, keyed by paper id. `project_lock` is held for the
-# whole body of `controller.step`, and a phase handler running inside that body is
-# entitled to call `add_cost`/`append_log` itself — that is the normal shape of future
-# per-call cost tracking, not a caller bug. The OS-level lock below is not reentrant
-# (a second acquire by the same thread would block on a lock it already holds — forever
-# on POSIX `fcntl.flock`, and on Windows until `EDEADLK` is raised), so a thread that
-# already holds this case's lock must skip re-acquiring it rather than deadlock itself.
-# `threading.local` scopes the counter to this thread alone: a DIFFERENT thread or
-# process must still contend for the real OS lock, exactly as before.
+# Per-thread re-entrancy depth, keyed by paper id. `project_lock` is held for the whole
+# body of `controller.step`, and a phase handler running inside that body is entitled to
+# call `add_cost`/`append_log` itself. The OS-level lock below is not reentrant (a second
+# acquire by the same thread would block on a lock it already holds), so a thread that
+# already holds this case's lock must skip re-acquiring it. `threading.local` scopes the
+# counter to this thread alone: a DIFFERENT thread or process still contends for the
+# real OS lock, exactly as before.
 _reentrancy = threading.local()
 
 
 @contextlib.contextmanager
 def project_lock(cfg: Config, pid: str):
-    """Exclusive OS-level advisory lock over one case's state.
-
-    Not a lock-file-EXISTS convention — an actual `msvcrt`/`fcntl` lock on an open file
-    handle, released automatically by the OS if the holding process dies or is killed,
-    so a crash can never leave a case permanently unlockable the way a stale PID-file
-    lock could. Every phase transition (`controller.step`) holds this for its whole
-    body, so two invocations of the harness racing on the same paper id serialize
-    instead of interleaving writes to `project.json`, `controller.json`,
-    `discovery/targets.json`, or any other case-state file.
+    """Exclusive OS-level advisory lock over one case's state. Not a lock-file-EXISTS
+    convention -- an actual `msvcrt`/`fcntl` lock on an open file handle, released
+    automatically by the OS if the holding process dies, so a crash can never leave a
+    case permanently unlockable. Every phase transition holds this for its whole body,
+    so two invocations racing on the same paper id serialize instead of interleaving
+    writes to any case-state file.
 
     Reentrant per THREAD per CASE: a call already holding this case's lock on this
-    thread (e.g. a phase handler calling `add_cost` from inside `controller.step`)
-    re-enters without touching the OS lock. A different thread, a different process, or
-    the same thread on a DIFFERENT case still takes the real lock and blocks normally.
+    thread re-enters without touching the OS lock. A different thread, process, or the
+    same thread on a DIFFERENT case still takes the real lock and blocks normally.
     """
     depths = getattr(_reentrancy, "depths", None)
     if depths is None:
@@ -205,11 +178,10 @@ def add_cost(cfg: Config, pid: str, cost_usd: float) -> None:
         save_meta(cfg, pid, meta)
 
 
-# In-process only: several lens/grade calls now run concurrently on threads within one
+# In-process only: several lens/grade calls run concurrently on threads within one
 # controller invocation, and a plain `open(..., "a").write(...)` from two threads at once
-# can interleave two records into one unparseable line. A per-process lock is enough —
-# cross-process writers still serialize through `project_lock`'s OS-level lock, which every
-# writer of this file already holds for the duration of its phase.
+# can interleave two records into one unparseable line. Cross-process writers still
+# serialize through `project_lock`'s OS-level lock.
 _log_lock = threading.Lock()
 
 
@@ -241,15 +213,11 @@ def append_log(
 
 def write_json(path: Path, obj: Any) -> str:
     """Write JSON atomically: build the full content, fsync it to a temp file in the
-    SAME directory as `path`, then `os.replace` it into place. `os.replace` is atomic
-    on both POSIX and Windows when source and destination share a volume, which they
-    always do here since the temp file is created next to its destination.
-
-    A process killed at any point before the `os.replace` call leaves `path` exactly
-    as it was; a process killed during or after `os.replace` leaves it exactly as the
-    new write intended. There is no window in which a reader can observe a truncated
-    or partially-written file.
-    """
+    SAME directory as `path`, then `os.replace` it into place (atomic on both POSIX and
+    Windows when source and destination share a volume, which they always do here). A
+    process killed before `os.replace` leaves `path` exactly as it was; killed during or
+    after leaves it exactly as the new write intended -- no window for a reader to
+    observe a truncated file."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
