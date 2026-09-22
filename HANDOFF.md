@@ -53,11 +53,13 @@ Concretely, three axes are kept apart and no single label may replace them
 A confound settled from the paper and a confound left open because no artifact exists are
 the *same kind of problem in opposite states*. One label for both tells a referee neither.
 
-RED / YELLOW / GREEN still exist, but they are a **routing** decision printed under
-`## Scope of this review`, not the result. The findings and their resolution states are
-the result. RED means a material failure was ESTABLISHED; YELLOW means a human should
-look and is never an accusation; GREEN means neither, *within the scope actually checked*,
-and is not a certificate of correctness.
+The RED/YELLOW/GREEN colour axis was removed outright in the 2026-09-21 de-triage pass —
+REFEREE is a reviewer copilot, not an acceptance-decision system. In its place,
+`decide.derive_disposition` prints a **routing** decision under `## Scope of this review`,
+not the result: the findings and their resolution states are the result. `STOP_MATERIAL_
+FAILURE` means a material failure was ESTABLISHED; `PASS_TO_HUMAN_UNRESOLVED`/`_CONCERNS`
+mean a human should look and are never an accusation; `PASS_TO_HUMAN_CLEAN` means neither,
+*within the scope actually checked*, and is not a certificate of correctness.
 
 **A clean paper is a real result.** Zero FATAL/MAJOR findings, a few MINOR concerns and
 some open questions is a complete, correct review of good work — not a reviewer that
@@ -413,9 +415,11 @@ you are most likely to trip over.
    `FAILED_REPRODUCTION`.** Only a crash *after* the experiment demonstrably started may
    convict.
 8. **The paper decision is a table, not a judgement and not a count.**
-   `MATERIAL_SEVERITY = ("FATAL",)`. Nothing accumulates: no number of MAJORs or MINORs
-   ever reaches RED, because a concern weakens a claim and does not reject one. Turning
-   grading off reproduces the ungraded decision exactly, by construction.
+   `MATERIAL_SEVERITY = ()`. `claim_status` (VERIFIED_FAILURE/VERIFIED_SUPPORT/NOT_VERIFIED)
+   plus `decide.material_target_failure` are what route a paper to
+   `STOP_MATERIAL_FAILURE`. Nothing accumulates: no number of MAJORs or MINORs ever reaches
+   it, because a concern weakens a claim and does not reject one. Turning grading off
+   reproduces the ungraded decision exactly, by construction.
 9. **No experiment is shrunk, substituted or downscaled to make it fit.** There is no
    function that does this, deliberately.
 10. **No paper-specific logic.** The pilot papers are evaluation cases, not special cases.
@@ -431,9 +435,14 @@ you are most likely to trip over.
     `Finding.verifiable_by_experiment` is an unchecked model boolean and is metadata.
 16. **A blocked target ends that target, never the paper.** One paper reporting a blocked
     target, a reproduced one and a failed one must report all three.
-17. **A colour may not be a property of this harness's configuration.** The first triage
-    made all seven corpus papers YELLOW because the execution gates are shut by default.
-    Only a target that was ATTEMPTED and settled nothing colours a paper.
+17. **A disposition may not be a property of this harness's own configuration.** The first
+    triage made all seven corpus papers YELLOW because the execution gates are shut by
+    default. Only a target that was ATTEMPTED and settled nothing may move the paper toward
+    `STOP_MATERIAL_FAILURE` or a `PASS_TO_HUMAN_*` disposition; a closed gate routes to a
+    `BLOCKED_*` disposition instead, which counts toward nothing. The 2026-09-21 de-triage
+    pass removed the RED/YELLOW/GREEN colour axis outright — `decide.derive_disposition`
+    is now the sole routing signal, and this rule is enforced directly by it rather than by
+    keeping a colour off of closed gates.
 18. **Positional coincidence may not establish a reconciliation.** `parse_metric` prefers a
     target-bound output object over a named one over a structured one over a bare key, and
     REFUSES when the winning tier disagrees with itself.
@@ -475,10 +484,12 @@ Read this before you quote a capability to anyone.
   created, because the development host holds no provider credentials. The logic is tested;
   the integration is not. **The seven results in `outputs/` were all produced on the `local`
   backend, before the remote backend existed.**
-- **No paper has been RED under the binary rule.** RED needs a counted FATAL or a failed
-  reproduction from an admissible provenance, and the seven papers produced neither. That is
-  the intended conservatism, but it means the RED path is proven by fixtures
-  (`tests/test_autonomous_review_e2e.py`) rather than by a real paper.
+- **No paper reached `STOP_MATERIAL_FAILURE` on this corpus.** That disposition needs a
+  counted FATAL or a failed reproduction from an admissible provenance, and the seven papers
+  produced neither. That is the intended conservatism, but it means that path is proven by
+  fixtures (`tests/test_autonomous_review_e2e.py`) rather than by a real paper. (Historical
+  note: this bullet predates the 2026-09-21 de-triage pass, which removed the RED/YELLOW/
+  GREEN vocabulary this bullet originally used; the underlying fact is unchanged.)
 - **Neither the grader nor the assessor ran on the corpus.** `grade_coverage` shows 0 of 15
   serious candidates graded, and no paper carries a `substantive_verdict`: both gates are off
   by default and were off. Every counted severity in those seven reviews is the asserting

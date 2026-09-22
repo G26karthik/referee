@@ -70,12 +70,15 @@ established:
 
 The reader-facing result is a **typed disposition** — `PASS_TO_HUMAN_CLEAN`,
 `BLOCKED_METHOD`, `BLOCKED_SPECIFICATION`, and so on (`harness/decide.py`,
-`reports/corpus.json`) — the action a human should take on this paper. A legacy
-RED/YELLOW/GREEN triage is retained internally for queue routing and is printed under the
-review's *scope* section, never as the headline: RED means a material failure was
-established from an admissible source on a target a central claim depends on; YELLOW means
-something needs a human's attention and is never itself an accusation; GREEN means neither,
-within the scope actually checked, and is explicitly not a certificate of correctness.
+`reports/corpus.json`) — the action a human should take on this paper, printed under the
+review's *scope* section, never as a headline verdict. The global RED/YELLOW/GREEN triage
+and the binary RED/GREEN paper verdict were removed outright in the 2026-09-21 de-triage
+pass: REFEREE is a reviewer copilot, not an acceptance-decision system, and no colour or
+disguised accept/reject score replaced them. `STOP_MATERIAL_FAILURE` means a material
+failure was established from an admissible source on a target a central claim depends on;
+`PASS_TO_HUMAN_UNRESOLVED`/`_CONCERNS` mean something needs a human's attention and is
+never itself an accusation; `PASS_TO_HUMAN_CLEAN` means neither, within the scope actually
+checked, and is explicitly not a certificate of correctness.
 
 An experiment that does not fit the machine, a repository whose code does not produce the
 cited number, a metric that cannot be bound to what was printed, a paper that does not
