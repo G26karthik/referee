@@ -505,8 +505,10 @@ Read this before you quote a capability to anyone.
 - **`scientific_class` falls back to the lens name** when a finding declared neither a
   `discrepancy_type` nor a `baseline_class`. In those cases the count is partly a count of
   what each lens chose to write.
-- **The artifact route has established 0 `PAPER_ARTIFACT_MISMATCH` on the current
-  `runs_final_2026-09-16` corpus.** The gated authors'-code auditor
+- **The artifact route has established 0 `PAPER_ARTIFACT_MISMATCH` on the
+  `runs_final_2026-09-16` corpus** (that run directory is no longer on disk; recoverable
+  from git via the `pre-destructive-simplification-2026-09-20` tag). The gated
+  authors'-code auditor
   (`harness/artifact_review_driver.py`, behind `SH_ALLOW_ARTIFACT_REVIEW`) is genuinely
   wired into the production route: `harness/stages/artifact.py`'s `run_route` calls it once
   per paper, gated on the env var and on an audited, cleanly pinned checkout, and what it

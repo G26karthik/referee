@@ -1384,8 +1384,10 @@ behind the decision rather than a line-count target:**
   parts → collect (20 substantiated, 6 dropped) → grade (3 candidates) → assess → discover
   (37 objects, 30 addressable) → probe → report, landing **YELLOW**, `CONCERNS_RECORDED`
   with 0 established as material. Compared against the pre-destructive-pass baseline for
-  the same paper (`../_pre-destructive-backup-2026-09-20/runs_final_2026-09-16/projects/acl`,
-  a full-gate corpus run predating BOTH this session's passes): same review path
+  the same paper (`runs_final_2026-09-16/projects/acl`, a full-gate corpus run predating
+  BOTH this session's passes — no longer on disk; recoverable from git via the
+  `pre-destructive-simplification-2026-09-20` tag or commit `334e663`, the last revision
+  where that run directory was tracked): same review path
   (PAPER_AND_ARTIFACT), same triage (YELLOW), same document-integrity count (9, all
   EXTRACTION), same "nothing was positively verified" framing, same reconstruction target
   (`TGT-REP-P60-155`) discovered and prioritized identically. The two visible differences
@@ -1517,7 +1519,8 @@ by grep:**
   re-dispatched this route and it established one fact about `acl`'s checkout rather than
   the two it had established before. The corpus's actual, final artifact-review state (read
   directly from `runs_final_2026-09-16/projects/<pid>/artifact/<pid>.route.json` on every
-  repository paper) is **6 `ARTIFACT_FACT`s — `acl`=1, `apt-icml`=2, `cvpr`=1, `iclr`=2 — and
+  repository paper — that run directory is no longer on disk; recoverable from git via the
+  `pre-destructive-simplification-2026-09-20` tag) is **6 `ARTIFACT_FACT`s — `acl`=1, `apt-icml`=2, `cvpr`=1, `iclr`=2 — and
   0 established mismatches**, every `*_MISMATCH`-named probe this final dispatch proposed
   having `authority: NONE` (refused, exactly per the discipline above: the auditor's
   reading did not establish which config belongs to which experiment). Re-running the
