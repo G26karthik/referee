@@ -155,7 +155,9 @@ generator + verifier, artifact review, extraction audit) is done by isolated sub
 the controlling session: each reads its task's `prompt`, writes JSON to `out`, and runs
 `run.py seal`; the harness validates and seals (mode `SESSION_SUBAGENT`). The saved
 workflow `.claude/workflows/referee.js` runs this loop autonomously (Haiku controller,
-Sonnet workers, explicit model on every agent — never Opus). Execution gates:
+Sonnet workers, explicit model on every agent — never Opus), using the minimal agent types
+`.claude/agents/referee-worker.md` / `referee-controller.md` (Read/Write/Bash only, ~13k
+fixed context vs ~47k default; they load at session start). Execution gates:
 `SH_ALLOW_REIMPLEMENTATION_EXEC`, `SH_ALLOW_CERTIFICATE_EXEC`, `SH_ALLOW_REPO_EXEC`,
 `SH_EXEC_BACKEND=container` (Docker).
 
