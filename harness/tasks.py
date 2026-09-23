@@ -290,6 +290,13 @@ def _seal_reimpl_gen(cfg: Config, pid: str, target_id: str, raw: str) -> dict:
     return {"target_id": target_id, "stored": str(path)}
 
 
+def _refuse_malformed_verdict(task_id: str, notes: str) -> None:
+    """A verifier answer that is not valid JSON is a delivery error, not a judgement: it is
+    refused so the worker fixes and resubmits it, never sealed as a rejection."""
+    if notes.startswith(("verifier JSON invalid", "verifier returned no JSON")):
+        raise ValueError(f"{task_id}: {notes}")
+
+
 def _seal_reimpl_verify(cfg: Config, pid: str, target_id: str, doc: PaperDoc, raw: str) -> dict:
     gen_path = _reimpl_generated_path(cfg, pid, target_id)
     if not gen_path.is_file():
@@ -299,6 +306,7 @@ def _seal_reimpl_verify(cfg: Config, pid: str, target_id: str, doc: PaperDoc, ra
     # ONLY if its reply parses as approved. A rejection is not an error -- it seals
     # honestly as `established=False`, exactly as a human reviewer's rejection would.
     approved, _notes = reimplement_driver._parse_verification(raw)
+    _refuse_malformed_verdict(f"reimpl_verify:{target_id}", _notes)
     readiness = _readiness(cfg, pid, doc)
     reimplement_driver.accept_reimplementation(
         cfg, pid, target_id, gen_path.read_text(encoding="utf-8"), readiness,
@@ -417,6 +425,7 @@ def _seal_cert_verify(cfg: Config, pid: str, tid: str, raw: str) -> dict:
     gen = _cert_dir(cfg, pid) / "generated" / f"{tid}.json"
     if not gen.is_file():
         raise ValueError(f"cert_verify:{tid}: seal cert_gen:{tid} first")
+    _refuse_malformed_verdict(f"cert_verify:{tid}", certificate.parse_verification(raw)[1])
     certificate.accept(cfg, pid, tid, gen.read_text(encoding="utf-8"), raw,
                        generated_by=REVIEWER + " (generator)",
                        reviewer=REVIEWER + " (verifier)",

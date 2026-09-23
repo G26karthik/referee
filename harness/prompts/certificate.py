@@ -74,10 +74,19 @@ script in this harness). For the instance indexed by the given `--seed`:
      (e.g. `SH_AUX key=lhs arm=certificate seed=0 value=1.5` and
      `SH_AUX key=rhs arm=certificate seed=0 value=1.0`).
 
+SEARCH WHERE A VIOLATION WOULD BE. A certificate is only as strong as the instance it tries:
+  - Stress the hypotheses at their edges (a point on a set's boundary, a degenerate or
+    rank-deficient matrix, equality in a stated inequality, a parameter at its allowed
+    limit) — typical random instances rarely break a flawed proof.
+  - A bound claimed for ALL t (a rate, an asymptotic or "for every iteration" statement)
+    must be evaluated along a LONG horizon — thousands of steps where exact arithmetic
+    stays fast enough — and checked at every step, not only a few early ones: a bound that
+    decays to 0 is typically broken only late, once the true error plateaus.
+  - Keep each run within about a minute (e.g. bound denominators, cap the horizon).
+
 DECLARE how many instances you are offering as `"instance_count"` in your JSON (below) — an
-integer N; the harness will invoke your script once for each seed in 0..N-1. A single,
-well-chosen instance is a complete answer (N=1); use more only when several genuinely
-different constructions are worth trying.
+integer N; the harness will invoke your script once for each seed in 0..N-1. Use several
+genuinely different constructions (including edge cases) when they are cheap.
 
 WHAT YOU MUST ALSO PRODUCE: for EACH of "hypotheses", "claimed_bound" and "instance", WHERE
 in your script it is realized — a line number or function name (`impl_ref`) and the literal

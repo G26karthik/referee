@@ -824,11 +824,11 @@ def certificate_targets(cfg: Config, pid: str) -> list[tuple[str, str]]:
         if obj.target_id not in routed:
             continue
         brief = certificate.build_brief(doc, claim=obj.claim_text, ref=obj.ref)
-        sealed = certificate.load_accepted(cfg, pid, obj.target_id)
-        # A verifier's rejection stands only for the brief it was given: when that brief
-        # has since changed, the question is asked again.
-        if sealed is not None and (sealed[1].established or certificate.sealed_record(
-                cfg, pid, obj.target_id).get("brief_sha256") == certificate.brief_sha(brief)):
+        # A sealed certificate answers only the brief it was given: when that brief has
+        # since changed, the question is asked again (until then the old seal still runs).
+        if certificate.load_accepted(cfg, pid, obj.target_id) is not None and (
+                certificate.sealed_record(cfg, pid, obj.target_id).get("brief_sha256")
+                == certificate.brief_sha(brief)):
             continue
         out.append((obj.target_id, brief))
     return out
