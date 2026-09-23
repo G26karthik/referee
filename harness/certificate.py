@@ -30,6 +30,7 @@ pair is deliberately excluded from `EVIDENCE_ABOUT_THE_PAPER`.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -66,21 +67,30 @@ def _full_paper_text(doc: PaperDoc) -> str:
     return "\n\n".join(" ".join((s.text or "").split()) for s in doc.sections)
 
 
-def section_excerpt(doc: PaperDoc, ref, *, max_chars: int = 6000) -> str:
+def section_excerpt(doc: PaperDoc, ref, *, before: int = 10000, after: int = 4000) -> str:
     """The section stating the claim, plus the section immediately before it (often where
-    a theorem's setup/hypotheses live) — BOUNDED, never the whole paper (invariant: minimize
-    context per role, CLAUDE.md). `ref` is the target's own `ClaimRef`; `None` falls back to
-    the whole document truncated, so a caller missing a resolved ref still gets something."""
+    a theorem's setup/hypotheses live) — BOUNDED, never the whole paper. The window is
+    anchored on the claim's own quote, mostly BEFORE it (hypotheses precede a bound), so a
+    theorem deep in a long section is never cut off. `ref` is the target's `ClaimRef`."""
+    budget = before + after
     idx = getattr(ref, "section_idx", -1) if ref is not None else -1
     if idx is None or idx < 0:
-        return _full_paper_text(doc)[:max_chars]
-    wanted = {i for i in (idx - 1, idx) if i >= 0}
-    parts = []
-    for s in doc.sections:
-        if s.section_idx in wanted:
-            parts.append(f"### {s.title or f'section {s.section_idx}'}  [s{s.section_idx}]\n"
-                        + " ".join((s.text or "").split()))
-    return "\n\n".join(parts)[:max_chars]
+        text = _full_paper_text(doc)
+    else:
+        wanted = {i for i in (idx - 1, idx) if i >= 0}
+        text = "\n\n".join(
+            f"### {s.title or f'section {s.section_idx}'}  [s{s.section_idx}]\n"
+            + " ".join((s.text or "").split())
+            for s in doc.sections if s.section_idx in wanted)
+    if len(text) <= budget:
+        return text
+    quote = _normalize_ws(getattr(ref, "quote", "") or "")
+    at = text.find(quote[:120]) if quote else -1
+    if at < 0:
+        return text[:budget]
+    lo = max(0, at - before)
+    hi = min(len(text), at + len(quote) + after)
+    return ("[…] " if lo else "") + text[lo:hi] + (" […]" if hi < len(text) else "")
 
 
 def build_brief(doc: PaperDoc, *, claim: str = "", ref=None) -> str:
@@ -205,7 +215,7 @@ def _paths(cfg: Config, pid: str, target_id: str) -> tuple[Path, Path]:
 
 
 def accept(cfg: Config, pid: str, target_id: str, raw: str, verdict_raw: str | None = None, *,
-          generated_by: str = "", reviewer: str = "") -> dict:
+          generated_by: str = "", reviewer: str = "", brief_sha256: str = "") -> dict:
     """Parse the generator's `raw` output (and, when given, the verifier's `verdict_raw`),
     compute conformance against the ingested paper text, and seal to
     `runs/<pid>/certificates/<target_id>.json` — mode `SESSION_SUBAGENT`, `written_by`
@@ -232,10 +242,24 @@ def accept(cfg: Config, pid: str, target_id: str, raw: str, verdict_raw: str | N
         mode="SESSION_SUBAGENT", reviewer=prov["reviewer"], tool_policy=prov["tool_policy"],
         extra={"paper_id": pid, "target_id": target_id, "established": conf.established,
               "generated_by": generated_by, "independent_verification": approved,
-              "verifier_notes": verifier_notes,
+              "verifier_notes": verifier_notes, "brief_sha256": brief_sha256,
               "isolation_claim": prov["isolation_claim"],
               "tool_policy_provable": prov["tool_policy_provable"]})
     return record
+
+
+def brief_sha(brief: str) -> str:
+    return hashlib.sha256((brief or "").encode("utf-8")).hexdigest()
+
+
+def sealed_record(cfg: Config, pid: str, target_id: str) -> dict:
+    """The sealed sidecar for this target ({} when none): its `brief_sha256` says which
+    generator brief the certificate answered, its `verifier_notes` why it was rejected."""
+    _out, sidecar = _paths(cfg, pid, target_id)
+    try:
+        return state.read_json(sidecar) if sidecar.is_file() else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def load_accepted(cfg: Config, pid: str, target_id: str

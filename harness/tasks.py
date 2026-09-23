@@ -240,10 +240,21 @@ def _reimpl_tasks(cfg: Config, pid: str, doc: PaperDoc) -> list[dict]:
     gen_model, gen_effort = _EFFORT["reimpl_gen"]
     ver_model, ver_effort = _EFFORT["reimpl_verify"]
     for target_id in _reimpl_targets(cfg, pid):
-        if reimplement_driver.load_accepted(cfg, pid, target_id) is not None:
-            continue                   # already established or honestly sealed as refused
         gen_path = _reimpl_generated_path(cfg, pid, target_id)
         brief_path = reimplement_driver._briefs_dir(cfg, pid) / f"reimpl_gen__{target_id}.md"
+        brief = brief_path.read_text(encoding="utf-8")
+        sealed = reimplement_driver.load_accepted(cfg, pid, target_id)
+        answered = reimplement_driver.answered_brief(cfg, pid, target_id, brief)
+        if sealed is not None and (sealed[1].established or answered):
+            continue                   # established, or refused against this very brief
+        if sealed is not None and not answered:
+            # A refusal of a brief that has since changed: archived (kept for audit), not
+            # the answer to the question now being asked.
+            for f in reimplement_driver._paths(cfg, pid, target_id):
+                if f.is_file():
+                    f.replace(f.with_name(f"{f.stem}.superseded{f.suffix}"))
+            if gen_path.is_file():
+                gen_path.unlink()
         if not gen_path.is_file():
             out.append(_task(id=f"reimpl_gen:{target_id}", role="reimpl_gen",
                              prompt=brief_path,
@@ -275,6 +286,7 @@ def _seal_reimpl_gen(cfg: Config, pid: str, target_id: str, raw: str) -> dict:
     path = _reimpl_generated_path(cfg, pid, target_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(raw, encoding="utf-8")
+    reimplement_driver.stamp_brief(cfg, pid, target_id)
     return {"target_id": target_id, "stored": str(path)}
 
 
@@ -365,6 +377,10 @@ def _cert_tasks(cfg: Config, pid: str, doc: PaperDoc) -> list[dict]:
     d, out = _cert_dir(cfg, pid), []
     for tid, brief in routes.certificate_targets(cfg, pid):
         gen = d / "generated" / f"{tid}.json"
+        stamp = gen.with_suffix(".brief_sha256")
+        if gen.is_file() and (not stamp.is_file()
+                              or stamp.read_text(encoding="utf-8") != certificate.brief_sha(brief)):
+            gen.unlink()               # answered a brief that has since changed
         if not gen.is_file():
             prompt = d / f"cert_gen__{tid}.md"
             prompt.parent.mkdir(parents=True, exist_ok=True)
@@ -390,6 +406,9 @@ def _seal_cert_gen(cfg: Config, pid: str, tid: str, raw: str) -> dict:
     path = _cert_dir(cfg, pid) / "generated" / f"{tid}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(raw, encoding="utf-8")
+    prompt = _cert_dir(cfg, pid) / f"cert_gen__{tid}.md"
+    brief = prompt.read_text(encoding="utf-8") if prompt.is_file() else ""
+    path.with_suffix(".brief_sha256").write_text(certificate.brief_sha(brief), encoding="utf-8")
     return {"target_id": tid, "stored": str(path)}
 
 
@@ -400,7 +419,9 @@ def _seal_cert_verify(cfg: Config, pid: str, tid: str, raw: str) -> dict:
         raise ValueError(f"cert_verify:{tid}: seal cert_gen:{tid} first")
     certificate.accept(cfg, pid, tid, gen.read_text(encoding="utf-8"), raw,
                        generated_by=REVIEWER + " (generator)",
-                       reviewer=REVIEWER + " (verifier)")
+                       reviewer=REVIEWER + " (verifier)",
+                       brief_sha256=(gen.with_suffix(".brief_sha256").read_text(encoding="utf-8")
+                                     if gen.with_suffix(".brief_sha256").is_file() else ""))
     sealed = certificate.load_accepted(cfg, pid, tid)
     return {"target_id": tid, "established": bool(sealed and sealed[1].established)}
 
@@ -492,6 +513,19 @@ def seal(cfg: Config, pid: str, task_id: str, path: str | Path) -> dict:
         raise ValueError(f"{task_id}: {type(e).__name__}: {e}") from e
 
 
+def _seal_newer_than_probe(cfg: Config, pid: str) -> bool:
+    """A certificate or reconstruction sealed after the last probe pass is evidence that
+    pass never saw: the probe must run again (a plain rewind stops short of it)."""
+    root = state.project_dir(cfg, pid)
+    probe = state.control_dir(root) / "probe_results.json"
+    if not probe.is_file():
+        return False
+    since = probe.stat().st_mtime
+    runs = root / "runs" / pid
+    seals = [*runs.glob("certificates/*.driver.json"), *runs.glob("reimplementation/*.driver.json")]
+    return any(s.stat().st_mtime > since for s in seals)
+
+
 def advance(cfg: Config, pid: str) -> dict:
     """Run the deterministic pipeline as far as it goes, then report what is pending.
 
@@ -502,7 +536,7 @@ def advance(cfg: Config, pid: str) -> dict:
     without this function needing its own rewind logic.
     """
     case = pipeline.open_case(cfg, pid)
-    case = pipeline.drive(cfg, case)
+    case = pipeline.drive(cfg, case, force_probe=_seal_newer_than_probe(cfg, case.paper_id or pid))
     resolved_pid = case.paper_id or pid
     return {"paper_id": resolved_pid, "phase": case.phase, "status": case.status,
            "blocked_reason": case.blocked_reason, "tasks": pending(cfg, resolved_pid)}

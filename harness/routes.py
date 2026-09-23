@@ -709,14 +709,24 @@ def _ref_section_idx(ref: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+# Vocabulary of how an experiment was run. A section dense in it (an "Experimental Setup"
+# paragraph, a training-details appendix) is what a reconstruction most needs after the
+# sections that name the target, whether or not it mentions the target's table.
+_SETUP_TERMS = re.compile(
+    r"\b(learning rate|batch size|epochs?|optimi[sz]er|adam|sgd|layers?|heads?|embedding"
+    r"|dimension|hidden|seeds?|trained|training|hyper-?parameters?|samples?|steps?"
+    r"|iterations?|warm-?up|weight decay|dropout|initiali[sz]ed|configuration)\b", re.I)
+_NO_SETUP = re.compile(r"^(references|bibliography|acknowledg)", re.I)
+
+
 def _scoped_paper_text(doc: PaperDoc, *, table_ref: str = "", claim_ref: str = "",
                        ingredient_refs: tuple[str, ...] = (), cap: int = 40_000) -> str:
-    """The paper text a reconstruction generator brief actually needs -- never the whole
-    paper (`_full_paper_text` renders EVERY section, mostly irrelevant to any one
-    target). Scopes by RELEVANCE: every section mentioning the target table's own
-    printed label ("Table 8"), every section a readiness ingredient was found in, the
-    section the claim under test cites, and the abstract -- deduped, kept in paper
-    order, capped at `cap` characters with an explicit note naming what was left out.
+    """The paper text a reconstruction generator brief needs, within `cap` characters.
+    First the sections that name the target: its table's printed label, every section a
+    readiness ingredient was found in, the section the claim cites, and the abstract. Then
+    the rest of the paper fills the budget, densest in experimental-setup vocabulary first
+    (bibliography never), so the setup and training details are never dropped merely for
+    not naming the table. Kept in paper order, with an explicit note of what was left out.
     """
     wanted: set[int] = set()
     wanted |= _table_label_sections(doc, _ref_table_idx(table_ref))
@@ -734,22 +744,26 @@ def _scoped_paper_text(doc: PaperDoc, *, table_ref: str = "", claim_ref: str = "
               (doc.sections[0].section_idx if doc.sections else -1))
     wanted.discard(-1)
 
-    parts, used, omitted = [], 0, []
-    for s in doc.sections:
-        if s.section_idx not in wanted:
+    def setup_density(sec) -> float:
+        text = sec.text or ""
+        return len(_SETUP_TERMS.findall(text)) / (1 + len(text) / 1000)
+
+    rest = sorted((sec for sec in doc.sections if sec.section_idx not in wanted
+                   and (sec.text or "").strip() and not _NO_SETUP.match(sec.title or "")),
+                  key=setup_density, reverse=True)
+    ordered = [sec for sec in doc.sections if sec.section_idx in wanted] + rest
+    kept, used = {}, 0
+    for sec in ordered:
+        body = (f"### {sec.title or f'section {sec.section_idx}'}  [s{sec.section_idx}]\n"
+               + " ".join(sec.text.split()))
+        if used + len(body) > cap and kept:
             continue
-        body = (f"### {s.title or f'section {s.section_idx}'}  [s{s.section_idx}]\n"
-               + " ".join(s.text.split()))
-        if used + len(body) > cap and parts:
-            omitted.append(s)
-            continue
-        parts.append(body)
+        kept[sec.section_idx] = body
         used += len(body)
-    omitted += [s for s in doc.sections if s.section_idx not in wanted]
+    parts = [kept[i] for i in sorted(kept)]
+    omitted = [sec.section_idx for sec in doc.sections if sec.section_idx not in kept]
     if omitted:
-        titles = ", ".join(f"s{s.section_idx}"
-                           for s in sorted(omitted, key=lambda s: s.section_idx))
-        parts.append(f"[... sections omitted: {titles} ...]")
+        parts.append(f"[... sections omitted: {', '.join(f's{i}' for i in omitted)} ...]")
     return "\n\n".join(parts)
 
 
@@ -801,16 +815,33 @@ def certificate_targets(cfg: Config, pid: str) -> list[tuple[str, str]]:
     ts = discover_stage.load(cfg, pid)
     if ts is None:
         return []
-    routed = {p.target_id for p in ts.plans if p.route == "EXACT_CERTIFICATE"}
+    # Only a target the plan will actually run: a certificate for a target outranked by a
+    # central one would be generated and verified and then never executed.
+    routed = {p.target_id for p in ts.plans
+              if p.route == "EXACT_CERTIFICATE" and p.requires_execution}
     out: list[tuple[str, str]] = []
     for obj in ts.objects:
         if obj.target_id not in routed:
             continue
-        if certificate.load_accepted(cfg, pid, obj.target_id) is not None:
-            continue
         brief = certificate.build_brief(doc, claim=obj.claim_text, ref=obj.ref)
+        sealed = certificate.load_accepted(cfg, pid, obj.target_id)
+        # A verifier's rejection stands only for the brief it was given: when that brief
+        # has since changed, the question is asked again.
+        if sealed is not None and (sealed[1].established or certificate.sealed_record(
+                cfg, pid, obj.target_id).get("brief_sha256") == certificate.brief_sha(brief)):
+            continue
         out.append((obj.target_id, brief))
     return out
+
+
+def _certificate_pending_reason(cfg: Config, pid: str, target_id: str) -> str:
+    rec = certificate.sealed_record(cfg, pid, target_id)
+    if rec and not rec.get("established"):
+        return ("the independent verifier did not approve the certificate generated for this "
+                "target, so nothing ran and no verdict may be drawn. Verifier: "
+                + " ".join(str(rec.get("verifier_notes") or "no reason recorded").split())[:600])
+    return ("no sealed, conformant EXACT_CERTIFICATE exists yet for this target; awaiting one "
+            "from the controlling session's task list.")
 
 
 def attempt_reimplementation_fallback(
@@ -836,15 +867,17 @@ def attempt_reimplementation_fallback(
         return None
     target_id = base_spec.target_id or "default"
     sealed = reimplement_driver.load_accepted(cfg, pid, target_id)
-    if sealed is None:
+    brief = reimplement_driver.build_brief(
+        readiness, paper_title=doc.title, claim=base_spec.claim,
+        table_ref=base_spec.table_ref, claimed_cell_value=base_spec.claimed_cell_value,
+        paper_text=_scoped_paper_text(
+            doc, table_ref=base_spec.table_ref, claim_ref=base_spec.claim_ref,
+            ingredient_refs=tuple(i.ref for i in readiness.ingredients)))
+    stale = (sealed is not None and not sealed[1].established
+             and not reimplement_driver.answered_brief(cfg, pid, target_id, brief))
+    if sealed is None or stale:
         ok, _why = reimplement_driver.available(cfg)
         if ok:
-            brief = reimplement_driver.build_brief(
-                readiness, paper_title=doc.title, claim=base_spec.claim,
-                table_ref=base_spec.table_ref, claimed_cell_value=base_spec.claimed_cell_value,
-                paper_text=_scoped_paper_text(
-                    doc, table_ref=base_spec.table_ref, claim_ref=base_spec.claim_ref,
-                    ingredient_refs=tuple(i.ref for i in readiness.ingredients)))
             reimplement_driver.persist_brief(cfg, pid, target_id, brief)
         return None
     script, conf = sealed
@@ -855,7 +888,7 @@ def attempt_reimplementation_fallback(
         rdir = root / "runs" / pid / "reimplementation"
         for f in sorted(rdir.glob(f"TGT-*-{table.group()}r*.json")):
             sib = f.stem
-            if sib == target_id or sib.endswith((".driver", ".spec")):
+            if sib == target_id or sib.endswith((".driver", ".spec", ".superseded")):
                 continue
             other = reimplement_driver.load_accepted(cfg, pid, sib)
             if other is not None and not other[1].established:
@@ -998,10 +1031,7 @@ def _review(cfg: Config, pid: str) -> dict:
     elif direct_certificate:
         result = ProbeResult(
             paper_id=pid, verdict="not_started", provenance="cert_exec",
-            reason=("no sealed, conformant EXACT_CERTIFICATE exists yet for this target; "
-                   "awaiting one from the controlling session's task list (see "
-                   "`routes.certificate_targets`). This target was not refused and was "
-                   "not attempted."),
+            reason=_certificate_pending_reason(cfg, pid, pairs[0][0].target_id if pairs else ""),
             executions=0, script_path="")
     elif direct_reconstruction and reconstruction_result is not None:
         result = reconstruction_result
@@ -1034,9 +1064,7 @@ def _review(cfg: Config, pid: str) -> dict:
         elif direct_certificate:
             outcomes.append(_not_started(
                 pairs[0][0], pairs[0][1],
-                "no sealed, conformant EXACT_CERTIFICATE exists yet for this target; "
-                "awaiting one from the controlling session's task list.",
-                "NOT_ATTEMPTED"))
+                _certificate_pending_reason(cfg, pid, pairs[0][0].target_id), "NOT_ATTEMPTED"))
         elif reconstruction_result is not None and reconstruction_plan is not None:
             outcomes.append(outcome_for(pairs[0][0].target_id, reconstruction_result,
                                         reconstruction_plan.action, reconstruction_plan.route))
@@ -1091,9 +1119,7 @@ def _review(cfg: Config, pid: str) -> dict:
                                                     plan.action, plan.route))
                     else:
                         outcomes.append(_not_started(
-                            obj, plan,
-                            "no sealed, conformant EXACT_CERTIFICATE exists yet for this "
-                            "target; awaiting one from the controlling session's task list.",
+                            obj, plan, _certificate_pending_reason(cfg, pid, obj.target_id),
                             "NOT_ATTEMPTED"))
                     continue
                 other = build_spec(cfg, pid, doc, obj)
@@ -1419,11 +1445,22 @@ def _self_check() -> None:
     assert "alpha=0.3" in scoped, "the section mentioning the table's own label must be kept"
     assert "does X" in scoped, "the claim's own section must be kept"
     assert "We propose a method" in scoped, "the abstract must always be kept"
-    assert "Nothing relevant here" not in scoped
-    assert "sections omitted: s3" in scoped
+    assert "Nothing relevant here" in scoped, "the rest of the paper fills the budget"
     tiny = _scoped_paper_text(scope_doc, table_ref="T8:r0:c0", claim_ref="s1",
                               ingredient_refs=("s1",), cap=10)
     assert "sections omitted" in tiny, "a tight cap still omits explicitly, never silently"
+    # Under a cap, an unnamed setup section outranks unrelated prose, and a bibliography
+    # never fills the budget.
+    setup_doc = PaperDoc(paper_id="setup", sections=[
+        Section(section_idx=0, title="Abstract", text="We propose a method."),
+        Section(section_idx=1, title="Discussion", text="Broad remarks on impact. " * 8),
+        Section(section_idx=2, title="Setup",
+               text="Trained with learning rate 0.001, batch size 64, 12 layers, 3 seeds."),
+        Section(section_idx=3, title="References", text="[1] A. Author. Title."),
+    ])
+    capped = _scoped_paper_text(setup_doc, claim_ref="s0", cap=160)
+    assert "learning rate 0.001" in capped and "Broad remarks" not in capped
+    assert "A. Author" not in capped and "sections omitted" in capped
 
     print("harness.routes self-check ok")
 

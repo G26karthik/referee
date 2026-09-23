@@ -40,6 +40,7 @@ code execution lands without that boundary enforced.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -61,37 +62,35 @@ WRITERS = ("reimplement_driver",) + tuple(delegation.WRITTEN_BY.values())
 # five are what decision 1 requires bound before a reconstruction may run.
 REQUIRED_KINDS = ("method", "training", "dataset", "metric", "comparison_target")
 
-_LINE_REF = re.compile(r"^lines?\s+(\d+)(?:\s*[-:]\s*(\d+))?$", re.I)
-_FUNCTION_REF = re.compile(r"^(?:function|def)\s+([A-Za-z_]\w*)$", re.I)
+_LINE_SPAN = re.compile(r"\blines?\s+(\d+)(?:\s*[-:–]\s*(\d+))?", re.I)
+_NAMED = re.compile(r"\b([A-Za-z_]\w*)\s*(?:\(\)|\((?:function|def)\))|\b(?:function|def)\s+([A-Za-z_]\w*)")
 
 
 def _implementation_locator_matches(script: str, impl_ref: str, impl_quote: str) -> bool:
-    """Verify the quote at the claimed implementation locator, not anywhere in the file."""
+    """Verify the quote at the claimed implementation locator, not anywhere in the file.
+    A locator is read for every line span ("lines 43-59") and function name ("f()",
+    "function f", "f (function)") it names, however phrased; the quote must lie inside
+    one of those named spans."""
     if not impl_ref or not impl_quote:
         return False
     lines = script.splitlines()
-    m = _LINE_REF.fullmatch(impl_ref.strip())
-    if m:
-        start = int(m.group(1))
-        end = int(m.group(2) or start)
-        if start < 1 or end < start or end > len(lines):
-            return False
-        return impl_quote in "\n".join(lines[start - 1:end])
-    m = _FUNCTION_REF.fullmatch(impl_ref.strip())
-    if m:
+    ref = impl_ref.strip()
+    spans: list[tuple[int, int]] = []
+    for m in _LINE_SPAN.finditer(ref):
+        start, end = int(m.group(1)), int(m.group(2) or m.group(1))
+        if 1 <= start <= end <= len(lines):
+            spans.append((start, end))
+    names = {a or b for a, b in _NAMED.findall(ref)} | (
+        {ref} if re.fullmatch(r"[A-Za-z_]\w*", ref) else set())
+    if names:
         try:
             import ast
-            tree = ast.parse(script)
-            node = next((n for n in ast.walk(tree)
-                         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                         and n.name == m.group(1)), None)
-            if node is None:
-                return False
-            end = int(getattr(node, "end_lineno", node.lineno))
-            return impl_quote in "\n".join(lines[node.lineno - 1:end])
-        except (SyntaxError, StopIteration):
-            return False
-    return False
+            for n in ast.walk(ast.parse(script)):
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names:
+                    spans.append((n.lineno, int(getattr(n, "end_lineno", n.lineno))))
+        except SyntaxError:
+            pass
+    return any(impl_quote in "\n".join(lines[s - 1:e]) for s, e in spans)
 
 
 class ReimplementationDriverError(RuntimeError):
@@ -130,6 +129,26 @@ def persist_brief(cfg: Config, pid: str, target_id: str, brief: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(brief, encoding="utf-8")
     return path
+
+
+def _brief_stamp(cfg: Config, pid: str, target_id: str) -> Path:
+    return _briefs_dir(cfg, pid) / "generated" / f"{target_id}.brief_sha256"
+
+
+def stamp_brief(cfg: Config, pid: str, target_id: str) -> None:
+    """Record which generator brief a generation answered (called when it is sealed)."""
+    brief = _briefs_dir(cfg, pid) / f"reimpl_gen__{target_id}.md"
+    text = brief.read_text(encoding="utf-8") if brief.is_file() else ""
+    _brief_stamp(cfg, pid, target_id).write_text(
+        hashlib.sha256(text.encode("utf-8")).hexdigest(), encoding="utf-8")
+
+
+def answered_brief(cfg: Config, pid: str, target_id: str, brief: str) -> bool:
+    """Did the sealed generation answer exactly this brief? A verifier's rejection stands
+    only for the brief it judged; when the brief has since changed it is asked again."""
+    stamp = _brief_stamp(cfg, pid, target_id)
+    return stamp.is_file() and stamp.read_text(encoding="utf-8") == hashlib.sha256(
+        brief.encode("utf-8")).hexdigest()
 
 
 def persist_verification_brief(cfg: Config, pid: str, target_id: str,

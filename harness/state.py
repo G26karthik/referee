@@ -226,7 +226,14 @@ def write_json(path: Path, obj: Any) -> str:
             f.write(json.dumps(obj, indent=2, default=str, ensure_ascii=False))
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_name, path)
+        for attempt in range(8):       # Windows: a sync client/AV briefly holding the target
+            try:
+                os.replace(tmp_name, path)
+                break
+            except PermissionError:
+                if attempt == 7:
+                    raise
+                time.sleep(0.25 * (attempt + 1))
     except BaseException:
         try:
             os.unlink(tmp_name)

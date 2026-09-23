@@ -54,6 +54,12 @@ _LONE_X = re.compile(r"(?<![A-Za-z0-9_])[xX](?![A-Za-z0-9_])")
 # may only be read as multiplication when the paper's own arithmetic confirms it.
 _LONE_SEPARATOR = re.compile(r"(?<=[\s\d])\s*([^\sA-Za-z0-9=.,()\[\]])\s*(?=[\s\d])")
 _UNSIGNED = re.compile(r"\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
+# An operand stands alone: a digit glued to an identifier, operator or norm bar is a
+# subscript/exponent (`f2`, `n−1`, `∥A∥2`), and a percentage composes, it does not multiply.
+_OPERAND = re.compile(r"(?<![^\s(\[$])\d+(?:\.\d+)?(?:[eE][-+]?\d+)?(?![\d.A-Za-z_(%′'])")
+# Relational or analysis notation marks a mathematical statement (an inequality chain, a
+# norm identity), not a flat numeric composition; its `=` is never re-evaluated as one.
+_MATH_NOTATION = re.compile("[≤≥<>≠≈∝∥∇∑∏∫∂∈∀∃→]")
 _SIGNED = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
 _THOUSANDS = re.compile(r"(?<=\d),(?=\d{3}\b)")               # 2,900 -> 2900
 
@@ -169,7 +175,7 @@ def parse_quantity(text: str) -> ReportedQuantity | None:
         if _magnitude_suffixed(rhs, rhs_nums[0]):
             return None
         value = float(rhs_nums[0])
-        operands, expression = _composition(lhs, value)
+        operands, expression = ([], "") if _MATH_NOTATION.search(raw) else _composition(lhs, value)
         ok: bool | None = None
         if expression:
             product = 1.0
@@ -197,7 +203,7 @@ def parse_quantity(text: str) -> ReportedQuantity | None:
 def _tokens(lhs: str, separators: bool) -> list[tuple[int, str, str]]:
     """Numbers and operators in source order. `separators` admits the unknown-glyph tier."""
     out: list[tuple[int, str, str]] = [
-        (m.start(), "num", m.group()) for m in _UNSIGNED.finditer(lhs)]
+        (m.start(), "num", m.group()) for m in _OPERAND.finditer(lhs)]
     for i, ch in enumerate(lhs):
         if ch in _MULT:
             out.append((i, "op", "*"))
@@ -472,6 +478,12 @@ def _self_check() -> None:
     assert parse_quantity("3 seeds and 4 datasets = 12").expression == ""
     assert parse_quantity("58 x 5 x 10 = 2901").arithmetic_ok is False
     assert parse_quantity("accuracy was 59.3").value == 59.3
+    # A proof line is not printed arithmetic: identifier digits (`f2`) and exponents
+    # (`∥A∥2`) are not operands, and an inequality chain is never re-evaluated.
+    assert not parse_quantity("for any x, y, ∥∇f2(x) −∇f2(y)∥= A [Ax]+ "
+                              "≤∥A∥2 ∥x −y∥").expression
+    assert not parse_quantity("f2 x 2 = 4").expression
+    assert not parse_quantity("50% from sharing × 50% from INT8 = 75% total").expression
 
     # the unknown-glyph tier, and the asymmetry that makes admitting it safe
     got = parse_quantity("yielding 58 topics ϵ 5 tem- plates ϵ 10 instances = 2,900 test cases")

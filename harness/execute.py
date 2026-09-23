@@ -650,10 +650,10 @@ def local_backend() -> LocalBackend:
 
 def backend_for(cfg: Config, spec: ProbeSpec) -> ExecutionBackend | None:
     """The backend this spec would run on, or None when the operator named an unknown
-    one. `reimpl_exec` is the one provenance without `spec.command` that is NOT exempted
-    to `local_backend()`: it is third-party model-authored code and must be able to reach
-    CONTAINER/REMOTE_SESSION isolation like `repo_exec` does."""
-    if not spec.command and spec.provenance != "reimpl_exec":
+    one. `reimpl_exec` and `cert_exec` are the provenances without `spec.command` that are
+    NOT exempted to `local_backend()`: model-authored code nobody ran before must be able
+    to reach CONTAINER/REMOTE_SESSION isolation like `repo_exec` does."""
+    if not spec.command and spec.provenance not in ("reimpl_exec", _CERT_PROVENANCE):
         return local_backend()
     try:
         return select_backend(cfg)
