@@ -17,6 +17,7 @@ import fnmatch
 import re
 import shlex
 from pathlib import Path
+from typing import NamedTuple
 
 from .decide import abstract_section_idx
 from .schema import (CandidateCommand, ConfigurationIdentity, ExperimentIdentity,
@@ -317,9 +318,8 @@ def _metric_key(table: Table, col: int) -> str:
 # (`--model bert`) — otherwise which cell the command produces is a guess.
 _CITED = re.compile(r"\[\s*\d+(?:\s*[,;–-]\s*\d+)*\s*\]|\bet\s+al\b|"
                     r"\(\s*[A-Z][^()]*?\b(?:19[5-9]\d|20[0-3]\d)[a-z]?\s*\)")
-_OURS = re.compile(r"\b(?:ours|proposed|this\s+work)\b", re.I)
-_PROPOSE = re.compile(r"\b(?i:we\s+(?:propose|introduce|present|develop|call|term|name)|"
-                      r"dubbed|termed|called|named)\b")
+_OURS = re.compile(r"^\s*(?:ours|proposed)\b|\(\s*(?:ours|proposed|this\s+work)\s*\)", re.I)
+_PROPOSE = re.compile(r"\b(?i:we\s+(?:propose|introduce|present|develop|call|term|name))\b")
 # Where the named thing ends: the first clause that compares, qualifies or starts a sentence.
 _NP_END = re.compile(r"[.;:]\s|\b(?:which|that|who|outperform\w*|improv\w*|than|over|"
                      r"compar\w*|against|versus|vs\.?|beat\w*|surpass\w*|and\s+show\w*)\b", re.I)
@@ -329,37 +329,58 @@ _ACRONYM = re.compile(r"\(\s*([A-Z][A-Za-z0-9\-]*[A-Z0-9][A-Za-z0-9\-]*)\s*\)")
 # names a field; "GNN-based" describes.
 _NAME_SHAPED = re.compile(r"[A-Z][A-Za-z0-9]*[A-Z0-9][\w\-]*")
 _DESCRIPTOR = re.compile(r"-(?:based|like|style|driven|aware|guided|free|agnostic)$", re.I)
-_ARTICLES = {"a", "an", "the", "our", "new", "novel"}
+_LEAD_WORDS = {"a", "an", "the", "our", "new", "novel", "it", "this", "method", "approach",
+               "model", "framework", "algorithm"}
+_CALLED = re.compile(r"\b(?:called|named|dubbed|termed)\s+([A-Z][\w\-]{2,})")
+# "a GNN-based model, FooNet": a second comma segment names the thing only after a noun
+# saying the first segment IS a method.
+_METHOD_NOUN = re.compile(r"\b(?:model|method|approach|framework|algorithm|architecture|"
+                          r"optimizer|estimator|network|system|technique|procedure|scheme|"
+                          r"objective|module|pipeline|agent|policy)s?\b", re.I)
+
+
+def _given_name(segment: str) -> str:
+    """The name a phrase segment gives, or ''."""
+    if m := _CALLED.search(segment):                       # "a new optimizer called Kite"
+        return m.group(1)
+    words = [w.strip("()\"'") for w in segment.split()]
+    while words and words[0].lower() in _LEAD_WORDS:
+        words.pop(0)
+    first = words[0] if words else ""
+    ok = (len(first) >= 3 and first[0].isupper() and not _DESCRIPTOR.search(first)
+          and (_NAME_SHAPED.fullmatch(first) or len(words) == 1))
+    return first if ok else ""
 
 
 def own_names(doc: PaperDoc) -> set[str]:
     """The names the paper gives its OWN method, where it gives them: a title led by one
-    ("FooNet: ..."), and — in the front matter through the abstract — the phrase right after
-    "we propose/introduce ..." up to its first comparison or clause: an acronym defined
-    there ("GRAdient-based Causal tree Ensembles (GRACE)"), else its first given name
-    ("Kite, a fast optimizer"; "a GNN-based model, FooNet"). "FooNet, which improves on
-    Low-Rank Adaptation (LoRA)" stops at "which": LoRA is the comparison, not theirs."""
+    ("FooNet: ...") that the front matter uses again as a name, and — through the abstract
+    — the phrase right after "we propose/introduce ..." up to its first comparison or
+    clause: an acronym defined there ("GRAdient-based Causal tree Ensembles (GRACE)"), else
+    the name it gives ("Kite, a fast optimizer"; "a GNN-based model, FooNet"; "an optimizer
+    called Kite"). Not a comparison ("FooNet, which improves on LoRA"), not a verb phrase
+    ("we propose to fine-tune BERT"), not a genre ("Position: ...")."""
     idx = abstract_section_idx(doc)
     upto = [s for s in doc.sections if idx < 0 or s.section_idx <= idx][:max(3, idx + 1)]
     front = re.sub(r"(\w)-\s+(\w)", r"\1\2", " ".join(s.text or "" for s in upto))[:8000]
     names = set()
     if head := re.match(r"\s*([A-Z][\w\-]{2,})\s*:", doc.title or ""):
-        names.add(head.group(1))
+        name = head.group(1)
+        reused = re.search(rf"\b{re.escape(name)}\b", front.replace(doc.title or "", " "))
+        if _NAME_SHAPED.fullmatch(name) or reused:
+            names.add(name)
     for m in _PROPOSE.finditer(front):
         rest = front[m.end():m.end() + 300]
         phrase = rest[:end.start()] if (end := _NP_END.search(rest)) else rest
-        for segment in phrase.split(",")[:2]:        # "a GNN-based model, FooNet"
-            if acronyms := _ACRONYM.findall(segment):
-                names |= set(acronyms)
-                break
-            words = [w.strip("()\"'") for w in segment.split()]
-            while words and words[0].lower() in _ARTICLES:
-                words.pop(0)
-            first = words[0] if words else ""
-            if (len(first) >= 3 and first[0].isupper() and not _DESCRIPTOR.search(first)
-                    and (_NAME_SHAPED.fullmatch(first) or len(words) == 1)):
-                names.add(first)
-                break
+        if re.match(r"\s*to\s", phrase):
+            continue
+        segments = phrase.split(",")
+        if acronyms := _ACRONYM.findall(segments[0]):
+            names |= set(acronyms)
+        elif name := _given_name(segments[0]):
+            names.add(name)
+        elif len(segments) > 1 and _METHOD_NOUN.search(segments[0]):
+            names |= set(_ACRONYM.findall(segments[1])) or {n for n in [_given_name(segments[1])] if n}
     return {_key(n) for n in names if len(_key(n)) >= 3}
 
 
@@ -379,44 +400,90 @@ def own_method(doc: PaperDoc, label: str) -> bool:
 _METHOD_FLAG = re.compile(r"^--?(?:model|method|arch(?:itecture)?|algo(?:rithm)?|baseline|variant|"
                           r"net(?:work)?|approach|estimator|learner|backbone)s?(?:[_-]?(?:name|type))?$",
                           re.I)
+_DATA_FLAG = re.compile(r"^--?\w*(?:data|task|benchmark|corpus)", re.I)
 
 
-def cell_method(doc: PaperDoc, table: Table, row: int, col: int) -> tuple[list[str], bool, str]:
-    """(labels, own, refusal): the label(s) naming the method a cell reports, whether that
-    method is the paper's own, and why nothing can be said. The table's own layout decides
-    the axis: if some ROW names the paper's method the methods are rows; else if some column
-    header does they are columns; else either label may name it and only a documented method
-    argument can select it."""
+class CellMethod(NamedTuple):
+    labels: list          # the label(s) naming the method; [] = the paper's own sweep
+    own: bool             # the paper's own method
+    refusal: str          # why nothing can be said, or ''
+    via_column: bool      # the methods are the columns
+    dataset_row: str      # via a column: the row label a data argument must name ('' = numeric row)
+
+
+def cell_method(doc: PaperDoc, table: Table, row: int, col: int) -> CellMethod:
+    """Which method a cell reports and whether it is the paper's own, from the table's own
+    layout: if some ROW names the paper's method the methods are rows. Else if some column
+    header does they are columns — but only once the row is shown to be a dataset (a
+    number, or a value a documented data argument names: `dataset_row`, checked per
+    command) and the column is not itself one. Else only documented arguments naming every
+    label of the cell, one of them the method, can select it (`selects`)."""
     from .paper import _METRIC_WORD, column_header  # deferred: paper imports this module
     row_label = (table.cell(row, 0) or "").strip()
     head = column_header(table, col)
     for label in (row_label, head):
         if label and _CITED.search(label):
-            return [label], False, (f"the cell reports {label!r}, which carries a citation: a "
-                                    f"baseline the authors cite, not a result their code produces")
+            return CellMethod([label], False, (f"the cell reports {label!r}, which carries a "
+                                               f"citation: a baseline the authors cite, not a "
+                                               f"result their code produces"), False, "")
+    numeric_row = not re.search(r"[^\W\d_]{2,}", row_label)      # a sample size, a dimension
     width = max((len(r) for r in table.rows), default=0)
     if any(own_method(doc, (table.cell(r, 0) or "")) for r in range(len(table.rows))):
-        return [row_label], own_method(doc, row_label), ""
+        return CellMethod([row_label], own_method(doc, row_label), "", False, "")
     if any(own_method(doc, column_header(table, c)) for c in range(1, width)):
-        return [head], own_method(doc, head), ""
-    if not re.search(r"[^\W\d_]{2,}", row_label):     # a sample size, a dimension
+        return CellMethod([head], own_method(doc, head), "", True, "" if numeric_row else row_label)
+    if numeric_row:
         if not head:
-            return [], False, ("the cited row is labelled by a number and extraction recovered "
-                               "no header for its column, so which method the cell reports is unknown")
+            return CellMethod([], False, ("the cited row is labelled by a number and extraction "
+                                          "recovered no header for its column, so which method "
+                                          "the cell reports is unknown"), False, "")
         if _METRIC_WORD.search(head) or _quantity_of(head):
-            return [], True, ""                      # "n | RMSE": a sweep of one method
-        return [head], False, ""
-    return [row_label, head], False, ""
+            return CellMethod([], True, "", False, "")          # "n | RMSE": a sweep of one method
+        return CellMethod([head], False, "", False, "")
+    labels = [x for x in (row_label, head) if x and not (_METRIC_WORD.search(x) or _quantity_of(x))]
+    return CellMethod(labels, False, "", False, "")
+
+
+def _slot_naming(cmd: CandidateCommand, label: str) -> tuple[str, str]:
+    """(kind, value): the documented argument whose value names `label` — kind 'method',
+    'data' or 'other' — or ('', '')."""
+    words = {w.lower() for w in re.split(r"[\s,;:()\[\]]+", label or "") if w}
+    for value in cmd.bound_slots.values():
+        if value.lower() not in words:
+            continue
+        at = cmd.argv.index(value) if value in cmd.argv else -1
+        flag = cmd.argv[at - 1] if at > 0 else ""
+        kind = ("method" if _METHOD_FLAG.match(flag) else
+                "data" if _DATA_FLAG.match(flag) else "other")
+        return kind, value
+    return "", ""
+
+
+def admits(cmd: CandidateCommand, cm: CellMethod) -> str:
+    """'' when this documented command produces the cell `cm` describes, else why not."""
+    if cm.own and cm.via_column:
+        if cm.dataset_row and _slot_naming(cmd, cm.dataset_row)[0] != "data":
+            return (f"the paper's method is a column, but no documented data argument names the "
+                    f"row {cm.dataset_row!r}, so the row may be another method")
+        if _slot_naming(cmd, cm.labels[0])[0] == "data":
+            return f"a documented data argument names {cm.labels[0]!r}: it is a dataset, not the method"
+    if not cm.own and not selects(cmd, cm.labels):
+        return (f"takes no documented arguments naming {' / '.join(repr(x) for x in cm.labels)} "
+                f"(one of them the method), which the paper does not name as its own")
+    return ""
 
 
 def selects(cmd: CandidateCommand, labels: list[str]) -> str:
-    """The documented METHOD argument value that names one of `labels`, or ''."""
-    words = {w.lower() for label in labels for w in re.split(r"[\s,;:()\[\]]+", label) if w}
-    for value in cmd.bound_slots.values():
-        at = cmd.argv.index(value) if value in cmd.argv else -1
-        if at > 0 and _METHOD_FLAG.match(cmd.argv[at - 1]) and value.lower() in words:
-            return value
-    return ""
+    """The documented METHOD-argument value that selects a cell whose labels are `labels`,
+    or '': every label must be named by a documented method or data argument, and one by a
+    method argument — `--backbone bert` alone does not select the LoRA row's method."""
+    chosen = ""
+    for label in labels:
+        kind, value = _slot_naming(cmd, label)
+        if kind not in ("method", "data"):
+            return ""
+        chosen = chosen or (value if kind == "method" else "")
+    return chosen
 
 
 def harness_seed_flag(cmd: CandidateCommand | None) -> str:
@@ -878,9 +945,10 @@ def resolve_experiment(doc: PaperDoc, repo: Path, table_ref: str,
     # WHICH method the cell reports, and whether it is the paper's own (`cell_method`).
     from .paper import table_role  # deferred: see `_metric_name`
     col = int(m.group(3))
-    labels, own, refusal = cell_method(doc, table, row, col)
-    if refusal:
-        ident.state, ident.reason = "no_candidate", refusal
+    cm = cell_method(doc, table, row, col)
+    labels, own = cm.labels, cm.own
+    if cm.refusal:
+        ident.state, ident.reason = "no_candidate", cm.refusal
         return ident
     label = labels[0] if labels else ""
     # A method the paper NAMES as its own must be implemented here (the code IS it, not a
@@ -905,18 +973,19 @@ def resolve_experiment(doc: PaperDoc, repo: Path, table_ref: str,
         # A cell that is not the paper's own method is produced only by a command whose own
         # documented METHOD argument names it (`--model {bert,ours}` filled with 'bert'); a
         # dataset argument never selects a method.
-        if not own and not selects(filled, labels):
-            ident.rejected.append(
-                f"{c.source_ref}: takes no documented method argument naming "
-                f"{' / '.join(repr(x) for x in labels if x)}, which the paper does not name as "
-                f"its own" + (" (a dataset row of a data-statistics table)"
-                              if table_role(table) == "data_statistics" else ""))
+        if why := admits(filled, cm):
+            ident.rejected.append(f"{c.source_ref}: {why}" + (
+                " (a dataset row of a data-statistics table)"
+                if table_role(table) == "data_statistics" and not own else ""))
             continue
         candidates.append(describe_command(repo, filled))
     ident.considered = len(candidates) + len(ident.rejected)
-    if not own and not candidates:
+    if (not own or cm.via_column) and not candidates:
         ident.state = "no_candidate"
         ident.reason = (
+            f"the paper's method {label!r} is this cell's column, but no advertised command "
+            f"establishes the row as a dataset: " + "; ".join(ident.rejected[:2])
+            if own else
             f"the cited row names {label!r}, a dataset rather than a method, and no advertised "
             f"program in this checkout is bound to its statistics"
             if table_role(table) == "data_statistics" else
@@ -1073,7 +1142,8 @@ def resolve_configuration(doc: PaperDoc, table_ref: str, cmd: CandidateCommand |
     # `instantiate`) is the dataset; a row label naming a method the checkout implements
     # (checked by `resolve_experiment`) is the method. Nothing else is inferred.
     row, col = int(m.group(2)), int(m.group(3))
-    labels, own, _refusal = cell_method(doc, table, row, col)
+    cm = cell_method(doc, table, row, col)
+    labels, own = cm.labels, cm.own and not admits(cmd, cm)
     if value := selects(cmd, labels):          # the command's own method argument selects it
         at = cmd.argv.index(value)
         ident.matched["model"] = value

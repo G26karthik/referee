@@ -135,17 +135,24 @@ _CUE_PATTERNS = (
 # available at", "the code of Smith et al. is available at", "we use the released code".
 _THIRD_PARTY = re.compile(r"\b(?:baselines?|their|et\s+al|original\s+authors|provided\s+by|"
                           r"we\s+(?:use[ds]?|adopt(?:ed)?|build\s+on|borrow(?:ed)?)|third[- ]party|"
-                          r"prior\s+work|existing\s+implementation)\b", re.I)
+                          r"prior\s+work|existing\s+implementation|builds?\s+(?:up)?on|built\s+on|"
+                          r"extends?|extending|based\s+on|codebase\s+of|implementation\s+of|"
+                          r"fork(?:ed)?\s+(?:of|from)|adapted\s+from)\b", re.I)
 
 
 def _sentence_before(text: str, start: int) -> str:
     window = text[max(0, start - _CUE_WINDOW):start]
-    cut = max(window.rfind(". "), window.rfind(".\n"))
+    cut = max(window.rfind(". "), window.rfind(".\n"), window.rfind("; "))
     return window[cut + 1:] if cut >= 0 else window
 
 
 def _first_person(text: str, start: int) -> bool:
-    return any(p.search(_sentence_before(text, start)) for p in _CUE_PATTERNS)
+    """A first-person code statement that THIS URL completes: nothing between the statement
+    and the URL hands the link to someone else ("our code ... builds on the official
+    codebase of X (url)" links X, not theirs)."""
+    sentence = _sentence_before(text, start)
+    ends = [m.end() for p in _CUE_PATTERNS for m in p.finditer(sentence)]
+    return bool(ends) and not _THIRD_PARTY.search(sentence[max(ends):])
 
 
 def _cued(text: str, start: int) -> bool:

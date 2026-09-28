@@ -23,6 +23,7 @@ def _doc(tables: list[Table], title: str = "FooNet: Small Models for Something S
 
 
 def _repo(tmp_path: Path, readme: str, files: dict[str, str]) -> Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     (tmp_path / "README.md").write_text(readme, encoding="utf-8")
     for rel, body in files.items():
         (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -191,7 +192,7 @@ def test_own_names_come_from_the_phrase_the_paper_introduces():
     assert names("We introduce FooNet, which improves on Low-Rank Adaptation (LoRA).") == {"foonet"}
     assert names("We propose a GNN-based model, FooNet, for graphs.") == {"foonet"}
     assert names("We propose Bayesian optimization with priors.") == set()
-    assert names("x", title="Kite: A Fast Optimizer") == {"kite"}
+    assert names("Kite trains fast.", title="Kite: A Fast Optimizer") == {"kite"}
     assert names("We intro- duce GRAdient-based Causal tree Ensembles (GRACE), a model.") == {"grace"}
     assert experiment_id.own_method(_doc([]), "FooNet (d=2048)")
 
@@ -213,6 +214,43 @@ def test_quantities_are_whole_words_and_a_column_keeps_its_own():
     marco = Table(table_idx=0, label="1", caption="NDCG@10 on MS MARCO", header=["m", "MS MARCO"],
                   rows=[["FooNet", "0.41"]])
     assert paper.metric_name(marco, 1) == "NDCG"
+
+
+def test_third_review_admission_holes_are_closed(tmp_path):
+    # a benchmark the paper introduces is a column the data argument names, not the method
+    bench = PaperDoc(paper_id="p", title="A Benchmark Study of Something Specific", sections=[
+        Section(section_idx=0, title="Abstract", text="We introduce MegaBench, a hard benchmark.")])
+    r = _repo(tmp_path / "a", "```bash\npython eval.py --task <megabench|mmlu>\n```\n",
+              {"eval.py": "print({'accuracy': 1})\n"})
+    bench.tables = [Table(table_idx=0, label="1", caption="Accuracy of models",
+                          header=["Model", "MegaBench", "MMLU"], rows=[["GPT-4", "60.1", "86.4"]])]
+    assert experiment_id.resolve_experiment(bench, r, "T0:r0:c1").state == "no_candidate"
+    t = Table(table_idx=0, label="1", caption="Accuracy", header=["Method", "Win vs. ours"],
+              rows=[["Baseline", "40.0"]])
+    assert not experiment_id.own_method(_doc([t]), "Win vs. ours")
+    # a backbone argument naming the column does not select the row's method
+    r2 = _repo(tmp_path / "b", "```bash\npython train.py --backbone <bert|roberta> --task <sst-2|mnli>\n```\n",
+               {"train.py": "print({'accuracy': 1})\n"})
+    lora = Table(table_idx=0, label="1", caption="Accuracy on MNLI", header=["Method", "BERT", "RoBERTa"],
+                 rows=[["LoRA", "84.0", "86.1"]])
+    assert experiment_id.resolve_experiment(_doc([lora]), r2, "T0:r0:c1").state == "no_candidate"
+    # names: a bare "called X", a data list, a genre title and "to fine-tune" name nothing
+    def names(abstract, title="A Study of Something"):
+        return experiment_id.own_names(PaperDoc(paper_id="p", title=title, sections=[
+            Section(section_idx=0, title="Abstract", text=abstract)]))
+    assert names("A popular optimizer called Adam, which is slow. We propose Kite, a fix.") == {"kite"}
+    assert names("We present experiments on news, Wikipedia, and books.") == set()
+    assert names("Graphs matter.", title="Position: Graph Foundation Models Are Here") == set()
+    assert names("We propose to fine-tune BERT, GPT-2 and T5.") == set()
+    assert names("We propose a new optimizer called Kite for training.") == {"kite"}
+    # a first-person statement does not attribute a URL it hands to someone else
+    def url(text):
+        return repo.official_repo_url(PaperDoc(paper_id="p", sections=[
+            Section(section_idx=0, title="M", text=text)]))
+    assert "LLaVA" not in url("Our implementation is publicly available and builds on the "
+                              "official codebase of LLaVA (https://github.com/haotian-liu/LLaVA).")
+    assert url("Our code is available upon request; the baseline implementation is at "
+               "https://github.com/them/base here.") == ""
 
 
 def test_a_numeric_row_takes_its_configuration_from_the_own_column():
