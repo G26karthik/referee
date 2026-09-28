@@ -61,7 +61,11 @@ class CertificateError(RuntimeError):
 
 
 def _normalize_ws(text: str) -> str:
-    return " ".join((text or "").split())
+    """Whitespace-normalised, with control characters dropped: a PDF parse emits them for
+    glyphs such as large brackets, and no quotation can reproduce them. Every printable
+    character must still match exactly."""
+    return " ".join("".join(c for c in (text or "")
+                            if c.isprintable() or c.isspace()).split())
 
 
 def _full_paper_text(doc: PaperDoc) -> str:

@@ -136,6 +136,16 @@ def test_constant_name_is_an_implementation_locator():
         script, "PATH module-level constant", "return 1")
 
 
+def test_quote_checks_tolerate_extraction_glyphs_and_skipped_comments():
+    assert certificate._normalize_ws("a \x12 b\x13 2 = c") == certificate._normalize_ws("a b 2 = c")
+    assert certificate._normalize_ws("x <= 1") != certificate._normalize_ws("x < 1")
+    script = "def f(s):\n    a = s + 1\n    # why\n    b = a * a\n    return b\n"
+    assert reimplement_driver._implementation_locator_matches(
+        script, "f()", "    a = s + 1\n    b = a * a")
+    assert not reimplement_driver._implementation_locator_matches(
+        script, "f()", "    a = s + 2\n    b = a * a")
+
+
 def test_verifier_approval_follows_the_same_required_kinds(tmp_path):
     released = [{"path": "data/labels.csv", "sha256": "0" * 64}]
     need = reimplement_driver.required_kinds(_SCRIPT, _BIND, released)

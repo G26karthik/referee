@@ -98,7 +98,13 @@ def _implementation_locator_matches(script: str, impl_ref: str, impl_quote: str)
                 spans.append((n.lineno, int(getattr(n, "end_lineno", n.lineno))))
     except SyntaxError:
         pass
-    return any(impl_quote in "\n".join(lines[s - 1:e]) for s, e in spans)
+    if any(impl_quote in "\n".join(lines[s - 1:e]) for s, e in spans):
+        return True
+    # A quote that skips the span's comment/blank lines still quotes its CODE verbatim.
+    code = lambda text: "\n".join(x for x in text.splitlines()      # noqa: E731
+                                  if x.strip() and not x.strip().startswith("#"))
+    q = code(impl_quote)
+    return bool(q) and any(q in code("\n".join(lines[s - 1:e])) for s, e in spans)
 
 
 class ReimplementationDriverError(RuntimeError):
