@@ -18,6 +18,7 @@ import re
 import shlex
 from pathlib import Path
 
+from .decide import abstract_section_idx
 from .schema import (CandidateCommand, ConfigurationIdentity, ExperimentIdentity,
                      IdentityEvidence, MetricIdentity, PaperDoc, Table)
 
@@ -291,6 +292,64 @@ def _metric_key(table: Table, col: int) -> str:
     return _key(_metric_name(table, col))
 
 
+# WHOSE ROW. A documented command runs the paper's own method; a row that cites its source
+# ("BERT (Devlin et al., 2019)", "LoRA [9]") reports someone else's number. A row that is
+# neither marked nor named as the paper's own is bound only when the command itself takes
+# an argument naming it — otherwise which row the command produces is a guess.
+_CITED = re.compile(r"\[\s*\d+(?:\s*[,;–-]\s*\d+)*\s*\]|\bet\s+al\b|\([^()]*\b(?:19|20)\d{2}[a-z]?\s*\)",
+                    re.I)
+_OURS = re.compile(r"\b(?:ours|proposed|this\s+work)\b", re.I)
+_NAME_LIKE = r"[A-Z][A-Za-z0-9]*[A-Z0-9][\w\-]*"            # FooNet, GRACE, DiffGBM, GPT-4
+_PROPOSE = re.compile(r"\b(?i:we\s+(?:propose|introduce|present|develop|call|term|name)|"
+                      r"dubbed|termed|called|named)\b")
+
+
+def own_names(doc: PaperDoc) -> set[str]:
+    """The names the paper gives its OWN method, where it gives them: a title led by the
+    name ("FooNet: ..."), and — in the front matter through the abstract — the first
+    name-shaped word after "we propose/introduce ..." plus an acronym it defines there
+    ("We introduce GRAdient-based Causal tree Ensembles (GRACE)"). Not every capitalised
+    word: "FooNet outperforms BERT" makes BERT a comparison, not theirs."""
+    idx = abstract_section_idx(doc)
+    upto = [s for s in doc.sections if idx < 0 or s.section_idx <= idx][:max(3, idx + 1)]
+    front = re.sub(r"(\w)-\s+(\w)", r"\1\2", " ".join(s.text or "" for s in upto))[:8000]
+    names = set()
+    if head := re.match(rf"\s*({_NAME_LIKE})\s*:", doc.title or ""):
+        names.add(head.group(1))
+    for m in _PROPOSE.finditer(front):
+        window = " ".join(front[m.end():].split()[:14])
+        if first := re.search(_NAME_LIKE, window):
+            names.add(first.group(0))
+        names |= set(re.findall(rf"\(({_NAME_LIKE})\)", window))
+    return {_key(n) for n in names if len(_key(n)) >= 3}
+
+
+def own_method(doc: PaperDoc, label: str) -> bool:
+    """Does a table label name the paper's OWN method? Never when it carries a citation."""
+    label = (label or "").strip()
+    if not label or _CITED.search(label):
+        return False
+    if _OURS.search(label):
+        return True
+    names = own_names(doc)
+    whole = re.sub(r"\([^)]*\)|[*†‡§]", "", label).strip()
+    return _key(re.split(r"[\s_/\-(]+", whole)[0]) in names or _key(whole) in names
+
+
+def harness_seed_flag(cmd: CandidateCommand | None) -> str:
+    """The seed flag the harness may append to a documented command, or '' when it may not:
+    the program takes none, the README pins one ("--seed 42", "--seed=42") — the documented
+    protocol — or the command is a shell/make wrapper, which need not forward argv to the
+    program whose flag was read."""
+    if cmd is None or not cmd.seed_flag:
+        return ""
+    argv = cmd.argv
+    if any(t == cmd.seed_flag or t.startswith(cmd.seed_flag + "=") for t in argv):
+        return ""
+    program = next((t for t in argv if t.endswith((".py", ".sh")) or t in ("make", "-m")), "")
+    return "" if program.endswith(".sh") or program == "make" else cmd.seed_flag
+
+
 def _prefer_fenced(fitting: list[CandidateCommand]) -> list[CandidateCommand]:
     """A command the README spells out outranks a program its prose merely names: prose
     names are consulted only when no spelled-out command fits, so they never turn a
@@ -329,7 +388,9 @@ def instantiate(cmd: CandidateCommand, context: str) -> tuple[CandidateCommand |
                           f"{len(named)} of them ({', '.join(named[:4]) or 'none'})")
         bound[token] = named[0]
     argv = [bound.get(t, t) for t in cmd.argv]
-    if hole := next((t for t in argv if re.search(r"\$\{?\w", t) or _PLACEHOLDER.match(t)), ""):
+    # A hole inside a token counts too: `configs/<dataset>.yaml`, `--data=<path>`, `{task}`.
+    if hole := next((t for t in argv if re.search(r"\$\{?\w|<[^<>\s]+>|\{(?!seed\})\w+\}", t)
+                     or _PLACEHOLDER.match(t)), ""):
         return None, f"the documented command still has an unfilled hole {hole!r}"
     if not bound:
         return cmd, ""
@@ -603,6 +664,10 @@ def resolve_metric(doc: PaperDoc, table_ref: str, cmd: CandidateCommand | None,
     by_name = next((k for k in (cmd.named_keys if cmd else []) if named and _key(k) == named), "")
     matched_by_class = bool(cmd and ident.cell_quantity and any(
         q == ident.cell_quantity for k, q in _OUTPUT_QUANTITY if k in cmd.emits))
+    # A name never overrides a quantity the cell was already identified by: 'accuracy'
+    # written by the program is not a 'Time (s)' column, however the caption reads.
+    if by_name and ident.cell_quantity and _quantity_of(by_name) not in ("", ident.cell_quantity):
+        by_name = ""
     if by_name and not matched_by_class:
         ident.cell_quantity = ident.cell_quantity or _metric_name(table, col)
         ident.output_key, ident.output_quantity = by_name, _metric_name(table, col)
@@ -726,38 +791,66 @@ def resolve_experiment(doc: PaperDoc, repo: Path, table_ref: str,
         quote=ident.row_method, source_ref=f"T{m.group(1)}:r{row}:c0",
         note="the method whose result this cell reports"))
 
-    # The row names a method. If the repository does not implement it, no command in the
-    # repository can produce the row, however capable the machine is. A row labelled by a
-    # number (a sample size, a dimension) names no method, so there is nothing to look for.
-    from .paper import table_role  # deferred: see `_metric_name`
-    # "Ours-large (ours)†" names the method "Ours-large". A variant suffix ("Method-flex")
-    # names a configuration of a method, so its leading name also counts — but only when
-    # the checkout DEFINES that name (a class, function or module of its own), never when it
-    # merely imports it: `from transformers import BertModel` does not make BERT theirs.
-    method = re.sub(r"\([^)]*\)|[*†‡§]", "", ident.row_method).strip(" -_")
-    lead = re.split(r"[\s\-_/]+", method)[0] if method else ""
-    if (re.search(r"[^\W\d_]{2,}", method) and not repo_implements(repo, method)
-            and not (len(lead) >= 4 and repo_defines(repo, lead))):
+    # WHICH method the cell reports: its row label, or — on a row labelled by a number (a
+    # sample size, a dimension) — its column header when that names no metric. A cell whose
+    # row and column name no method is the paper's own experiment.
+    from .paper import _METRIC_WORD, column_header, table_role  # deferred: see `_metric_name`
+    col = int(m.group(3))
+    label = ident.row_method
+    if not re.search(r"[^\W\d_]{2,}", label):
+        head = column_header(table, col)
+        if not head:
+            ident.state = "no_candidate"
+            ident.reason = ("the cited row is labelled by a number and extraction recovered no "
+                            "header for its column, so which method the cell reports is unknown")
+            return ident
+        label = "" if _METRIC_WORD.search(head) or _quantity_of(head) else head
+    if label and _CITED.search(label):
         ident.state = "no_candidate"
-        ident.reason = (
-            f"the cited row names {ident.row_method!r}, a dataset rather than a method, and no "
-            f"advertised program in this checkout is bound to its statistics"
-            if table_role(table) == "data_statistics" else
-            f"the cited row reports {ident.row_method!r}, and no .py or .sh file in this "
-            f"checkout implements it — the cell is a third-party baseline the authors cited "
-            f"rather than a result their code produces")
+        ident.reason = (f"the cited cell reports {label!r}, which carries a citation: a baseline "
+                        f"the authors cite, not a result their code produces")
+        return ident
+    own = not label or own_method(doc, label)
+    # A method the paper NAMES as its own must be implemented here (the code IS it, not a
+    # string about it); a variant ("FooNet-large") counts when the checkout DEFINES its
+    # leading name. A row marked "ours" names no identifier to look for.
+    method = re.sub(r"\([^)]*\)|[*†‡§]", "", label).strip(" -_")
+    lead = re.split(r"[\s\-_/]+", method)[0] if method else ""
+    if own and method and not _OURS.search(label) and not repo_implements(repo, method) and not (
+            len(lead) >= 4 and repo_defines(repo, lead)):
+        ident.state = "no_candidate"
+        ident.reason = (f"the cited row reports {label!r}, and no .py or .sh file in this "
+                        f"checkout implements it")
         return ident
 
-    col = int(m.group(3))
     context = cell_context(table, row, col)
+    label_words = {w.lower() for w in re.split(r"[\s,;:()\[\]]+", label) if w}
     candidates = []
     for c in harvest_candidates(repo):
         filled, why = instantiate(c, context)
         if filled is None:
             ident.rejected.append(f"{c.source_ref}: {why}")
             continue
+        # A row that is not the paper's own method is produced only by a command whose own
+        # documented argument names it (`--model {bert,ours}` filled with 'bert').
+        if not own and not any(v.lower() in label_words for v in filled.bound_slots.values()):
+            ident.rejected.append(
+                f"{c.source_ref}: takes no documented argument naming {label!r}, which is not "
+                f"the paper's own method" + (" (a dataset row of a data-statistics table)"
+                                              if table_role(table) == "data_statistics" else ""))
+            continue
         candidates.append(describe_command(repo, filled))
     ident.considered = len(candidates) + len(ident.rejected)
+    if not own and not candidates:
+        ident.state = "no_candidate"
+        ident.reason = (
+            f"the cited row names {label!r}, a dataset rather than a method, and no advertised "
+            f"program in this checkout is bound to its statistics"
+            if table_role(table) == "data_statistics" else
+            f"the cited row reports {label!r}, which the paper does not name as its own method, "
+            f"and no advertised command takes a documented argument naming it — which row a "
+            f"command produces would be a guess")
+        return ident
     cell_quantity = _quantity_of(_header_for(table, col)) or _quantity_of(table.caption or "")
     named = _metric_key(table, col)
     fitting = _prefer_fenced([c for c in candidates
@@ -907,20 +1000,32 @@ def resolve_configuration(doc: PaperDoc, table_ref: str, cmd: CandidateCommand |
     # `instantiate`) is the dataset; a row label naming a method the checkout implements
     # (checked by `resolve_experiment`) is the method. Nothing else is inferred.
     row_label = (table.cell(int(m.group(2)), 0) or "").strip()
+    row_words = {w.lower() for w in re.split(r"[\s,;:()\[\]]+", row_label) if w}
     for slot, value in cmd.bound_slots.items():
         at = cmd.argv.index(value) if value in cmd.argv else -1
         flag = cmd.argv[at - 1].lower() if at > 0 else ""
-        if "dataset" in ident.matched or not re.search(r"data|task|benchmark|corpus", flag):
-            continue                     # a slot is the dataset only when its flag says so
+        if "model" not in ident.matched and value.lower() in row_words:
+            ident.matched["model"] = value       # the command's own argument selects the row
+            ident.evidence.append(IdentityEvidence(
+                quote=f"{flag} {value}".strip(), source_ref=cmd.source_ref,
+                note=f"the README documents {value!r} for {slot}, and the cited row names it"))
+            continue
+        # A slot is the dataset only when a FLAG says so; a positional's predecessor is the
+        # program file, which says nothing.
+        if ("dataset" in ident.matched or not flag.startswith("-")
+                or not re.search(r"data|task|benchmark|corpus", flag)):
+            continue
         ident.matched["dataset"] = value
         ident.evidence.append(IdentityEvidence(
             quote=f"{flag} {value}", source_ref=cmd.source_ref,
             note=f"the README documents {value!r} for {slot}, and the cited cell names it"))
-    if "model" not in ident.matched and re.search(r"[^\W\d_]{2,}", row_label):
+    # A command with no argument naming the method runs the paper's OWN method; the row is
+    # that configuration only when the paper names it as its own.
+    if "model" not in ident.matched and own_method(doc, row_label):
         ident.matched["model"] = row_label
         ident.evidence.append(IdentityEvidence(
             quote=row_label, source_ref=f"T{m.group(1)}:r{m.group(2)}:c0",
-            note="the cited row names the method the checkout implements"))
+            note="the cited row is the paper's own method, which the documented command runs"))
     # `sparsity` is REPORTED when the caption states it, never REQUIRED (it exists only
     # in pruning papers). Model and dataset identify a configuration in general.
     for field in ("model", "dataset"):
@@ -961,7 +1066,7 @@ def resolve_configuration(doc: PaperDoc, table_ref: str, cmd: CandidateCommand |
     single_repo_seed = len(cmd.seed_values) <= 1
     # A command with no seed argument is run exactly as documented (`routes.plan_execution`
     # repeats it only to observe determinism), so it passes ONE seed policy: the repo's own.
-    harness_distinct = harness_seeds if cmd.seed_flag and cmd.seed_flag not in cmd.argv else 1
+    harness_distinct = harness_seeds if harness_seed_flag(cmd) else 1
     ident.seed_policy_match = not (single_repo_seed and harness_distinct > 1 and not reported)
     if not ident.seed_policy_match:
         ident.state = "unsupported"

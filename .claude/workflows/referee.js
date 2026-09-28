@@ -10,10 +10,12 @@ export const meta = {
 //         maxRounds: 20 }
 // Model work is done ONLY by isolated Sonnet workers (one context per task) and a Haiku
 // controller that runs the harness command. Worker model is clamped to haiku|sonnet: never
-// Opus. Token budget: workers use the minimal `referee-worker` agent type (Read/Write/Bash
-// only) when it is registered, and a two-tool-call protocol (read prompt; write+seal in one
-// Bash call). Whether a task sealed is read back from the harness's own task list, never
-// from the worker's say-so.
+// Opus. Token budget: every worker turn re-sends its whole context, so the protocol is three
+// turns — read the prompt in ONE message of parallel Reads over the harness's `reads` ranges
+// (each under the Read tool's 25k-token cap), create files with Write (a heredoc through the
+// shell mangles quotes in JSON/code), seal with one Bash call — on the minimal
+// `referee-worker` agent type (Read/Write/Bash only) when registered. Whether a task sealed
+// is read back from the harness's own task list, never from the worker's say-so.
 const A = args || {}
 const REPO = A.repo
 const PY = A.python || '../.venv/Scripts/python'
@@ -34,6 +36,7 @@ const STATE = {
     tasks: { type: 'array', items: { type: 'object', properties: {
       id: { type: 'string' }, role: { type: 'string' }, prompt: { type: 'string' },
       out: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' },
+      reads: { type: 'array', items: { type: 'array', items: { type: 'integer' } } },
       after: { type: 'array', items: { type: 'string' } } },
       required: ['id', 'role', 'prompt', 'out', 'model', 'effort', 'after'] } },
   },
@@ -66,15 +69,22 @@ function controller(source, label) {
 }
 
 function worker(pid, t, prior) {
+  const r = t.reads || []
+  const how = r.length > 1
+    ? `in ONE message of ${r.length} parallel Read calls, (offset, limit) = ` +
+      r.map(([o, n]) => `(${o}, ${n})`).join(', ')
+    : `with one Read call`
   return run('worker',
     `One isolated REFEREE task. Judge independently; read nothing but the task prompt ` +
     `(and an image file it names).\n` +
-    `1. Read ${t.prompt} (self-contained; read it fully).\n` +
-    `2. In ONE Bash call, write your JSON answer (exactly as the prompt specifies) and seal:\n` +
-    `cat > "${t.out}" <<'__REFEREE_JSON__'\n<your JSON>\n__REFEREE_JSON__\n` +
-    `${sh(`run.py seal ${pid} "${t.id}" "${t.out}"`)}\n` +
-    `3. If sealing fails, fix the JSON and repeat step 2 (at most 2 retries). Never invent ` +
-    `or weaken evidence to pass validation.\n` +
+    `1. Read ${t.prompt} ${how}. It is self-contained; read all of it.\n` +
+    `2. Create every file (your answer, any script you test) with the Write tool, never a ` +
+    `shell heredoc or echo: shell quoting corrupts JSON and code. Write your JSON answer, ` +
+    `exactly as the prompt specifies, to ${t.out} (if Write asks you to read it first, Read ` +
+    `it, then Write).\n` +
+    `3. Seal with one Bash call: ${sh(`run.py seal ${pid} "${t.id}" "${t.out}"`)}\n` +
+    `4. If sealing fails, fix the JSON, Write it again and re-seal (at most 2 retries). Never ` +
+    `invent or weaken evidence to pass validation.\n` +
     (prior ? `A previous attempt at this task failed with: ${prior}\n` : '') +
     `Reply with one line: SEALED, or FAILED: <the exact seal error>.`,
     { label: `${pid}:${t.id}`, phase: 'Review',

@@ -905,6 +905,8 @@ _METRIC_WORD = re.compile(
     r"likelihood|NLL|score|bias|variance|FID|mAP|IoU|mIoU|PSNR|SSIM|LPIPS|WER|CER|NDCG|MRR|"
     r"CRPSS?|R2|correlation|win rate|success rate|runtime|latency|throughput|memory|"
     r"speed-?up)\b", re.I)
+_SPREAD_WORDS = re.compile(r"\b(?:standard|std\.?)\s+(?:error|deviation)s?\b|\berror\s+bars?\b|"
+                           r"\bmargin\s+of\s+error\b", re.I)
 
 
 def table_role(table: Table) -> str:
@@ -933,9 +935,13 @@ def table_role(table: Table) -> str:
     if (words and numbers and digits_only
             and not _METRIC_WORD.search(" ".join([cap, *table.header]))):
         return "text"
-    # A caption naming a measured quantity ("RMSE under different hyper-parameters") is a
-    # result table whatever else it mentions.
-    if _SPEC_CAPTION.search(cap) and not _METRIC_WORD.search(cap):
+    # A caption LEADING with a measured quantity ("RMSE under different hyper-parameters"),
+    # or a column headed by one, is a result table; a metric word inside the specification
+    # ("Hyperparameters for training the reward model") measures nothing.
+    spec, metric = _SPEC_CAPTION.search(cap), _METRIC_WORD.search(cap)
+    width = max((len(r) for r in table.rows), default=0)
+    if spec and not (metric and metric.start() < spec.start()) and not any(
+            _METRIC_WORD.search(column_header(table, c)) for c in range(width)):
         return "specification"
     if _DATA_CAPTION.search(cap) and not _METRIC_WORD.search(cap):
         return "data_statistics"
@@ -966,15 +972,23 @@ def column_header(table: Table, col: int) -> str:
 
 
 def metric_name(table: Table, col: int) -> str:
-    """The metric a column reports, as the paper names it — its header, else the metric the
-    caption names — or '' when the paper names none. A header that is not a metric word
-    ("IHDP", "Ours") names a dataset or method; the caption's metric then wins."""
+    """The metric a column reports, as the paper names it — its header when that is a metric
+    word, else the caption's metric when it is the table's ONE metric (no column header
+    names a quantity of its own, so the columns are datasets or methods, and the caption
+    names exactly one metric) — or '' when the paper names none. "Accuracy and time" with a
+    "Time (s)" column names no metric for its "Top-5" column."""
+    from .experiment_id import _quantity_of  # deferred: experiment_id imports this module
     header = column_header(table, col)
     if header and _METRIC_WORD.search(header):
         return header
-    if m := _METRIC_WORD.search(table.caption or ""):
-        return m.group(1)
-    return header if re.search(r"[^\W\d_]", _norm(header)) else ""
+    # "standard error in parentheses" describes the spread, not a second metric.
+    cap = _SPREAD_WORDS.sub(" ", table.caption or "")
+    width = max((len(r) for r in table.rows), default=0)
+    heads = [column_header(table, c) for c in range(1, width)]
+    if (len({w.lower() for w in _METRIC_WORD.findall(cap)}) == 1
+            and not any(_METRIC_WORD.search(h) or _quantity_of(h) for h in heads)):
+        return _METRIC_WORD.search(cap).group(1)
+    return ""
 
 
 def metric_label(table: Table, col: int) -> str:
@@ -1262,11 +1276,13 @@ class AnchorPacket(NamedTuple):
     def chars(self) -> int:
         return len(self.render())
 
-    def render(self) -> str:
+    def render(self, carried: frozenset = frozenset()) -> str:
+        """`carried`: section indices the receiving part prints in full itself, whose anchor
+        copy would be the same text twice."""
         out = [f"# {self.title}"] if self.title else []
-        if self.abstract:
+        if self.abstract and self.abstract_idx not in carried:
             out.append(f"## Abstract  [section {self.abstract_idx}]\n{self.abstract}")
-        if self.conclusion:
+        if self.conclusion and self.conclusion_idx not in carried:
             out.append(f"## Conclusion  [section {self.conclusion_idx}]\n{self.conclusion}")
         if self.outline:
             rows = "\n".join(f"- [{i}] {t or '(untitled)'}  ({n:,} chars)"
@@ -1364,7 +1380,8 @@ def plan(doc: PaperDoc, budget_chars: int) -> ReadingPlan:
             # must not appear in the accounting.
             anchor_chars=0 if n <= 1 else anchor.chars,
             part_local_chars=covered,
-            anchor_repeat_chars=anchor.chars * max(0, n - 1),
+            anchor_repeat_chars=max(0, sum(len(anchor.render(_carried(p, anchor)))
+                                           for p in parts) - anchor.chars),
             parts=n,
             synthesis_required=n > 1,
         ))
@@ -1448,15 +1465,24 @@ def synthesis_brief(paper_id: str, lens: str, anchor: AnchorPacket,
                           candidates=out, parts_read=len(per_part_findings))
 
 
+def _carried(part, anchor: AnchorPacket) -> frozenset:
+    """The anchor sections this part prints from their first character on (a slice that
+    starts mid-section does not carry the section's opening claims)."""
+    return frozenset(i for i, a, _b in part.slices
+                     if a == 0 and i in (anchor.abstract_idx, anchor.conclusion_idx))
+
+
 def render_part_with_anchor(part, anchor: AnchorPacket) -> str:
     """One part's prompt body: the anchors, then this part's own sections. The order is
     deliberate: anchors come first so a reader meets the paper's claims before the span
-    it is being asked to examine, the order a referee reads in."""
-    head = anchor.render()
+    it is being asked to examine, the order a referee reads in. An abstract or conclusion
+    the part itself prints is not repeated in the anchor: it is right below."""
+    head = anchor.render(_carried(part, anchor))
     body = render_part(part)
     where = (f"\n\n## The span you are reading now — {part.label}\n"
              f"Sections below are the portion of the paper assigned to this pass. The "
-             f"abstract, conclusion and outline above describe the whole paper.\n")
+             f"abstract, conclusion and outline describe the whole paper (an abstract or "
+             f"conclusion this span contains is printed once, below).\n")
     return f"{head}{where}\n{body}" if head else body
 
 
@@ -1482,10 +1508,13 @@ if __name__ == "__main__":  # self-check: python -m harness.paper [file.pdf]
     p = plan(doc, 4000)
     assert p.coverage.parts > 1, "this fixture must need more than one part"
     assert p.coverage.part_local_fraction == 1.0, p.coverage
-    assert p.coverage.anchor_repeat_chars == a.chars * (p.coverage.parts - 1)
+    assert p.coverage.anchor_repeat_chars < a.chars * (p.coverage.parts - 1)
     assert p.coverage.synthesis_required is True
     rendered = render_part_with_anchor(p.parts[0], a)
     assert "we claim X." in rendered and "we showed Y." in rendered and "part 1 of" in rendered
+    assert rendered.count("we claim X.") == 1, "a part carrying its own abstract is not sent it twice"
+    last = render_part_with_anchor(p.parts[-1], a)
+    assert last.count("we showed Y.") == 1 and "we claim X." in last
 
     one = plan(PaperDoc(paper_id="q", title="T",
                         sections=[Section(section_idx=0, title="Abstract", text="a")]), 70_000)

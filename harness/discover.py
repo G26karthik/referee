@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 
 from . import decide, locate
+from .experiment_id import own_method
 from .schema import (
     ClaimRef, DiscoveredObject, Finding, PaperDoc, PlanDecision, ReimplementationIngredient,
     ReimplementationReadiness, ReviewQuestion, TargetOutcome, TargetSet,
@@ -646,17 +647,10 @@ def _section_numbers(doc: PaperDoc, section_idx: int) -> list[str]:
 
 
 def _own_row(doc: PaperDoc, method: str) -> bool:
-    """Does a table row report the paper's OWN method? Marked "(ours)"/"proposed", or its
-    method name is one the abstract itself uses. A cited baseline's row is supporting
-    evidence for the comparison, never the paper's central claim."""
-    label = (method or "").strip()
-    if re.search(r"\b(?:ours|proposed)\b", label, re.I):
-        return True
-    lead = re.split(r"[\s\-_/(]+", label)[0] if label else ""
-    abstract = decide.abstract_section_idx(doc)
-    text = next((s.text or "" for s in doc.sections if s.section_idx == abstract), "")
-    return bool(len(lead) >= 3 and re.search(r"[^\W\d_]", lead)
-                and re.search(rf"\b{re.escape(lead)}\b", text))
+    """Does a table row report the paper's OWN method? The one rule execution binding uses
+    (`experiment_id.own_method`): a cited baseline's row is supporting evidence for the
+    comparison, never the paper's central claim, even when the abstract names it."""
+    return own_method(doc, method)
 
 
 def _cited_in_summary(doc: PaperDoc, label: str, own_section: int, own_text: str) -> bool:

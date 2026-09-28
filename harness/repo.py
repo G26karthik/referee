@@ -112,13 +112,18 @@ def _score(text: str, start: int, host: str, url: str) -> int:
     return score
 
 
-# Authorship stated in any phrasing: "available in our public repository:", "can be found
-# in our GitHub repo", "is publicly available at", "we release ... at".
+# Authorship stated in any phrasing: "available in our public repository:", "our code is
+# publicly available at", "we release our code at". First person, the thing owned is CODE,
+# only a whitelisted adjective in between, and an availability verb: "our pipeline uses the
+# implementation provided by the original authors" owns nothing it links.
+_OWN_CODE = (r"our\s+(?:(?:public|publicly\s+available|official|open[- ]source|github|full|"
+             r"complete|accompanying)\s+){0,2}(?:code(?:base)?s?|implementation|"
+             r"repositor(?:y|ies)|repo|source\s+code|software|toolkit|project\s+page)")
+_AVAILABLE = r"(?:available|released|hosted|found|provided|accessible|published)"
 _CUE_PATTERNS = (
-    # "our public repository", "our code and data", "our implementation" — first person, and
-    # the thing owned is CODE. "our experiments use the data from …" owns nothing linked.
-    re.compile(r"\bour\s+(?:[\w\-]+\s+){0,3}?(?:code|codes|implementation|repositor(?:y|ies)|"
-               r"repo|codebase|source\s+code|software|toolkit|project\s+page)\b", re.I),
+    re.compile(rf"\b{_OWN_CODE}\b(?:\s+and\s+\w+)?\s+(?:is|are|will\s+be|can\s+be)\s+"
+               rf"(?:\w+\s+)?{_AVAILABLE}\b", re.I),
+    re.compile(rf"\b{_AVAILABLE}\s+(?:\w+\s+)?(?:at|in|on|from|via)\s+{_OWN_CODE}\b", re.I),
     re.compile(r"\bwe\s+(?:have\s+)?(?:release|open-?source|publish)(?:d)?\s+(?:our|the|all)?\s*"
                r"(?:code|implementation|software|repository|codebase)\b", re.I),
 )
@@ -250,9 +255,13 @@ def readme_attributes(readme: str, doc: PaperDoc) -> str:
     README's opening; not a list of papers; no "unofficial"/re-implementation wording; and
     either an author's full name from the paper's front matter or an official/first-person
     statement next to the title. An identifier alone proves the README is ABOUT the paper,
-    which a re-implementation also is — so it is not evidence here."""
+    which a re-implementation also is — so it is not evidence here; nor is an author's name,
+    which a re-implementation's citation block carries too."""
     def norm(s: str) -> str:
         return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+    # A BibTeX/citation block CITES the paper — title and authors — and says nothing about
+    # who wrote the code.
+    readme = re.sub(r"```.*?```|@\w+\s*\{.*?\n\s*\}", " ", readme or "", flags=re.S)
     title = norm(doc.title)
     body = norm(readme)
     if len(title.split()) < 4 or title not in body:
@@ -268,22 +277,27 @@ def readme_attributes(readme: str, doc: PaperDoc) -> str:
     if len(others) > 3:
         return ""
     # About the paper is not BY its authors: a re-implementation cites the same title and id.
-    if _NOT_AUTHORS.search(readme[:4000]):
+    head = readme[:4000]
+    if _NOT_AUTHORS.search(head) or any(
+            not re.search(r"\b(?:official|our)\b", head[max(0, m.start() - 40):m.start()], re.I)
+            and not re.match(r"\s*(?:our|the\s+paper)\b", head[m.end():], re.I)
+            for m in re.finditer(r"\bimplementation\s+of\b", head, re.I)):
         return ""
     window = body[max(0, at - 300):at + len(title) + 300]
-    for first, last in _author_names(doc):
-        if re.search(rf"\b{first.lower()}\s+(?:\w\s+)?{last.lower()}\b|\b{last.lower()}\s+{first.lower()}\b",
-                     body):
-            return f"README cites the title and the author {first} {last}"
-    if _README_AUTHORSHIP.search(window):
-        return "README cites the title with a first-person or official statement: " + window[:200]
-    return ""
+    if not _README_AUTHORSHIP.search(window):
+        return ""
+    named = next((f"{f} {l}" for f, l in _author_names(doc)
+                  if re.search(rf"\b{f.lower()}\s+(?:\w\s+)?{l.lower()}\b", body)), "")
+    return ("README cites the title with a first-person or official statement"
+            + (f" and names the author {named}" if named else "") + ": " + window[:200])
 
 
-# A README that says it is someone else's version of the paper.
+# A README that says it is someone else's version of the paper, or that the official code
+# is elsewhere / not out ("The official code has not been released yet").
 _NOT_AUTHORS = re.compile(
     r"\b(unofficial|non-?official|re-?implementation|reimplementation|reproducibility "
-    r"challenge|replication of|port of|third[- ]party|not affiliated)\b", re.I)
+    r"challenge|replication of|port of|third[- ]party|not affiliated|my (?:own )?implementation|"
+    r"not (?:yet )?(?:been )?released)\b", re.I)
 _NAME_STOP = {"university", "institute", "department", "conference", "international",
               "proceedings", "abstract", "anonymous", "laboratory", "school", "college",
               "research", "science", "sciences", "technology", "engineering", "computer",

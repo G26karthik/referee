@@ -49,7 +49,11 @@ def test_public_readme_must_cite_the_full_title_and_an_attribution():
                title="A Study of Something Quite Specific")
     assert repo.readme_attributes("# Tool\nofficial code for A Study of Something Quite "
                                   "Specific (ICML).", doc)
-    assert repo.readme_attributes("# A Study of Something Quite Specific\nby Maria Kowalska", doc)
+    named = repo.readme_attributes("# A Study of Something Quite Specific\nOfficial code, by "
+                                   "Maria Kowalska", doc)
+    assert named and "Maria Kowalska" in named
+    assert not repo.readme_attributes("# A Study of Something Quite Specific\nby Maria Kowalska",
+                                      doc), "an author's name alone is what a citation carries too"
     for foreign in ("# Unofficial PyTorch implementation of A Study of Something Quite "
                     "Specific, official numbers", "We attempt a re-implementation of A Study of "
                     "Something Quite Specific (arXiv 2601.01234), our work",
@@ -103,7 +107,7 @@ def test_a_bare_glob_names_no_program_and_prose_never_breaks_a_unique_command(tm
     argvs = [" ".join(c.argv) for c in experiment_id.harvest_candidates(r)]
     assert "python other.py" not in argvs
     t = Table(table_idx=0, label="1", caption="Accuracy on X", header=["method", "accuracy"],
-              rows=[["train", "0.9"]])
+              rows=[["Ours", "0.9"]])
     e = experiment_id.resolve_experiment(_doc("", [t]), r, "T0:r0:c1")
     assert e.state == "established" and e.command.argv == ["python", "train.py"]
 

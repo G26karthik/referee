@@ -457,7 +457,7 @@ def plan_execution(cfg: Config, spec: ProbeSpec, acq: RepoAcquisition,
         acq = acq.model_copy(update={"entrypoint": program.relative_to(acq.path).as_posix()})
     # A seed the README already pins ("--seed 42") is the documented protocol; it is kept,
     # not overridden, and the run is then as seedless as one with no flag at all.
-    seed_flag = bound.seed_flag if bound and bound.seed_flag not in bound.argv else ""
+    seed_flag = experiment_id.harness_seed_flag(bound)
     spec.capability = backend.capability(
         acq, acq.env_path, cfg.python,
         flag="" if (is_count or (bound and not seed_flag)) else (seed_flag.lstrip("-") or "seed"))

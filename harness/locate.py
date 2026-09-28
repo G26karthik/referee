@@ -53,7 +53,6 @@ _LONE_X = re.compile(r"(?<![A-Za-z0-9_])[xX](?![A-Za-z0-9_])")
 # looks like after a font encoding loses its name. See `_composition` for why this tier
 # may only be read as multiplication when the paper's own arithmetic confirms it.
 _LONE_SEPARATOR = re.compile(r"(?<=[\s\d])\s*([^\sA-Za-z0-9=.,()\[\]])\s*(?=[\s\d])")
-_UNSIGNED = re.compile(r"\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
 # An operand stands alone: a digit glued to an identifier, operator or norm bar is a
 # subscript/exponent (`f2`, `n−1`, `∥A∥2`), and a percentage composes, it does not multiply.
 _OPERAND = re.compile(r"(?<![^\s(\[$])\d+(?:\.\d+)?(?:[eE][-+]?\d+)?(?![\d.A-Za-z_(%′'])")
@@ -149,7 +148,7 @@ MEASURE_WORDS = re.compile(
     r"LPIPS|WER|CER|NDCG\S*|MRR|hits@\S+|pass@\S+|EM|CRPS\w*|R2|R²|correlation|win rate|"
     r"success rate|runtime|latency|throughput|memory|speed-?up|faster|slower|improv\w*|"
     r"outperform\w*|reduc\w*|increas\w*|decreas\w*|times (?:smaller|larger|faster|lower|"
-    r"higher)|gain|drop)\b", re.I)
+    r"higher)|gain|drop|converg\w*|takes|took)\b", re.I)
 # A number that SETS the experiment up: "we use 5 seeds", "3 layers", "learning rate of
 # 0.01", "we set C = 10". Rejected unless the same span also reports an outcome.
 _SETTING = re.compile(

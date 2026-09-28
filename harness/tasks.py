@@ -72,10 +72,35 @@ _EFFORT: dict[str, tuple[str, str]] = {   # role -> (model, effort)
 }
 
 
+# A worker's Read tool refuses more than 25k tokens per call; a prompt over that was being
+# re-read in overlapping chunks, one model turn (a full context re-send) per chunk.
+# ponytail: ~45k chars is ~16k tokens at the 2.8 chars/token lens prompts measure; one line
+# longer than that is its own range (sections are clipped at 40k chars, so none exist).
+READ_CHUNK_CHARS = 45_000
+
+
+def read_ranges(path: Path) -> list[list[int]]:
+    """[offset, limit] line ranges covering the whole file, each under the Read cap, so a
+    worker reads it in ONE turn of parallel calls. [] when the file is not written yet."""
+    try:
+        lines = path.read_text(encoding="utf-8").split("\n")
+    except OSError:
+        return []
+    out, start, size = [], 1, 0
+    for i, line in enumerate(lines, start=1):
+        if size and size + len(line) > READ_CHUNK_CHARS:
+            out.append([start, i - start])
+            start, size = i, 0
+        size += len(line) + 1
+    return out + [[start, len(lines) - start + 1]]
+
+
 def _task(*, id: str, role: str, prompt: Path, out: Path, model: str = "",
          effort: str = "", after: list[str] | None = None) -> dict:
     default_model, default_effort = _EFFORT.get(role, ("sonnet", "medium"))
-    return {"id": id, "role": role, "prompt": str(prompt), "out": str(out),
+    # Forward slashes: a backslash path pasted into a worker's shell command is mangled.
+    return {"id": id, "role": role, "prompt": Path(prompt).as_posix(),
+           "out": Path(out).as_posix(), "reads": read_ranges(Path(prompt)),
            "model": model or default_model, "effort": effort or default_effort,
            "after": list(after or [])}
 
@@ -829,7 +854,14 @@ if __name__ == "__main__":       # self-check: python -m harness.tasks
             artifact_stage._reviewer_facts(cfg, pid3, doc3, checkout, snap, url, [])
             task = _artifact_review_task(cfg, pid3)
             assert task is not None and task["role"] == "artifact_review"
-            assert task["prompt"] == str(_artifact_review_prompt_path(cfg, pid3))
+            assert task["prompt"] == _artifact_review_prompt_path(cfg, pid3).as_posix()
+            big = Path(td) / "big.md"
+            big.write_text("\n".join(["x" * 30_000] * 5), encoding="utf-8")
+            rs = read_ranges(big)
+            assert rs == [[1, 1], [2, 1], [3, 1], [4, 1], [5, 1]], rs
+            assert read_ranges(Path(td) / "nope.md") == []
+            small = read_ranges(task_path := Path(task["prompt"]))
+            assert small == [[1, len(task_path.read_text(encoding="utf-8").split("\n"))]], small
 
             concern = json.dumps({"concerns": [
                 {"kind": "SUSPICIOUS_IMPLEMENTATION", "title": "x", "statement": "s",
