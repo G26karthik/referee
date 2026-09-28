@@ -1451,7 +1451,8 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
         rec.failure_class = authorization.failure_class or "execution_unauthorized"
         rec.reached_experiment = False
         rec.reason = (
-            f"the repository was not executed, so nothing was reproduced: "
+            f"{'the repository' if spec.provenance == 'repo_exec' else 'the program'} was "
+            f"not executed, so nothing was reproduced: "
             f"{authorization.detail} (decision '{authorization.decision}'). No reproduction "
             f"verdict is drawn, because a refusal by this harness is not evidence about "
             f"{_addressed(spec)}.")

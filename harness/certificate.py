@@ -116,12 +116,14 @@ def proof_location(doc: PaperDoc, label: str) -> tuple[int, int]:
     if not label:
         return -1, -1
     pat = re.compile(rf"\bProof\s+of\s+(?:the\s+)?{re.escape(label)}(?![\d.]*\d)", re.I)
+    last = (-1, -1)
     for sec in doc.sections:
         for m in pat.finditer(sec.text or ""):
-            # "Proof of Theorem 3.1 can be found in Appendix B" points AT the proof.
+            # "Proof of Theorem 3.1 can be found in Appendix B" points AT the proof. The
+            # LAST real one wins: a main-text sketch precedes the full appendix proof.
             if not _POINTER.match((sec.text or "")[m.end():m.end() + 60]):
-                return sec.section_idx, m.start()
-    return -1, -1
+                last = (sec.section_idx, m.start())
+    return last
 
 
 def proof_excerpt(doc: PaperDoc, label: str) -> str:

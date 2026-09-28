@@ -91,6 +91,10 @@ WHAT TO CHECK — the statement's CONCLUSION, or ONE STEP OF ITS PRINTED PROOF:
     finite instance. Do not test it as if it could. Instead check ONE explicit inequality or
     identity the PRINTED PROOF asserts as a step ("hence …", "so that … ≥ …"), with the
     constants the proof itself uses, on an admissible instance — or refuse.
+  - Choose the step a careful referee would doubt: one whose constants, case split or
+    probability bound are specific to THIS proof and asserted rather than derived line
+    by line. A textbook fact (triangle inequality, Cauchy–Schwarz, expanding a square) is
+    not in doubt; certifying it spends the check on nothing.
   - Declare which in `"checked_statement"`: "conclusion" or "proof_step". For "proof_step",
     `paper_quotes.claimed_bound` is the step copied verbatim from the proof, and
     `paper_quotes.hypotheses` is what the proof has assumed or established at that point.
