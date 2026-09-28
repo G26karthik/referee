@@ -1,885 +1,669 @@
-"""THE DELEGATION PROTOCOL: what a session subagent should answer right now, and how its
-answer gets validated and sealed. The harness never spawns its own `claude` CLI subprocess;
-every judgement this review needs (a lens reading, a grade, the substantive verdict, a
-governed reconstruction, an authors'-code reading) is answered by an isolated subagent the
-controlling session dispatches. `pending()` lists what still needs an answer and where to
-read/write it; `seal()` validates whatever comes back and persists it through the SAME
-`parse_*`/`accept_*` machinery the manual channel has always used (`harness/agent.py`,
-`harness/audit.py`, `harness/reimplement_driver.py`, `harness/artifact_review_driver.py`);
-`advance()` runs the deterministic pipeline as far as it can and reports what is pending.
+"""The review protocol: which task is owed next, and what a sealed answer must satisfy.
 
-**The protocol, for whatever is orchestrating the subagents:**
-
-    1. `python run.py tasks <paper-id-or-pdf>` -- advances the deterministic pipeline as
-       far as it can and prints the pending task list as JSON.
-    2. For each task: read `task["prompt"]`, have an ISOLATED subagent answer it (a fresh
-       context per task), and have it write its JSON answer to `task["out"]`.
-    3. `python run.py seal <paper-id> <task-id> <path-to-that-file>` -- validates and
-       seals it. Exit 0 and "sealed <id>" on success; exit 1 and an actionable refusal
-       reason on failure.
-    4. Re-run `python run.py tasks <paper-id>` -- sealing can unblock a phase, change what
-       is pending, or finish the review.
-
-**What this module is NOT.** It does not decide what a lens found, what a grade means, or
-whether a reconstruction may run — those are `harness/audit.py`, `harness/decide.py` and
-`harness/execute.py`'s jobs. It does not trust a delegate's own say-so about anything
-harness-owned (invariant 2): every `seal()` path routes through the same validation the
-manual channel already used, and a malformed or self-certifying answer is refused with a
-message the worker can act on, never silently repaired.
-
-**Task ids** are `"<role>"` for a whole-paper role (`verdict`, `artifact_review`) or
-`"<role>:<sub-id>"` otherwise (`lens:overclaim/part-02`, `reimpl_gen:T0:r0:c0`). `seal()`
-dispatches on the role prefix.
-
-`python -m harness.tasks` runs the self-check.
+`advance` derives everything from files on disk (idempotent; safe to call any time) and
+returns the tasks a worker can do now. `seal` validates one worker answer and stores only
+harness-derived fields (invariant 2: a model's own status/verdict fields are never copied).
+Phases: read (4 lenses) -> critic -> plan -> verify (per check) -> report -> done.
 """
 from __future__ import annotations
 
-import hashlib
+import json
+import os
+import shutil
+import re
+import subprocess
+import sys
+import time
 from pathlib import Path
 
-from . import agent, artifact_review_driver, pipeline, reimplement_driver, state
-from .audit import LENSES as _LENSES
-from .audit import accept_grade, plan_for, run_audit, run_grade, unit_is_accepted, units_for
-from .config import Config
-from .prompts import audit as AUDIT_P
-from .reviewer_cli import prompt_fingerprint, prompt_is_unchanged
-from .schema import PaperDoc
+from . import execute, paper, reconcile, report, state
+from .evidence import command, documented, flat, has_word, interval, value_in
+from .repo import listing, released
 
-# What every sealed artifact's `reviewer`/`grader`/`reader` field names. One isolated
-# subagent context per task -- see `harness.delegation.ISOLATION_CLAIM["SESSION_SUBAGENT"]`
-# for exactly what that mode is and is not entitled to claim.
-REVIEWER = "controlling session subagent (Agent tool), one isolated context per task"
-
-# Model tier + reasoning effort per role, attached to every task dict as dispatch metadata
-# (this harness never calls a model itself). Every role judges prose against evidence
-# rather than merely reformatting it, so none is "mechanical" enough for a cheaper tier
-# than sonnet; only effort varies with how much the role has to weigh.
-_EFFORT: dict[str, tuple[str, str]] = {   # role -> (model, effort)
-    "lens": ("sonnet", "high"),             # per-lens/synthesis model is still read from
-                                             # `prompts.audit.LENSES` below; this is the
-                                             # fallback if a lens declares none.
-    "grade": ("sonnet", "medium"),
-    "verdict": ("sonnet", "medium"),
-    "reimpl_gen": ("sonnet", "high"),
-    "reimpl_verify": ("sonnet", "high"),
-    "artifact_review": ("sonnet", "medium"),
-    "cert_gen": ("sonnet", "high"),
-    "cert_verify": ("sonnet", "high"),
-    "proof_map": ("sonnet", "high"),         # lists a proof's checkable steps; harness re-finds each
-    "check_plan": ("sonnet", "medium"),      # proposes addresses; harness re-resolves each
-    "extraction_audit": ("sonnet", "low"),   # vision compare: mechanical, needs image input
-}
+LENSES = ("overclaim", "protocol", "confound", "contradiction")
+KINDS = ("AUTHOR_CODE", "RELEASED_DATA", "RECONSTRUCTION", "CERTIFICATE", "ARITHMETIC")
+SCRIPT_KINDS = ("RELEASED_DATA", "RECONSTRUCTION", "CERTIFICATE")
+REQUIRED = {"CERTIFICATE": ("hypotheses", "claimed_bound", "instance"),
+            "RELEASED_DATA": ("dataset", "metric", "comparison_target"),
+            "RECONSTRUCTION": ("method", "training", "dataset", "metric", "comparison_target")}
+SEVERITY = ("NOTE", "MINOR", "MAJOR", "FATAL")
+CLASSES = ("CONFIRMED_FINDING", "PLAUSIBLE_CONCERN", "OPEN_QUESTION", "DISMISSED")
+PROMPTS = Path(__file__).parent / "prompts"
+_EFFORT = {"lens": "high", "critic": "high", "plan": "high", "bind": "high", "gen": "high",
+           "verify": "high", "report": "medium"}
 
 
-# A worker's Read tool refuses more than 25k tokens per call; a prompt over that was being
-# re-read in overlapping chunks, one model turn (a full context re-send) per chunk.
-# ponytail: 30k chars stays under the cap at the densest text measured (digit-heavy tables,
-# 1.76 chars/token incl. line numbers -> ~17k tokens); one line longer than that is its own
-# range (sections are clipped at 40k chars, ~23k tokens at that density).
-READ_CHUNK_CHARS = 30_000
+class SealError(ValueError):
+    """A fixable problem with a worker's answer; the worker is told exactly what."""
 
 
-def read_ranges(path: Path) -> list[list[int]]:
-    """[offset, limit] line ranges covering the whole file, each under the Read cap, so a
-    worker reads it in ONE turn of parallel calls. [] when the file is not written yet."""
+# --- files ------------------------------------------------------------------------------
+def _safe(tid: str) -> str:
+    return re.sub(r"[^\w.-]+", "__", tid)
+
+
+def _sealed(root: Path, tid: str) -> dict | None:
+    """A sealed record, only if its bytes still hash to what was sealed."""
+    path = root / "sealed" / f"{_safe(tid)}.json"
+    seals = state.read_json(root / "seals.json", {})
+    if tid not in seals or not path.is_file() or state.sha256(path.read_bytes()) != seals[tid]:
+        return None
+    return state.read_json(path)
+
+
+def _template(name: str, **kw) -> str:
+    text = (PROMPTS / f"{name}.md").read_text(encoding="utf-8")
+    for k, v in {"security": (PROMPTS / "security.md").read_text(encoding="utf-8"), **kw}.items():
+        text = text.replace("{{" + k + "}}", str(v))
+    return text
+
+
+def _section(name: str, title: str) -> str:
+    """The `## title` section of prompts/<name>.md."""
+    text = (PROMPTS / f"{name}.md").read_text(encoding="utf-8")
+    m = re.search(rf"(?ms)^## {re.escape(title)}\n(.*?)(?=^## |\Z)", text)
+    return m.group(1).strip() if m else ""
+
+
+def read_ranges(path: Path, chunk: int) -> list[list]:
+    """[path, offset, limit] line ranges of about `chunk` chars, so a worker reads a file in
+    one turn of parallel Reads, each under the Read tool's cap."""
     try:
-        lines = path.read_text(encoding="utf-8").split("\n")
+        lines = path.read_text(encoding="utf-8").splitlines()
     except OSError:
         return []
-    out, start, size = [], 1, 0
-    for i, line in enumerate(lines, start=1):
-        if size and size + len(line) > READ_CHUNK_CHARS:
-            out.append([start, i - start])
+    out, start, size = [], 0, 0
+    for i, line in enumerate(lines):
+        if size and size + len(line) + 1 > chunk:
+            out.append([path.as_posix(), start + 1, i - start])
             start, size = i, 0
         size += len(line) + 1
-    return out + [[start, len(lines) - start + 1]]
-
-
-def _task(*, id: str, role: str, prompt: Path, out: Path, model: str = "",
-         effort: str = "", after: list[str] | None = None) -> dict:
-    default_model, default_effort = _EFFORT.get(role, ("sonnet", "medium"))
-    # Forward slashes: a backslash path pasted into a worker's shell command is mangled.
-    return {"id": id, "role": role, "prompt": Path(prompt).as_posix(),
-           "out": Path(out).as_posix(), "reads": read_ranges(Path(prompt)),
-           "model": model or default_model, "effort": effort or default_effort,
-           "after": list(after or [])}
-
-
-def _staging_out(cfg: Config, pid: str, role: str, sub: str) -> Path:
-    safe = (sub or role).replace("/", "__").replace(":", "__")
-    return state.project_dir(cfg, pid) / "tasks" / "out" / f"{role}__{safe}.json"
-
-
-def _doc(cfg: Config, pid: str) -> PaperDoc | None:
-    p = state.project_dir(cfg, pid) / "paper" / "doc.json"
-    if not p.exists():
-        return None
-    return PaperDoc(**state.read_json(p))
-
-
-# --------------------------------------------------------------------------- #
-# LENS  (whole / part / synthesis units -- was tools/subagent_accept.py's `units`/`pending`)
-# --------------------------------------------------------------------------- #
-def _lens_units(cfg: Config, pid: str, doc: PaperDoc):
-    root = state.project_dir(cfg, pid)
-    run_audit(cfg, pid)                # renders/refreshes every prompt; no model call
-    return units_for(root, _LENSES, plan_for(doc))
-
-
-def _lens_tasks(cfg: Config, pid: str, doc: PaperDoc) -> list[dict]:
-    """Every lens/part/synthesis unit with a rendered prompt, not yet sealed, and — for a
-    synthesis — whose own parts are ALL sealed (a synthesis prompt over incomplete parts
-    is not a question anyone can answer yet, so it is not offered)."""
-    units = _lens_units(cfg, pid, doc)
-    sealed = {u.unit_id for u in units if unit_is_accepted(u)[0]}
-    out = []
-    for u in units:
-        if u.unit_id in sealed or not u.prompt_path.is_file():
-            continue
-        if u.kind == "synthesis":
-            parts = [p for p in units if p.lens == u.lens and p.kind == "part"]
-            if not all(p.unit_id in sealed for p in parts):
-                continue
-        model, effort = _EFFORT["lens"]
-        declared = AUDIT_P.LENSES.get(u.lens, {}).get("model", "")
-        out.append(_task(id=f"lens:{u.unit_id}", role="lens", prompt=u.prompt_path,
-                         out=u.out_path, model=declared or model, effort=effort))
-    return out
-
-
-def _seal_lens(cfg: Config, pid: str, unit_id: str, doc: PaperDoc, raw: str) -> dict:
-    units = _lens_units(cfg, pid, doc)
-    match = [u for u in units if u.unit_id == unit_id]
-    if not match:
-        raise ValueError(f"lens:{unit_id}: no such unit for '{pid}'; run "
-                         f"`python run.py tasks {pid}` to list what is actually pending")
-    unit = match[0]
-    # Seal-time mirror of `_lens_tasks`' offer rules: never over a current seal, never a
-    # synthesis before its own prompt exists and every part of its lens is sealed.
-    if unit_is_accepted(unit)[0]:
-        raise ValueError(f"lens:{unit_id}: already sealed against the current prompt")
-    if not unit.prompt_path.is_file():
-        raise ValueError(f"lens:{unit_id}: its prompt is not rendered yet")
-    if unit.kind == "synthesis" and not all(
-            unit_is_accepted(p)[0] for p in units if p.lens == unit.lens and p.kind == "part"):
-        raise ValueError(f"lens:{unit_id}: a synthesis is sealed only after all its parts")
-    report = agent.parse_lens_json(raw, unit.lens)     # raises agent.AgentError on bad input
-    unit.out_path.parent.mkdir(parents=True, exist_ok=True)
-    state.write_json(unit.out_path, report.model_dump())
-    raw_path = unit.out_path.with_suffix(".raw.txt")
-    raw_path.write_text(raw, encoding="utf-8")
-    record = {
-        "lens": unit.lens, "unit_id": unit.unit_id, "paper_id": pid,
-        **agent.provenance_record(mode="SESSION_SUBAGENT", reviewer=REVIEWER),
-        "content_sha256": hashlib.sha256(unit.out_path.read_bytes()).hexdigest(),
-        "prompt_sha256": prompt_fingerprint(unit.prompt_path),
-        "prompt_path": str(unit.prompt_path),
-        "raw_sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
-        "raw_response": raw_path.name,
-        "findings": len(report.findings),
-        "ts": state.now(),
-    }
-    state.write_json(unit.sidecar_path, record)
-    ok, why = unit_is_accepted(unit)
-    if not ok:
-        raise ValueError(f"lens:{unit_id}: sealed and still refused: {why}")
-    return record
-
-
-# --------------------------------------------------------------------------- #
-# GRADE
-# --------------------------------------------------------------------------- #
-def _grade_tasks(cfg: Config, pid: str) -> list[dict]:
-    res = run_grade(cfg, pid)          # renders prompts; deterministic, no model call
-    if "error" in res:
-        return []                      # e.g. the lens panel is not complete yet
-    model, effort = _EFFORT["grade"]
-    return [_task(id=f"grade:{slug}", role="grade", prompt=Path(path),
-                  out=state.project_dir(cfg, pid) / "audit" / "grade" / f"{slug}.json",
-                  model=model, effort=effort)
-            for slug, path in res["prompts"].items()]
-
-
-def _seal_grade(cfg: Config, pid: str, slug: str, raw: str) -> dict:
-    # Only a grade the harness is currently asking for: a slug is a pure function of a
-    # model-written finding id, so a grade sealed ahead of its finding would bind to it.
-    if slug not in (run_grade(cfg, pid).get("prompts") or {}):
-        raise ValueError(f"grade:{slug}: not a pending grade for '{pid}'")
-    return accept_grade(cfg, pid, slug, raw, grader=REVIEWER,
-                        tool_policy="unrecorded", mode="SESSION_SUBAGENT")
-
-
-# --------------------------------------------------------------------------- #
-# VERDICT  (one whole-paper opinion; its prompt is rendered by `pipeline.run_report_stage`)
-# --------------------------------------------------------------------------- #
-def _verdict_prompt_path(cfg: Config, pid: str) -> Path:
-    return state.project_dir(cfg, pid) / "reports" / "verdict_prompt.md"
-
-
-def _verdict_task(cfg: Config, pid: str) -> dict | None:
-    if agent.load_verdict(cfg, pid) is not None:
-        return None
-    prompt = _verdict_prompt_path(cfg, pid)
-    if not prompt.is_file():
-        return None
-    model, effort = _EFFORT["verdict"]
-    return _task(id="verdict", role="verdict", prompt=prompt,
-                out=state.project_dir(cfg, pid) / "reports" / "substantive.json",
-                model=model, effort=effort)
-
-
-def _seal_verdict(cfg: Config, pid: str, raw: str) -> dict:
-    prompt = _verdict_prompt_path(cfg, pid)
-    prompt_sha = prompt_fingerprint(prompt) if prompt.is_file() else ""
-    return agent.accept_verdict(cfg, pid, raw, reader=REVIEWER, mode="SESSION_SUBAGENT",
-                                prompt_sha256=prompt_sha)
-
-
-# --------------------------------------------------------------------------- #
-# GOVERNED RECONSTRUCTION  (reimpl_gen then reimpl_verify -- a DIFFERENT subagent context
-# for each, exactly as `reimplement_driver.conformance` requires: `generated_by` and
-# `verified_by` must be distinct attributions for `independently_verified` to be True)
-# --------------------------------------------------------------------------- #
-def _readiness(cfg: Config, pid: str, doc: PaperDoc, target_id: str = ""):
-    """The SAME target-scoped readiness `routes.attempt_reimplementation_fallback` built
-    the generator's brief from, so the verifier and the seal bind the same paper quotes."""
-    from . import discover
-    ts = discover.load(cfg, pid)
-    obj = ts.by_id(target_id) if ts is not None and target_id else None
-    ref = obj.ref.ref if obj is not None and obj.ref is not None else ""
-    return discover.reimplementation_readiness(doc, ref)
-
-
-def _reimpl_generated_path(cfg: Config, pid: str, target_id: str) -> Path:
-    return reimplement_driver._briefs_dir(cfg, pid) / "generated" / f"{target_id}.json"
-
-
-def _reimpl_targets(cfg: Config, pid: str) -> list[str]:
-    """Every target with a persisted generator brief -- written by
-    `routes.attempt_reimplementation_fallback` during the probe phase, whenever an
-    INDEPENDENT_RECONSTRUCTION fallback is in play and no accepted reconstruction is
-    sealed yet."""
-    d = reimplement_driver._briefs_dir(cfg, pid)
-    if not d.is_dir():
-        return []
-    prefix = "reimpl_gen__"
-    return sorted(p.stem[len(prefix):] for p in d.glob(f"{prefix}*.md"))
-
-
-def _reimpl_tasks(cfg: Config, pid: str, doc: PaperDoc) -> list[dict]:
-    out: list[dict] = []
-    readiness = None
-    gen_model, gen_effort = _EFFORT["reimpl_gen"]
-    ver_model, ver_effort = _EFFORT["reimpl_verify"]
-    for target_id in _reimpl_targets(cfg, pid):
-        gen_path = _reimpl_generated_path(cfg, pid, target_id)
-        brief_path = reimplement_driver._briefs_dir(cfg, pid) / f"reimpl_gen__{target_id}.md"
-        brief = brief_path.read_text(encoding="utf-8")
-        sealed = reimplement_driver.load_accepted(cfg, pid, target_id)
-        answered = reimplement_driver.answered_brief(cfg, pid, target_id, brief)
-        if sealed is not None and (sealed[1].established or answered):
-            continue                   # established, or refused against this very brief
-        if sealed is not None and not answered:
-            # A refusal of a brief that has since changed: archived (kept for audit), not
-            # the answer to the question now being asked.
-            for f in reimplement_driver._paths(cfg, pid, target_id):
-                if f.is_file():
-                    f.replace(f.with_name(f"{f.stem}.superseded{f.suffix}"))
-            if gen_path.is_file():
-                gen_path.unlink()
-        if not gen_path.is_file():
-            out.append(_task(id=f"reimpl_gen:{target_id}", role="reimpl_gen",
-                             prompt=brief_path,
-                             out=_staging_out(cfg, pid, "reimpl_gen", target_id),
-                             model=gen_model, effort=gen_effort))
-            continue
-        # A GENERATION EXISTS: build (or refresh) the verifier's brief from it, and offer
-        # the verify task -- ONLY now, and only to a subagent this generator's own answer
-        # was not shown building the brief for (a fresh context reading it below).
-        readiness = _readiness(cfg, pid, doc, target_id)
-        raw = gen_path.read_text(encoding="utf-8")
-        verify_path = reimplement_driver.persist_verification_brief(
-            cfg, pid, target_id, readiness, raw)
-        out.append(_task(id=f"reimpl_verify:{target_id}", role="reimpl_verify",
-                         prompt=verify_path,
-                         out=_staging_out(cfg, pid, "reimpl_verify", target_id),
-                         model=ver_model, effort=ver_effort,
-                         after=[f"reimpl_gen:{target_id}"]))
-    return out
-
-
-def _seal_reimpl_gen(cfg: Config, pid: str, target_id: str, raw: str) -> dict:
-    # Validate it parses as a reconstruction report before storing it -- the same
-    # validation `reimplement_driver.accept_reimplementation` will run again once a
-    # verifier's answer is sealed; failing fast here means a malformed generation never
-    # reaches the verifier task at all.
-    reimplement_driver.parse_reimplementation_report(raw)
-    path = _reimpl_generated_path(cfg, pid, target_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(raw, encoding="utf-8")
-    reimplement_driver.stamp_brief(cfg, pid, target_id)
-    return {"target_id": target_id, "stored": str(path)}
-
-
-def _refuse_malformed_verdict(task_id: str, notes: str) -> None:
-    """A verifier answer that is not valid JSON is a delivery error, not a judgement: it is
-    refused so the worker fixes and resubmits it, never sealed as a rejection."""
-    if notes.startswith(("verifier JSON invalid", "verifier returned no JSON")):
-        raise ValueError(f"{task_id}: {notes}")
-
-
-def _seal_reimpl_verify(cfg: Config, pid: str, target_id: str, doc: PaperDoc, raw: str) -> dict:
-    gen_path = _reimpl_generated_path(cfg, pid, target_id)
-    if not gen_path.is_file():
-        raise ValueError(f"reimpl_verify:{target_id}: no generated reconstruction to verify "
-                         f"for '{pid}'; seal reimpl_gen:{target_id} first")
-    # The rule `reimplement_driver.run` always applied: the verifier is named on the seal
-    # ONLY if its reply parses as approved. A rejection is not an error -- it seals
-    # honestly as `established=False`, exactly as a human reviewer's rejection would.
-    script, bindings, _gnotes, _meta = reimplement_driver.parse_reimplementation_report(
-        gen_path.read_text(encoding="utf-8"))
-    approved, _notes = reimplement_driver._parse_verification(
-        raw, reimplement_driver.required_kinds(
-            script, bindings, reimplement_driver.load_released(cfg, pid, target_id)))
-    _refuse_malformed_verdict(f"reimpl_verify:{target_id}", _notes)
-    verdict, required = reimplement_driver.parse_verdict(raw, approved)
-    base_file = reimplement_driver.base_sha_path(cfg, pid, target_id)
-    attempt = reimplement_driver.record_attempt(
-        reimplement_driver.revision_path(cfg, pid, target_id),
-        base_sha=base_file.read_text(encoding="utf-8") if base_file.is_file() else "",
-        verdict=verdict, script=script, required=required, notes=_notes,
-        max_revisions=cfg.max_revisions)
-    readiness = _readiness(cfg, pid, doc, target_id)
-    reimplement_driver.accept_reimplementation(
-        cfg, pid, target_id, gen_path.read_text(encoding="utf-8"), readiness,
-        reviewer=(REVIEWER + " (verifier)") if approved else "",
-        generated_by=REVIEWER + " (generator)", mode="SESSION_SUBAGENT",
-        verdict=verdict, required_changes=required, verifier_notes=_notes, attempt=attempt)
-    sealed = reimplement_driver.load_accepted(cfg, pid, target_id)
-    if sealed is None:
-        raise ValueError(f"reimpl_verify:{target_id}: sealed but refused by load_accepted "
-                         f"-- an internal attribution inconsistency, not a JSON problem")
-    _script, conf = sealed
-    return {"target_id": target_id, "established": conf.established, "reason": conf.reason}
-
-
-# --------------------------------------------------------------------------- #
-# AUTHORS'-CODE READING  (one per paper; its prompt is persisted by
-# `harness.stages.artifact._reviewer_facts` during the probe phase)
-# --------------------------------------------------------------------------- #
-def _artifact_review_prompt_path(cfg: Config, pid: str) -> Path:
-    return state.project_dir(cfg, pid) / "tasks" / "artifact_review.md"
-
-
-def _artifact_review_task(cfg: Config, pid: str) -> dict | None:
-    prompt = _artifact_review_prompt_path(cfg, pid)
-    if not prompt.is_file():
-        return None
-    _out, sidecar = artifact_review_driver._paths(cfg, pid)
-    fresh, _note = prompt_is_unchanged(sidecar, prompt)
-    if fresh:
-        return None                    # a valid sealed reading already answers this
-    model = artifact_review_driver.role_model(cfg)
-    _default_model, effort = _EFFORT["artifact_review"]
-    return _task(id="artifact_review", role="artifact_review", prompt=prompt,
-                out=_staging_out(cfg, pid, "artifact_review", "inspection"),
-                model=model, effort=effort)
-
-
-def _checkout_for(cfg: Config, pid: str, doc: PaperDoc) -> tuple[Path, str]:
-    """Where `routes.repo.acquire` already cloned this paper's repository, if it did —
-    read-only: this never fetches anything itself, only locates what is already there."""
-    from . import repo as repo_mod
-    root = state.project_dir(cfg, pid)
-    dest = root / "runs" / pid / "repo"
-    url = doc.repo_url or repo_mod.official_repo_url(doc)
-    return dest, url
-
-
-def _seal_artifact_review(cfg: Config, pid: str, doc: PaperDoc, raw: str) -> dict:
-    root, url = _checkout_for(cfg, pid, doc)
-    if not root.is_dir():
-        raise ValueError(f"artifact_review: no checkout at {root} for '{pid}' to relocate "
-                         f"citations against")
-    prompt = _artifact_review_prompt_path(cfg, pid)
-    prompt_sha = prompt_fingerprint(prompt) if prompt.is_file() else ""
-    inspection = artifact_review_driver.accept(
-        cfg, pid, doc, root, raw, url=url, reader=REVIEWER, mode="SESSION_SUBAGENT",
-        prompt_sha256=prompt_sha)
-    return {"proposed": inspection.proposed, "relocated": inspection.relocated,
-           "discharged": inspection.discharged}
-
-
-# --------------------------------------------------------------------------- #
-# EXACT CERTIFICATE  (cert_gen then cert_verify, distinct subagents -- same rule as above)
-# --------------------------------------------------------------------------- #
-def _cert_dir(cfg: Config, pid: str) -> Path:
-    return state.project_dir(cfg, pid) / "tasks" / "certificate"
-
-
-def _cert_obj(cfg: Config, pid: str, target_id: str):
-    from . import discover
-    ts = discover.load(cfg, pid)
-    return next((o for o in (ts.objects if ts else []) if o.target_id == target_id), None)
-
-
-def _cert_tasks(cfg: Config, pid: str, doc: PaperDoc) -> list[dict]:
-    from . import certificate, routes
-    d, out = _cert_dir(cfg, pid), []
-    for tid, brief, base_sha in routes.certificate_targets(cfg, pid):
-        (d / f"cert_gen__{tid}.base_sha256").parent.mkdir(parents=True, exist_ok=True)
-        (d / f"cert_gen__{tid}.base_sha256").write_text(base_sha, encoding="utf-8")
-        gen = d / "generated" / f"{tid}.json"
-        stamp = gen.with_suffix(".brief_sha256")
-        if gen.is_file() and (not stamp.is_file()
-                              or stamp.read_text(encoding="utf-8") != certificate.brief_sha(brief)):
-            gen.unlink()               # answered a brief that has since changed
-        if not gen.is_file():
-            prompt = d / f"cert_gen__{tid}.md"
-            prompt.parent.mkdir(parents=True, exist_ok=True)
-            prompt.write_text(brief, encoding="utf-8")
-            out.append(_task(id=f"cert_gen:{tid}", role="cert_gen", prompt=prompt,
-                             out=_staging_out(cfg, pid, "cert_gen", tid)))
-            continue
-        obj = _cert_obj(cfg, pid, tid)
-        raw = gen.read_text(encoding="utf-8")
-        script, bindings, quotes, _notes, _n = certificate.parse(raw)
-        prompt = d / f"cert_verify__{tid}.md"
-        claim, ref = getattr(obj, "claim_text", ""), getattr(obj, "ref", None)
-        prompt.write_text(certificate.verification_brief(
-            doc, claim=claim, ref=ref, script=script, bindings=bindings, paper_quotes=quotes,
-            scope=("proof_step" if getattr(obj, "prebound_quote", "")
-                   else certificate.parse_scope(raw)),
-            images=certificate.page_images(cfg, pid, doc, ref, claim),
-            step=getattr(obj, "prebound_quote", "")), encoding="utf-8")
-        out.append(_task(id=f"cert_verify:{tid}", role="cert_verify", prompt=prompt,
-                         out=_staging_out(cfg, pid, "cert_verify", tid),
-                         after=[f"cert_gen:{tid}"]))
-    return out
-
-
-def _seal_cert_gen(cfg: Config, pid: str, tid: str, raw: str) -> dict:
-    from . import certificate
-    certificate.parse(raw)             # fail fast: a malformed generation never reaches a verifier
-    path = _cert_dir(cfg, pid) / "generated" / f"{tid}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(raw, encoding="utf-8")
-    prompt = _cert_dir(cfg, pid) / f"cert_gen__{tid}.md"
-    brief = prompt.read_text(encoding="utf-8") if prompt.is_file() else ""
-    path.with_suffix(".brief_sha256").write_text(certificate.brief_sha(brief), encoding="utf-8")
-    return {"target_id": tid, "stored": str(path)}
-
-
-def _seal_cert_verify(cfg: Config, pid: str, tid: str, raw: str) -> dict:
-    from . import certificate
-    gen = _cert_dir(cfg, pid) / "generated" / f"{tid}.json"
-    if not gen.is_file():
-        raise ValueError(f"cert_verify:{tid}: seal cert_gen:{tid} first")
-    _refuse_malformed_verdict(f"cert_verify:{tid}", certificate.parse_verification(raw)[1])
-    base = _cert_dir(cfg, pid) / f"cert_gen__{tid}.base_sha256"
-    obj = _cert_obj(cfg, pid, tid)
-    certificate.accept(cfg, pid, tid, gen.read_text(encoding="utf-8"), raw,
-                       generated_by=REVIEWER + " (generator)",
-                       reviewer=REVIEWER + " (verifier)",
-                       brief_sha256=(gen.with_suffix(".brief_sha256").read_text(encoding="utf-8")
-                                     if gen.with_suffix(".brief_sha256").is_file() else ""),
-                       prebound=getattr(obj, "prebound_quote", "") or "",
-                       base_sha=base.read_text(encoding="utf-8") if base.is_file() else "",
-                       max_revisions=cfg.max_revisions)
-    sealed = certificate.load_accepted(cfg, pid, tid)
-    return {"target_id": tid, "established": bool(sealed and sealed[1].established)}
-
-
-# --------------------------------------------------------------------------- #
-# PROOF MAPS and CHECK PLANS  (a model proposes WHAT to check; the harness re-finds every
-# proposal in the paper before it becomes a target — `harness.certificate`, `harness.routes`)
-# --------------------------------------------------------------------------- #
-def _proof_map_tasks(cfg: Config, pid: str) -> list[dict]:
-    from . import routes
-    out = []
-    for tid, brief, _label in routes.proof_map_targets(cfg, pid):
-        prompt = _cert_dir(cfg, pid) / f"proof_map__{tid}.md"
-        prompt.parent.mkdir(parents=True, exist_ok=True)
-        prompt.write_text(brief, encoding="utf-8")
-        out.append(_task(id=f"proof_map:{tid}", role="proof_map", prompt=prompt,
-                         out=_staging_out(cfg, pid, "proof_map", tid)))
-    return out
-
-
-def _seal_proof_map(cfg: Config, pid: str, tid: str, raw: str) -> dict:
-    from . import certificate
-    prompt = _cert_dir(cfg, pid) / f"proof_map__{tid}.md"
-    obj = _cert_obj(cfg, pid, tid)
-    if obj is None or not prompt.is_file():
-        raise ValueError(f"proof_map:{tid}: no such pending proof map for '{pid}'")
-    record = certificate.accept_proof_map(
-        cfg, pid, tid, raw, label=certificate.statement_label(obj.claim_text),
-        brief=prompt.read_text(encoding="utf-8"), max_steps=cfg.max_proof_steps,
-        reviewer=REVIEWER)
-    return {"target_id": tid, "kept": record.get("kept"), "dropped": record.get("dropped")}
-
-
-def _check_plan_tasks(cfg: Config, pid: str) -> list[dict]:
-    from . import routes
-    out = []
-    for unit, brief, qid in routes.check_plan_targets(cfg, pid):
-        prompt = state.project_dir(cfg, pid) / "tasks" / f"check_plan__{unit}.md"
-        prompt.parent.mkdir(parents=True, exist_ok=True)
-        prompt.write_text(brief, encoding="utf-8")
-        prompt.with_suffix(".question").write_text(qid, encoding="utf-8")
-        out.append(_task(id=f"check_plan:{unit}", role="check_plan", prompt=prompt,
-                         out=_staging_out(cfg, pid, "check_plan", unit)))
-    return out
-
-
-def _seal_check_plan(cfg: Config, pid: str, unit: str, raw: str) -> dict:
-    from . import routes
-    prompt = state.project_dir(cfg, pid) / "tasks" / f"check_plan__{unit}.md"
-    if not prompt.is_file():
-        raise ValueError(f"check_plan:{unit}: no such pending check plan for '{pid}'")
-    qfile = prompt.with_suffix(".question")
-    record = routes.accept_check_plan(
-        cfg, pid, unit, raw, brief=prompt.read_text(encoding="utf-8"), reviewer=REVIEWER,
-        question_id=qfile.read_text(encoding="utf-8") if qfile.is_file() else "")
-    return {"unit": unit, "sealed": bool(record)}
-
-
-# Roles whose pending tasks mean a claim this review set out to check has not yet reached
-# the end of its route (`pipeline.step` holds a case open while any remains).
-VERIFICATION_ROLES = ("cert_gen", "cert_verify", "reimpl_gen", "reimpl_verify",
-                      "proof_map", "check_plan")
-
-
-def verification_pending(cfg: Config, pid: str) -> list[str]:
-    return [t["id"] for t in pending(cfg, pid) if t["role"] in VERIFICATION_ROLES]
-
-
-# --------------------------------------------------------------------------- #
-# EXTRACTION AUDIT  (vision check of the parser; only ever a document observation)
-# --------------------------------------------------------------------------- #
-def _extraction_audit_task(cfg: Config, pid: str) -> dict | None:
-    from . import extraction_audit
-    if extraction_audit.load(cfg, pid) is not None:
-        return None
-    return _task(id="extraction_audit", role="extraction_audit",
-                 prompt=extraction_audit.build_prompt(cfg, pid),
-                 out=_staging_out(cfg, pid, "extraction_audit", "audit"))
-
-
-# --------------------------------------------------------------------------- #
-# THE PROTOCOL
-# --------------------------------------------------------------------------- #
-def pending(cfg: Config, pid: str) -> list[dict]:
-    """Every delegable unit this paper still needs RIGHT NOW — deterministic, no model
-    call, safe to call as often as wanted. `[]` before the paper is ingested."""
-    doc = _doc(cfg, pid)
-    if doc is None:
-        return []
-    # Offer a role only once the case has reached the phase that consumes it: a verdict,
-    # reconstruction or certificate built from a previous run's discovery is stale work.
-    from .schema import PHASES
-    case = pipeline.load_case(cfg, pid)
-    at = PHASES.index(case.phase) if case and case.phase in PHASES else 0
-    x = _extraction_audit_task(cfg, pid)          # independent of every phase: run early
-    out: list[dict] = [x] if x is not None else []
-    out += _lens_tasks(cfg, pid, doc)
-    if at >= PHASES.index("grade"):
-        out += _grade_tasks(cfg, pid)
-    if at >= PHASES.index("probe"):
-        out += _reimpl_tasks(cfg, pid, doc)
-        a = _artifact_review_task(cfg, pid)
-        out += [a] if a is not None else []
-        out += _cert_tasks(cfg, pid, doc)
-        out += _proof_map_tasks(cfg, pid)
-        out += _check_plan_tasks(cfg, pid)
-    if at >= PHASES.index("report"):
-        v = _verdict_task(cfg, pid)
-        out += [v] if v is not None else []
-    return out
-
-
-def _require_doc(doc: PaperDoc | None, pid: str, label: str) -> PaperDoc:
-    if doc is None:
-        raise ValueError(f"{label}: '{pid}' has not been ingested")
-    return doc
-
-
-def seal(cfg: Config, pid: str, task_id: str, path: str | Path) -> dict:
-    """Validate a staged answer and, on success, persist it through the same
-    `parse_*`/`accept_*` gate the manual channel has always used. Raises `ValueError` with
-    an actionable message on any validation failure — the worker reads it and fixes its
-    JSON; nothing here repairs a malformed answer."""
-    from . import extraction_audit as EA
-    src = Path(path)
-    if not src.is_file():
-        raise ValueError(f"{task_id}: no such file: {src}")
-    raw = src.read_text(encoding="utf-8")
-    role, _, sub = str(task_id).partition(":")
-    doc = _doc(cfg, pid)
-    # Table-driven dispatch by role prefix. Each lambda is only EVALUATED for the matching
-    # role, so a role needing no doc never pays `_require_doc`'s check.
-    handlers = {
-        "lens": lambda: _seal_lens(cfg, pid, sub, _require_doc(doc, pid, f"lens:{sub}"), raw),
-        "grade": lambda: _seal_grade(cfg, pid, sub, raw),
-        "verdict": lambda: _seal_verdict(cfg, pid, raw),
-        "reimpl_gen": lambda: _seal_reimpl_gen(cfg, pid, sub, raw),
-        "reimpl_verify": lambda: _seal_reimpl_verify(
-            cfg, pid, sub, _require_doc(doc, pid, f"reimpl_verify:{sub}"), raw),
-        "artifact_review": lambda: _seal_artifact_review(
-            cfg, pid, _require_doc(doc, pid, "artifact_review"), raw),
-        "cert_gen": lambda: _seal_cert_gen(cfg, pid, sub, raw),
-        "cert_verify": lambda: _seal_cert_verify(cfg, pid, sub, raw),
-        "proof_map": lambda: _seal_proof_map(cfg, pid, sub, raw),
-        "check_plan": lambda: _seal_check_plan(cfg, pid, sub, raw),
-        "extraction_audit": lambda: EA.seal(cfg, pid, raw),
-    }
-    handler = handlers.get(role)
-    if handler is None:
-        raise ValueError(f"{task_id}: unknown role {role!r}; expected one of "
-                         f"{', '.join(handlers)}")
-    try:
-        return handler()
-    except ValueError:
-        raise
-    except Exception as e:                        # noqa: BLE001 — turned into an actionable refusal
-        raise ValueError(f"{task_id}: {type(e).__name__}: {e}") from e
-
-
-def _seal_newer_than_probe(cfg: Config, pid: str) -> bool:
-    """A certificate or reconstruction sealed after the last probe pass is evidence that
-    pass never saw: the probe must run again (a plain rewind stops short of it)."""
-    root = state.project_dir(cfg, pid)
-    probe = state.control_dir(root) / "probe_results.json"
-    if not probe.is_file():
+    return out + ([[path.as_posix(), start + 1, len(lines) - start]] if lines[start:] else [])
+
+
+# --- the protocol -----------------------------------------------------------------------
+class _Ctx:
+    def __init__(self, cfg: state.Config, pid: str):
+        self.cfg, self.pid, self.root = cfg, pid, state.pdir(cfg, pid)
+        self.meta, self.paper = paper.load(cfg, pid)
+        self.src = state.read_json(self.root / "source.json", {})
+        self.checkout = self.root / "repo"
+        self.pages_dir = (self.root / "paper" / "pages").as_posix()
+
+    def sealed(self, tid: str) -> dict | None:
+        return _sealed(self.root, tid)
+
+    def tracked(self) -> set[str]:
+        if not hasattr(self, "_tracked"):
+            from .repo import git
+            rc, out = git(["ls-files", "-z"], self.checkout, 60) if (self.checkout / ".git").is_dir() else (1, "")
+            self._tracked = set(out.split("\0")) - {""} if rc == 0 else set()
+        return self._tracked
+
+    def concerns(self) -> list[dict]:
+        out = [c for lens in LENSES for c in (self.sealed(f"lens:{lens}") or {}).get("concerns", [])]
+        crit = {r["id"]: r for r in (self.sealed("critic") or {}).get("reviews", [])}
+        for c in out:
+            r = crit.get(c["id"], {})
+            if r.get("severity") in SEVERITY and SEVERITY.index(r["severity"]) < SEVERITY.index(c["severity"]):
+                c["severity"], c["critic"] = r["severity"], r.get("reason", "")   # only ever lowered
+            if r.get("withdraw"):
+                c["withdrawn"] = r.get("reason", "") or "withdrawn by the critic"
+        return out
+
+    def task(self, tid: str, role: str, prompt: str, extra_reads: tuple[Path, ...] = ()) -> dict:
+        path = self.root / "tasks" / f"{_safe(tid)}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(prompt, encoding="utf-8")
+        reads = [r for p in (path, self.root / "paper" / "paper.md", *extra_reads)
+                 for r in read_ranges(p, self.cfg.read_chunk)]
+        return {"id": tid, "role": role, "prompt": path.as_posix(),
+                "out": (self.root / "out" / f"{_safe(tid)}.json").as_posix(), "model": "sonnet",
+                "effort": _EFFORT[role], "reads": reads, "after": []}
+
+
+def _concern_lines(concerns: list[dict]) -> str:
+    return "\n".join(json.dumps({k: c.get(k) for k in ("id", "lens", "severity", "class", "central", "checkable",
+                                                         "statement", "evidence")}, ensure_ascii=False)
+                     for c in concerns if not c.get("withdrawn")) or "(no concerns survived)"
+
+
+def _repo_text(x: _Ctx) -> tuple[str, str]:
+    if not (x.checkout / ".git").is_dir():
+        return (f"none ({x.src.get('evidence') or 'the paper advertises no repository of its own'})",
+                "(no checkout)")
+    rel = state.read_json(x.root / "released.json")
+    if rel is None:                    # hashed once, at the pinned commit
+        rel = released(x.checkout)
+        state.write_json(x.root / "released.json", rel)
+    return (f"{x.src['url']} @ {x.src.get('commit', '')[:12]} (attributed by {x.src.get('discovered_by')}: "
+            f"\"{x.src.get('evidence', '')[:300]}\")", listing(x.checkout, rel))
+
+
+def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
+    """(phase, tasks, executions to start)."""
+    missing = [lens for lens in LENSES if x.sealed(f"lens:{lens}") is None]
+    title = x.meta["title"]
+    if missing:
+        return "read", [x.task(f"lens:{lens}", "lens", _template(
+            "lens", lens=lens, focus=_section("lenses", lens), title=title, pages_dir=x.pages_dir))
+            for lens in missing], []
+    if x.sealed("critic") is None:
+        return "critic", [x.task("critic", "critic", _template(
+            "critic", title=title, pages_dir=x.pages_dir, concerns=_concern_lines(x.concerns())))], []
+    plan = x.sealed("plan")
+    rows = (x.root / "paper" / "rows.md",)
+    if plan is None:
+        repo_line, lst = _repo_text(x)
+        return "plan", [x.task("plan", "plan", _template(
+            "plan", title=title, pages_dir=x.pages_dir, repo=repo_line, checkout=x.checkout.as_posix(),
+            gpu="unknown until first use", concerns=_concern_lines(x.concerns()), listing=lst,
+            max_checks=x.cfg.max_checks), rows)], []
+    tasks, spawn = [], []
+    for c in plan["checks"]:
+        t, s = _step(x, c)
+        tasks += t
+        spawn += s
+    if tasks or spawn or any(_running(x, c["id"]) for c in plan["checks"]):
+        return "verify", tasks, spawn
+    ledger = report.ledger(x)
+    if x.sealed("report") is None:
+        return "report", [x.task("report", "report", _template(
+            "report", title=title, table=report.table(ledger), concerns=_concern_lines(ledger["concerns"]),
+            checks=json.dumps(ledger["checks"], ensure_ascii=False, indent=1)[:40_000],
+            central=json.dumps(ledger["central_claims"], ensure_ascii=False, indent=1)))], []
+    report.render(x, ledger, x.sealed("report"))
+    return "done", [], []
+
+
+def _running(x: _Ctx, cid: str) -> bool:
+    cdir = x.root / "checks" / cid
+    if (cdir / "outcome.json").exists() or not (run := state.read_json(cdir / "running.json")):
         return False
-    since = probe.stat().st_mtime
-    runs = root / "runs" / pid
-    seals = [*runs.glob("certificates/*.driver.json"), *runs.glob("reimplementation/*.driver.json"),
-             *runs.glob("proof_maps/*.driver.json"), *runs.glob("check_plans/*.driver.json")]
-    return any(s.stat().st_mtime > since for s in seals)
+    if _alive(run["os_pid"]):
+        return True
+    state.write_json(cdir / "outcome.json", {"check": cid, "status": "INCONCLUSIVE", "authorized": True,
+                                             "reason": "the execution process ended without writing an outcome "
+                                                       "(killed or crashed): nothing was established"})
+    return False
 
 
-def advance(cfg: Config, pid: str) -> dict:
-    """Run the deterministic pipeline as far as it goes, then report what is pending.
-
-    A single `pipeline.drive` call both re-renders every prompt a phase would render (each
-    phase handler is idempotent and driven by what is on disk) and, for a case that was
-    already `complete`, REWINDS to `collect` and re-derives — so a grade or a verdict
-    sealed after the report was last written is picked up and the report re-rendered,
-    without this function needing its own rewind logic.
-    """
-    case = pipeline.open_case(cfg, pid)
-    case = pipeline.drive(cfg, case, force_probe=_seal_newer_than_probe(cfg, case.paper_id or pid))
-    from . import decide
-    from . import discover as discover_stage
-
-    resolved_pid = case.paper_id or pid
-    ts = discover_stage.load(cfg, resolved_pid)
-    sci = decide.scientific_outcome(ts) if ts is not None else {"status": "NOT_ASSESSED"}
-    # `status` is the workflow's; `scientific_status` is what the review established. A
-    # "complete" case with NO_CONCLUSIVE_CHECK checked nothing, and says so with its blocker.
-    return {"paper_id": resolved_pid, "phase": case.phase, "status": case.status,
-           "blocked_reason": case.blocked_reason,
-           "scientific_status": sci["status"], "scientific_blocker": sci.get("blocker", ""),
-           "tasks": pending(cfg, resolved_pid)}
-
-
-# --------------------------------------------------------------------------- #
-if __name__ == "__main__":       # self-check: python -m harness.tasks
-    import json
-    import subprocess
-    import tempfile
-
-    from .schema import Grade, SubstantiveVerdict
-
-    def _write(base: Path, content: str) -> Path:
-        p = base / f"staged-{hashlib.sha256(content.encode()).hexdigest()[:12]}.json"
-        p.write_text(content, encoding="utf-8")
-        return p
-
-    with tempfile.TemporaryDirectory() as td:
-        td = Path(td)
-        cfg = Config(projects_dir=td / "projects")
-
-        # --- before ingest: nothing pending ------------------------------------------------
-        assert pending(cfg, "nope") == []
-
-        # --- seal() dispatches by role prefix, and refuses cleanly ------------------------
-        pid = "p"
-        state.create_project(cfg, "", "T", pid=pid)
-        from .schema import PaperDoc as _PD, Section
-        state.write_json(
-            state.project_dir(cfg, pid) / "paper" / "doc.json",
-            _PD(paper_id=pid, title="T", n_pages=1,
-               sections=[Section(section_idx=0, title="Method", page_start=1,
-                                 text="We train with Adam for 30 epochs.")]).model_dump())
-
-        # A task id naming a role this module does not know is refused, not silently
-        # ignored -- the worker's mistake is visible, not swallowed.
-        stub = td / "stub.json"
-        stub.write_text('{"whatever": 1}', encoding="utf-8")
+def _alive(os_pid: int) -> bool:
+    if sys.platform == "win32":
+        import ctypes
+        h = ctypes.windll.kernel32.OpenProcess(0x100000, False, os_pid)      # SYNCHRONIZE
+        if not h:
+            return False
         try:
-            seal(cfg, pid, "not_a_role:x", stub)
-            raise AssertionError("an unknown role must be refused")
-        except ValueError as e:
-            assert "unknown role" in str(e)
+            return ctypes.windll.kernel32.WaitForSingleObject(h, 0) == 0x102  # WAIT_TIMEOUT
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+    try:
+        os.kill(os_pid, 0)
+        return True
+    except OSError:
+        return False
 
-        # A missing staged file is refused with the path named.
+
+def _step(x: _Ctx, c: dict) -> tuple[list[dict], list[dict]]:
+    """The next thing owed for one check: a task, an execution, or nothing (done)."""
+    cid, kind = c["id"], c["kind"]
+    cdir = x.root / "checks" / cid
+    if (cdir / "outcome.json").exists() or _running(x, cid):
+        return [], []
+    spec = _spec_text(c)
+    if kind == "AUTHOR_CODE":
+        b = x.sealed(f"bind:{cid}")
+        if b is None:
+            _, lst = _repo_text(x)
+            t = c["target"]
+            return [x.task(f"bind:{cid}", "bind", _template(
+                "bind", title=x.meta["title"], pages_dir=x.pages_dir, claim=c["claim"],
+                target=json.dumps(t, ensure_ascii=False), page=t["page"],
+                page_png=f"{x.pages_dir}/p{t['page']:03d}.png", checkout=x.checkout.as_posix(), listing=lst))], []
+        check = {**c, **b, "repo_attributed": c["repo_attributed"]}
+        return _start(x, check)
+    rounds = 1 + x.cfg.max_revisions
+    if kind == "ARITHMETIC":
+        v = x.sealed(f"verify:{cid}.1")
+        if v is None:
+            return [_verify_task(x, c, 1, spec, json.dumps(
+                {k: c[k] for k in ("operands", "expression", "target")}, ensure_ascii=False, indent=1), "")], []
+        if v["verdict"] == "APPROVE":
+            out = reconcile.arithmetic(*c["interval"], c["printed"])
+        else:
+            out = {"status": "NOT_CHECKABLE", "reason": f"verifier {v['verdict']}: {v['required_changes'] or v['notes']}"}
+        state.write_json(cdir / "outcome.json", {"check": cid, "kind": kind, "evidence": "PAPER_ARITHMETIC",
+                                                 "authorized": True, **out})
+        return [], []
+    for r in range(1, rounds + 1):
+        g = x.sealed(f"gen:{cid}.{r}")
+        if g is None:
+            prev = x.sealed(f"verify:{cid}.{r - 1}") if r > 1 else None
+            revision = "" if not prev else (
+                f"\n=== REVISION {r}: an independent verifier rejected the previous attempt ===\nFix exactly "
+                f"this, from the paper's own words (never by weakening the claim or inventing a detail):\n"
+                f"{prev['required_changes'] or prev['notes']}\n--- the rejected script ---\n"
+                f"{(cdir / f'script.{r - 1}.py').read_text(encoding='utf-8')}\n")
+            try_cmd = (f'cd "{state.ROOT.as_posix()}" && PYTHONUTF8=1 SH_PROJECTS_DIR="{x.cfg.projects.as_posix()}" '
+                       f'SH_ALLOW_INSTALL={int(x.cfg.allow_install)} SH_ALLOW_SCRIPT_EXEC={int(x.cfg.allow_script_exec)} '
+                       f'"{Path(x.cfg.python).as_posix()}" run.py try {x.pid} gen:{cid}.{r}')
+            extra = "" if kind != "RELEASED_DATA" else "\n\n=== RELEASED FILES (checkout) ===\n" + _repo_text(x)[1]
+            return [x.task(f"gen:{cid}.{r}", "gen", _template(
+                "gen", title=x.meta["title"], pages_dir=x.pages_dir, check_id=cid, kind=kind, claim=c["claim"],
+                spec=spec + extra, contract=_section("contracts", f"gen {kind}"), metric=c["metric"] or "violated",
+                required=", ".join(REQUIRED[kind]), max_tries=x.cfg.max_tries, try_cmd=try_cmd, revision=revision))], []
+        if g.get("refused"):
+            return _terminal(cdir, c, "NOT_CHECKABLE", f"the script author refused: {g['notes'][:400]}")
+        v = x.sealed(f"verify:{cid}.{r}")
+        if v is None:
+            tries = (cdir / "tries.jsonl").read_text(encoding="utf-8")[-6000:] if (cdir / "tries.jsonl").exists() else "(none)"
+            proposal = json.dumps({"script": (cdir / f"script.{r}.py").read_text(encoding="utf-8"), **{
+                k: g[k] for k in ("runs", "runs_quote", "outputs", "bindings", "checked_statement")}},
+                ensure_ascii=False, indent=1)
+            return [_verify_task(x, c, r, spec, proposal, tries)], []
+        if v["verdict"] == "APPROVE":
+            check = {**c, "runs": g["runs"], "script_sha256": g["script_sha256"],
+                     "approval": {"approved": True, "script_sha256": v["script_sha256"]}}
+            shutil.copyfile(cdir / f"script.{r}.py", cdir / "script.py")
+            return _start(x, check)
+        if v["verdict"] == "UNCHECKABLE" or r == rounds:
+            why = "unCheckable" if v["verdict"] == "UNCHECKABLE" else f"{rounds} rounds rejected"
+            return _terminal(cdir, c, "NOT_CHECKABLE", f"verifier: {why}: {(v['required_changes'] or v['notes'])[:400]}")
+    return [], []
+
+
+def _terminal(cdir: Path, c: dict, status: str, reason: str) -> tuple[list, list]:
+    state.write_json(cdir / "outcome.json", {"check": c["id"], "kind": c["kind"], "status": status,
+                                             "authorized": False, "reason": reason})
+    return [], []
+
+
+def _start(x: _Ctx, check: dict) -> tuple[list, list]:
+    """Authorize now; a refusal is recorded at once, an authorized run starts in the background."""
+    cdir = x.root / "checks" / check["id"]
+    state.write_json(cdir / "check.json", check)
+    if check["kind"] == "AUTHOR_CODE" and not check.get("identity", {}).get("established"):
+        return _terminal(cdir, check, "BLOCKED", "not run: experiment identity is not established: "
+                         + check.get("identity", {}).get("reason", ""))
+    ok, why = execute.authorize(x.cfg, check, (True, "the commit is re-verified at run time"))
+    if not ok:
+        return _terminal(cdir, check, "BLOCKED", f"not run: {why}")
+    return [], [check]
+
+
+def _verify_task(x: _Ctx, c: dict, r: int, spec: str, proposal: str, tries: str) -> dict:
+    return x.task(f"verify:{c['id']}.{r}", "verify", _template(
+        "verify", title=x.meta["title"], pages_dir=x.pages_dir, check_id=c["id"], kind=c["kind"], claim=c["claim"],
+        spec=spec, rules=_section("contracts", f"verify {c['kind']}"), proposal=proposal, tries=tries))
+
+
+def _spec_text(c: dict) -> str:
+    parts = []
+    if c.get("target"):
+        parts.append(f"Printed target: {json.dumps(c['target'], ensure_ascii=False)}")
+    if c.get("statement"):
+        parts.append(f"Statement (verbatim): {c['statement']}")
+    if c.get("step"):
+        parts.append(f"CHECK EXACTLY THIS PROOF STEP (verbatim; bound by the harness): {c['step']}")
+    return "\n".join(parts)
+
+
+def advance(cfg: state.Config, source: str, wait: int = 0) -> dict:
+    """Advance one paper as far as the harness can alone; return what workers can do now."""
+    pid = source if (state.pdir(cfg, source) / "paper" / "doc.json").exists() else None
+    if pid is None:
+        with state.lock(cfg.projects / ".ingest.lock"):
+            pid = paper.ingest(cfg, Path(source))
+    root = state.pdir(cfg, pid)
+    deadline = time.time() + wait
+    while True:
+        with state.lock(root / ".lock"):
+            x = _Ctx(cfg, pid)
+            phase, tasks, spawn = _plan(x)
+            for check in spawn:
+                _spawn(cfg, pid, check["id"])
+        if tasks or phase == "done" or time.time() >= deadline:
+            break
+        time.sleep(15)
+    running = [p.parent.name for p in (root / "checks").glob("*/running.json")
+               if not (p.parent / "outcome.json").exists()]
+    return {"paper_id": pid, "phase": phase, "status": "complete" if phase == "done" else "waiting",
+            "blocked_reason": f"executions running: {', '.join(running)}" if running and not tasks else "",
+            "scientific_status": report.scientific_status(root), "tasks": tasks}
+
+
+def _spawn(cfg: state.Config, pid: str, cid: str) -> None:
+    cdir = state.pdir(cfg, pid) / "checks" / cid
+    log = (cdir / "exec.log").open("ab")
+    flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if sys.platform == "win32" else 0
+    p = subprocess.Popen([cfg.python, str(state.ROOT / "run.py"), "exec", pid, cid], cwd=state.ROOT,
+                         stdout=log, stderr=log, stdin=subprocess.DEVNULL, creationflags=flags,
+                         start_new_session=sys.platform != "win32")
+    state.write_json(cdir / "running.json", {"os_pid": p.pid, "started_at": state.now()})
+
+
+# --- sealing ----------------------------------------------------------------------------
+def seal(cfg: state.Config, pid: str, tid: str, path: str) -> dict:
+    raw = Path(path).read_text(encoding="utf-8", errors="replace")
+    body = raw[raw.find("{"):raw.rfind("}") + 1]
+    try:
+        obj = json.loads(body)
+    except ValueError as e:
+        raise SealError(f"the answer is not valid JSON: {e}") from e
+    root = state.pdir(cfg, pid)
+    with state.lock(root / ".lock"):
+        x = _Ctx(cfg, pid)
+        pending = {t["id"] for t in _plan(x)[1]}
+        if tid not in pending:
+            raise SealError(f"'{tid}' is not a pending task (pending: {sorted(pending)})")
+        attempts = state.read_json(root / "attempts.json", {})
+        attempts[tid] = attempts.get(tid, 0) + 1
+        state.write_json(root / "attempts.json", attempts)
+        role, final = tid.split(":")[0], attempts[tid] >= 3
         try:
-            seal(cfg, pid, "lens:overclaim", td / "does-not-exist.json")
-            raise AssertionError("a missing file must be refused")
-        except ValueError as e:
-            assert "no such file" in str(e)
+            if not isinstance(obj, dict):
+                raise TypeError("the answer must be a JSON object")
+            rec = VALIDATORS[role](x, tid, obj, final=final)
+        except SealError:
+            raise
+        except (AttributeError, TypeError, KeyError, ValueError, IndexError) as e:
+            # A malformed answer is the worker's to fix; on the last attempt it seals as an
+            # honest nothing, so one bad answer cannot stall the review.
+            if not final:
+                raise SealError(f"malformed answer ({type(e).__name__}: {e}); follow the JSON shape exactly") from e
+            rec = {**_EMPTY[role], "malformed": f"{type(e).__name__}: {e}"[:300]}
+        out = root / "sealed" / f"{_safe(tid)}.json"
+        state.write_json(out, rec)
+        seals = state.read_json(root / "seals.json", {})
+        seals[tid] = state.sha256(out.read_bytes())
+        state.write_json(root / "seals.json", seals)
+        state.append_jsonl(root / "log.jsonl", {"event": "seal", "task": tid})
+    return {"sealed": tid, "dropped": len(rec.get("dropped", []))}
 
-        # A lens unit id that does not exist for this paper is refused, actionably.
-        try:
-            seal(cfg, pid, "lens:not-a-lens", stub)
-            raise AssertionError("an unknown lens unit must be refused")
-        except ValueError as e:
-            assert "no such unit" in str(e)
 
-        # --- grade / verdict seal through the SAME accept_* the manual channel uses ------
-        # A grade the harness is not asking for (no such candidate) is refused: a slug is a
-        # pure function of a model-written finding id and would bind to a later finding.
-        grade_json = Grade(verdict="CONFIRMED", severity="MAJOR").model_dump()
-        try:
-            _seal_grade(cfg, pid, "c-01", json.dumps(grade_json))
-            raise AssertionError("a grade sealed ahead of its finding must be refused")
-        except ValueError as e:
-            assert "not a pending grade" in str(e)
-        # The sealing itself (offline, against a hand-placed prompt)
-        grade_dir = state.project_dir(cfg, pid) / "audit" / "grade"
-        (grade_dir / "prompts").mkdir(parents=True, exist_ok=True)
-        rec = accept_grade(cfg, pid, "c-01", json.dumps(grade_json), grader=REVIEWER,
-                           mode="SESSION_SUBAGENT")
-        assert rec["verdict"] == "CONFIRMED" and rec["written_by"] == "session_subagent"
-        assert rec["grader"] == REVIEWER
+def _fail_or_drop(errors: list[str], final: bool) -> None:
+    """Fixable errors go back to the worker; on the final attempt the offending items are
+    dropped (and recorded) instead, so one bad quote cannot stall a review."""
+    if errors and not final:
+        raise SealError("fix these (copy the paper's parsed text exactly; never weaken the claim):\n- "
+                        + "\n- ".join(errors[:12]))
 
-        verdict_prompt = _verdict_prompt_path(cfg, pid)
-        verdict_prompt.parent.mkdir(parents=True, exist_ok=True)
-        verdict_prompt.write_text("assess this paper", encoding="utf-8")
-        assert _verdict_task(cfg, pid) is not None, "a rendered prompt with no verdict yet is pending"
-        v = SubstantiveVerdict(verdict="STRONG", reason="r", strongest_contribution="c",
-                              weakest_link="w", weaknesses_are="LOCAL")
-        vrec = seal(cfg, pid, "verdict", _write(td, json.dumps(v.model_dump())))
-        assert vrec["verdict"] == "STRONG" and vrec["delegation_mode"] == "SESSION_SUBAGENT"
-        assert _verdict_task(cfg, pid) is None, "a sealed, fresh-prompt verdict is not pending again"
 
-        # --- reimpl_gen -> reimpl_verify: a DIFFERENT context for each, mutually exclusive
-        # in the pending list ---------------------------------------------------------------
-        from .schema import Table
+def _find(x: _Ctx, quote: str, errors: list[str], what: str) -> dict | None:
+    hit, why = x.paper.find(quote or "")
+    if hit is None:
+        errors.append(f"{what}: {why}: {(quote or '')[:120]!r}")
+    return hit
 
-        pid2 = "p2"
-        state.create_project(cfg, "", "T2", pid=pid2)
-        doc2 = _PD(paper_id=pid2, title="T2", n_pages=1, sections=[
-            Section(section_idx=0, title="Method", page_start=1,
-                   text="We define the objective as a sum and train with Adam for 30 "
-                        "epochs on the CIFAR-100 dataset, reporting accuracy on Table 1.")],
-                  tables=[Table(table_idx=0, caption="Table 1: results",
-                                header=["method", "acc"], rows=[["ours", "0.9"]])])
-        state.write_json(state.project_dir(cfg, pid2) / "paper" / "doc.json", doc2.model_dump())
-        reimplement_driver.persist_brief(cfg, pid2, "t1", "GENERATE A RECONSTRUCTION")
-        gen_tasks = _reimpl_tasks(cfg, pid2, doc2)
-        assert len(gen_tasks) == 1 and gen_tasks[0]["id"] == "reimpl_gen:t1"
-        assert gen_tasks[0]["model"] == "sonnet" and gen_tasks[0]["effort"] == "high"
 
-        good_gen = json.dumps({
-            "script": "import argparse\n# method: sum objective\ndef train():\n    pass\n"
-                     "print('SH_METRIC arm=a seed=0 value=0.9')",
-            "bindings": [
-                {"kind": "method", "impl_ref": "line 2", "impl_quote": "# method: sum objective"},
-                {"kind": "training", "impl_ref": "line 3", "impl_quote": "def train():"},
-                {"kind": "dataset", "impl_ref": "line 1", "impl_quote": "import argparse"},
-                {"kind": "metric", "impl_ref": "line 5",
-                "impl_quote": "SH_METRIC arm=a seed=0 value=0.9"},
-                {"kind": "comparison_target", "impl_ref": "line 5",
-                "impl_quote": "SH_METRIC arm=a seed=0 value=0.9"},
-            ], "notes": ""})
-        gen_rec = seal(cfg, pid2, "reimpl_gen:t1", _write(td, good_gen))
-        assert gen_rec["target_id"] == "t1"
+def _seal_lens(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
+    lens, kept, dropped, errors = tid.split(":")[1], [], [], []
+    for c in obj.get("concerns") or []:
+        errs: list[str] = []
+        ev = [(e, _find(x, e.get("quote", ""), errs, f"concern {c.get('title', '')[:40]!r}"))
+              for e in (c.get("evidence") or [])]
+        if not ev or errs:
+            dropped.append({"title": c.get("title", ""), "why": errs or ["no evidence quote"]})
+            errors += errs or [f"concern {c.get('title', '')[:40]!r} has no evidence quote"]
+            continue
+        sev = c.get("severity") if c.get("severity") in SEVERITY else "NOTE"
+        cls = c.get("class") if c.get("class") in CLASSES else "OPEN_QUESTION"
+        conf = c.get("confidence") if c.get("confidence") in ("HIGH", "MEDIUM", "LOW") else "LOW"
+        # Evidence class bounds severity; nothing raises it (invariant 8).
+        cap = {"DISMISSED": "NOTE", "OPEN_QUESTION": "MINOR", "PLAUSIBLE_CONCERN": "MAJOR"}.get(cls, "FATAL")
+        cap = "MINOR" if conf == "LOW" else ("MAJOR" if cap == "FATAL" and conf != "HIGH" else cap)
+        counted = SEVERITY[min(SEVERITY.index(sev), SEVERITY.index(cap))]
+        kept.append({"id": f"{lens}-{len(kept) + 1:02d}", "lens": lens, "lens_severity": sev, "severity": counted,
+                     "confidence": conf, "class": cls, "central": c.get("central") is True,
+                     "evidence": [{"quote": h["quote"], "page": h["page"], "role": e.get("role", "")} for e, h in ev],
+                     **{k: str(c.get(k) or "")[:2000] for k in ("title", "statement", "reasoning", "alternative",
+                                                                 "why_alternative_fails", "steelman",
+                                                                 "effect_on_claim", "checkable")},
+                     "calculation": c.get("calculation") if isinstance(c.get("calculation"), dict) else None})
+    _fail_or_drop(errors, final)
+    return {"lens": lens, "concerns": kept, "dropped": dropped,
+            "unasked_question": str(obj.get("unasked_question") or "")[:2000], "notes": str(obj.get("notes") or "")[:2000]}
 
-        verify_tasks = _reimpl_tasks(cfg, pid2, doc2)
-        assert len(verify_tasks) == 1 and verify_tasks[0]["id"] == "reimpl_verify:t1", (
-            "once generated, ONLY reimpl_verify is offered for this target")
-        assert verify_tasks[0]["after"] == ["reimpl_gen:t1"]
-        verify_prompt = Path(verify_tasks[0]["prompt"]).read_text(encoding="utf-8")
-        assert "independent verifier" in verify_prompt
 
-        approval = json.dumps({"approved": True, "approved_kinds": [
-            "method", "training", "dataset", "metric", "comparison_target"], "notes": "ok"})
-        vrec2 = seal(cfg, pid2, "reimpl_verify:t1", _write(td, approval))
-        assert vrec2["established"] is True, vrec2
-        assert _reimpl_tasks(cfg, pid2, doc2) == [], (
-            "an established reconstruction is not offered again")
-        assert reimplement_driver.load_accepted(cfg, pid2, "t1") is not None
+def _seal_critic(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
+    known = {c["id"] for c in x.concerns()}
+    return {"reviews": [{"id": r["id"], "severity": r.get("severity"), "withdraw": r.get("withdraw") is True,
+                         "reason": str(r.get("reason") or "")[:1000]}
+                        for r in obj.get("reviews") or [] if isinstance(r, dict) and r.get("id") in known]}
 
-        # A rejection seals honestly rather than erroring.
-        reimplement_driver.persist_brief(cfg, pid2, "t2", "GENERATE ANOTHER")
-        seal(cfg, pid2, "reimpl_gen:t2", _write(td, good_gen))
-        rejection = json.dumps({"approved": False, "approved_kinds": [], "notes": "no"})
-        vrec3 = seal(cfg, pid2, "reimpl_verify:t2", _write(td, rejection))
-        assert vrec3["established"] is False
 
-        # --- authors'-code reading: persisted prompt -> pending task -> sealed answer ----
-        pid3 = "p3"
-        state.create_project(cfg, "", "T3", pid=pid3)
-        doc3 = _PD(paper_id=pid3, title="T3", n_pages=1, repo_url="https://example.invalid/r",
-                  sections=[Section(section_idx=0, title="Method", page_start=1,
-                                    text="We release requirements.txt alongside the code.")])
-        state.write_json(state.project_dir(cfg, pid3) / "paper" / "doc.json", doc3.model_dump())
+def _target(x: _Ctx, t: dict, errors: list[str], cid: str) -> dict | None:
+    value = str((t or {}).get("value") or "").strip()
+    if not value:
+        errors.append(f"{cid}: the target has no printed value")
+        return None
+    if t.get("row_quote"):
+        hit, why = x.paper.cell(str(t["row_quote"]), value, str(t.get("column_quote") or ""),
+                                t["page"] if isinstance(t.get("page"), int) else 0)
+        if not hit:
+            errors.append(f"{cid}: {why}")
+            return None
+        return {"row_quote": t["row_quote"], "column_quote": t["column_quote"], "value": value, **hit}
+    hit = _find(x, t.get("quote", ""), errors, f"{cid} target")
+    if hit and not value_in(hit["quote"], value):
+        errors.append(f"{cid}: the value {value!r} is not printed in the target quote")
+        return None
+    return hit and {"quote": hit["quote"], "value": value, "page": hit["page"]}
 
-        root3 = td / "repo3"
-        root3.mkdir()
-        (root3 / "requirements.txt").write_text("torch==2.1.0\n", encoding="utf-8")
-        git_ok = True
-        try:
-            for args in (("init", "-q"), ("config", "user.email", "s@e"),
-                        ("config", "user.name", "s"), ("add", "-A"), ("commit", "-qm", "c")):
-                subprocess.run(["git", *args], cwd=root3, check=True,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except (OSError, subprocess.CalledProcessError):    # pragma: no cover
-            git_ok = False
 
-        if git_ok:
-            assert _artifact_review_task(cfg, pid3) is None, "no task before any checkout exists"
-            checkout, url = _checkout_for(cfg, pid3, doc3)
-            checkout.parent.mkdir(parents=True, exist_ok=True)
-            import shutil as _shutil
-            _shutil.copytree(root3, checkout)
-            assert url == "https://example.invalid/r"
+def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
+    errors, checks, dropped = [], [], []
+    concern_ids = {c["id"] for c in x.concerns()}
+    attributed = (x.checkout / ".git").is_dir() and obj.get("repo_is_authors") is True
+    proposed = [c for c in obj.get("checks") or [] if isinstance(c, dict)]
+    for c in proposed[x.cfg.max_checks:]:
+        dropped.append({"check": c.get("id"), "why": f"over the budget of {x.cfg.max_checks} checks"})
+    for i, c in enumerate(proposed[:x.cfg.max_checks], 1):
+        cid, kind, errs = f"C{i}", c.get("kind"), []
+        if kind not in KINDS:
+            errs.append(f"{cid}: unknown kind {kind!r}")
+        claim = _find(x, c.get("claim_quote", ""), errs, f"{cid} claim_quote")
+        rec = {"id": cid, "proposed_id": c.get("id"), "kind": kind, "concerns": [k for k in c.get("concerns") or []
+                                                                               if k in concern_ids],
+               "claim": claim["quote"] if claim else "", "why": str(c.get("why") or "")[:1000],
+               "metric": str(c.get("metric") or "").strip(), "repo_attributed": attributed}
+        if kind != "CERTIFICATE":
+            rec["target"] = _target(x, c.get("target") or {}, errs, cid)
+            rec["printed"] = rec["target"]["value"] if rec["target"] else ""
+        if kind == "AUTHOR_CODE":
+            if not attributed:
+                errs.append(f"{cid}: AUTHOR_CODE needs a checkout you judge to be the authors' own")
+            elif not documented(_repo_file(x, c.get("command_file")), str(c.get("command_quote") or "")):
+                errs.append(f"{cid}: command_quote is not a whole documented command in tracked file "
+                            f"{c.get('command_file')!r}")
+            prep = str(c.get("prepare_quote") or "")
+            if prep and not documented(_repo_file(x, c.get("prepare_file")), prep):
+                errs.append(f"{cid}: prepare_quote is not a whole documented command in {c.get('prepare_file')!r}")
+            rec.update(command_quote=command(str(c.get("command_quote") or "")), prepare_quote=command(prep))
+        if kind == "CERTIFICATE":
+            st = _find(x, c.get("statement_quote", ""), errs, f"{cid} statement_quote")
+            sp = _find(x, c["step_quote"], errs, f"{cid} step_quote") if c.get("step_quote") else None
+            rec.update(statement=st["quote"] if st else "", step=sp["quote"] if sp else "")
+        if kind == "ARITHMETIC":
+            printed, ops = {}, []
+            for o in [o for o in c.get("operands") or [] if isinstance(o, dict)]:
+                h = _find(x, str(o.get("quote") or ""), errs, f"{cid} operand {o.get('name')}")
+                name, val = str(o.get("name") or ""), str(o.get("value") or "")
+                if h and not (name.isidentifier() and value_in(h["quote"], val)):
+                    errs.append(f"{cid}: operand {name!r} value {val!r} is not printed in its quote")
+                elif h:
+                    printed[name] = val
+                    ops.append({"name": name, "quote": h["quote"], "value": val})
+            try:
+                rec["interval"] = list(interval(str(c.get("expression") or ""), printed)) if not errs else None
+            except ValueError as e:
+                errs.append(f"{cid}: expression: {e}")
+            rec.update(operands=ops, expression=str(c.get("expression") or ""))
+        if errs:
+            errors += errs
+            dropped.append({"check": cid, "why": errs})
+        else:
+            checks.append(rec)
+    central = []
+    for cc in [cc for cc in obj.get("central_claims") or [] if isinstance(cc, dict)]:
+        h = _find(x, str(cc.get("quote") or ""), errors, "central claim")
+        if not h:
+            dropped.append({"check": "central claim", "why": f"quote not found: {str(cc.get('quote'))[:120]!r}"})
+        else:
+            central.append({"quote": h["quote"], "page": h["page"],
+                            "checks": [k for k in cc.get("checks") or [] if k in {c.get("id") for c in proposed}],
+                            "why_unchecked": str(cc.get("why_unchecked") or "")[:600]})
+    _fail_or_drop(errors, final)
+    # The planner's own ids map onto the harness's C1..Cn.
+    ids = {c["proposed_id"]: c["id"] for c in checks}
+    for cc in central:
+        cc["checks"] = [ids[k] for k in cc["checks"] if k in ids]
+    return {"checks": checks, "central_claims": central, "dropped": dropped,
+            "repo_is_authors": attributed, "repo_note": str(obj.get("repo_note") or "")[:1000]}
 
-            from . import artifact_evidence
-            from .stages import artifact as artifact_stage
-            snap = artifact_evidence.snapshot(checkout, url)
-            artifact_stage._reviewer_facts(cfg, pid3, doc3, checkout, snap, url, [])
-            task = _artifact_review_task(cfg, pid3)
-            assert task is not None and task["role"] == "artifact_review"
-            assert task["prompt"] == _artifact_review_prompt_path(cfg, pid3).as_posix()
-            big = Path(td) / "big.md"
-            big.write_text("\n".join(["x" * 30_000] * 5), encoding="utf-8")
-            rs = read_ranges(big)
-            assert rs == [[1, 1], [2, 1], [3, 1], [4, 1], [5, 1]], rs
-            assert read_ranges(Path(td) / "nope.md") == []
-            small = read_ranges(task_path := Path(task["prompt"]))
-            assert small == [[1, len(task_path.read_text(encoding="utf-8").split("\n"))]], small
 
-            concern = json.dumps({"concerns": [
-                {"kind": "SUSPICIOUS_IMPLEMENTATION", "title": "x", "statement": "s",
-                 "file": "requirements.txt", "code_quote": "torch==2.1.0"}], "notes": "n"})
-            arec = seal(cfg, pid3, "artifact_review", _write(td, concern))
-            assert arec["proposed"] == 1 and arec["relocated"] == 1
-            assert _artifact_review_task(cfg, pid3) is None, (
-                "a fresh sealed reading is not pending again")
-        else:                                       # pragma: no cover
-            print("harness.tasks self-check: git unavailable, skipping artifact_review path")
+def _repo_file(x: _Ctx, rel) -> Path | None:
+    """A file git tracks in the pinned checkout — never a path outside it."""
+    rel = str(rel or "").strip().replace("\\", "/").removeprefix("./")
+    return x.checkout / rel if rel and rel in x.tracked() else None
 
-        # --- advance(): runs the deterministic pipeline and never raises on an already-
-        # ingested, minimally-populated project (whatever it cannot progress past becomes
-        # an 'error'/'waiting' PhaseOutcome, not an exception escaping this function) -----
-        res = advance(cfg, pid)
-        assert set(res) == {"paper_id", "phase", "status", "blocked_reason", "tasks",
-                            "scientific_status", "scientific_blocker"}
-        assert res["paper_id"] == pid
 
-    print(json.dumps({"self_check": "ok"}, indent=2))
+_PLACEHOLDER = re.compile(r"<[^<>]+>|\$\{?\w|\{\w*\}|\[[A-Z][A-Z_ -]*\]|path/to|/path/|\.\.\.|YOUR_", re.I)
+
+
+def _runs(x: _Ctx, runs, quote, why: list[str]) -> int | None:
+    """A paper-stated run count, only if its sentence is re-found printing that number."""
+    if not isinstance(runs, int) or isinstance(runs, bool) or runs < 1:
+        return None
+    if runs > 1 and not ((h := x.paper.find(str(quote or ""))[0]) and value_in(h["quote"], str(runs))):
+        return None
+    if runs > x.cfg.max_runs:
+        why.append(f"the paper's {runs} runs exceed SH_MAX_RUNS={x.cfg.max_runs}: refused rather than downscaled")
+    return runs
+
+
+def _seal_bind(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
+    """Two-key identity: established only if this independent answer names the same whole
+    documented command (and prepare step) and metric key as the planner, each at the pinned
+    commit: the command as a full line or code span of a tracked doc, the key as a whole word
+    of a tracked code file."""
+    cid = tid.split(":")[1]
+    c = next(k for k in x.sealed("plan")["checks"] if k["id"] == cid)
+    cmd, why, errors = command(str(obj.get("command_quote") or "")), [], []
+    if cmd and not documented(_repo_file(x, obj.get("command_file")), cmd):
+        errors.append(f"command_quote is not a whole documented command in tracked file {obj.get('command_file')!r}")
+    _fail_or_drop(errors, final)
+    key, flag = str(obj.get("metric_key") or "").strip(), str(obj.get("seed_flag") or "").strip()
+    if not cmd:
+        why.append(f"no documented command produces this number: {str(obj.get('notes') or '')[:300]}")
+    why += errors
+    if cmd and _PLACEHOLDER.search(cmd):
+        why.append("the documented command has unfilled placeholders")
+    if cmd and cmd != c["command_quote"]:
+        why.append("the independent verifier named a different command than the planner")
+    if key != c["metric"]:
+        why.append(f"the independent verifier's metric key {key!r} differs from the planner's {c['metric']!r}")
+    elif not has_word(_repo_file(x, obj.get("metric_file")), key):
+        why.append(f"the metric key {key!r} is not a whole word of tracked code file {obj.get('metric_file')!r}")
+    seeded = bool(re.fullmatch(r"--?[\w-]*seed[\w-]*", flag)) and bool(
+        re.search(rf"(?<!\S){re.escape(flag)}(?:\s+|=)\d+(?!\S)", cmd))
+    runs = _runs(x, obj.get("runs"), obj.get("runs_quote"), why) if seeded else 1
+    prepare = command(str(obj.get("prepare_quote") or ""))
+    if prepare != c.get("prepare_quote", "") or (prepare and not documented(_repo_file(x, obj.get("prepare_file")), prepare)):
+        prepare = ""        # a prepare step both keys name, verbatim, or none (the run may then fail: INCONCLUSIVE)
+    return {"identity": {"established": not why, "reason": "; ".join(why) or "two independent keys agree",
+                         "basis": "independent verifier + whole documented command and metric key at the pinned commit"},
+            "command": cmd, "metric": key or c["metric"], "seed_flag": flag if seeded else "",
+            "runs": runs or 3, "runs_quote": str(obj.get("runs_quote") or "")[:500],
+            "prepare": prepare, "notes": str(obj.get("notes") or "")[:1000]}
+
+
+def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
+    cid, r = tid.split(":")[1].rsplit(".", 1)
+    c = next(k for k in x.sealed("plan")["checks"] if k["id"] == cid)
+    script = str(obj.get("script") or "")
+    need = REQUIRED[c["kind"]]
+    binds = {b.get("kind"): b for b in obj.get("bindings") or [] if isinstance(b, dict)}
+    if not script.strip() or any(not (binds.get(k) or {}).get("impl_quote") for k in need):
+        return {"refused": True, "notes": str(obj.get("notes") or "the script or a required binding is missing")[:2000]}
+    errors, out = [], []
+    rel = [f["path"] for f in state.read_json(x.root / "released.json", [])]
+    for k in need:
+        b = binds[k]
+        if flat(b["impl_quote"]) not in flat(script):
+            errors.append(f"binding {k}: impl_quote is not in the script")
+        h = None if k == "instance" else _find(x, b.get("paper_quote", ""), errors, f"binding {k} paper_quote")
+        out.append({"kind": k, "impl_quote": b["impl_quote"][:1000], "paper_quote": h["quote"] if h else "",
+                    "page": h["page"] if h else None})
+    if c["kind"] == "RELEASED_DATA" and not any(p in binds["dataset"]["impl_quote"] and p in script for p in rel):
+        errors.append("the dataset binding must open a released file by its full relative path")
+    if c["kind"] == "CERTIFICATE" and c.get("step") and flat(c["step"]) not in flat(binds["claimed_bound"].get("paper_quote", "")):
+        errors.append("claimed_bound must be the proof step the harness bound")
+    runs = obj.get("runs") if isinstance(obj.get("runs"), int) and not isinstance(obj.get("runs"), bool) else 1
+    cap = 200 if c["kind"] == "CERTIFICATE" else x.cfg.max_runs     # ponytail: instances are cheap
+    if not 1 <= runs <= cap:
+        return {"refused": True, "notes": f"{runs} runs is outside 1..{cap}: refused rather than downscaled"}
+    if runs > 1 and c["kind"] == "RECONSTRUCTION" and not (
+            (h := x.paper.find(str(obj.get("runs_quote") or ""))[0]) and value_in(h["quote"], str(runs))):
+        errors.append("runs > 1 needs runs_quote: the paper's sentence printing that number, verbatim")
+    if c["metric"] and c["metric"] not in (obj.get("outputs") or []) and c["kind"] != "CERTIFICATE":
+        errors.append(f"outputs must include the check's metric {c['metric']!r}")
+    if errors and final:
+        return {"refused": True, "notes": "; ".join(errors)[:2000]}
+    _fail_or_drop(errors, final)
+    cdir = x.root / "checks" / cid
+    cdir.mkdir(parents=True, exist_ok=True)
+    (cdir / f"script.{r}.py").write_bytes(script.encode("utf-8"))   # bytes: the sha is of exactly these
+    return {"script_sha256": state.sha256(script), "runs": runs, "runs_quote": str(obj.get("runs_quote") or "")[:500],
+            "outputs": obj.get("outputs") or [], "bindings": out,
+            "checked_statement": "proof_step" if c.get("step") else str(obj.get("checked_statement") or "conclusion"),
+            "notes": str(obj.get("notes") or "")[:2000]}
+
+
+def _seal_verify(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
+    cid, r = tid.split(":")[1].rsplit(".", 1)
+    verdict = obj.get("verdict") if obj.get("verdict") in ("APPROVE", "REVISE", "UNCHECKABLE") else None
+    if verdict is None:
+        raise SealError("verdict must be APPROVE, REVISE or UNCHECKABLE")
+    errors: list[str] = []
+    quotes = [h["quote"] for q in obj.get("quotes") or [] if (h := _find(x, str(q), errors, "verifier quote"))]
+    if verdict == "APPROVE" and not quotes:
+        _fail_or_drop(errors or ["APPROVE must cite the paper text relied on, verbatim"], final)
+        verdict = "REVISE"          # an approval that cites nothing checkable is not an approval
+    g = x.sealed(f"gen:{cid}.{r}") or {}
+    return {"verdict": verdict, "required_changes": str(obj.get("required_changes") or "")[:3000],
+            "notes": str(obj.get("notes") or "")[:2000], "quotes": quotes, "script_sha256": g.get("script_sha256", "")}
+
+
+def _seal_report(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
+    return {"summary_md": str(obj.get("summary_md") or "")[:8000]}
+
+
+VALIDATORS = {"lens": _seal_lens, "critic": _seal_critic, "plan": _seal_plan, "bind": _seal_bind,
+              "gen": _seal_gen, "verify": _seal_verify, "report": _seal_report}
+_EMPTY = {"lens": {"concerns": [], "dropped": []}, "critic": {"reviews": []},
+          "plan": {"checks": [], "central_claims": [], "dropped": [], "repo_is_authors": False, "repo_note": ""},
+          "bind": {"identity": {"established": False, "reason": "malformed binding answer"}, "command": "",
+                   "metric": "", "seed_flag": "", "runs": 1, "prepare": ""},
+          "gen": {"refused": True, "notes": "malformed answer"},
+          "verify": {"verdict": "UNCHECKABLE", "required_changes": "", "notes": "malformed verifier answer",
+                     "quotes": [], "script_sha256": ""},
+          "report": {"summary_md": ""}}
+
+
+def try_(cfg: state.Config, pid: str, tid: str, script_path: str) -> dict:
+    """A generator's draft run, counted against its budget and shown to its verifier."""
+    root = state.pdir(cfg, pid)
+    if not tid.startswith("gen:") or not (root / "tasks" / f"{_safe(tid)}.md").exists() \
+            or _sealed(root, tid) is not None:
+        return {"error": f"'{tid}' is not an open script-writing task"}
+    cid = tid.split(":")[1].rsplit(".", 1)[0]
+    cdir = state.pdir(cfg, pid) / "checks" / cid
+    n = len((cdir / "tries.jsonl").read_text(encoding="utf-8").splitlines()) if (cdir / "tries.jsonl").exists() else 0
+    if n >= cfg.max_tries * (1 + cfg.max_revisions):
+        return {"error": f"the draft budget ({cfg.max_tries} per round) is spent"}
+    script = Path(script_path).read_text(encoding="utf-8")
+    res = execute.try_script(cfg, pid, cid, script)
+    state.append_jsonl(cdir / "tries.jsonl", {"task": tid, "script_sha256": state.sha256(script), **res})
+    return res

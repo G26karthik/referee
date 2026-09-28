@@ -1,258 +1,130 @@
-"""Project state on the local filesystem: one directory per project, an
-append-only research log, and typed artifact files. This is the shared memory
-the Director and every stage read; it stores ARTIFACTS, never transcripts.
+"""Configuration, project paths, JSON on disk and the project lock.
+
+ponytail: one host, one operator, a few papers per run. State is plain files under
+`projects/<pid>/`; a second host would need a real store and a distributed lock.
 """
 from __future__ import annotations
 
-import contextlib
+import hashlib
 import json
 import os
 import re
 import sys
-import tempfile
-import threading
 import time
-import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
-from .config import Config
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def _flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+@dataclass
+class Config:
+    projects: Path = field(default_factory=lambda: Path(os.environ.get("SH_PROJECTS_DIR") or ROOT / "projects"))
+    python: str = field(default_factory=lambda: os.environ.get("SH_PYTHON") or sys.executable)
+    # Execution gates: each is an explicit per-invocation opt-in (invariant 4).
+    allow_repo_exec: bool = field(default_factory=lambda: _flag("SH_ALLOW_REPO_EXEC"))
+    allow_script_exec: bool = field(default_factory=lambda: _flag("SH_ALLOW_SCRIPT_EXEC") or _flag(
+        "SH_ALLOW_CERTIFICATE_EXEC") or _flag("SH_ALLOW_REIMPLEMENTATION_EXEC"))
+    allow_install: bool = field(default_factory=lambda: _flag("SH_ALLOW_INSTALL"))
+    allow_network: bool = field(default_factory=lambda: _flag("SH_ALLOW_NETWORK", "1"))
+    allow_source_search: bool = field(default_factory=lambda: _flag("SH_ALLOW_SOURCE_SEARCH"))
+    # ponytail: token caps sized for a few papers per run; raise per invocation via env.
+    max_checks: int = field(default_factory=lambda: _int("SH_MAX_CHECKS", 3))
+    max_revisions: int = field(default_factory=lambda: _int("SH_MAX_REVISIONS", 1))
+    max_tries: int = field(default_factory=lambda: _int("SH_MAX_TRIES", 3))
+    # ponytail: a paper stating more runs than this is refused, never downscaled.
+    max_runs: int = field(default_factory=lambda: _int("SH_MAX_RUNS", 100))
+    run_timeout_s: int = field(default_factory=lambda: _int("SH_RUN_TIMEOUT_S", 3600))
+    install_timeout_s: int = field(default_factory=lambda: _int("SH_INSTALL_TIMEOUT_S", 3600))
+    try_timeout_s: int = field(default_factory=lambda: _int("SH_TRY_TIMEOUT_S", 300))
+    # ponytail: 30k chars per Read call keeps dense text (~1.8 chars/token) under the Read
+    # tool's 25k-token cap.
+    read_chunk: int = 30_000
+
+
+def now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def slug(s: str, n: int = 40) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-")[:n].strip("-") or "paper"
+
+
+def pdir(cfg: Config, pid: str) -> Path:
+    return cfg.projects / pid
+
+
+def sha256(data: bytes | str) -> str:
+    return hashlib.sha256(data.encode("utf-8") if isinstance(data, str) else data).hexdigest()
+
+
+def read_json(path: Path, default=None):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path: Path, obj) -> None:
+    """Atomic: a reader never sees half a file."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def append_jsonl(path: Path, obj) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": now(), **obj}, ensure_ascii=False) + "\n")
+
 
 if sys.platform == "win32":
     import msvcrt
-    import time as _time
 
-    def _lock_file(f) -> None:
-        # msvcrt.locking's LK_LOCK only retries internally for ~10s before raising OSError
-        # (errno 36 / EDEADLK) -- it does NOT block indefinitely like POSIX
-        # fcntl.flock(LOCK_EX). Retry-wrap it so a longer-held lock is waited out rather
-        # than crashing the waiter. EDEADLK here is not a reliable same-thread deadlock
-        # signal (ordinary cross-thread contention past ~9s raises the identical errno),
-        # so re-raising on it would misreport ordinary contention as a bug; the real fix
-        # for self-deadlock is the reentrancy in `project_lock` below.
-        while True:
+    def _lock(f) -> None:
+        while True:          # LK_LOCK gives up after ~10s; wait out a longer holder
             f.seek(0)
             try:
-                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
-                return
+                return msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
             except OSError:
-                _time.sleep(0.05)
+                time.sleep(0.05)
 
-    def _unlock_file(f) -> None:
+    def _unlock(f) -> None:
         f.seek(0)
         msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
 else:
     import fcntl
 
-    def _lock_file(f) -> None:
+    def _lock(f) -> None:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
 
-    def _unlock_file(f) -> None:
+    def _unlock(f) -> None:
         fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
-SUBDIRS = [
-    "paper",     # S1 — the ingested PaperDoc
-    "audit",     # S2 — prompts in, one lens report per lens out
-    "runs",      # S3 — checkout, probe source, probe results
-    "reports",   # S4 — the rendered evaluation report
-]
 
-
-def now() -> str:
-    """The one UTC timestamp in this harness. One format, one source of time."""
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-def slugify(s: str, n: int = 28) -> str:
-    s = re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-")
-    return (s[:n] or "project").strip("-")
-
-
-def project_dir(cfg: Config, pid: str) -> Path:
-    return cfg.projects_dir / pid
-
-
-def control_dir(root: Path) -> Path:
-    """The trusted control-state directory for one case: `<project_root>/control/`.
-    Structurally separate from `runs/<pid>/`, which IS bind-mounted into every execution
-    that runs untrusted code -- `control/` must never be reachable from inside a
-    container or subprocess, so a later invocation can trust what it reads back here."""
-    return Path(root) / "control"
-
-
-def new_project_id(direction: str) -> str:
-    date = time.strftime("%Y%m%d", time.gmtime())
-    return f"{date}-{slugify(direction, 24)}-{uuid.uuid4().hex[:6]}"
-
-
-def create_project(cfg: Config, repo_url: str, direction: str, pid: str | None = None) -> str:
-    """Create one case directory. `pid` is explicit for the reviewer pipeline, where a
-    case is identified by its paper file rather than by a date-stamped slug."""
-    pid = pid or new_project_id(direction)
-    root = project_dir(cfg, pid)
-    root.mkdir(parents=True, exist_ok=False)
-    for d in SUBDIRS:
-        (root / d).mkdir(parents=True, exist_ok=True)
-    meta = {
-        "id": pid,
-        "repo_url": repo_url,
-        "direction": direction,
-        "phase": "created",
-        "status": "active",
-        "created_at": now(),
-        "updated_at": now(),
-        "cost_usd": 0.0,
-    }
-    save_meta(cfg, pid, meta)
-    (root / "research_log.jsonl").touch()
-    return pid
-
-
-# Per-thread re-entrancy depth, keyed by paper id. `project_lock` is held for the whole
-# body of `controller.step`, and a phase handler running inside that body is entitled to
-# call `add_cost`/`append_log` itself. The OS-level lock below is not reentrant (a second
-# acquire by the same thread would block on a lock it already holds), so a thread that
-# already holds this case's lock must skip re-acquiring it. `threading.local` scopes the
-# counter to this thread alone: a DIFFERENT thread or process still contends for the
-# real OS lock, exactly as before.
-_reentrancy = threading.local()
-
-
-@contextlib.contextmanager
-def project_lock(cfg: Config, pid: str):
-    """Exclusive OS-level advisory lock over one case's state. Not a lock-file-EXISTS
-    convention -- an actual `msvcrt`/`fcntl` lock on an open file handle, released
-    automatically by the OS if the holding process dies, so a crash can never leave a
-    case permanently unlockable. Every phase transition holds this for its whole body,
-    so two invocations racing on the same paper id serialize instead of interleaving
-    writes to any case-state file.
-
-    Reentrant per THREAD per CASE: a call already holding this case's lock on this
-    thread re-enters without touching the OS lock. A different thread, process, or the
-    same thread on a DIFFERENT case still takes the real lock and blocks normally.
-    """
-    depths = getattr(_reentrancy, "depths", None)
-    if depths is None:
-        depths = _reentrancy.depths = {}
-    if depths.get(pid, 0) > 0:
-        depths[pid] += 1
-        try:
-            yield
-        finally:
-            depths[pid] -= 1
-        return
-
-    root = project_dir(cfg, pid)
-    root.mkdir(parents=True, exist_ok=True)
-    lock_path = root / ".lock"
-    lock_path.touch(exist_ok=True)
-    with open(lock_path, "r+b") as f:
-        _lock_file(f)
-        depths[pid] = 1
-        try:
-            yield
-        finally:
-            depths[pid] -= 1
-            _unlock_file(f)
-
-
-def load_meta(cfg: Config, pid: str) -> dict[str, Any]:
-    return json.loads((project_dir(cfg, pid) / "project.json").read_text(encoding="utf-8"))
-
-
-def save_meta(cfg: Config, pid: str, meta: dict[str, Any]) -> None:
-    meta["updated_at"] = now()
-    write_json(project_dir(cfg, pid) / "project.json", meta)
-
-
-def set_phase(cfg: Config, pid: str, phase: str) -> None:
-    meta = load_meta(cfg, pid)
-    meta["phase"] = phase
-    save_meta(cfg, pid, meta)
-
-
-def add_cost(cfg: Config, pid: str, cost_usd: float) -> None:
-    with project_lock(cfg, pid):
-        meta = load_meta(cfg, pid)
-        meta["cost_usd"] = round(float(meta.get("cost_usd", 0.0)) + float(cost_usd or 0.0), 6)
-        save_meta(cfg, pid, meta)
-
-
-# In-process only: several lens/grade calls run concurrently on threads within one
-# controller invocation, and a plain `open(..., "a").write(...)` from two threads at once
-# can interleave two records into one unparseable line. Cross-process writers still
-# serialize through `project_lock`'s OS-level lock.
-_log_lock = threading.Lock()
-
-
-def append_log(
-    cfg: Config,
-    pid: str,
-    *,
-    artifact_type: str,
-    phase: str,
-    headers: dict[str, Any] | None = None,
-    path: str | None = None,
-    cost_usd: float = 0.0,
-) -> None:
-    """Append one artifact record to research_log.jsonl (the Director reads headers)."""
-    rec = {
-        "ts": now(),
-        "type": artifact_type,
-        "phase": phase,
-        "headers": headers or {},
-        "path": path,
-        "cost_usd": round(float(cost_usd or 0.0), 6),
-    }
-    with _log_lock:
-        with (project_dir(cfg, pid) / "research_log.jsonl").open("a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    if cost_usd:
-        add_cost(cfg, pid, cost_usd)
-
-
-def write_json(path: Path, obj: Any) -> str:
-    """Write JSON atomically: build the full content, fsync it to a temp file in the
-    SAME directory as `path`, then `os.replace` it into place (atomic on both POSIX and
-    Windows when source and destination share a volume, which they always do here). A
-    process killed before `os.replace` leaves `path` exactly as it was; killed during or
-    after leaves it exactly as the new write intended -- no window for a reader to
-    observe a truncated file."""
+@contextmanager
+def lock(path: Path):
+    """An OS lock on `path`: parallel seals of one paper serialize here."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(json.dumps(obj, indent=2, default=str, ensure_ascii=False))
-            f.flush()
-            os.fsync(f.fileno())
-        for attempt in range(8):       # Windows: a sync client/AV briefly holding the target
-            try:
-                os.replace(tmp_name, path)
-                break
-            except PermissionError:
-                if attempt == 7:
-                    raise
-                time.sleep(0.25 * (attempt + 1))
-    except BaseException:
+    with path.open("a+b") as f:
+        _lock(f)
         try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
-    return str(path)
-
-
-def read_json(path: Path) -> Any:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
-
-
-def list_projects(cfg: Config) -> list[dict[str, Any]]:
-    out = []
-    if not cfg.projects_dir.exists():
-        return out
-    for d in sorted(cfg.projects_dir.iterdir()):
-        meta = d / "project.json"
-        if meta.exists():
-            out.append(json.loads(meta.read_text(encoding="utf-8")))
-    return out
+            yield
+        finally:
+            _unlock(f)
