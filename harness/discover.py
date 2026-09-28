@@ -229,6 +229,11 @@ _TEMPLATE_BY_DISCOVERY_KIND = {
                       "A number whose definition cannot be recovered from the paper "
                       "cannot be checked by anyone."),
     "UNCLASSIFIED": _DEFAULT,
+    "MATHEMATICAL_BOUND": ("Does the stated result hold on concrete admissible instances, and "
+                           "does each checked step of its printed proof hold?",
+                           "A mathematical result the paper's conclusions rest on is only as "
+                           "strong as its proof. Explicit instances can refute the statement "
+                           "or a proof step; they can never prove it."),
 }
 _QUESTIONABLE = ("CONFIRMED_FINDING", "PLAUSIBLE_CONCERN", "OPEN_QUESTION", "")
 _MATERIALITY = {"CONFIRMED_FINDING": "CENTRAL", "PLAUSIBLE_CONCERN": "SUPPORTING",
@@ -498,6 +503,113 @@ def _add(objects: list, taken: set, obj: DiscoveredObject) -> DiscoveredObject:
     return obj
 
 
+# FORMAL STATEMENTS — the paper's own numbered results, found from structure alone. A
+# statement HEADER is the label, its number, an optional short parenthetical, then a full
+# stop and a capitalised sentence, at the START of a sentence: "… eigenvalues. Theorem
+# 3.1. For any u" is one; "given in Theorem 3.1. Then" and "Theorem 3.1 yields" are
+# citations. Definitions state nothing checkable and are excluded.
+_FORMAL_HEAD = re.compile(
+    r"\b(Theorem|Proposition|Lemma|Corollary|Result)\s+([A-Z]?\d+(?:\.\d+)*)"
+    r"\s*(?:\([^()]{0,120}\))?\s*\.\s+(?=[A-Z(\u2200-\u22ff])")
+_FORMAL_END = re.compile(
+    r"\b(?:Proof\b|Remark\s+\d|Definition\s+\d|Example\s+\d|Theorem\s+\d|Lemma\s+\d"
+    r"|Proposition\s+\d|Corollary\s+\d|Assumption\s+\d)")
+_SUMMARY_TITLE = re.compile(r"abstract|introduction|contribution|conclusion|summary|overview",
+                            re.I)
+_FORMAL_MAX_CHARS = 1200
+
+
+def _statement_head(text: str, start: int) -> bool:
+    before = text[:start].rstrip()
+    return not before or before[-1] in ".:;)]\n" or before.endswith("\u25a1")
+
+
+def formal_statements(doc: PaperDoc) -> list[dict]:
+    """[{label, section_idx, text, context}] — the FIRST occurrence of every numbered
+    theorem/proposition/lemma/corollary/result the paper states, in paper order. A later
+    restatement (an appendix repeating the statement before its proof) is not a second
+    statement."""
+    out, seen = [], set()
+    for sec in doc.sections:
+        title = (sec.title or "").strip().lower()
+        if title.startswith(_NOT_THE_PAPER):
+            continue
+        text = sec.text or ""
+        for m in _FORMAL_HEAD.finditer(text):
+            label = f"{m.group(1)} {m.group(2)}"
+            if label in seen or not _statement_head(text, m.start()):
+                continue
+            body_start = m.end()
+            nxt = _FORMAL_END.search(text, body_start)
+            end = min(nxt.start() if nxt else len(text), body_start + _FORMAL_MAX_CHARS)
+            body = " ".join(text[m.start():end].split())
+            if len(body) - len(label) < 40:
+                continue
+            seen.add(label)
+            out.append({"label": label, "section_idx": sec.section_idx, "text": body,
+                        "context": " ".join(text[max(0, m.start() - 80):m.start()].split())})
+    return out
+
+
+_NUMBERED_TITLE = re.compile(r"^\s*(\d+|[A-Z](?=\.))((?:\.\d+)*)\.?\s+[A-Za-z]")
+
+
+def _summary_sections(doc: PaperDoc) -> list:
+    """The abstract, introduction, contributions and conclusion — plus the sections a PDF
+    parse split them into, whose titles are running headers or sentence fragments rather
+    than a new numbered heading."""
+    out, inside = [], False
+    abstract = decide.abstract_section_idx(doc)
+    for sec in doc.sections:
+        title = sec.title or ""
+        if _SUMMARY_TITLE.search(title) or sec.section_idx == abstract:
+            inside = True
+        elif _NUMBERED_TITLE.match(title) or title.strip().lower().startswith(_NOT_THE_PAPER):
+            inside = False
+        if inside:
+            out.append(sec)
+    return out
+
+
+def _section_numbers(doc: PaperDoc, section_idx: int) -> list[str]:
+    """The numbered heading a section sits under ("3.1") and its parents ("3"), found by
+    walking back past unnumbered fragments."""
+    for sec in reversed([s for s in doc.sections if s.section_idx <= section_idx]):
+        m = _NUMBERED_TITLE.match(sec.title or "")
+        if m:
+            parts = (m.group(1) + m.group(2)).split(".")
+            return [".".join(parts[:i]) for i in range(len(parts), 0, -1)]
+    return []
+
+
+def _cited_in_summary(doc: PaperDoc, label: str, own_section: int, own_text: str) -> bool:
+    """Is this statement cited by the paper's own summary — by its label, or by the
+    numbered section it sits in ("Section 3.1") — outside the statement itself? Structure,
+    not a model: the paper's own summary says which results it rests on."""
+    pats = [re.compile(rf"\b{re.escape(label)}(?![\d.]*\d)")] + [
+        re.compile(rf"\bSec(?:tion|\.)?s?\s+{re.escape(n)}(?![\d.]*\d)")
+        for n in _section_numbers(doc, own_section)]
+    for sec in _summary_sections(doc):
+        text = " ".join((sec.text or "").split())
+        if sec.section_idx == own_section:
+            text = text.replace(own_text, " ")
+        if any(p.search(text) for p in pats):
+            return True
+    return False
+
+
+_FORMAL_RANK = {"Theorem": 0, "Result": 0, "Proposition": 1, "Corollary": 2, "Lemma": 3}
+
+
+def _mint_statement(doc: PaperDoc, st: dict) -> ClaimRef:
+    """An address for a statement, preferring its own words; a verbatim restatement
+    elsewhere makes those ambiguous, so the words just before it disambiguate."""
+    ref = locate.mint(doc, st["text"][:300])
+    if not ref.resolved and st["context"]:
+        ref = locate.mint(doc, (st["context"] + " " + st["text"])[:400])
+    return ref
+
+
 def prose_compositions(doc: PaperDoc) -> list[ClaimRef]:
     """Every prose span stating a composition the harness can re-evaluate, e.g.
     '58 x 5 x 10 = 2,900': the arithmetic is checkable without running anything."""
@@ -518,7 +630,8 @@ def prose_compositions(doc: PaperDoc) -> list[ClaimRef]:
 def discovered_objects(doc: PaperDoc, findings: list[Finding],
                        questions: list[ReviewQuestion] | None = None, *,
                        repo_available: bool | None = None,
-                       specification_complete: bool = False) -> tuple[list[DiscoveredObject], dict]:
+                       specification_complete: bool = False,
+                       max_formal: int = 10) -> tuple[list[DiscoveredObject], dict]:
     """(objects, extraction_coverage) for one paper. Deterministic, consults no model,
     runs before any execution."""
     questions = questions or []
@@ -600,7 +713,32 @@ def discovered_objects(doc: PaperDoc, findings: list[Finding],
         if ref.resolved:
             claimed_refs.add(ref.ref)
 
-    # (4) the artifact itself is a claim the paper makes
+    # (4) the paper's own numbered results — positive verification targets whether or not a
+    # lens questioned them, so a theory paper is never reduced to its reviewers' concerns.
+    # ponytail: at most `max_formal` (SH_MAX_FORMAL_TARGETS) — summary-cited first, then
+    # theorem > proposition > corollary > lemma, then paper order; each costs two Sonnet
+    # tasks. The rest are counted in coverage (`formal_statements_found`), never hidden.
+    statements = formal_statements(doc)
+    ranked = sorted(statements, key=lambda st: (
+        not _cited_in_summary(doc, st["label"], st["section_idx"], st["text"]),
+        _FORMAL_RANK.get(st["label"].split()[0], 4), statements.index(st)))
+    targeted = 0
+    for st in ranked:
+        if targeted >= max(0, max_formal):
+            break
+        ref = _mint_statement(doc, st)
+        if not ref.resolved or ref.ref in claimed_refs:
+            continue
+        claimed_refs.add(ref.ref)
+        central = _cited_in_summary(doc, st["label"], st["section_idx"], st["text"])
+        _add(objects, taken, _object(
+            "SCIENTIFIC_CLAIM", ref, claim_text=st["text"], n=len(objects),
+            repo_available=repo_available, taken=taken, question_kind="MATHEMATICAL_BOUND",
+            in_abstract=central, anchored_by_any=True, material_abstract_idx=material_abstract_idx,
+            materiality_doc=doc, specification_complete=specification_complete))
+        targeted += 1
+
+    # (5) the artifact itself is a claim the paper makes
     if repo_available:
         _add(objects, taken, _object(
             "IMPLEMENTATION_CLAIM", None, n=len(objects), repo_available=True, taken=taken,
@@ -616,6 +754,8 @@ def discovered_objects(doc: PaperDoc, findings: list[Finding],
         "prose_compositions": sum(1 for o in objects if o.kind == "REPRODUCTION_TARGET"),
         "sections": len(doc.sections), "equations_extracted": len(doc.equations),
         "objects_discovered": len(objects),
+        "formal_statements_found": len(statements),
+        "formal_statements_targeted": targeted,
         "objects_addressable": sum(1 for o in objects if o.harness_addressable),
         "findings_with_resolved_ref": sum(
             1 for f in findings if locate.address(doc, f.evidence_ref, f.evidence_quote).resolved),
@@ -918,7 +1058,7 @@ def run(cfg, pid: str, *, investigation_open: bool = True) -> dict:
     prior = load(cfg, pid)
     prior_outcomes = {o.target_id: o for o in prior.outcomes} if prior else None
     ts = build(pid, doc, findings, investigation_open=investigation_open,
-              prior_outcomes=prior_outcomes)
+              prior_outcomes=prior_outcomes, max_formal=cfg.max_formal_targets)
     path = targets_path(cfg, pid)
     state.write_json(path, ts.model_dump())
 
@@ -945,7 +1085,8 @@ def run(cfg, pid: str, *, investigation_open: bool = True) -> dict:
 
 def build(pid: str, doc: PaperDoc, findings: list[Finding], *,
          investigation_open: bool = True,
-         prior_outcomes: dict[str, TargetOutcome] | None = None) -> TargetSet:
+         prior_outcomes: dict[str, TargetOutcome] | None = None,
+         max_formal: int = 10) -> TargetSet:
     """The whole target set for one paper. Pure with respect to what is on disk -- takes
     `findings` directly rather than loading them. `investigation_open=False` means a
     material failure is already established, so `decide.plan` refuses every executable
@@ -966,7 +1107,7 @@ def build(pid: str, doc: PaperDoc, findings: list[Finding], *,
     readiness = reimplementation_readiness(doc)
     objects, coverage = discovered_objects(
         doc, findings, qs, repo_available=repo_available,
-        specification_complete=readiness.established)
+        specification_complete=readiness.established, max_formal=max_formal)
 
     ordered = decide.order(objects, artifact_available=repo_available)
 

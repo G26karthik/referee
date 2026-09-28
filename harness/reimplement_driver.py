@@ -157,7 +157,8 @@ def persist_verification_brief(cfg: Config, pid: str, target_id: str,
     `_verification_brief` against the generator's own proposed script/bindings/replication,
     so the verifier is shown exactly what was proposed and nothing this harness invented."""
     script, bindings, _notes, meta = parse_reimplementation_report(generated_raw)
-    brief = _verification_brief(readiness, script, bindings, meta.get("replication"))
+    brief = _verification_brief(readiness, script, bindings, meta.get("replication"),
+                                released=load_released(cfg, pid, target_id))
     path = _briefs_dir(cfg, pid) / f"reimpl_verify__{target_id}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(brief, encoding="utf-8")
@@ -165,7 +166,16 @@ def persist_verification_brief(cfg: Config, pid: str, target_id: str,
 
 
 def _verification_brief(readiness: ReimplementationReadiness, script: str,
-                        bindings: list[dict], replication: dict | None = None) -> str:
+                        bindings: list[dict], replication: dict | None = None,
+                        released: list[dict] | None = None) -> str:
+    rel = released_table(list(released or []))
+    released_block = (
+        "\n=== THE AUTHORS' RELEASED FILES (the script's working directory is their pinned "
+        "checkout) ===\n" + rel + "\nIf the script recomputes the claim from these files, "
+        "check it opens the right file(s) and computes the paper's stated quantity from them "
+        "without altering, filtering beyond the paper's own stated procedure, or regenerating "
+        "the data. Only in that case may \"training\" be absent from approved_kinds: nothing "
+        "is trained.\n") if rel else ""
     return f"""{RP.SECURITY}
 
 You are the independent verifier, not the generator. Check the proposed reconstruction
@@ -178,6 +188,7 @@ absent, smaller, or quotes a sentence that does not state it.
 === PAPER INGREDIENTS ===
 {ingredients_table(readiness)}
 
+{released_block}
 === PROPOSED SCRIPT ===
 ```python
 {script}
@@ -196,7 +207,89 @@ Print only JSON:
 """
 
 
-def _parse_verification(text: str) -> tuple[bool, str]:
+# RELEASED DATA — the authors' own files in the pinned checkout. A reconstruction that
+# recomputes a printed quantity FROM them is a RELEASED_DATA_RECOMPUTATION: its dataset is
+# the authors' own, not an invention, and nothing is trained, so "training" is exempt —
+# but only when the harness itself re-finds a released path inside the dataset binding.
+_DATA_SUFFIXES = (".csv", ".tsv", ".json", ".jsonl", ".parquet", ".npy", ".npz", ".pkl",
+                  ".h5", ".hdf5", ".xlsx", ".feather", ".arrow")
+# ponytail: 60 files / 2 GB per file hashed; a release beyond that lists only the first 60
+# data files (sorted) — raise both if a real paper ships more and needs a later one.
+_MAX_RELEASED, _MAX_HASH_BYTES = 60, 2 << 30
+
+
+def released_files(checkout: Path) -> list[dict]:
+    """[{path, bytes, sha256, first_line}] for the data files of a checkout, paths relative
+    to it with forward slashes. Deterministic, read-only, never raises."""
+    out: list[dict] = []
+    try:
+        root = Path(checkout)
+        files = sorted(f for f in root.rglob("*")
+                       if f.is_file() and f.suffix.lower() in _DATA_SUFFIXES
+                       and ".git" not in f.relative_to(root).parts)
+    except OSError:
+        return out
+    for f in files[:_MAX_RELEASED]:
+        try:
+            size = f.stat().st_size
+            if size > _MAX_HASH_BYTES:
+                continue
+            h = hashlib.sha256()
+            with f.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            first = ""
+            if f.suffix.lower() in (".csv", ".tsv", ".jsonl", ".json"):
+                with f.open("r", encoding="utf-8", errors="replace") as fh:
+                    first = fh.readline().strip()[:300]
+            out.append({"path": f.relative_to(root).as_posix(), "bytes": size,
+                        "sha256": h.hexdigest(), "first_line": first})
+        except OSError:
+            continue
+    return out
+
+
+def released_manifest_path(cfg: Config, pid: str, target_id: str) -> Path:
+    return _paths(cfg, pid, target_id)[0].with_suffix(".inputs.json")
+
+
+def load_released(cfg: Config, pid: str, target_id: str) -> list[dict]:
+    path = released_manifest_path(cfg, pid, target_id)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else []
+        return [d for d in data if isinstance(d, dict) and d.get("path") and d.get("sha256")]
+    except (OSError, ValueError):
+        return []
+
+
+def released_used(script: str, bindings: list[dict], released: list[dict]) -> list[str]:
+    """"path@sha256:<hex>" for every released file the DATASET binding opens — the path must
+    occur both in the script and in the dataset binding's own quote (whose presence in the
+    script `conformance` verifies separately)."""
+    ds = next((b for b in bindings if b.get("kind") == "dataset"), None) or {}
+    quote = str(ds.get("impl_quote") or "")
+    return [f"{r['path']}@sha256:{r['sha256']}" for r in released
+            if r["path"] in script and r["path"] in quote]
+
+
+def required_kinds(script: str, bindings: list[dict], released: list[dict]) -> tuple[str, ...]:
+    if released_used(script, bindings, released):
+        return tuple(k for k in REQUIRED_KINDS if k != "training")
+    return REQUIRED_KINDS
+
+
+def released_table(released: list[dict]) -> str:
+    if not released:
+        return ""
+    rows = ["| path (relative to the working directory) | bytes | sha256 | first line |",
+            "|---|---|---|---|"]
+    for r in released:
+        first = (r.get("first_line") or "").replace("|", "/")[:160]
+        rows.append(f"| `{r['path']}` | {r['bytes']} | {r['sha256'][:16]} | {first} |")
+    return "\n".join(rows)
+
+
+def _parse_verification(text: str, required: tuple[str, ...] = REQUIRED_KINDS) -> tuple[bool, str]:
     start, end = (text or "").find("{"), (text or "").rfind("}")
     if start < 0 or end <= start:
         return False, "verifier returned no JSON object"
@@ -205,7 +298,7 @@ def _parse_verification(text: str) -> tuple[bool, str]:
     except json.JSONDecodeError as e:
         return False, f"verifier JSON invalid: {e}"
     kinds = {str(x) for x in (data.get("approved_kinds") or [])}
-    approved = bool(data.get("approved")) and kinds == set(REQUIRED_KINDS)
+    approved = bool(data.get("approved")) and set(required) <= kinds
     return approved, str(data.get("notes") or "")
 
 
@@ -225,9 +318,11 @@ def ingredients_table(readiness: ReimplementationReadiness) -> str:
 
 
 def build_brief(readiness: ReimplementationReadiness, *, paper_title: str = "", claim: str = "",
-                table_ref: str = "", claimed_cell_value: str = "", paper_text: str = "") -> str:
+                table_ref: str = "", claimed_cell_value: str = "", paper_text: str = "",
+                released: list[dict] | None = None) -> str:
     return RP.build(paper_title, claim, table_ref, claimed_cell_value,
-                    ingredients_table(readiness), paper_text)
+                    ingredients_table(readiness), paper_text,
+                    released_table=released_table(list(released or []))).replace("\x00", "")
 
 
 def parse_reimplementation_report(text: str) -> tuple[str, list[dict], str, dict]:
@@ -262,7 +357,8 @@ def parse_reimplementation_report(text: str) -> tuple[str, list[dict], str, dict
 
 def conformance(readiness: ReimplementationReadiness, script: str,
                 bindings: list[dict], *, generated_by: str = "",
-                verified_by: str = "") -> ReimplementationConformance:
+                verified_by: str = "",
+                released: list[dict] | None = None) -> ReimplementationConformance:
     """Pure. Pairs each REQUIRED ingredient's PAPER locator (from `readiness`, already
     established) with the driver's IMPLEMENTATION locator, and — the harness's own check,
     never the delegate's — verifies `impl_quote` occurs verbatim in `script`.
@@ -276,7 +372,9 @@ def conformance(readiness: ReimplementationReadiness, script: str,
     driver_by_kind = {b.get("kind"): b for b in bindings}
     out: list[ReimplementationBinding] = []
     unbound: list[str] = []
-    for kind in REQUIRED_KINDS:
+    released = list(released or [])
+    used = released_used(script, bindings, released)
+    for kind in required_kinds(script, bindings, released):
         paper = by_kind.get(kind)
         paper_ref = paper.ref if paper else ""
         paper_quote = paper.quote if paper else ""
@@ -308,10 +406,13 @@ def conformance(readiness: ReimplementationReadiness, script: str,
                   "verifiably realize " + ("this ingredient" if len(unbound) == 1 else
                                             "these ingredients") + ", so no verdict may be "
                   "drawn from running it")
+    if used:
+        reason += ("; it recomputes from the authors' released file(s) " + ", ".join(used)
+                   + ", so no training ingredient applies")
     return ReimplementationConformance(
         established=established, bindings=out, unbound=unbound, reason=reason,
         generated_by=generator, verified_by=verifier,
-        independently_verified=independent)
+        independently_verified=independent, released_inputs=used)
 
 
 def _replication(conf: ReimplementationConformance, meta: dict) -> None:
@@ -357,7 +458,7 @@ def accept_reimplementation(cfg: Config, pid: str, target_id: str, raw: str,
     this one."""
     script, bindings, _notes, meta = parse_reimplementation_report(raw)
     conf = conformance(readiness, script, bindings, generated_by=generated_by,
-                       verified_by=reviewer)
+                       verified_by=reviewer, released=load_released(cfg, pid, target_id))
     _replication(conf, meta)
     prov = delegation.provenance_record(mode=mode, reviewer=reviewer, tool_policy=tool_policy)
     return _seal(cfg, pid, target_id, script, conf, {

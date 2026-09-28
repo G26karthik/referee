@@ -141,6 +141,12 @@ _REASON = {
         "available.",
 }
 
+_UNCHECKED_CENTRAL_REASON = (
+    "a central claim of the paper was identified and no admissible check of it completed "
+    "(its route was refused, deferred, gated off or is still pending). It is handed over "
+    "open. Nothing about the paper follows, and this is NOT a clean paper: it was not "
+    "verified.")
+
 _ESTABLISHED_NON_MATERIAL_REASON = (
     "no material failure was established, and this review did establish a defect: it sits "
     "on a target no central scientific claim was established to depend on, so it weakens "
@@ -179,7 +185,8 @@ def blockers_from(dispositions, centralities) -> tuple[str, ...]:
 def derive_disposition(*, review_complete: bool = True, claim_status: str = "NOT_VERIFIED",
                        basis: str = "NONE", central_blockers: tuple[str, ...] = (),
                        central_unresolved: int = 0, counted_major: int = 0,
-                       established_non_material: int = 0) -> tuple[str, str, str]:
+                       established_non_material: int = 0,
+                       central_unchecked: int = 0) -> tuple[str, str, str]:
     """(disposition, basis, reason). Total over its inputs and deterministic.
 
     Precedence: PROVEN (an established defect) outranks OPEN (unresolved central claim)
@@ -202,6 +209,10 @@ def derive_disposition(*, review_complete: bool = True, claim_status: str = "NOT
         return "PASS_TO_HUMAN_CONCERNS", "NONE", _ESTABLISHED_NON_MATERIAL_REASON
     if central_unresolved > 0:
         return "PASS_TO_HUMAN_UNRESOLVED", "NONE", _REASON["PASS_TO_HUMAN_UNRESOLVED"]
+    # A central claim nobody checked must never fold into CLEAN: "no concern found" and
+    # "not looked at" are different statements to hand a referee.
+    if central_unchecked > 0:
+        return "PASS_TO_HUMAN_UNRESOLVED", "NONE", _UNCHECKED_CENTRAL_REASON
     if counted_major > 0:
         return "PASS_TO_HUMAN_CONCERNS", "NONE", _REASON["PASS_TO_HUMAN_CONCERNS"]
     return "PASS_TO_HUMAN_CLEAN", "NONE", _REASON["PASS_TO_HUMAN_CLEAN"]
@@ -744,6 +755,10 @@ def material_target_failure(objects, outcomes):
     `unjoinable_established_failures`."""
     for o in (outcomes or []):
         if not getattr(o, "establishes_failure", False):
+            continue
+        # A violated PROOF STEP shows the printed proof invalid, not the statement false:
+        # an established defect of the paper, never grounds to stop it (invariant 7).
+        if getattr(o, "evidence_kind", "") == "PROOF_AUDIT":
             continue
         if is_material(basis_for_target(getattr(o, "target_id", ""), objects) or "NONE"):
             return o

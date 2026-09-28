@@ -84,8 +84,24 @@ Print ONLY this JSON to standard output:
  "notes": "anything you could not bind without inventing a detail, or '' if none"}"""
 
 
+RELEASED = """\
+The authors released the files below in their pinned checkout, and your script will run
+with that checkout as its working directory. If the claim is a quantity computed FROM these
+files (a count, a split, a rate, an accuracy/AUROC over released labels or predictions),
+compute it from them by the relative path shown — a RELEASED-DATA RECOMPUTATION. Then:
+  - bind "dataset" to the line that opens the released file; its impl_quote must contain
+    the file's relative path exactly as listed;
+  - "training" does not apply (nothing is trained; the released files already carry the
+    outputs) and may be left unbound — ONLY in this case;
+  - apply only the selection/filtering/metric the paper itself states; never regenerate,
+    edit, resample or fabricate released data. Stdlib `csv`/`json` suffice for most files.
+If the claim cannot be computed from these files, ignore this section."""
+
+
 def build(paper_title: str, claim: str, table_ref: str, claimed_cell_value: str,
-          ingredients_table: str, paper_text: str) -> str:
+          ingredients_table: str, paper_text: str, released_table: str = "") -> str:
+    released = (f"\n=== THE AUTHORS' RELEASED FILES ===\n{RELEASED}\n\n{released_table}\n"
+                if released_table else "")
     return f"""{SECURITY}
 
 {ROLE}
@@ -99,7 +115,7 @@ Compare against `{table_ref or "(no cell bound)"}` = `{claimed_cell_value or "(n
 
 === REQUIRED INGREDIENTS, WITH THE PAPER'S OWN WORDS ===
 {ingredients_table}
-
+{released}
 === THE PAPER ===
 {paper_text}
 

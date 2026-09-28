@@ -305,7 +305,11 @@ def _seal_reimpl_verify(cfg: Config, pid: str, target_id: str, doc: PaperDoc, ra
     # The rule `reimplement_driver.run` always applied: the verifier is named on the seal
     # ONLY if its reply parses as approved. A rejection is not an error -- it seals
     # honestly as `established=False`, exactly as a human reviewer's rejection would.
-    approved, _notes = reimplement_driver._parse_verification(raw)
+    script, bindings, _gnotes, _meta = reimplement_driver.parse_reimplementation_report(
+        gen_path.read_text(encoding="utf-8"))
+    approved, _notes = reimplement_driver._parse_verification(
+        raw, reimplement_driver.required_kinds(
+            script, bindings, reimplement_driver.load_released(cfg, pid, target_id)))
     _refuse_malformed_verdict(f"reimpl_verify:{target_id}", _notes)
     readiness = _readiness(cfg, pid, doc)
     reimplement_driver.accept_reimplementation(
@@ -397,11 +401,14 @@ def _cert_tasks(cfg: Config, pid: str, doc: PaperDoc) -> list[dict]:
                              out=_staging_out(cfg, pid, "cert_gen", tid)))
             continue
         obj = _cert_obj(cfg, pid, tid)
-        script, bindings, quotes, _notes, _n = certificate.parse(gen.read_text(encoding="utf-8"))
+        raw = gen.read_text(encoding="utf-8")
+        script, bindings, quotes, _notes, _n = certificate.parse(raw)
         prompt = d / f"cert_verify__{tid}.md"
+        claim, ref = getattr(obj, "claim_text", ""), getattr(obj, "ref", None)
         prompt.write_text(certificate.verification_brief(
-            doc, claim=getattr(obj, "claim_text", ""), ref=getattr(obj, "ref", None),
-            script=script, bindings=bindings, paper_quotes=quotes), encoding="utf-8")
+            doc, claim=claim, ref=ref, script=script, bindings=bindings, paper_quotes=quotes,
+            scope=certificate.parse_scope(raw),
+            images=certificate.page_images(cfg, pid, doc, ref, claim)), encoding="utf-8")
         out.append(_task(id=f"cert_verify:{tid}", role="cert_verify", prompt=prompt,
                          out=_staging_out(cfg, pid, "cert_verify", tid),
                          after=[f"cert_gen:{tid}"]))

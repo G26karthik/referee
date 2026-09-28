@@ -53,6 +53,39 @@ def label(provenance: str = "") -> str:
     return PROVENANCE_LABEL.get(provenance or "", "SYNTHESIZED_DIAGNOSTIC")
 
 
+# WHAT KIND of evidence a run is, for the reader — finer than the provenance label, never
+# an input to admissibility (`admits` above stays the only gate). Five kinds that must
+# never be conflated, plus the paper-internal route and "nothing ran".
+EVIDENCE_KINDS: tuple[str, ...] = (
+    "AUTHOR_CODE_REPRODUCTION",     # the authors' own checkout, at a verified commit
+    "RELEASED_DATA_RECOMPUTATION",  # a verified script recomputing from the authors' released files
+    "PAPER_DERIVED_IMPLEMENTATION",  # a verified reconstruction from the paper's text alone
+    "INSTANCE_CHECK",               # exact-arithmetic check of a stated result on instances
+    "PROOF_AUDIT",                  # exact-arithmetic check of one step of the printed proof
+    "DIAGNOSTIC_ONLY",              # synthesized/template: informs, settles nothing
+    "PAPER_INTERNAL",               # re-read against the paper's own printed content
+    "NONE",
+)
+
+
+def evidence_kind(provenance: str = "", *, released_inputs: bool = False,
+                  scope: str = "") -> str:
+    """Pure: the reader-facing kind of one run. Fails closed to DIAGNOSTIC_ONLY for any
+    token the ceiling does not admit, so a diagnostic can never read as a reproduction."""
+    p = provenance or ""
+    if p in ("", "none"):
+        return "NONE"
+    if p == "paper":
+        return "PAPER_INTERNAL"
+    if not admits(p):
+        return "DIAGNOSTIC_ONLY"
+    if p == "repo_exec":
+        return "AUTHOR_CODE_REPRODUCTION"
+    if p == "cert_exec":
+        return "PROOF_AUDIT" if scope == "proof_step" else "INSTANCE_CHECK"
+    return "RELEASED_DATA_RECOMPUTATION" if released_inputs else "PAPER_DERIVED_IMPLEMENTATION"
+
+
 def _self_check() -> None:
     assert admits("driver") and admits("repo_exec") and admits("reimpl_exec")
     assert admits("cert_exec")
@@ -84,6 +117,11 @@ def _self_check() -> None:
     # ever read as AUTHOR_REPOSITORY, exactly as `test_reimplementation_path.py` pins it
     author = [p for p, lab in PROVENANCE_LABEL.items() if lab == "AUTHOR_REPOSITORY"]
     assert author == ["repo_exec"]
+    assert evidence_kind("synthesized", released_inputs=True) == "DIAGNOSTIC_ONLY"
+    assert evidence_kind("reimpl_exec", released_inputs=True) == "RELEASED_DATA_RECOMPUTATION"
+    assert evidence_kind("reimpl_exec") == "PAPER_DERIVED_IMPLEMENTATION"
+    assert evidence_kind("cert_exec", scope="proof_step") == "PROOF_AUDIT"
+    assert evidence_kind("repo_exec", released_inputs=True) == "AUTHOR_CODE_REPRODUCTION"
     print("harness.provenance self-check ok")
 
 

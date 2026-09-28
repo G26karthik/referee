@@ -1170,8 +1170,20 @@ def resolve_command(cfg: Config, spec: ProbeSpec, script: Path, seed: int,
         if argv and Path(argv[0]).name.lower() in ("python", "python3", "python.exe", "python3.exe"):
             argv[0] = spec.interpreter or cfg.python
         return argv, Path(spec.cwd) if spec.cwd else script.parent
+    # A script's cwd is its own directory unless the spec names one: a released-data
+    # recomputation runs inside the authors' pinned checkout so it reads their files there.
     return ([spec.interpreter or cfg.python, str(script), "--seed", str(seed), "--arm", arm],
-           script.parent)
+           Path(spec.cwd) if spec.cwd else script.parent)
+
+
+def spec_evidence_kind(spec: ProbeSpec) -> str:
+    """The reader-facing evidence kind of what this spec runs (`provenance.evidence_kind`),
+    read off harness-written conformance fields only."""
+    from .provenance import evidence_kind
+    rc, cc = spec.reimplementation_conformance, spec.certificate_conformance
+    return evidence_kind(spec.provenance,
+                         released_inputs=bool(rc is not None and rc.released_inputs),
+                         scope=(cc.scope if cc is not None else ""))
 
 
 def parse_cell_number(text: str) -> float | None:
@@ -1732,7 +1744,7 @@ def _blocked(cfg: Config, root: Path, spec: ProbeSpec, auth: ExecAuthorization,
         metric_identity=spec.metric_identity, configuration=spec.configuration,
         seconds=seconds, resources=spec.resources, commit_verification=commit,
         backend_selection=spec.backend_selection, backend_considered=spec.backend_considered,
-        commit_state=spec.commit_state,
+        commit_state=spec.commit_state, evidence_kind=spec_evidence_kind(spec),
         reason=(f"execution was not authorized ('{auth.decision}'): {auth.detail}. "
                f"No process was started, so no measurement exists and no claim about "
                f"the paper is drawn from this."))
@@ -1899,7 +1911,8 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
         metric_identity=spec.metric_identity, configuration=spec.configuration,
         backend=backend.name, authorization=auth, resources=spec.resources,
         commit_verification=commit, backend_selection=spec.backend_selection,
-        backend_considered=spec.backend_considered, commit_state=spec.commit_state)
+        backend_considered=spec.backend_considered, commit_state=spec.commit_state,
+        evidence_kind=spec_evidence_kind(spec))
 
     if len(ok) < len(spec.arms):
         result.verdict = "failed"

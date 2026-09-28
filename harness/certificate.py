@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 from . import delegation, sealing, state
@@ -93,19 +94,100 @@ def section_excerpt(doc: PaperDoc, ref, *, before: int = 10000, after: int = 400
     return ("[…] " if lo else "") + text[lo:hi] + (" […]" if hi < len(text) else "")
 
 
-def build_brief(doc: PaperDoc, *, claim: str = "", ref=None) -> str:
-    """The GENERATOR's prompt — a bounded section excerpt, never the full paper."""
-    return CP.build(doc.title, claim, section_excerpt(doc, ref))
+_LABEL = re.compile(r"^\s*(Theorem|Proposition|Lemma|Corollary|Result)\s+([A-Z]?\d+(?:\.\d+)*)")
+_MAX_PROOF_CHARS = 12000
+_POINTER = re.compile(r"\s*(?:\([^)]*\)\s*)?(?:can\s+be\s+found|is\s+(?:given|deferred|provided|"
+                      r"postponed|in|found|sketched)|are\s+(?:given|deferred)|appears|see\b|"
+                      r"in\s+(?:Appendix|Section)|follows\s+(?:from|in))", re.I)
+_SCOPES = ("conclusion", "proof_step")
+
+
+def statement_label(claim: str = "") -> str:
+    m = _LABEL.match(claim or "")
+    return f"{m.group(1)} {m.group(2)}" if m else ""
+
+
+def proof_location(doc: PaperDoc, label: str) -> tuple[int, int]:
+    """(section_idx, char offset) of "Proof of <label>" in the parsed paper, or (-1, -1)."""
+    if not label:
+        return -1, -1
+    pat = re.compile(rf"\bProof\s+of\s+(?:the\s+)?{re.escape(label)}(?![\d.]*\d)", re.I)
+    for sec in doc.sections:
+        for m in pat.finditer(sec.text or ""):
+            # "Proof of Theorem 3.1 can be found in Appendix B" points AT the proof.
+            if not _POINTER.match((sec.text or "")[m.end():m.end() + 60]):
+                return sec.section_idx, m.start()
+    return -1, -1
+
+
+def proof_excerpt(doc: PaperDoc, label: str) -> str:
+    """The printed proof of `label` wherever it lives (often an appendix the statement's
+    own section never reaches), BOUNDED, up to the next "Proof of" — or ''."""
+    idx, at = proof_location(doc, label)
+    if idx < 0:
+        return ""
+    parts = [(x.text or "")[at:] if x.section_idx == idx else (x.text or "")
+             for x in doc.sections if x.section_idx >= idx]
+    text = " ".join(" ".join(parts).split())
+    nxt = re.search(r"\bProof\s+of\s+(Theorem|Proposition|Lemma|Corollary|Result)", text[20:])
+    end = 20 + nxt.start() if nxt else len(text)
+    cut = min(end, _MAX_PROOF_CHARS)
+    return text[:cut] + (" […]" if end > cut else "")
+
+
+def page_images(cfg: Config, pid: str, doc: PaperDoc, ref=None, claim: str = "") -> list[str]:
+    """Rendered PNGs of the statement's page and its proof's pages — the parsed text can
+    garble mathematics (roots, fractions, indices), and a delegate that cannot read the
+    exact inequality cannot check it. Best-effort; [] when the PDF is not on disk."""
+    from .extraction_audit import render_pages
+
+    src = Path(doc.source_path) if doc.source_path else None
+    if src is None or not src.is_file():
+        return []
+    pages: set[int] = set()
+    if ref is not None and getattr(ref, "page", None):
+        pages.add(int(ref.page))
+    idx, _at = proof_location(doc, statement_label(claim))
+    sec = next((x for x in doc.sections if x.section_idx == idx), None)
+    if sec is not None and sec.page_start:
+        # ponytail: at most 4 proof pages; a longer proof is cut, and the brief says the
+        # parsed text above continues it.
+        pages.update(range(sec.page_start, min(sec.page_end or sec.page_start,
+                                               sec.page_start + 3) + 1))
+    out = render_pages(src, pages, state.project_dir(cfg, pid) / "paper" / "pages")
+    return [out[k] for k in sorted(out)]
+
+
+def build_brief(doc: PaperDoc, *, claim: str = "", ref=None,
+                images: list[str] | None = None) -> str:
+    """The GENERATOR's prompt — a bounded section excerpt plus the statement's own printed
+    proof, never the full paper."""
+    return CP.build(doc.title, claim, section_excerpt(doc, ref),
+                    proof=proof_excerpt(doc, statement_label(claim)), images=list(images or [])).replace("\x00", "")
 
 
 def verification_brief(doc: PaperDoc, *, claim: str = "", ref=None, script: str = "",
                        bindings: list[dict] | None = None,
-                       paper_quotes: dict | None = None) -> str:
+                       paper_quotes: dict | None = None, scope: str = "",
+                       images: list[str] | None = None) -> str:
     """The SEPARATE verifier's prompt. Independence is enforced later, at `accept()` time
     (`generated_by != verified_by`) — this function only builds the text; it does not know
     or care who reads it."""
     return CP.verification_build(doc.title, claim, section_excerpt(doc, ref), script,
-                                 list(bindings or []), dict(paper_quotes or {}))
+                                 list(bindings or []), dict(paper_quotes or {}),
+                                 proof=proof_excerpt(doc, statement_label(claim)),
+                                 scope=scope, images=list(images or [])).replace("\x00", "")
+
+
+def parse_scope(raw: str) -> str:
+    """The generator's declared `checked_statement`, one of `_SCOPES`, else "conclusion"."""
+    text = (raw or "").strip()
+    try:
+        data = json.loads(text[text.find("{"):text.rfind("}") + 1])
+    except (ValueError, TypeError):
+        return "conclusion"
+    v = str((data or {}).get("checked_statement") or "").strip().lower()
+    return v if v in _SCOPES else "conclusion"
 
 
 def parse(raw: str) -> tuple[str, list[dict], dict, str, int]:
@@ -234,6 +316,7 @@ def accept(cfg: Config, pid: str, target_id: str, raw: str, verdict_raw: str | N
     conf = conformance(paper_text, script, bindings, paper_quotes,
                        generated_by=generated_by,
                        verified_by=(reviewer if approved else ""))
+    conf.scope = parse_scope(raw)
     prov = delegation.provenance_record(mode="SESSION_SUBAGENT", reviewer=reviewer)
     out, _sidecar = _paths(cfg, pid, target_id)
     record = sealing.seal(

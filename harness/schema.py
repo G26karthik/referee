@@ -40,7 +40,7 @@ PAPER_DISPOSITIONS: tuple[str, ...] = (
     # never the paper's fault, never the artifact's, never the host's — this review's own
     # method inventory ran out.
     "BLOCKED_METHOD",
-    "PASS_TO_HUMAN_UNRESOLVED",    # a central question was pursued admissibly and stayed open
+    "PASS_TO_HUMAN_UNRESOLVED",    # a central question stayed open: pursued without settling, or never checked
     "PASS_TO_HUMAN_CONCERNS",      # verified concerns that weaken a claim without rejecting it
     "PASS_TO_HUMAN_CLEAN",         # nothing of the above, within the audited scope
     "NOT_REVIEWED",                # the pipeline did not complete
@@ -477,6 +477,14 @@ class ReimplementationConformance(_Base):
     # 0 = none declared; used only after `routes` re-finds `replication_quote` in the paper.
     replication_runs: int = 0
     replication_quote: str = ""
+    # WRITTEN BY THE HARNESS. Files of the authors' own pinned checkout the script reads,
+    # as "path@sha256:<hex>" — re-found in the script text and hashed from the checkout,
+    # never taken from the generator. Non-empty makes this a RELEASED_DATA_RECOMPUTATION.
+    released_inputs: list[str] = Field(default_factory=list)
+    # Certificates only: what the checked relation is — the statement's own conclusion, or
+    # an inequality its printed PROOF asserts. A proof-step violation refutes the proof as
+    # printed, never the theorem statement (see `decide.material_target_failure`).
+    scope: str = Field(default="", description="'' | conclusion | proof_step")
 
 
 # === 4. REPO ACQUISITION + STATIC AUDIT — what the checkout is, and what it demands ====
@@ -1045,6 +1053,8 @@ class ProbeResult(_Base):
     metric_identity: MetricIdentity | None = None
     configuration: ConfigurationIdentity | None = None
     aux: dict[str, dict[str, ArmStats]] = Field(default_factory=dict)
+    evidence_kind: str = Field(default="NONE", description="WRITTEN BY THE HARNESS: "
+                               "see `provenance.EVIDENCE_KINDS`")
 
 
 # Why a backend was or was not selected. `backend_unavailable` is a TRANSIENT property of
@@ -1632,6 +1642,8 @@ class TargetOutcome(_Base):
     attempts: int = 0
     launched: int = Field(default=0, description="processes STARTED, read off the execution record")
     identity_state: str = Field(default="", description=" | ".join(IDENTITY_STATES) + ", or ''")
+    evidence_kind: str = Field(default="NONE", description="WRITTEN BY THE HARNESS: "
+                               "see `provenance.EVIDENCE_KINDS`")
 
     @property
     def establishes_failure(self) -> bool:

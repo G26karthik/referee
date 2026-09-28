@@ -26,7 +26,8 @@ from . import provenance as provenance_mod
 from . import state
 from .config import Config
 from .schema import (
-    CodeAudit, DiscoveredObject, Finding, PaperDoc, PlanDecision, ProbeResult, ProbeSpec,
+    CodeAudit, DiscoveredObject, ExperimentIdentity, Finding, PaperDoc, PlanDecision,
+    ProbeResult, ProbeSpec,
     ReimplementationReadiness, RepoAcquisition, TargetOutcome,
 )
 
@@ -212,7 +213,11 @@ def build_spec(cfg: Config, pid: str, doc: PaperDoc, target=None) -> ProbeSpec:
         spec.target_id = getattr(target, "target_id", "")
         spec.claim_ref = ref_obj.ref
         spec.claim_kind = ref_obj.kind
-        spec.claim = getattr(target, "claim_text", "") or ref_obj.quote
+        # The claim under test is the PAPER's own words at the re-resolved address — a
+        # lens's paraphrase of it is a proposal about the claim, not the claim.
+        paper_words = ref_obj.quote if (ref_obj.resolved and ref_obj.kind == "prose_claim"
+                                        and len(ref_obj.quote or "") >= 40) else ""
+        spec.claim = paper_words or getattr(target, "claim_text", "") or ref_obj.quote
         if ref_obj.kind == "table_cell":
             spec.table_ref = ref_obj.ref
         value, raw = grounded_quantity(target)
@@ -377,6 +382,16 @@ def plan_execution(cfg: Config, spec: ProbeSpec, acq: RepoAcquisition,
     conditions, all required: the execution gate open, a checkout, an entrypoint, and this
     machine CAPABLE of a fair run. Assessment runs even with the gate shut (only PROMOTION
     is gated), so the report can say precisely what would have been required."""
+    if acq.status in ("cloned", "cached") and acq.path and not acq.entrypoint:
+        # ASSESSED, not unassessed: the checkout was read and names no command to run, so
+        # the authors'-code route is exhausted for this target. Left unset, the
+        # reconstruction fallback (`replan_after_author_code_exhausted`) never engages and a
+        # data-only release is never used at all.
+        spec.experiment = ExperimentIdentity(
+            state="no_candidate", table_ref=spec.table_ref,
+            reason="the pinned checkout advertises no runnable entrypoint, so no author "
+                   "command can be bound to this target")
+        return spec
     if acq.status not in ("cloned", "cached") or not acq.path or not acq.entrypoint:
         return spec
     try:
@@ -491,7 +506,7 @@ def outcome_for(target_id: str, result: ProbeResult, action: str, route: str) ->
         launched=result.executions,
         execution_ref=(result.execution_log or result.script_path or ""),
         authorized=(result.authorization.allowed if result.authorization is not None else None),
-        attempts=1)
+        attempts=1, evidence_kind=result.evidence_kind)
 
 
 def _executable_targets(cfg: Config, pid: str):
@@ -530,8 +545,12 @@ def admissible_if_it_succeeds(cfg: Config, spec: ProbeSpec) -> tuple[bool, str]:
         return True, ""
     if cfg.diagnostic_mode:
         return True, "diagnostic mode"
+    why_no_author_code = (f"{spec.experiment.reason}; " if spec.experiment is not None
+                          and spec.experiment.state in _IDENTITY_FAILURE_STATES
+                          and spec.experiment.reason else "")
     return False, (
-        f"the only program available for this target was {spec.provenance or 'unset'}, "
+        f"{why_no_author_code}the only program available for this target was "
+        f"{spec.provenance or 'unset'}, "
         f"which the provenance ceiling does not admit against a printed quantity in "
         f"either direction. Set SH_DIAGNOSTIC_MODE=1 to run it as a diagnostic; its "
         f"result is recorded separately and settles nothing.")
@@ -823,7 +842,9 @@ def certificate_targets(cfg: Config, pid: str) -> list[tuple[str, str]]:
     for obj in ts.objects:
         if obj.target_id not in routed:
             continue
-        brief = certificate.build_brief(doc, claim=obj.claim_text, ref=obj.ref)
+        brief = certificate.build_brief(
+            doc, claim=obj.claim_text, ref=obj.ref,
+            images=certificate.page_images(cfg, pid, doc, obj.ref, obj.claim_text))
         # A sealed certificate answers only the brief it was given: when that brief has
         # since changed, the question is asked again (until then the old seal still runs).
         if certificate.load_accepted(cfg, pid, obj.target_id) is not None and (
@@ -863,16 +884,27 @@ def attempt_reimplementation_fallback(
     if fallback_plan is None or not fallback_plan.requires_execution:
         return None
     readiness = discover_stage.reimplementation_readiness(doc)
-    if not readiness.established:
+    checkout = (Path(acq.path) if acq is not None and acq.path
+                and acq.status in ("cloned", "cached") else None)
+    released = reimplement_driver.released_files(checkout) if checkout is not None else []
+    # With the authors' own data released, a missing TRAINING description does not make
+    # the paper unreconstructable: a statistic of released outputs trains nothing.
+    # `reimplement_driver.conformance` still requires every other ingredient bound.
+    if not readiness.established and not (released and set(readiness.missing) <= {"training"}):
         return None
     target_id = base_spec.target_id or "default"
+    manifest = reimplement_driver.released_manifest_path(cfg, pid, target_id)
+    if released:
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        state.write_json(manifest, released)
     sealed = reimplement_driver.load_accepted(cfg, pid, target_id)
     brief = reimplement_driver.build_brief(
         readiness, paper_title=doc.title, claim=base_spec.claim,
         table_ref=base_spec.table_ref, claimed_cell_value=base_spec.claimed_cell_value,
         paper_text=_scoped_paper_text(
             doc, table_ref=base_spec.table_ref, claim_ref=base_spec.claim_ref,
-            ingredient_refs=tuple(i.ref for i in readiness.ingredients)))
+            ingredient_refs=tuple(i.ref for i in readiness.ingredients)),
+        released=released)
     stale = (sealed is not None and not sealed[1].established
              and not reimplement_driver.answered_brief(cfg, pid, target_id, brief))
     if sealed is None or stale:
@@ -888,7 +920,8 @@ def attempt_reimplementation_fallback(
         rdir = root / "runs" / pid / "reimplementation"
         for f in sorted(rdir.glob(f"TGT-*-{table.group()}r*.json")):
             sib = f.stem
-            if sib == target_id or sib.endswith((".driver", ".spec", ".superseded")):
+            if sib == target_id or sib.endswith((".driver", ".spec", ".superseded",
+                                                 ".inputs")):
                 continue
             other = reimplement_driver.load_accepted(cfg, pid, sib)
             if other is not None and not other[1].established:
@@ -907,6 +940,15 @@ def attempt_reimplementation_fallback(
             quote, re.I)
             and quote in " ".join(_full_paper_text(doc).split())):
         seeds = list(range(conf.replication_runs))
+    # A recomputation's inputs are re-hashed NOW: a released file that changed since the
+    # generator saw it is not the file the verifier approved, so nothing may be concluded.
+    if conf.released_inputs:
+        now = {f"{r['path']}@sha256:{r['sha256']}" for r in released}
+        drift = [x for x in conf.released_inputs if x not in now]
+        if drift:
+            conf = conf.model_copy(update={"established": False, "reason": (
+                "the released file(s) " + ", ".join(drift) + " no longer match the pinned "
+                "checkout's bytes, so this recomputation is not about the approved data")})
     fspec = ProbeSpec(
         paper_id=pid, target_id=target_id, finding_id=base_spec.finding_id,
         claim=base_spec.claim, claim_ref=base_spec.claim_ref, claim_kind=base_spec.claim_kind,
@@ -917,6 +959,7 @@ def attempt_reimplementation_fallback(
                 else f"printed value at {base_spec.table_ref or base_spec.claim_ref}"),
         seeds=seeds, arms=["reproduction"], script=script, provenance="reimpl_exec",
         interpreter=(acq.env_path if acq is not None else "") or "",
+        cwd=(str(checkout) if conf.released_inputs and checkout is not None else ""),
         reimplementation_conformance=conf, written_by="harness")
     fspec = establish_comparison(fspec, fallback_plan.route)
     fdir = out_dir or (root / "runs" / pid / "reimplementation")

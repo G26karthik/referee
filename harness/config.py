@@ -41,6 +41,10 @@ class Config:
     # targets are worth pursuing is `harness.planner`'s decision and the ORDER is
     # `harness.priority`'s, so lowering this drops the least useful targets first.
     max_targets: int = field(default_factory=lambda: int(os.environ.get("SH_MAX_TARGETS", "3")))
+    # How many of the paper's own numbered results (theorems, propositions, ...) become
+    # positive-verification targets, beside whatever the lenses questioned.
+    max_formal_targets: int = field(
+        default_factory=lambda: int(os.environ.get("SH_MAX_FORMAL_TARGETS", "10")))
 
     # --- S3 code-reproduction gates, graded by risk since fetching and running code are
     # different acts: network (clone, read-only, for the static audit), install (resolves

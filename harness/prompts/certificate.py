@@ -84,6 +84,19 @@ SEARCH WHERE A VIOLATION WOULD BE. A certificate is only as strong as the instan
     decays to 0 is typically broken only late, once the true error plateaus.
   - Keep each run within about a minute (e.g. bound denominators, cap the horizon).
 
+WHAT TO CHECK — the statement's CONCLUSION, or ONE STEP OF ITS PRINTED PROOF:
+  - Check the conclusion itself when it is finitely checkable: an identity, or a bound
+    with explicit constants, on an explicit admissible instance.
+  - An asymptotic claim (O, Ω, Θ, "as p → ∞", unstated constants) cannot be violated by a
+    finite instance. Do not test it as if it could. Instead check ONE explicit inequality or
+    identity the PRINTED PROOF asserts as a step ("hence …", "so that … ≥ …"), with the
+    constants the proof itself uses, on an admissible instance — or refuse.
+  - Declare which in `"checked_statement"`: "conclusion" or "proof_step". For "proof_step",
+    `paper_quotes.claimed_bound` is the step copied verbatim from the proof, and
+    `paper_quotes.hypotheses` is what the proof has assumed or established at that point.
+    A violated proof step shows the printed proof is invalid at that step. It NEVER shows
+    the statement false — never describe it so in `notes`.
+
 DECLARE how many instances you are offering as `"instance_count"` in your JSON (below) — an
 integer N; the harness will invoke your script once for each seed in 0..N-1. Use several
 genuinely different constructions (including edge cases) when they are cheap.
@@ -114,13 +127,30 @@ Print ONLY this JSON to standard output:
  ],
  "paper_quotes": {"hypotheses": "the theorem's stated hypotheses, copied verbatim",
                   "claimed_bound": "the theorem's stated inequality/bound, copied verbatim"},
+ "checked_statement": "conclusion or proof_step",
  "notes": "anything you could not check without inventing a detail, or '' if none"}"""
 
 
-def build(paper_title: str, claim: str, section_excerpt: str) -> str:
+def _extra(proof: str, images: list[str]) -> str:
+    out = ""
+    if proof:
+        out += f"\n=== THE PRINTED PROOF OF THIS STATEMENT (parsed text) ===\n{proof}\n"
+    if images:
+        out += ("\n=== PAGE IMAGES — READ THESE FIRST ===\nThe parsed text can garble "
+                "mathematics (square roots, fractions, indices, sums). Read each image file "
+                "below to see the exact statement and proof before writing anything:\n"
+                + "\n".join(f"  {p}" for p in images)
+                + "\nCopy every `paper_quotes` entry verbatim from the PARSED TEXT above "
+                "(the harness re-finds it there), even where that text is garbled; use the "
+                "images only to understand what it says.\n")
+    return out
+
+
+def build(paper_title: str, claim: str, section_excerpt: str, *, proof: str = "",
+          images: list[str] | None = None) -> str:
     """The generator's prompt. `section_excerpt` is BOUNDED — the section(s) stating the
     claimed theorem and its hypotheses, never the whole paper (see
-    `harness.certificate.build_brief`)."""
+    `harness.certificate.build_brief`) — plus the statement's own printed proof."""
     return f"""{SECURITY}
 
 You are writing an EXACT_CERTIFICATE for one theorem/bound claim from a published paper.
@@ -134,7 +164,7 @@ Paper: {paper_title or "(title not detected)"}
 
 === THE RELEVANT SECTION(S) OF THE PAPER ===
 {section_excerpt}
-
+{_extra(proof, list(images or []))}
 {_RETURN}"""
 
 
@@ -154,13 +184,19 @@ reject anything that does not hold up:
      hypotheses describe, without inventing a scenario the theorem does not cover?
   4. Does the script's arithmetic actually use `fractions.Fraction` (never `float`) for
      the decisive comparison?
+  5. Is the declared `checked_statement` honest? "conclusion": `claimed_bound` is the
+     statement's own conclusion, and it is finitely checkable (not an asymptotic O/Ω/Θ
+     claim with unstated constants). "proof_step": `claimed_bound` is an inequality or
+     identity the PRINTED PROOF of this statement asserts, with the proof's own constants,
+     and `hypotheses` are exactly what the proof has at that point.
 
 Reject if ANY of the four fails, or if a binding's `impl_quote` does not look like it
 actually appears in the script."""
 
 
 def verification_build(paper_title: str, claim: str, section_excerpt: str, script: str,
-                       bindings: list[dict], paper_quotes: dict) -> str:
+                       bindings: list[dict], paper_quotes: dict, *, proof: str = "",
+                       scope: str = "", images: list[str] | None = None) -> str:
     """The SEPARATE verifier's prompt — a different subagent from the one that wrote
     `script`, exactly as `reimplement_driver`'s verifier is independent of its generator
     (`harness.certificate.accept`'s `generated_by != verified_by` rule)."""
@@ -176,6 +212,9 @@ Paper: {paper_title or "(title not detected)"}
 
 === THE RELEVANT SECTION(S) OF THE PAPER ===
 {section_excerpt}
+{_extra(proof, list(images or []))}
+=== DECLARED checked_statement ===
+{scope or "conclusion"}
 
 === PROPOSED SCRIPT ===
 ```python

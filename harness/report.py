@@ -222,6 +222,7 @@ def claim_status(findings: list[Finding], reconciliation: Reconciliation | None 
                 f"printed composition does not evaluate to the total it states "
                 f"({getattr(source, 'reason', '') or 'see the ledger'})")
         if getattr(source, "disposition", "") == "COUNTEREXAMPLE_ESTABLISHED":
+            # (a PROOF_AUDIT counterexample never reaches here: it is not material)
             return "VERIFIED_FAILURE", (
                 f"target {getattr(source, 'target_id', '?')}: an independently verified "
                 f"exact-arithmetic certificate constructed an instance that satisfies the "
@@ -1293,6 +1294,17 @@ def render_reviewer_report(report: EvalReport, target_set: TargetSet | None = No
                       f"evaluate to the total it states. No code was executed and no "
                       f"artifact was required to reach this conclusion.",
                       _material_line]
+            elif (o.disposition == "COUNTEREXAMPLE_ESTABLISHED"
+                  and getattr(o, "evidence_kind", "") == "PROOF_AUDIT"):
+                L += ["", f"- **Invalid step in the printed proof — {o.target_id}**",
+                      f"  - statement: {_short(getattr(obj, 'claim_text', ''))}",
+                      f"  - evidence: {_short(o.reason)}",
+                      "  - why it matters: an independently verified exact-arithmetic check "
+                      "found an admissible instance violating an inequality the paper's "
+                      "PROOF asserts. The proof as printed does not establish the statement; "
+                      "whether the statement itself is true is NOT settled by this.",
+                      "  - materiality: a proof-step defect never stops a paper here; it is "
+                      "handed to the reviewer as an established concern."]
             elif o.disposition == "COUNTEREXAMPLE_ESTABLISHED":
                 L += ["", f"- **Counterexample to a claimed bound — {o.target_id}**",
                       f"  - claim: {_short(getattr(obj, 'claim_text', ''))}",
@@ -1367,16 +1379,22 @@ def render_reviewer_report(report: EvalReport, target_set: TargetSet | None = No
                   f"  - {_short(getattr(o, 'reason', '') or 'not attempted', 200)}"]
         L.append("")
 
-    held = [o for o in outcomes if o.disposition in ("REPRODUCED", "PAPER_ONLY_RESOLVED")]
+    held = [o for o in outcomes if o.disposition in ("REPRODUCED", "PAPER_ONLY_RESOLVED",
+                                                     "NO_COUNTEREXAMPLE_FOUND")]
     L += ["", "## What held up"]
     if not held:
         L += ["", "Nothing was positively verified. An empty section here would mean "
                   "'not checked', and this report does not say that."]
     for o in held[:_MAX_HELD]:
         obj = next((x for x in objects if x.target_id == o.target_id), None)
-        L += ["", f"- **{o.target_id}** ({o.disposition.replace('_', ' ').lower()}) — "
+        kind = getattr(o, "evidence_kind", "NONE") or "NONE"
+        L += ["", f"- **{o.target_id}** ({o.disposition.replace('_', ' ').lower()}"
+                  f"{'' if kind == 'NONE' else ' · ' + kind}) — "
                   f"{_short(getattr(obj, 'claim_text', ''), 120)}",
               f"  - {_short(o.reason, 200)}"]
+        if o.disposition == "NO_COUNTEREXAMPLE_FOUND":
+            L.append("  - consistent on the tested instances only; never a proof, and the "
+                     "question stays open.")
     if len(held) > _MAX_HELD:
         L.append(f"- …and {len(held) - _MAX_HELD} more; see `discovery/targets.json`.")
 
@@ -1397,7 +1415,7 @@ def render_reviewer_report(report: EvalReport, target_set: TargetSet | None = No
 
     triggered = [o for o in outcomes if o.action in
                  ("AUTHOR_CODE_REPRODUCTION", "INDEPENDENT_RECONSTRUCTION",
-                  "MECHANISM_TEST_ONLY")]
+                  "MECHANISM_TEST_ONLY", "EXACT_CERTIFICATE")]
     L += ["", "## Experiments triggered"]
     if not triggered:
         eff = report.review_efficiency or {}
@@ -1412,8 +1430,9 @@ def render_reviewer_report(report: EvalReport, target_set: TargetSet | None = No
         # opens with a large delta. PLANNED and RAN are two facts, kept apart, so a
         # synthesized diagnostic is never described in the grammatical position of a run
         # whose provenance is `INDEPENDENT_RECONSTRUCTION`.
-        _ran = (f"ran: `{provenance_label(o.provenance)}`" if int(getattr(o, "launched", 0) or 0)
-                else "nothing ran")
+        _ran = (f"ran: `{provenance_label(o.provenance)}` as "
+                f"`{getattr(o, 'evidence_kind', 'NONE') or 'NONE'}`"
+                if int(getattr(o, "launched", 0) or 0) else "nothing ran")
         L += ["", f"- **{o.target_id}** — planned: {o.action.replace('_', ' ').lower()} · "
                   f"{_ran}, ended `{o.disposition}`",
               f"  - question: {_short(getattr(obj, 'claim_text', ''), 140)}"]
@@ -3594,6 +3613,7 @@ def assemble_report(*, pid: str, title: str, doc: PaperDoc, reports: list[LensRe
                     getattr(_failed, "disposition", "") == "PAPER_ARITHMETIC_CONTRADICTION")),
             central_blockers=decide.blockers_from(_central_dispositions, _centralities),
             central_unresolved=len(unresolved_central(objects, outcomes)),
+            central_unchecked=len(unchecked_central(objects, outcomes)),
             counted_major=len(material_concerns(findings)),
             established_non_material=(
                 0 if _failed is not None
