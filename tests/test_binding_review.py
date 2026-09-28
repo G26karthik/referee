@@ -162,3 +162,111 @@ def test_pinned_or_wrapped_commands_get_no_harness_seed():
     assert experiment_id.harness_seed_flag(pinned) == ""
     assert experiment_id.harness_seed_flag(wrapped) == ""
     assert experiment_id.harness_seed_flag(free) == "--seed"
+    templated = CandidateCommand(argv=["python", "main.py", "--seed", "{seed}"])
+    assert experiment_id.instantiate(templated, "x")[0] is None, "a README {seed} pins nothing"
+
+
+# --- second review (cb95922): layout, names, quantities, cues ----------------------------
+def test_methods_as_columns_bind_only_the_papers_own_column(tmp_path):
+    r = _repo(tmp_path, "```bash\nfor d in mnli sst2; do python main.py --data $d; done\n```\n",
+              {"main.py": _MAIN})
+    t = Table(table_idx=0, label="1", caption="Accuracy on GLUE", header=["Task", "BERT", "FooNet"],
+              rows=[["MNLI", "84.0", "86.1"]])
+    doc = _doc([t])
+    assert experiment_id.resolve_experiment(doc, r, "T0:r0:c1").state == "no_candidate"
+    own = experiment_id.resolve_experiment(doc, r, "T0:r0:c2")
+    assert own.state == "established", own.reason
+    cfg = experiment_id.resolve_configuration(doc, "T0:r0:c2", own.command, 5, repo=r)
+    assert cfg.matched.get("model") == "FooNet", "a --data slot names the dataset, never the model"
+    cited = Table(table_idx=1, label="2", caption="Fine-tuning BERT-base on SST-2",
+                  header=["m", "Accuracy"], rows=[["[12]", "90.1"]])
+    assert experiment_id.resolve_experiment(_doc([cited]), r, "T1:r0:c1").state == "no_candidate"
+
+
+def test_own_names_come_from_the_phrase_the_paper_introduces():
+    def names(abstract, title="A Study of Something"):
+        return experiment_id.own_names(PaperDoc(paper_id="p", title=title, sections=[
+            Section(section_idx=0, title="Abstract", text=abstract)]))
+    assert names("We propose Kite, a fast optimizer. Kite outperforms AdamW.") == {"kite"}
+    assert names("We introduce FooNet, which improves on Low-Rank Adaptation (LoRA).") == {"foonet"}
+    assert names("We propose a GNN-based model, FooNet, for graphs.") == {"foonet"}
+    assert names("We propose Bayesian optimization with priors.") == set()
+    assert names("x", title="Kite: A Fast Optimizer") == {"kite"}
+    assert names("We intro- duce GRAdient-based Causal tree Ensembles (GRACE), a model.") == {"grace"}
+    assert experiment_id.own_method(_doc([]), "FooNet (d=2048)")
+
+
+def test_quantities_are_whole_words_and_a_column_keeps_its_own():
+    q = experiment_id._quantity_of
+    assert q("MSE") == "" and q("MS MARCO") == "" and q("embedding dim") == ""
+    assert q("Latency (ms)") == "latency" and q("Time (s)") == "latency" and q("pass@1") == "accuracy"
+    cmd = CandidateCommand(argv=["python", "main.py"], emits=["accuracy"], named_keys=["accuracy", "ECE"])
+    ece = Table(table_idx=0, label="1", caption="Accuracy and calibration on CIFAR-10",
+                header=["Method", "Acc.", "ECE"], rows=[["FooNet", "91.2", "0.03"]])
+    assert experiment_id.resolve_metric(_doc([ece]), "T0:r0:c2", cmd).output_key != "accuracy"
+    top5 = Table(table_idx=0, label="1", caption="Accuracy on ImageNet", header=["Method", "Top-5"],
+                 rows=[["FooNet", "99.0"]])
+    assert not experiment_id.resolve_metric(_doc([top5]), "T0:r0:c1", cmd).established
+    sized = Table(table_idx=0, label="1", caption="ImageNet accuracy of FooNet variants of "
+                  "increasing size", header=["Model", "ImageNet"], rows=[["FooNet-S", "80.1"]])
+    assert experiment_id.cell_quantity(sized, 1) == "accuracy"
+    marco = Table(table_idx=0, label="1", caption="NDCG@10 on MS MARCO", header=["m", "MS MARCO"],
+                  rows=[["FooNet", "0.41"]])
+    assert paper.metric_name(marco, 1) == "NDCG"
+
+
+def test_a_numeric_row_takes_its_configuration_from_the_own_column():
+    t = Table(table_idx=0, label="2", caption="Accuracy by data size", header=["n", "FooNet"],
+              rows=[["100", "80.1"]])
+    cmd = CandidateCommand(argv=["python", "main.py"])
+    assert experiment_id.resolve_configuration(_doc([t]), "T0:r0:c1", cmd, 1).matched["model"] == "FooNet"
+
+
+def test_impersonal_cues_attributed_to_others_and_ranking():
+    def url(text):
+        return repo.official_repo_url(PaperDoc(paper_id="p", sections=[
+            Section(section_idx=0, title="M", text=text)]))
+    assert url("For comparison the baseline implementation is available at "
+               "https://github.com/smith/baseline today.") == ""
+    assert url("The baseline code is available at https://github.com/smith/b here. Our code is "
+               "available at https://github.com/us/ours now.") == "https://github.com/us/ours"
+    assert url("Code is available at https://github.com/us/ours now.") == "https://github.com/us/ours"
+
+
+def test_readme_negations_forks_and_unrelated_implementations():
+    doc = _doc([], title="FooNet Small Models for Something Specific")
+    t = "# FooNet Small Models for Something Specific\n"
+    assert not repo.readme_attributes(t + "This is not the official code.", doc)
+    assert not repo.readme_attributes(t + "A community fork of the official code.", doc)
+    assert repo.readme_attributes(t + "Official code. It uses the implementation of "
+                                  "FlashAttention; checkpoints have not been released yet.", doc)
+    import time
+    start = time.time()
+    repo.readme_attributes("@a{ " * 20000, doc)
+    assert time.time() - start < 2, "a pathological README must stay linear"
+
+
+def test_read_ranges_stay_under_the_cap_on_dense_text(tmp_path):
+    from harness import tasks
+    p = tmp_path / "dense.md"
+    p.write_text("\n".join("- [T5:r7:c3] 0.123 ± 0.004 | 12,345 | 9.87e-3" for _ in range(1200)),
+                 encoding="utf-8")
+    ranges = tasks.read_ranges(p)
+    lines = p.read_text(encoding="utf-8").split("\n")
+    assert sum(n for _, n in ranges) == len(lines) and ranges[0][0] == 1
+    assert all(sum(len(x) + 1 for x in lines[o - 1:o - 1 + n]) <= tasks.READ_CHUNK_CHARS + 60
+               for o, n in ranges)
+
+
+def test_anchor_is_kept_when_the_part_shows_only_the_start_of_it():
+    from harness.paper import anchors, plan, render_part_with_anchor
+    doc = PaperDoc(paper_id="p", title="T", sections=[
+        Section(section_idx=0, title="Abstract", page_start=1, text=("claim500 " + "a " * 3000)),
+        Section(section_idx=1, title="Method", page_start=2, text="m " * 3000),
+        Section(section_idx=2, title="Conclusion", page_start=3, text="done.")])
+    p = plan(doc, 5000)
+    first = render_part_with_anchor(p.parts[0], anchors(doc))
+    assert first.count("claim500") >= 1
+    body_has_all = any(i == 0 and a == 0 and b >= len(doc.sections[0].text)
+                       for i, a, b in p.parts[0].slices)
+    assert body_has_all or "## Abstract  [section 0]" in first

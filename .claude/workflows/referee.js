@@ -70,10 +70,10 @@ function controller(source, label) {
 
 function worker(pid, t, prior) {
   const r = t.reads || []
-  const how = r.length > 1
-    ? `in ONE message of ${r.length} parallel Read calls, (offset, limit) = ` +
+  const how = r.length
+    ? `in ONE message of ${r.length} parallel Read call(s) with exactly these (offset, limit): ` +
       r.map(([o, n]) => `(${o}, ${n})`).join(', ')
-    : `with one Read call`
+    : `(if Read reports it too large, read it in ONE message of parallel Reads of 300 lines each)`
   return run('worker',
     `One isolated REFEREE task. Judge independently; read nothing but the task prompt ` +
     `(and an image file it names).\n` +

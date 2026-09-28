@@ -246,12 +246,31 @@ _HUNDRED = re.compile(r"^\s*100(?:\.0+)?\s*%")
 
 
 def _quantity_of(text: str) -> str:
-    """The semantic quantity a header/caption/key names, or '' when it names none."""
+    """The semantic quantity a header/caption/key names, or '' when it names none. Whole
+    words (a plural allowed): "MSE" is not "ms", "embedding" is not "em". A time unit counts
+    only as a unit, "(ms)", never the dataset "MS MARCO"."""
     low = (text or "").lower()
     for quantity, words in _QUANTITY_WORDS:
-        if any(re.search(rf"\b{re.escape(w)}", low) for w in words):
+        if any(re.search(rf"\b{re.escape(w)}" + (r"(?:e?s)?(?!\w)" if w[-1].isalnum() else ""), low)
+               for w in words if w != "ms"):
+            return quantity
+        if quantity == "latency" and re.search(r"\(\s*(?:ms|s|sec|min|h)\s*\)|\bms/", low):
             return quantity
     return ""
+
+
+def cell_quantity(table: Table, col: int) -> str:
+    """The quantity ONE column reports: its header's, else the caption's metric when that
+    is the table's single metric (`paper.metric_name`'s rule) — never the caption's first
+    quantity word applied to every column. A header naming a metric this vocabulary does
+    not know ("ECE", "Top-5") reports that metric, not the caption's."""
+    from .paper import _METRIC_WORD, column_header, metric_name  # deferred: paper imports this
+    header = column_header(table, col)
+    if q := _quantity_of(header):
+        return q
+    if _METRIC_WORD.search(header):
+        return ""
+    return _quantity_of(metric_name(table, col))
 
 
 def cell_basis(table: Table, col: int) -> tuple[str, str]:
@@ -292,35 +311,55 @@ def _metric_key(table: Table, col: int) -> str:
     return _key(_metric_name(table, col))
 
 
-# WHOSE ROW. A documented command runs the paper's own method; a row that cites its source
-# ("BERT (Devlin et al., 2019)", "LoRA [9]") reports someone else's number. A row that is
-# neither marked nor named as the paper's own is bound only when the command itself takes
-# an argument naming it — otherwise which row the command produces is a guess.
-_CITED = re.compile(r"\[\s*\d+(?:\s*[,;–-]\s*\d+)*\s*\]|\bet\s+al\b|\([^()]*\b(?:19|20)\d{2}[a-z]?\s*\)",
-                    re.I)
+# WHOSE CELL. A documented command runs the paper's own method; a label that cites its source
+# ("BERT (Devlin et al., 2019)", "LoRA [9]", "[12]") reports someone else's number. A cell
+# that is not the paper's own is bound only when the command's own METHOD argument names it
+# (`--model bert`) — otherwise which cell the command produces is a guess.
+_CITED = re.compile(r"\[\s*\d+(?:\s*[,;–-]\s*\d+)*\s*\]|\bet\s+al\b|"
+                    r"\(\s*[A-Z][^()]*?\b(?:19[5-9]\d|20[0-3]\d)[a-z]?\s*\)")
 _OURS = re.compile(r"\b(?:ours|proposed|this\s+work)\b", re.I)
-_NAME_LIKE = r"[A-Z][A-Za-z0-9]*[A-Z0-9][\w\-]*"            # FooNet, GRACE, DiffGBM, GPT-4
 _PROPOSE = re.compile(r"\b(?i:we\s+(?:propose|introduce|present|develop|call|term|name)|"
                       r"dubbed|termed|called|named)\b")
+# Where the named thing ends: the first clause that compares, qualifies or starts a sentence.
+_NP_END = re.compile(r"[.;:]\s|\b(?:which|that|who|outperform\w*|improv\w*|than|over|"
+                     r"compar\w*|against|versus|vs\.?|beat\w*|surpass\w*|and\s+show\w*)\b", re.I)
+_ACRONYM = re.compile(r"\(\s*([A-Z][A-Za-z0-9\-]*[A-Z0-9][A-Za-z0-9\-]*)\s*\)")
+# A name the paper gives opens its phrase: name-shaped (FooNet, GPT-4), or a capitalised
+# word standing alone as an appositive ("Kite, a fast optimizer"). "Bayesian optimization"
+# names a field; "GNN-based" describes.
+_NAME_SHAPED = re.compile(r"[A-Z][A-Za-z0-9]*[A-Z0-9][\w\-]*")
+_DESCRIPTOR = re.compile(r"-(?:based|like|style|driven|aware|guided|free|agnostic)$", re.I)
+_ARTICLES = {"a", "an", "the", "our", "new", "novel"}
 
 
 def own_names(doc: PaperDoc) -> set[str]:
-    """The names the paper gives its OWN method, where it gives them: a title led by the
-    name ("FooNet: ..."), and — in the front matter through the abstract — the first
-    name-shaped word after "we propose/introduce ..." plus an acronym it defines there
-    ("We introduce GRAdient-based Causal tree Ensembles (GRACE)"). Not every capitalised
-    word: "FooNet outperforms BERT" makes BERT a comparison, not theirs."""
+    """The names the paper gives its OWN method, where it gives them: a title led by one
+    ("FooNet: ..."), and — in the front matter through the abstract — the phrase right after
+    "we propose/introduce ..." up to its first comparison or clause: an acronym defined
+    there ("GRAdient-based Causal tree Ensembles (GRACE)"), else its first given name
+    ("Kite, a fast optimizer"; "a GNN-based model, FooNet"). "FooNet, which improves on
+    Low-Rank Adaptation (LoRA)" stops at "which": LoRA is the comparison, not theirs."""
     idx = abstract_section_idx(doc)
     upto = [s for s in doc.sections if idx < 0 or s.section_idx <= idx][:max(3, idx + 1)]
     front = re.sub(r"(\w)-\s+(\w)", r"\1\2", " ".join(s.text or "" for s in upto))[:8000]
     names = set()
-    if head := re.match(rf"\s*({_NAME_LIKE})\s*:", doc.title or ""):
+    if head := re.match(r"\s*([A-Z][\w\-]{2,})\s*:", doc.title or ""):
         names.add(head.group(1))
     for m in _PROPOSE.finditer(front):
-        window = " ".join(front[m.end():].split()[:14])
-        if first := re.search(_NAME_LIKE, window):
-            names.add(first.group(0))
-        names |= set(re.findall(rf"\(({_NAME_LIKE})\)", window))
+        rest = front[m.end():m.end() + 300]
+        phrase = rest[:end.start()] if (end := _NP_END.search(rest)) else rest
+        for segment in phrase.split(",")[:2]:        # "a GNN-based model, FooNet"
+            if acronyms := _ACRONYM.findall(segment):
+                names |= set(acronyms)
+                break
+            words = [w.strip("()\"'") for w in segment.split()]
+            while words and words[0].lower() in _ARTICLES:
+                words.pop(0)
+            first = words[0] if words else ""
+            if (len(first) >= 3 and first[0].isupper() and not _DESCRIPTOR.search(first)
+                    and (_NAME_SHAPED.fullmatch(first) or len(words) == 1)):
+                names.add(first)
+                break
     return {_key(n) for n in names if len(_key(n)) >= 3}
 
 
@@ -334,6 +373,50 @@ def own_method(doc: PaperDoc, label: str) -> bool:
     names = own_names(doc)
     whole = re.sub(r"\([^)]*\)|[*†‡§]", "", label).strip()
     return _key(re.split(r"[\s_/\-(]+", whole)[0]) in names or _key(whole) in names
+
+
+# A flag that SELECTS the method a run executes; a dataset flag never does.
+_METHOD_FLAG = re.compile(r"^--?(?:model|method|arch(?:itecture)?|algo(?:rithm)?|baseline|variant|"
+                          r"net(?:work)?|approach|estimator|learner|backbone)s?(?:[_-]?(?:name|type))?$",
+                          re.I)
+
+
+def cell_method(doc: PaperDoc, table: Table, row: int, col: int) -> tuple[list[str], bool, str]:
+    """(labels, own, refusal): the label(s) naming the method a cell reports, whether that
+    method is the paper's own, and why nothing can be said. The table's own layout decides
+    the axis: if some ROW names the paper's method the methods are rows; else if some column
+    header does they are columns; else either label may name it and only a documented method
+    argument can select it."""
+    from .paper import _METRIC_WORD, column_header  # deferred: paper imports this module
+    row_label = (table.cell(row, 0) or "").strip()
+    head = column_header(table, col)
+    for label in (row_label, head):
+        if label and _CITED.search(label):
+            return [label], False, (f"the cell reports {label!r}, which carries a citation: a "
+                                    f"baseline the authors cite, not a result their code produces")
+    width = max((len(r) for r in table.rows), default=0)
+    if any(own_method(doc, (table.cell(r, 0) or "")) for r in range(len(table.rows))):
+        return [row_label], own_method(doc, row_label), ""
+    if any(own_method(doc, column_header(table, c)) for c in range(1, width)):
+        return [head], own_method(doc, head), ""
+    if not re.search(r"[^\W\d_]{2,}", row_label):     # a sample size, a dimension
+        if not head:
+            return [], False, ("the cited row is labelled by a number and extraction recovered "
+                               "no header for its column, so which method the cell reports is unknown")
+        if _METRIC_WORD.search(head) or _quantity_of(head):
+            return [], True, ""                      # "n | RMSE": a sweep of one method
+        return [head], False, ""
+    return [row_label, head], False, ""
+
+
+def selects(cmd: CandidateCommand, labels: list[str]) -> str:
+    """The documented METHOD argument value that names one of `labels`, or ''."""
+    words = {w.lower() for label in labels for w in re.split(r"[\s,;:()\[\]]+", label) if w}
+    for value in cmd.bound_slots.values():
+        at = cmd.argv.index(value) if value in cmd.argv else -1
+        if at > 0 and _METHOD_FLAG.match(cmd.argv[at - 1]) and value.lower() in words:
+            return value
+    return ""
 
 
 def harness_seed_flag(cmd: CandidateCommand | None) -> str:
@@ -388,8 +471,9 @@ def instantiate(cmd: CandidateCommand, context: str) -> tuple[CandidateCommand |
                           f"{len(named)} of them ({', '.join(named[:4]) or 'none'})")
         bound[token] = named[0]
     argv = [bound.get(t, t) for t in cmd.argv]
-    # A hole inside a token counts too: `configs/<dataset>.yaml`, `--data=<path>`, `{task}`.
-    if hole := next((t for t in argv if re.search(r"\$\{?\w|<[^<>\s]+>|\{(?!seed\})\w+\}", t)
+    # A hole inside a token counts too: `configs/<dataset>.yaml`, `--data=<path>`, `{task}`,
+    # and a README's own `{seed}`, which pins nothing (the harness appends its seed flag).
+    if hole := next((t for t in argv if re.search(r"\$\{?\w|<[^<>\s]+>|\{\w+\}", t)
                      or _PLACEHOLDER.match(t)), ""):
         return None, f"the documented command still has an unfilled hole {hole!r}"
     if not bound:
@@ -651,7 +735,7 @@ def resolve_metric(doc: PaperDoc, table_ref: str, cmd: CandidateCommand | None,
 
     col = int(m.group(3))
     header = _header_for(table, col)
-    ident.cell_quantity = _quantity_of(header) or _quantity_of(table.caption or "")
+    ident.cell_quantity = cell_quantity(table, col)
     ident.cell_basis, ident.cell_unit = cell_basis(table, col)
     ident.evidence.append(IdentityEvidence(
         quote=header or (table.caption or "")[:120], source_ref=table_ref,
@@ -791,53 +875,42 @@ def resolve_experiment(doc: PaperDoc, repo: Path, table_ref: str,
         quote=ident.row_method, source_ref=f"T{m.group(1)}:r{row}:c0",
         note="the method whose result this cell reports"))
 
-    # WHICH method the cell reports: its row label, or — on a row labelled by a number (a
-    # sample size, a dimension) — its column header when that names no metric. A cell whose
-    # row and column name no method is the paper's own experiment.
-    from .paper import _METRIC_WORD, column_header, table_role  # deferred: see `_metric_name`
+    # WHICH method the cell reports, and whether it is the paper's own (`cell_method`).
+    from .paper import table_role  # deferred: see `_metric_name`
     col = int(m.group(3))
-    label = ident.row_method
-    if not re.search(r"[^\W\d_]{2,}", label):
-        head = column_header(table, col)
-        if not head:
-            ident.state = "no_candidate"
-            ident.reason = ("the cited row is labelled by a number and extraction recovered no "
-                            "header for its column, so which method the cell reports is unknown")
-            return ident
-        label = "" if _METRIC_WORD.search(head) or _quantity_of(head) else head
-    if label and _CITED.search(label):
-        ident.state = "no_candidate"
-        ident.reason = (f"the cited cell reports {label!r}, which carries a citation: a baseline "
-                        f"the authors cite, not a result their code produces")
+    labels, own, refusal = cell_method(doc, table, row, col)
+    if refusal:
+        ident.state, ident.reason = "no_candidate", refusal
         return ident
-    own = not label or own_method(doc, label)
+    label = labels[0] if labels else ""
     # A method the paper NAMES as its own must be implemented here (the code IS it, not a
     # string about it); a variant ("FooNet-large") counts when the checkout DEFINES its
-    # leading name. A row marked "ours" names no identifier to look for.
-    method = re.sub(r"\([^)]*\)|[*†‡§]", "", label).strip(" -_")
+    # leading name. A label marked "ours" names no identifier to look for.
+    method = re.sub(r"\([^)]*\)|[*†‡§]", "", label).strip(" -_") if own else ""
     lead = re.split(r"[\s\-_/]+", method)[0] if method else ""
-    if own and method and not _OURS.search(label) and not repo_implements(repo, method) and not (
+    if method and not _OURS.search(label) and not repo_implements(repo, method) and not (
             len(lead) >= 4 and repo_defines(repo, lead)):
         ident.state = "no_candidate"
-        ident.reason = (f"the cited row reports {label!r}, and no .py or .sh file in this "
+        ident.reason = (f"the cell reports {label!r}, and no .py or .sh file in this "
                         f"checkout implements it")
         return ident
 
     context = cell_context(table, row, col)
-    label_words = {w.lower() for w in re.split(r"[\s,;:()\[\]]+", label) if w}
     candidates = []
     for c in harvest_candidates(repo):
         filled, why = instantiate(c, context)
         if filled is None:
             ident.rejected.append(f"{c.source_ref}: {why}")
             continue
-        # A row that is not the paper's own method is produced only by a command whose own
-        # documented argument names it (`--model {bert,ours}` filled with 'bert').
-        if not own and not any(v.lower() in label_words for v in filled.bound_slots.values()):
+        # A cell that is not the paper's own method is produced only by a command whose own
+        # documented METHOD argument names it (`--model {bert,ours}` filled with 'bert'); a
+        # dataset argument never selects a method.
+        if not own and not selects(filled, labels):
             ident.rejected.append(
-                f"{c.source_ref}: takes no documented argument naming {label!r}, which is not "
-                f"the paper's own method" + (" (a dataset row of a data-statistics table)"
-                                              if table_role(table) == "data_statistics" else ""))
+                f"{c.source_ref}: takes no documented method argument naming "
+                f"{' / '.join(repr(x) for x in labels if x)}, which the paper does not name as "
+                f"its own" + (" (a dataset row of a data-statistics table)"
+                              if table_role(table) == "data_statistics" else ""))
             continue
         candidates.append(describe_command(repo, filled))
     ident.considered = len(candidates) + len(ident.rejected)
@@ -847,14 +920,14 @@ def resolve_experiment(doc: PaperDoc, repo: Path, table_ref: str,
             f"the cited row names {label!r}, a dataset rather than a method, and no advertised "
             f"program in this checkout is bound to its statistics"
             if table_role(table) == "data_statistics" else
-            f"the cited row reports {label!r}, which the paper does not name as its own method, "
-            f"and no advertised command takes a documented argument naming it — which row a "
-            f"command produces would be a guess")
+            f"the cell reports {' / '.join(repr(x) for x in labels if x)}, which the paper does "
+            f"not name as its own method, and no advertised command takes a documented method "
+            f"argument naming it — which cell a command produces would be a guess")
         return ident
-    cell_quantity = _quantity_of(_header_for(table, col)) or _quantity_of(table.caption or "")
+    quantity = cell_quantity(table, col)
     named = _metric_key(table, col)
     fitting = _prefer_fenced([c for c in candidates
-               if (cell_quantity and any(q == cell_quantity for k, q in _OUTPUT_QUANTITY
+               if (quantity and any(q == quantity for k, q in _OUTPUT_QUANTITY
                                          if k in c.emits))
                or (named and named in {_key(k) for k in c.named_keys})])
     for c in candidates:
@@ -864,7 +937,7 @@ def resolve_experiment(doc: PaperDoc, repo: Path, table_ref: str,
     if not fitting:
         ident.state = "no_candidate"
         ident.reason = (f"none of the {ident.considered} advertised command(s) emits "
-                        f"{cell_quantity or _metric_name(table, col) or 'the cell’s quantity'}"
+                        f"{quantity or _metric_name(table, col) or 'the cell’s quantity'}"
                         + ("" if _metric_name(table, col) else
                            " (the paper names no metric for this column, so none can be bound)"))
         return ident
@@ -885,7 +958,7 @@ def resolve_experiment(doc: PaperDoc, repo: Path, table_ref: str,
             ident.state = "established"
             ident.evidence.append(IdentityEvidence(
                 quote=" ".join(chosen.argv), source_ref=chosen.source_ref,
-                note=f"the only one of {len(fitting)} candidates emitting {cell_quantity} "
+                note=f"the only one of {len(fitting)} candidates emitting {quantity} "
                      f"whose declared configuration matches the cited row ({fields_str})"))
             for field, ref in expected_evidence.items():
                 ident.evidence.append(IdentityEvidence(
@@ -893,7 +966,7 @@ def resolve_experiment(doc: PaperDoc, repo: Path, table_ref: str,
                     note="the cited row's own configuration, matched against the chosen "
                          "command's declared configuration"))
             ident.reason = (
-                f"{len(fitting)} advertised commands could produce {cell_quantity}; "
+                f"{len(fitting)} advertised commands could produce {quantity}; "
                 f"configuration matching narrowed them to one by {fields_str}"
                 + (f" (excluded: {'; '.join(dropped.values())})" if dropped else ""))
             return ident
@@ -905,7 +978,7 @@ def resolve_experiment(doc: PaperDoc, repo: Path, table_ref: str,
             f"({', '.join(f'{k}={v}' for k, v in expected.items())}) but could not reach "
             f"one; {'; '.join(dropped.values()) or 'none excluded'}."
             if expected and len(narrowed) < len(fitting) else "")
-        ident.reason = (f"{len(fitting)} advertised commands could produce {cell_quantity}; "
+        ident.reason = (f"{len(fitting)} advertised commands could produce {quantity}; "
                         f"choosing between them would be a guess, so none is chosen "
                         f"({', '.join(c.source_ref for c in fitting[:4])})."
                         f"{narrowing_note}")
@@ -915,8 +988,8 @@ def resolve_experiment(doc: PaperDoc, repo: Path, table_ref: str,
     ident.state = "established"
     ident.evidence.append(IdentityEvidence(
         quote=" ".join(ident.command.argv), source_ref=ident.command.source_ref,
-        note=f"the only advertised command emitting {cell_quantity}"))
-    ident.reason = (f"one advertised command emits {cell_quantity or _metric_name(table, col)}: "
+        note=f"the only advertised command emitting {quantity}"))
+    ident.reason = (f"one advertised command emits {quantity or _metric_name(table, col)}: "
                     f"{' '.join(ident.command.argv)}")
     return ident
 
@@ -999,17 +1072,24 @@ def resolve_configuration(doc: PaperDoc, table_ref: str, cmd: CandidateCommand |
     # a documented value the README's command takes and the cell names (the slot filled by
     # `instantiate`) is the dataset; a row label naming a method the checkout implements
     # (checked by `resolve_experiment`) is the method. Nothing else is inferred.
-    row_label = (table.cell(int(m.group(2)), 0) or "").strip()
-    row_words = {w.lower() for w in re.split(r"[\s,;:()\[\]]+", row_label) if w}
+    row, col = int(m.group(2)), int(m.group(3))
+    labels, own, _refusal = cell_method(doc, table, row, col)
+    if value := selects(cmd, labels):          # the command's own method argument selects it
+        at = cmd.argv.index(value)
+        ident.matched["model"] = value
+        ident.evidence.append(IdentityEvidence(
+            quote=f"{cmd.argv[at - 1]} {value}", source_ref=cmd.source_ref,
+            note=f"the README documents {value!r} as a method argument, and the cited cell names it"))
+    elif own:
+        # A command with no argument naming the method runs the paper's OWN method; the cell
+        # is that configuration only when the paper names it as its own.
+        ident.matched["model"] = labels[0] if labels and labels[0] else "the paper's own method"
+        ident.evidence.append(IdentityEvidence(
+            quote=ident.matched["model"], source_ref=table_ref,
+            note="the cited cell is the paper's own method, which the documented command runs"))
     for slot, value in cmd.bound_slots.items():
         at = cmd.argv.index(value) if value in cmd.argv else -1
         flag = cmd.argv[at - 1].lower() if at > 0 else ""
-        if "model" not in ident.matched and value.lower() in row_words:
-            ident.matched["model"] = value       # the command's own argument selects the row
-            ident.evidence.append(IdentityEvidence(
-                quote=f"{flag} {value}".strip(), source_ref=cmd.source_ref,
-                note=f"the README documents {value!r} for {slot}, and the cited row names it"))
-            continue
         # A slot is the dataset only when a FLAG says so; a positional's predecessor is the
         # program file, which says nothing.
         if ("dataset" in ident.matched or not flag.startswith("-")
@@ -1019,13 +1099,6 @@ def resolve_configuration(doc: PaperDoc, table_ref: str, cmd: CandidateCommand |
         ident.evidence.append(IdentityEvidence(
             quote=f"{flag} {value}", source_ref=cmd.source_ref,
             note=f"the README documents {value!r} for {slot}, and the cited cell names it"))
-    # A command with no argument naming the method runs the paper's OWN method; the row is
-    # that configuration only when the paper names it as its own.
-    if "model" not in ident.matched and own_method(doc, row_label):
-        ident.matched["model"] = row_label
-        ident.evidence.append(IdentityEvidence(
-            quote=row_label, source_ref=f"T{m.group(1)}:r{m.group(2)}:c0",
-            note="the cited row is the paper's own method, which the documented command runs"))
     # `sparsity` is REPORTED when the caption states it, never REQUIRED (it exists only
     # in pruning papers). Model and dataset identify a configuration in general.
     for field in ("model", "dataset"):

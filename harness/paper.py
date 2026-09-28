@@ -904,7 +904,7 @@ _METRIC_WORD = re.compile(
     r"BLEU|ROUGE|METEOR|perplexity|reward|return|regret|delay|ECE|calibration|coverage|"
     r"likelihood|NLL|score|bias|variance|FID|mAP|IoU|mIoU|PSNR|SSIM|LPIPS|WER|CER|NDCG|MRR|"
     r"CRPSS?|R2|correlation|win rate|success rate|runtime|latency|throughput|memory|"
-    r"speed-?up)\b", re.I)
+    r"speed-?up|top-?\d+)\b", re.I)
 _SPREAD_WORDS = re.compile(r"\b(?:standard|std\.?)\s+(?:error|deviation)s?\b|\berror\s+bars?\b|"
                            r"\bmargin\s+of\s+error\b", re.I)
 
@@ -1466,10 +1466,13 @@ def synthesis_brief(paper_id: str, lens: str, anchor: AnchorPacket,
 
 
 def _carried(part, anchor: AnchorPacket) -> frozenset:
-    """The anchor sections this part prints from their first character on (a slice that
-    starts mid-section does not carry the section's opening claims)."""
-    return frozenset(i for i, a, _b in part.slices
-                     if a == 0 and i in (anchor.abstract_idx, anchor.conclusion_idx))
+    """The anchor sections this part prints at least everything the anchor would: a slice
+    from the first character through the anchor's own (possibly clipped) length. A slice
+    that starts mid-section, or stops short of the anchor's text, carries less than it."""
+    shown = {anchor.abstract_idx: anchor.abstract, anchor.conclusion_idx: anchor.conclusion}
+    return frozenset(i for i, a, b in part.slices
+                     if a == 0 and i in shown
+                     and b >= len(shown[i].removesuffix(" …[anchor clipped]")))
 
 
 def render_part_with_anchor(part, anchor: AnchorPacket) -> str:

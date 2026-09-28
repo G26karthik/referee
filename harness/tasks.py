@@ -74,9 +74,10 @@ _EFFORT: dict[str, tuple[str, str]] = {   # role -> (model, effort)
 
 # A worker's Read tool refuses more than 25k tokens per call; a prompt over that was being
 # re-read in overlapping chunks, one model turn (a full context re-send) per chunk.
-# ponytail: ~45k chars is ~16k tokens at the 2.8 chars/token lens prompts measure; one line
-# longer than that is its own range (sections are clipped at 40k chars, so none exist).
-READ_CHUNK_CHARS = 45_000
+# ponytail: 30k chars stays under the cap at the densest text measured (digit-heavy tables,
+# 1.76 chars/token incl. line numbers -> ~17k tokens); one line longer than that is its own
+# range (sections are clipped at 40k chars, ~23k tokens at that density).
+READ_CHUNK_CHARS = 30_000
 
 
 def read_ranges(path: Path) -> list[list[int]]:

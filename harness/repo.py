@@ -102,6 +102,8 @@ def _score(text: str, start: int, host: str, url: str) -> int:
     score = 0
     if any(c in window for c in _CUES):
         score += 3
+    if _first_person(text, start):      # "our code is available at" outranks an impersonal cue
+        score += 3
     if host.lower() == "github.com":
         score += 1
     # A footnote marker fused to the URL signs a citation to someone else's repository.
@@ -129,11 +131,31 @@ _CUE_PATTERNS = (
 )
 
 
-def _cued(text: str, start: int) -> bool:
-    """Does an availability or authorship phrase precede this URL?"""
+# The URL's own sentence gives the code to someone else: "the baseline implementation is
+# available at", "the code of Smith et al. is available at", "we use the released code".
+_THIRD_PARTY = re.compile(r"\b(?:baselines?|their|et\s+al|original\s+authors|provided\s+by|"
+                          r"we\s+(?:use[ds]?|adopt(?:ed)?|build\s+on|borrow(?:ed)?)|third[- ]party|"
+                          r"prior\s+work|existing\s+implementation)\b", re.I)
+
+
+def _sentence_before(text: str, start: int) -> str:
     window = text[max(0, start - _CUE_WINDOW):start]
-    low = window.lower()
-    return any(c in low for c in _CUES) or any(p.search(window) for p in _CUE_PATTERNS)
+    cut = max(window.rfind(". "), window.rfind(".\n"))
+    return window[cut + 1:] if cut >= 0 else window
+
+
+def _first_person(text: str, start: int) -> bool:
+    return any(p.search(_sentence_before(text, start)) for p in _CUE_PATTERNS)
+
+
+def _cued(text: str, start: int) -> bool:
+    """Does an availability or authorship phrase precede this URL in its own sentence? A
+    first-person statement ("our code is available at") always counts; an impersonal one
+    ("code is available at") only when the sentence gives the code to no one else."""
+    sentence = _sentence_before(text, start)
+    if _first_person(text, start):
+        return True
+    return any(c in sentence.lower() for c in _CUES) and not _THIRD_PARTY.search(sentence)
 
 
 def _reference_spans(doc: PaperDoc, joiner: int = 1) -> list[tuple[int, int]]:
@@ -261,7 +283,8 @@ def readme_attributes(readme: str, doc: PaperDoc) -> str:
         return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
     # A BibTeX/citation block CITES the paper — title and authors — and says nothing about
     # who wrote the code.
-    readme = re.sub(r"```.*?```|@\w+\s*\{.*?\n\s*\}", " ", readme or "", flags=re.S)
+    # ponytail: a citation block is bounded (4k chars) so a pathological README stays linear.
+    readme = re.sub(r"```[^`]{0,8000}```|@\w+\s*\{[^@]{0,4000}?\n\s*\}", " ", readme or "")
     title = norm(doc.title)
     body = norm(readme)
     if len(title.split()) < 4 or title not in body:
@@ -277,11 +300,12 @@ def readme_attributes(readme: str, doc: PaperDoc) -> str:
     if len(others) > 3:
         return ""
     # About the paper is not BY its authors: a re-implementation cites the same title and id.
-    head = readme[:4000]
-    if _NOT_AUTHORS.search(head) or any(
-            not re.search(r"\b(?:official|our)\b", head[max(0, m.start() - 40):m.start()], re.I)
-            and not re.match(r"\s*(?:our|the\s+paper)\b", head[m.end():], re.I)
-            for m in re.finditer(r"\bimplementation\s+of\b", head, re.I)):
+    # "Implementation of <this title>" without "official"/"our" before it is someone's
+    # version of the paper; "uses the implementation of FlashAttention" is not about it.
+    head = body[:4000]
+    if _NOT_AUTHORS.search(readme[:4000]) or any(
+            not re.search(r"\b(?:official|our)\b", head[max(0, m.start() - 40):m.start()])
+            for m in re.finditer(rf"\bimplementation of (?:the paper )?{re.escape(title)}", head)):
         return ""
     window = body[max(0, at - 300):at + len(title) + 300]
     if not _README_AUTHORSHIP.search(window):
@@ -297,7 +321,8 @@ def readme_attributes(readme: str, doc: PaperDoc) -> str:
 _NOT_AUTHORS = re.compile(
     r"\b(unofficial|non-?official|re-?implementation|reimplementation|reproducibility "
     r"challenge|replication of|port of|third[- ]party|not affiliated|my (?:own )?implementation|"
-    r"not (?:yet )?(?:been )?released)\b", re.I)
+    r"not (?:the )?official|community fork|fork of (?:the )?(?:official|original|authors)|"
+    r"(?:code|implementation) (?:has|have|is|are) not (?:yet )?(?:been )?released)\b", re.I)
 _NAME_STOP = {"university", "institute", "department", "conference", "international",
               "proceedings", "abstract", "anonymous", "laboratory", "school", "college",
               "research", "science", "sciences", "technology", "engineering", "computer",
