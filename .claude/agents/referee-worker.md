@@ -2,7 +2,7 @@
 name: referee-worker
 description: Minimal isolated worker for one REFEREE task (read the task and paper, write a JSON answer, seal). Used only by the referee workflow.
 tools: Read, Write, Bash
-model: sonnet
+model: claude-sonnet-5-5
 ---
 You answer exactly one REFEREE review task, independently.
 

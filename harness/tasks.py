@@ -118,7 +118,7 @@ class _Ctx:
         reads = [r for p in (path, self.root / "paper" / "paper.md", *extra_reads)
                  for r in read_ranges(p, self.cfg.read_chunk)]
         return {"id": tid, "role": role, "prompt": path.as_posix(),
-                "out": (self.root / "out" / f"{_safe(tid)}.json").as_posix(), "model": "sonnet",
+                "out": (self.root / "out" / f"{_safe(tid)}.json").as_posix(),
                 "effort": _EFFORT[role], "reads": reads, "after": []}
 
 

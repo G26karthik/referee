@@ -6,9 +6,12 @@ export const meta = {
 }
 
 // args: { papers: ["papers/x.pdf" | "<paper-id>", ...], repo: "C:/.../single-harness",
-//         python: "../.venv/Scripts/python", env: "PYTHONUTF8=1 SH_PROJECTS_DIR=... ...", maxRounds: 30 }
+//         python: "../.venv/Scripts/python", env: "PYTHONUTF8=1 SH_PROJECTS_DIR=... ...", maxRounds: 30,
+//         workerModel?: "claude-sonnet-5-5", controllerModel?: "haiku" }
 // Model work is done ONLY by isolated Sonnet workers (one fresh context per task) and a Haiku
-// controller that runs the harness command — never Opus. Whether a task sealed is read back
+// controller that runs the harness command — never Opus. The worker model is pinned (it makes
+// every scientific judgment, so a run records exactly which model made them); the controller
+// only relays JSON, so it follows the current Haiku alias. Whether a task sealed is read back
 // from the harness's own task list, never from the worker's say-so. Token budget: every
 // worker turn re-sends its context, so the protocol is ~3 turns: one message of parallel
 // Reads over the harness's ranges, Write the answer, one Bash seal.
@@ -19,6 +22,8 @@ const ENV = A.env || 'PYTHONUTF8=1'
 // Rounds: lenses -> critic -> plan -> per-check bind/gen/verify (+1 revision) -> report,
 // plus polls while experiments run in the background (each poll waits up to 9 minutes).
 const MAX_ROUNDS = A.maxRounds || 30
+const WORKER_MODEL = A.workerModel || 'claude-sonnet-5-5'
+const CONTROLLER_MODEL = A.controllerModel || 'haiku'
 const sh = cmd => `cd "${REPO}" && ${ENV} ${PY} ${cmd}`
 
 const STATE = {
@@ -28,9 +33,9 @@ const STATE = {
     blocked_reason: { type: 'string' }, scientific_status: { type: 'string' },
     tasks: { type: 'array', items: { type: 'object', properties: {
       id: { type: 'string' }, role: { type: 'string' }, prompt: { type: 'string' },
-      out: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' },
+      out: { type: 'string' }, effort: { type: 'string' },
       reads: { type: 'array', items: { type: 'array' } } },
-      required: ['id', 'role', 'prompt', 'out', 'model', 'effort', 'reads'] } },
+      required: ['id', 'role', 'prompt', 'out', 'effort', 'reads'] } },
   },
   required: ['paper_id', 'phase', 'status', 'tasks'],
 }
@@ -54,7 +59,7 @@ function controller(source, label) {
     `Run exactly this shell command (Bash, timeout 600000 ms) and return its JSON stdout fields ` +
     `verbatim (paper_id, phase, status, blocked_reason, scientific_status, tasks). Do nothing else:\n\n` +
     sh(`run.py tasks "${source}" --json --wait 540`),
-    { label, phase: 'Review', model: 'haiku', effort: 'low', schema: STATE })
+    { label, phase: 'Review', model: CONTROLLER_MODEL, effort: 'low', schema: STATE })
 }
 
 function worker(pid, t, prior) {
@@ -73,8 +78,7 @@ function worker(pid, t, prior) {
     `Write again and re-seal (at most 2 retries). Never invent or weaken evidence to pass.\n` +
     (prior ? `A previous attempt at this task failed with: ${prior}\n` : '') +
     `Reply with one line: SEALED, or FAILED: <the exact seal error>.`,
-    { label: `${pid}:${t.id}`, phase: 'Review', model: t.model === 'haiku' ? 'haiku' : 'sonnet',
-      effort: t.effort || 'medium' })
+    { label: `${pid}:${t.id}`, phase: 'Review', model: WORKER_MODEL, effort: t.effort || 'medium' })
 }
 
 async function review(source) {
@@ -101,7 +105,7 @@ async function review(source) {
     })
     rounds.push({ round: round + 1, phase: st && st.phase, sealed, tasks: ready.length })
   }
-  return { source, final: st && { paper_id: st.paper_id, phase: st.phase, workflow_status: st.status,
+  return { source, models: { worker: WORKER_MODEL, controller: CONTROLLER_MODEL }, final: st && { paper_id: st.paper_id, phase: st.phase, workflow_status: st.status,
            blocked_reason: st.blocked_reason, scientific_status: st.scientific_status || 'NOT_ASSESSED',
            left: (st.tasks || []).map(t => t.id) },
            rounds, gave_up: Object.keys(fails).filter(k => fails[k] >= 2) }
