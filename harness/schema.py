@@ -237,6 +237,8 @@ class PaperDoc(_Base):
         default=1, description="bumped when address numbering/scope changes; a ref minted "
                                "under an older parse must not resolve against a newer one")
     repo_url: str = Field(default="", description="the official repo the paper advertises")
+    repo_discovery: str = Field(default="", description="how repo_url was attributed: "
+                                "'pdf_cue: ...' | 'public_search: <README evidence>' | 'none: why'")
     repo_urls: list[str] = Field(
         default_factory=list, description="every candidate URL found, best first — NOT the "
                                           "same list as `repo_url`, which requires a cue word")
@@ -524,6 +526,8 @@ class RepoAcquisition(_Base):
     env_path: str = Field(default="")
     env_status: str = Field(default="not_attempted", description=" | ".join(ENV_STATUSES))
     env_backend: str = Field(default="", description="which backend BUILT this environment")
+    discovered_by: str = Field(default="", description="pdf_cue | public_search | ''")
+    discovery_evidence: str = Field(default="", description="the quote that attributes it")
 
 
 class RuntimeDemand(_Base):
@@ -687,7 +691,7 @@ class ArtifactInspection(_Base):
 # === 6. IDENTITY + CAPABILITY — which experiment, which quantity, can this machine run it ===
 
 IDENTITY_STATES = ("established", "ambiguous", "no_candidate", "unmapped", "unsupported")
-COMMAND_SOURCES = ("readme", "run_script", "scripts_dir", "makefile")
+COMMAND_SOURCES = ("readme", "readme_named", "run_script", "scripts_dir", "makefile")
 CELL_QUANTITIES = ("accuracy", "memory", "latency", "flops", "macs", "loss", "params")
 CELL_BASES = ("absolute", "relative_to_baseline")
 
@@ -716,6 +720,13 @@ class CandidateCommand(_Base):
     seed_values: list[str] = Field(default_factory=list)
     emits: list[str] = Field(default_factory=list)
     label: str = Field(default="")
+    # argv token -> the values the README documents for it ("$ds" in a for-loop, "<a|b>");
+    # an empty list is a free placeholder. `bound_slots` records what filled each, and why.
+    slots: dict[str, list[str]] = Field(default_factory=dict)
+    bound_slots: dict[str, str] = Field(default_factory=dict)
+    # String keys the invoked program's own source names ("PEHE", "kendall_tau"): a metric
+    # is bound by NAME only when the cell's metric is literally one of them.
+    named_keys: list[str] = Field(default_factory=list)
 
 
 class _Identity(_Base):
@@ -1071,11 +1082,14 @@ class ProbeSpec(_Base):
     finding_id: str = Field(default="")
     claim: str = Field(default="")
     claimed_delta: float | None = Field(default=None)
-    metric: str = Field(default="accuracy")
+    # Unset means the paper named no metric/dataset/epoch count for this spec. The noise-floor
+    # template supplies its OWN values at render time; a default here used to label every
+    # target "accuracy on digits, 30 epochs" regardless of what the paper printed.
+    metric: str = Field(default="")
     arms: list[str] = Field(default_factory=lambda: ["baseline", "treatment"])
     seeds: list[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4])
-    dataset: str = Field(default="digits")
-    epochs: int = Field(default=30)
+    dataset: str = Field(default="")
+    epochs: int = Field(default=0)
     script: str = Field(default="", description="empty = default template")
     command: list[str] = Field(default_factory=list, description="the repo's own eval command")
     cwd: str = Field(default="")
@@ -1810,6 +1824,10 @@ class CaseState(_Base):
     disposition: str = Field(default="NOT_REVIEWED", description="carried from the report: " + " | ".join(PAPER_DISPOSITIONS))
     disposition_basis: str = Field(default="NONE", description=" | ".join(DISPOSITION_BASIS))
     report_path: str = ""
+    # `status == "complete"` says the WORKFLOW ended. What the review established about the
+    # paper is this, separately (`decide.scientific_outcome`).
+    scientific_status: str = Field(default="NOT_ASSESSED", description="decide.SCIENTIFIC_STATUSES")
+    scientific_blocker: str = Field(default="")
     resume_after: str = Field(default="", description="advisory hint; the controller does not sleep on it")
     failure_kind: str = Field(default="", description=" | ".join(FAILURE_KINDS))
     retry_policy: str = Field(default="", description=" | ".join(RETRY_POLICIES))

@@ -222,6 +222,72 @@ def stops_the_paper(disposition: str = "") -> bool:
     return (disposition or "") == "STOP_MATERIAL_FAILURE"
 
 
+# === WHAT THE REVIEW ESTABLISHED — never the same fact as "the workflow finished" =======
+# Five outcome kinds, never merged: reproducing a printed result, checking a stated result on
+# finite instances, checking ONE proof step, a disagreement between paper and released
+# artifact, and a check against the paper's own printed text.
+OUTCOME_KINDS = ("empirical_reproduction", "finite_instance", "proof_step", "artifact",
+                 "paper_internal", "none")
+SCIENTIFIC_STATUSES = ("CENTRAL_CLAIM_CHECKED", "ONLY_NON_CENTRAL_CHECKED", "NO_CONCLUSIVE_CHECK")
+_CONCLUSIVE = ("REPRODUCED", "FAILED_REPRODUCTION", "COUNTEREXAMPLE_ESTABLISHED",
+               "PAPER_ARITHMETIC_CONTRADICTION")
+
+
+def outcome_kind(route: str, *, fragment: bool = False) -> str:
+    if route == "EXACT_CERTIFICATE":
+        return "proof_step" if fragment else "finite_instance"
+    if route in ("AUTHOR_CODE_EXECUTION", "INDEPENDENT_RECONSTRUCTION"):
+        return "empirical_reproduction"
+    if route == "ARTIFACT_INSPECTION":
+        return "artifact"
+    if route in ("PAPER_INTERNAL_CHECK", "ARITHMETIC_RECHECK"):
+        return "paper_internal"
+    return "none"
+
+
+def scientific_outcome(ts) -> dict:
+    """Whether any admissible check reached a conclusion about a claim, by outcome kind,
+    with the paper's top central claim and exactly where its check stopped. Read off the
+    target set only. A proof-step defect is reported as one and never counts as checking
+    the statement it belongs to; a quotation re-check or a clean instance sweep concludes
+    nothing."""
+    objs = {o.target_id: o for o in ts.objects}
+    by_kind: dict[str, dict[str, int]] = {}
+    central_checked, other_checked, step_defects = [], [], []
+    for out in ts.outcomes:
+        obj = objs.get(out.target_id)
+        kind = outcome_kind(out.route, fragment=bool(obj and getattr(obj, "parent_target", "")))
+        counts = by_kind.setdefault(kind, {})
+        counts[out.disposition] = counts.get(out.disposition, 0) + 1
+        if out.disposition not in _CONCLUSIVE or not (
+                out.disposition == "PAPER_ARITHMETIC_CONTRADICTION" or admits(out.provenance)):
+            continue
+        if kind == "proof_step":
+            step_defects.append(out.target_id)
+        elif obj is not None and obj.centrality == "CENTRAL":
+            central_checked.append(out.target_id)
+        else:
+            other_checked.append(out.target_id)
+    status = ("CENTRAL_CLAIM_CHECKED" if central_checked else
+              "ONLY_NON_CENTRAL_CHECKED" if other_checked else "NO_CONCLUSIVE_CHECK")
+    outcomes = {o.target_id: o for o in ts.outcomes}
+    top = next((o for o in ts.objects if o.centrality == "CENTRAL" and not getattr(
+        o, "parent_target", "")), None)
+    central: dict[str, str] = {}
+    if top is not None:
+        out = outcomes.get(top.target_id)
+        central = {"target_id": top.target_id, "claim": (top.claim_text or "")[:400],
+                   "ref": getattr(top.ref, "ref", "") if top.ref else "",
+                   "route": out.route if out else "", "disposition": out.disposition if out else
+                   (top.status or "PENDING"), "reason": (out.reason if out else "")[:600]}
+    blocker = ("" if central_checked else
+               (central.get("reason") or central.get("disposition") or "")
+               if central else "no CENTRAL claim was identified from the paper's structure")
+    return {"status": status, "central_claim": central, "blocker": blocker,
+            "central_checked": central_checked, "non_central_checked": other_checked,
+            "proof_step_defects": step_defects, "by_kind": by_kind}
+
+
 # === PLANNER — whether a target is worth an experiment, and which kind, deterministically ===
 # This module decides whether to TRY; `execute.authorize` decides whether it may RUN.
 # Identity, capability, commit verification and resource sufficiency all live there, and
@@ -513,15 +579,23 @@ _CHEAPNESS = {"PAPER_INTERNAL_CHECK": 3, "ARITHMETIC_RECHECK": 3, "EXACT_CERTIFI
              "ARTIFACT_INSPECTION": 2,
              "AUTHOR_CODE_EXECUTION": 1, "INDEPENDENT_RECONSTRUCTION": 0, "NONE": 0}
 _IDENTITY_SCORE = {"established": 3, "ambiguous": 1, "unmapped": 0, "": 0}
-_BASE, _FIELDS = 8, 6          # base > any field's max, so the sum is provably lexicographic
+_BASE, _FIELDS = 8, 7          # base > any field's max, so the sum is provably lexicographic
+
+
+def route_family(route: str) -> str:
+    """'certificate' for an exact-arithmetic check of a stated result, else 'empirical'."""
+    return "certificate" if route == "EXACT_CERTIFICATE" else "empirical"
 
 
 def score(*, centrality: str, addressable: bool, cheapest_route: str,
-         identity_state: str = "", artifact_available: bool = False) -> tuple[float, str]:
+         identity_state: str = "", artifact_available: bool = False,
+         fragment: bool = False) -> tuple[float, str]:
     """(priority, reason). A model may argue a target matters; that reaches here only as
-    `centrality`, derived from structure, never from a lens's own opinion."""
+    `centrality`, derived from structure, never from a lens's own opinion. A proof-step
+    `fragment` ranks after every whole claim of the same centrality: a step is checked in
+    service of its statement, never ahead of the paper's own claims."""
     values = [
-        _CENTRALITY.get(centrality, 0), 1 if addressable else 0,
+        _CENTRALITY.get(centrality, 0), 1 if addressable else 0, 0 if fragment else 1,
         _DECISIVENESS.get(cheapest_route, 0), _IDENTITY_SCORE.get(identity_state, 0),
         1 if artifact_available else 0, _CHEAPNESS.get(cheapest_route, 0),
     ]
@@ -532,7 +606,7 @@ def score(*, centrality: str, addressable: bool, cheapest_route: str,
               f"addressable={'yes' if addressable else 'no'}; route={cheapest_route or 'NONE'}; "
               f"identity={identity_state or 'unmapped'}; "
               f"artifact={'yes' if artifact_available else 'no'}")
-    return round(total / (_BASE ** _FIELDS), 6), reason
+    return round(total / (_BASE ** _FIELDS), 9), reason   # 8**7 > 1e6: 6 places would blur
 
 
 def order(objects, *, identity_state: str = "", artifact_available: bool = False):
@@ -542,7 +616,8 @@ def order(objects, *, identity_state: str = "", artifact_available: bool = False
         o.priority, o.priority_reason = score(
             centrality=o.centrality, addressable=bool(o.harness_addressable),
             cheapest_route=route_that_would_be_taken(tuple(o.routes or ())),
-            identity_state=identity_state, artifact_available=artifact_available)
+            identity_state=identity_state, artifact_available=artifact_available,
+            fragment=bool(getattr(o, "parent_target", "")))
     return sorted(objects, key=lambda o: (-o.priority, o.target_id))
 
 

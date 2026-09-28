@@ -204,6 +204,33 @@ def _running_boilerplate(pages: list[str]) -> frozenset[str]:
     return frozenset(line for line, n in counts.items() if n >= 2)
 
 
+def title_from_layout(path: str | Path) -> str:
+    """The title as typeset: the largest horizontal text on page 1, every line of it (a
+    title that wraps is still one title). '' when the layout gives no plausible answer,
+    so the caller falls back to `guess_title`. A rotated margin stamp is not horizontal."""
+    try:
+        import pymupdf
+        with pymupdf.open(str(path)) as d:
+            blocks = d[0].get_text("dict")["blocks"] if d.page_count else []
+    except Exception:
+        return ""
+    spans = []
+    for block in blocks:
+        for line in block.get("lines", []):
+            if tuple(round(x) for x in line.get("dir", (1, 0))) != (1, 0):
+                continue
+            for s in line.get("spans", []):
+                text = _norm(s.get("text", ""))
+                if len(text) >= 2 and not text.lower().startswith("arxiv:"):
+                    spans.append((s.get("size", 0.0), s["bbox"][1], s["bbox"][0], text))
+    if not spans:
+        return ""
+    top = max(size for size, *_ in spans)
+    title = _norm(" ".join(t for size, _y, _x, t in sorted(spans, key=lambda s: (s[1], s[2]))
+                           if abs(size - top) < 0.6))
+    return title if title_is_plausible(title) and len(title) <= 300 else ""
+
+
 def guess_title(pages: list[str]) -> str:
     """First substantial line of page 1 that is not a header/arXiv stamp/venue banner."""
     boilerplate = _running_boilerplate(pages)
@@ -860,21 +887,131 @@ def is_numeric_cell(text: str) -> bool:
     return bool(_NUMERIC_CELL.match(_norm(text)))
 
 
+# WHAT A TABLE IS. Only a RESULT table's cells are measurements a reproduction can be held
+# against. A table that SPECIFIES the experiment (its settings, data-generating functions,
+# hyper-parameters, notation, an analogy) prints inputs, not outcomes; a table describing a
+# dataset prints statistics of that data — checkable against released data, never a result
+# of the method. Decided from the paper's own caption, never from a paper name.
+_SPEC_CAPTION = re.compile(
+    r"\b(hyper-?\s?parameters?|notation|analogy|used to generate|data[- ]generating|"
+    r"search space|architecture details|glossary|symbols)\b", re.I)
+_DATA_CAPTION = re.compile(
+    r"\b(statistics of|dataset statistics|summary of (?:the )?datasets?|datasets? summary|"
+    r"data summary|characteristics of|datasets? used|data ?sets? (?:used|considered))\b", re.I)
+# The metric NOUN a caption names (for `metric_name`), from the one shared vocabulary.
+_METRIC_WORD = re.compile(
+    r"\b(RMSE|MSE|MAE|PEHE|ATE|AUC|AUROC|AUPRC|F1|accuracy|error|loss|precision|recall|"
+    r"BLEU|ROUGE|METEOR|perplexity|reward|return|regret|delay|ECE|calibration|coverage|"
+    r"likelihood|NLL|score|bias|variance|FID|mAP|IoU|mIoU|PSNR|SSIM|LPIPS|WER|CER|NDCG|MRR|"
+    r"CRPSS?|R2|correlation|win rate|success rate|runtime|latency|throughput|memory|"
+    r"speed-?up)\b", re.I)
+
+
+def table_role(table: Table) -> str:
+    """'text' | 'specification' | 'data_statistics' | 'result' — from the grid's own cells
+    and caption, never from a paper name."""
+    cap = table.caption or ""
+    # A boxed theorem, example or equation the extractor read as a grid: its cells are prose
+    # and math fragments, and a lone "1" or "2" among them is a subscript, not a measurement.
+    cells = [_norm(c) for row in table.rows for c in row if _norm(c)]
+    words = [c for c in cells if not is_numeric_cell(c)]
+    numbers = [c for c in cells if is_numeric_cell(c)]
+    digits_only = all(re.fullmatch(r"\d", n) for n in numbers)
+    # A column of real numbers (two or more, not just single digits) is a measured column,
+    # however much prose sits beside it: "Model | Training data | Decoding | Score".
+    numeric_column = any(
+        sum(1 for r in table.rows if c < len(r) and is_numeric_cell(r[c])) >= 2
+        and any(c < len(r) and is_numeric_cell(r[c]) and not re.fullmatch(r"\d", _norm(r[c]))
+                for r in table.rows)
+        for c in range(max((len(r) for r in table.rows), default=0)))
+    if (len(cells) >= 4 and not numeric_column
+            and sum(len(w) for w in words) > 12 * max(1, len(words))
+            and (len(numbers) * 3 < len(cells) or digits_only)):
+        return "text"
+    # Only single digits, and neither caption nor header names what they measure: indices,
+    # subscripts or counts of a worked example — nothing a reproduction could be held to.
+    if (words and numbers and digits_only
+            and not _METRIC_WORD.search(" ".join([cap, *table.header]))):
+        return "text"
+    # A caption naming a measured quantity ("RMSE under different hyper-parameters") is a
+    # result table whatever else it mentions.
+    if _SPEC_CAPTION.search(cap) and not _METRIC_WORD.search(cap):
+        return "specification"
+    if _DATA_CAPTION.search(cap) and not _METRIC_WORD.search(cap):
+        return "data_statistics"
+    return "result"
+
+
+def _index_row(row: list[str]) -> bool:
+    """A row of consecutive small integers ("1 2 3", "(i) (ii)") labels columns; it
+    measures nothing."""
+    vals = [_norm(c) for c in row if _norm(c)]
+    if len(vals) < 2 or not all(re.fullmatch(r"\d{1,2}", v) for v in vals):
+        return False
+    nums = [int(v) for v in vals]
+    return nums == list(range(nums[0], nums[0] + len(nums)))
+
+
+def column_header(table: Table, col: int) -> str:
+    """The column's label: the extracted header, else a first row that carries no number
+    while a later row carries one in this column (a header the extractor left in the body)."""
+    if col < len(table.header) and _norm(table.header[col]):
+        return table.header[col].strip()
+    rows = table.rows
+    if (rows and col < len(rows[0]) and _norm(rows[0][col])
+            and not any(is_numeric_cell(c) for c in rows[0] if _norm(c))
+            and any(col < len(r) and is_numeric_cell(r[col]) for r in rows[1:])):
+        return rows[0][col].strip()
+    return ""
+
+
+def metric_name(table: Table, col: int) -> str:
+    """The metric a column reports, as the paper names it — its header, else the metric the
+    caption names — or '' when the paper names none. A header that is not a metric word
+    ("IHDP", "Ours") names a dataset or method; the caption's metric then wins."""
+    header = column_header(table, col)
+    if header and _METRIC_WORD.search(header):
+        return header
+    if m := _METRIC_WORD.search(table.caption or ""):
+        return m.group(1)
+    return header if re.search(r"[^\W\d_]", _norm(header)) else ""
+
+
+def metric_label(table: Table, col: int) -> str:
+    """The quantity a column measures: its header, else the metric the caption names,
+    else an explicit 'unnamed' label — never a default like 'accuracy'."""
+    if header := column_header(table, col):
+        return header
+    name = metric_name(table, col)
+    label = f"Table {table.label or table.table_idx}"
+    return f"{name} ({label}, column {col})" if name else f"unnamed quantity ({label}, column {col})"
+
+
 def table_numbers(tables: list[Table]) -> list[QuantFinding]:
     """Every numeric cell, as a QuantFinding addressed back to its exact coordinates.
     Deterministic by construction: the value IS the cell. Column 0 is the row label
     (arm/method), the header row the metric names."""
     out: list[QuantFinding] = []
     for t in tables:
+        role = table_role(t)
+        if role in ("specification", "text"):
+            continue                       # inputs to the experiment, not its outcomes
         for r, row in enumerate(t.rows):
+            if _index_row(row):
+                continue                   # column labels, not measurements
             method = row[0] if row else ""
             for c, cell in enumerate(row):
                 if c == 0 or not is_numeric_cell(cell):
                     continue
                 spread = _SPREAD.search(cell)
+                metric = metric_label(t, c)
+                if metric.startswith("unnamed") and _norm(method) and role == "data_statistics":
+                    # A statistics table names its quantity per ROW ("#Frames").
+                    metric = f"{_norm(method)} (Table {t.label or t.table_idx}, column {c})"
                 out.append(QuantFinding(
-                    benchmark=t.caption[:120], method=method,
-                    metric=t.header[c] if c < len(t.header) else f"column {c}",
+                    benchmark=(("[data statistic] " if role == "data_statistics" else "")
+                               + t.caption)[:120], method=method,
+                    metric=metric,
                     value=cell, seeds_or_variance=spread.group(1) if spread else "",
                     source_quote=cell, page=t.page, table_ref=t.ref(r, c),
                 ))

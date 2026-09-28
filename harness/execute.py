@@ -1142,10 +1142,17 @@ _METRIC = re.compile(r"^SH_METRIC\s+arm=(\S+)\s+seed=(\d+)\s+value=([-\d.eE+]+)"
 _AUX = re.compile(r"^SH_AUX\s+key=(\S+)\s+arm=(\S+)\s+seed=(\d+)\s+value=([-\d.eE+]+)")
 
 
+# The noise-floor template's own experiment. It belongs to the template, never to a spec:
+# a target whose paper names no metric stays unlabelled rather than becoming "accuracy".
+_TEMPLATE_METRIC, _TEMPLATE_DATASET, _TEMPLATE_EPOCHS = "accuracy", "digits", 30
+
+
 def render_default(spec: ProbeSpec) -> str:
     body = DEFAULT_TEMPLATE
-    for key, value in (("__METRIC__", spec.metric), ("__DATASET__", spec.dataset),
-                      ("__ARMS__", "/".join(spec.arms)), ("__EPOCHS__", str(spec.epochs)),
+    for key, value in (("__METRIC__", spec.metric or _TEMPLATE_METRIC),
+                      ("__DATASET__", spec.dataset or _TEMPLATE_DATASET),
+                      ("__ARMS__", "/".join(spec.arms)),
+                      ("__EPOCHS__", str(spec.epochs or _TEMPLATE_EPOCHS)),
                       ("__CLAIM__", (spec.claim or "(none given)").replace('"""', "'''"))):
         body = body.replace(key, value)
     return body
@@ -1220,7 +1227,12 @@ _TARGET_KEYS = ("split", "dataset", "task", "subset", "benchmark", "eval_set", "
                "experiment", "model")
 _CONTAINER_KEYS = ("results", "metrics", "summary", "final", "eval", "test", "scores")
 _NAMING_KEYS = ("metric", "name", "metric_name", "key")
-METRIC_TIERS = ("target_bound", "named_artifact", "structured", "identity", "positional")
+METRIC_TIERS = ("target_bound", "named_artifact", "structured", "identity",
+                "text_aggregate", "text", "positional")
+# A printed "KEY: value" line, the plain-text form most research code reports in. The key
+# is the bound metric's own name, matched whole; an aggregate ("PEHE : 0.12 ± 0.01") is
+# preferred to per-run lines, and several distinct values at one tier are refused.
+_TEXT_VALUE = r"\s*[:=]\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
 
 
 @dataclass(frozen=True)
@@ -1234,7 +1246,8 @@ class MetricParse:
     @property
     def authoritative(self) -> bool:
         return (self.value is not None and not self.ambiguous
-               and self.tier in ("target_bound", "named_artifact", "structured", "identity"))
+               and self.tier in ("target_bound", "named_artifact", "structured", "identity",
+                                 "text_aggregate", "text"))
 
 
 def _json_objects(stdout: str) -> list[dict]:
@@ -1294,6 +1307,14 @@ def parse_metric(stdout: str, key: str, experiment_hint: str = "") -> MetricPars
     for obj in _json_objects(stdout):
         for tier, value in _tiered(obj, key, experiment_hint):
             per_tier.setdefault(tier, []).append(value)
+    text_line = re.compile(rf"(?<![\w.]){re.escape(key)}{_TEXT_VALUE}(\s*(?:±|\+/-|\+-)\s*\d)?",
+                           re.I)
+    for line in (stdout or "").splitlines():
+        if line.lstrip().startswith("{"):
+            continue
+        for m in text_line.finditer(line):
+            per_tier.setdefault("text_aggregate" if m.group(2) else "text", []).append(
+                float(m.group(1)))
     for tier in METRIC_TIERS:
         values = per_tier.get(tier) or []
         if not values:
@@ -1309,6 +1330,15 @@ def parse_metric(stdout: str, key: str, experiment_hint: str = "") -> MetricPars
         return MetricParse(value=distinct[0], tier=tier, candidates=candidates,
                            detail=f"'{key}' identified at tier {tier}")
     return MetricParse(detail=f"no JSON object on stdout reported '{key}'")
+
+
+def usable_metric(parsed: MetricParse, returncode: int | None) -> bool:
+    """May this parse count as the run's result? A plain-text line only from a process that
+    finished cleanly: a "loss: 0.93" logged before a crash is progress output, and counting
+    it would turn an environment failure into a reproduction (invariant 5)."""
+    if not (parsed.authoritative and parsed.value is not None):
+        return False
+    return not (parsed.tier in ("text", "text_aggregate") and returncode != 0)
 
 
 def _scale_ratio(a: float, b: float) -> float:
@@ -1685,6 +1715,22 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
             f"has no seed-to-seed distribution, so the tolerance is the precision the paper "
             f"printed rather than a 2-sigma band: |delta| {rec.delta_error:.4f}{precision_note} "
             + ("is within it. The stated total stands." if within else "exceeds it."))
+    elif spec.command and len(rec.seeds_run) > 1 and not any(
+            "{seed}" in str(a) for a in spec.command):
+        # The documented command takes no seed from this harness (none defined, or the README
+        # pins one), so every invocation is the SAME experiment. Their spread is not the
+        # paper's seed-to-seed protocol, so no band may call a difference a failure: agreement
+        # to the printed precision is support, anything else is reported, not scored.
+        within = effective_delta <= 0
+        rec.status = "RESOLVED_VERIFIED" if within else "INCONCLUSIVE"
+        rec.reason = (
+            f"the documented command takes no seed from this harness; {len(rec.seeds_run)} "
+            f"invocations gave {rec.reproduced_value:g} (spread {rec.reproduced_std:g}) against "
+            f"the printed {rec.claimed_value:g}: |delta| {rec.delta_error:.4f}{precision_note} "
+            + ("is within the printed precision. The printed number stands." if within else
+               "exceeds the printed precision, but repeating one configuration is not the "
+               "paper's seed protocol, so there is no band that could call it a failed "
+               "reproduction; it is reported, not scored."))
     elif noise_band <= 0:
         rec.status = "INCONCLUSIVE"
         rec.reason = (f"seed-to-seed noise measured as zero over {len(rec.seeds_run)} seeds, so "
@@ -1868,7 +1914,7 @@ def run_probe(cfg: Config, root: Path, spec: ProbeSpec,
                                 if isinstance(v, str)) if (
                                     spec.configuration and spec.configuration.established) else ""
                 parsed = parse_metric(p.stdout or "", bound_key, hint)
-                if parsed.authoritative and parsed.value is not None:
+                if usable_metric(parsed, p.returncode):
                     per_seed.setdefault(arm, {})[seed] = parsed.value
                     record.metric = parsed.value
                     evidence.saw_json_metric = True

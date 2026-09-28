@@ -511,6 +511,12 @@ def _object(kind: str, ref: ClaimRef | None, *, claim_text: str, n: int,
            materiality_doc: PaperDoc | None = None,
            taken: set[str] | None = None) -> DiscoveredObject:
     quantity = ref.quantity if (ref and ref.quantity) else None
+    # A lone prose number is a comparison target only when the sentence reports a measured
+    # outcome; "sequences of length 1", "5 seeds", "published in 2020" are not results.
+    # A table cell and a printed composition carry their own structure and are exempt.
+    if (quantity is not None and ref is not None and ref.kind == "prose_claim"
+            and not quantity.expression and not locate.measurement_context(ref.quote)):
+        quantity = None
     has_value = quantity is not None and quantity.value is not None
     arithmetic_broken = bool(quantity and quantity.arithmetic_ok is False)
     self_checking = bool(quantity and quantity.expression)
@@ -639,6 +645,20 @@ def _section_numbers(doc: PaperDoc, section_idx: int) -> list[str]:
     return []
 
 
+def _own_row(doc: PaperDoc, method: str) -> bool:
+    """Does a table row report the paper's OWN method? Marked "(ours)"/"proposed", or its
+    method name is one the abstract itself uses. A cited baseline's row is supporting
+    evidence for the comparison, never the paper's central claim."""
+    label = (method or "").strip()
+    if re.search(r"\b(?:ours|proposed)\b", label, re.I):
+        return True
+    lead = re.split(r"[\s\-_/(]+", label)[0] if label else ""
+    abstract = decide.abstract_section_idx(doc)
+    text = next((s.text or "" for s in doc.sections if s.section_idx == abstract), "")
+    return bool(len(lead) >= 3 and re.search(r"[^\W\d_]", lead)
+                and re.search(rf"\b{re.escape(lead)}\b", text))
+
+
 def _cited_in_summary(doc: PaperDoc, label: str, own_section: int, own_text: str) -> bool:
     """Is this statement cited by the paper's own summary — by its label, or by the
     numbered section it sits in ("Section 3.1") — outside the statement itself? Structure,
@@ -735,7 +755,11 @@ def discovered_objects(doc: PaperDoc, findings: list[Finding],
             if f.verifiable_by_experiment:
                 proposed.add(r.ref)
 
-    # (1) printed table results the extractor already addressed and parsed a number for
+    # (1) printed table results the extractor already addressed and parsed a number for.
+    # A RESULT table the paper's own summary cites ("Table 2 shows ...") carries a central
+    # claim — the same structural rule numbered results use; a data-statistics table's
+    # cells describe the data, never the method, and are peripheral.
+    summary_cited: dict[int, bool] = {}
     for num in doc.reported_numbers:
         ref_s = (num.table_ref or "").strip()
         if not ref_s or ref_s in claimed_refs:
@@ -744,11 +768,18 @@ def discovered_objects(doc: PaperDoc, findings: list[Finding],
         if not ref.resolved:
             continue
         claimed_refs.add(ref_s)
+        data_stat = (num.benchmark or "").startswith("[data statistic]")
+        t_idx = int(re.match(r"T(\d+)", ref_s).group(1)) if re.match(r"T(\d+)", ref_s) else -1
+        if t_idx not in summary_cited:
+            table = next((t for t in doc.tables if t.table_idx == t_idx), None)
+            summary_cited[t_idx] = bool(table is not None and table.label and _cited_in_summary(
+                doc, f"Table {table.label}", -1, ""))
         _add(objects, taken, _object(
             "DATASET_RESULT" if num.benchmark else "EXPERIMENTAL_RESULT", ref,
             claim_text=num.source_quote or ref.quote, n=len(objects),
             repo_available=repo_available, metric=num.metric,
-            experiment=num.benchmark or num.method, is_reported_result=True, taken=taken,
+            experiment=num.benchmark or num.method, is_reported_result=not data_stat, taken=taken,
+            in_abstract=summary_cited[t_idx] and not data_stat and _own_row(doc, num.method),
             anchored_by_any=ref.ref in attacked, anchored_by_confirmed=attacked.get(ref.ref, False),
             proposed_by_lens=ref.ref in proposed, material_abstract_idx=material_abstract_idx,
             materiality_doc=doc, specification_complete=specification_complete))
@@ -978,11 +1009,16 @@ def _demote_when_a_central_target_is_being_pursued(
         objects: list[DiscoveredObject], plans: list[PlanDecision]) -> list[PlanDecision]:
     """A SUPPORTING target does not earn an execution while a CENTRAL one is available --
     a SET-level fact `decide.plan` cannot see since it decides one target at a time."""
-    if not any(p.requires_execution and o.centrality == "CENTRAL" for o, p in zip(objects, plans)):
+    # Within a route FAMILY only: a central theorem being certified says nothing about
+    # whether a supporting printed result needs its run, and vice versa.
+    central_families = {decide.route_family(p.route) for o, p in zip(objects, plans)
+                        if p.requires_execution and o.centrality == "CENTRAL"}
+    if not central_families:
         return plans
     out: list[PlanDecision] = []
     for obj, plan in zip(objects, plans):
-        if plan.requires_execution and obj.centrality != "CENTRAL" and not obj.planned_for:
+        if (plan.requires_execution and obj.centrality != "CENTRAL" and not obj.planned_for
+                and decide.route_family(plan.route) in central_families):
             out.append(PlanDecision(
                 target_id=plan.target_id, action="NO_EXPERIMENT_NEEDED", route=plan.route,
                 reason=(f"a {obj.centrality.lower()} result, and at least one CENTRAL target "

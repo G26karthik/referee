@@ -129,6 +129,42 @@ _BRACKETED_CITATION = re.compile(r"\[\s*\d+\s*\]")
 _OBJECT_CITATION = re.compile(
     r"\b(?:table|tab|figure|fig|equation|eq|section|sec|appendix|app|algorithm|alg)"
     r"\s*\.?\s*\d", re.I)
+# A reported spread ("0.024 ± 0.003", "12.1 +/- 0.4") qualifies the value before it; it is
+# not a second quantity. Only the value is compared; the spread is the paper's own noise.
+_SPREAD = re.compile(r"\s*(?:±|\+/-|\+-)\s*\d+(?:\.\d+)?\s*%?")
+# An author-year citation names another work's publication year, never a measurement:
+# "(Smith et al., 2020)", "Alfaro et al. (2023a)", "[Chen, 2019]".
+_CITATION_YEAR = re.compile(
+    r"(?:\bet\s+al\.?,?\s*\(?|[A-Z][A-Za-z\-]+,\s*|\(\s*)(?:19|20)\d{2}[a-z]?\b")
+# A digit glued to an identifier or operator is a subscript, exponent or index ("N−1",
+# "x_2", "f2", "k-1"), not a reported number.
+_GLUED = re.compile(r"[A-Za-z_][−\-+^_]?$")
+# Words that mark a number as an outcome. Shared with `paper.table_role`, so a caption and
+# a sentence are judged by one vocabulary. Open-ended by design: it only EXEMPTS a span from
+# the settings rule below, it never has to be complete for a metric to be read.
+MEASURE_WORDS = re.compile(
+    r"%|×|\b(?:RMSE|MSE|MAE|PEHE|ATE|AUC|AUROC|AUPRC|F1|accuracy|error|errors|loss|"
+    r"precision|recall|BLEU|ROUGE|METEOR|perplexity|reward|return|regret|delay|ECE|"
+    r"calibration|coverage|likelihood|NLL|score|bias|variance|FID|mAP|AP|IoU|mIoU|PSNR|SSIM|"
+    r"LPIPS|WER|CER|NDCG\S*|MRR|hits@\S+|pass@\S+|EM|CRPS\w*|R2|R²|correlation|win rate|"
+    r"success rate|runtime|latency|throughput|memory|speed-?up|faster|slower|improv\w*|"
+    r"outperform\w*|reduc\w*|increas\w*|decreas\w*|times (?:smaller|larger|faster|lower|"
+    r"higher)|gain|drop)\b", re.I)
+# A number that SETS the experiment up: "we use 5 seeds", "3 layers", "learning rate of
+# 0.01", "we set C = 10". Rejected unless the same span also reports an outcome.
+_SETTING = re.compile(
+    r"\b\d[\d,.]*\s*(?:random\s+|independent\s+)?(?:seeds?|layers?|epochs?|iterations?|"
+    r"steps?|heads?|trees?|folds?|runs?|trials?|repetitions?|dimensions?|neurons?|units?|"
+    r"GPUs?|nodes?|batch(?:es)?|hours?|minutes?)\b"
+    r"|\b(?:seed|depth|width|batch size|learning rate|lr|temperature|horizon|window|budget|"
+    r"dimension|length|set|fix|choose|use)\s*(?:of|is|to|=|as)?\s*[A-Za-z]?\s*=?\s*-?\d", re.I)
+
+
+def measurement_context(text: str) -> bool:
+    """May a prose number be read as a reported outcome? Yes unless its span only sets the
+    experiment up; a span that also reports an outcome word stays readable."""
+    text = text or ""
+    return bool(MEASURE_WORDS.search(text)) or not _SETTING.search(text)
 
 
 def _magnitude_suffixed(rhs: str, number: str) -> bool:
@@ -162,6 +198,7 @@ def parse_quantity(text: str) -> ReportedQuantity | None:
     coincidence.
     """
     raw = _THOUSANDS.sub("", (text or "").strip())
+    raw = _SPREAD.sub("", raw)
     if not raw:
         return None
     if raw.count("=") > 1:
@@ -189,15 +226,18 @@ def parse_quantity(text: str) -> ReportedQuantity | None:
         return ReportedQuantity(value=value, raw=rhs_nums[0], operands=operands,
                                 expression=expression, arithmetic_ok=ok)
 
-    nums = _SIGNED.findall(raw)
-    if len(nums) != 1:
+    raw = _CITATION_YEAR.sub(" ", raw)
+    found = list(_SIGNED.finditer(raw))
+    if len(found) != 1:
         return None
     # A lone scholarly reference such as "U-Net [25]" is an address to another work, not
     # a reported value — treating it as 25 minted a reproduction target whose expected
     # result was literally the bibliography index.
     if _BRACKETED_CITATION.search(raw) or _OBJECT_CITATION.search(raw):
         return None
-    return ReportedQuantity(value=float(nums[0]), raw=nums[0])
+    if _GLUED.search(raw[:found[0].start()]):
+        return None
+    return ReportedQuantity(value=float(found[0].group()), raw=found[0].group())
 
 
 def _tokens(lhs: str, separators: bool) -> list[tuple[int, str, str]]:

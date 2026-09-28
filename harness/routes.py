@@ -259,6 +259,15 @@ def acquire_and_audit(cfg: Config, root: Path, pid: str, doc: PaperDoc,
     from . import discover as discover_stage
 
     acq = repo_mod.acquire(cfg, root, pid, doc, revision=audited_commit(root, pid))
+    # What exactly was reviewed: the paper's bytes and printed identifiers, the code's URL,
+    # commit and how it was attributed, and the data archives the paper links.
+    state.write_json(root / "paper" / "sources.json", {
+        "paper": repo_mod.paper_identifiers(doc),
+        "code": {"url": acq.url, "status": acq.status, "commit": acq.commit,
+                 "requested_revision": acq.requested_revision, "pinned": acq.pinned,
+                 "shallow": acq.shallow, "discovered_by": acq.discovered_by,
+                 "evidence": acq.discovery_evidence, "reason": acq.reason},
+        "data": repo_mod.data_sources(doc)})
     if acq.status == "unavailable":
         readiness = discover_stage.reimplementation_readiness(doc)
         acq = repo_mod.synthesize_standalone(
@@ -361,16 +370,17 @@ def synthesize_probe(cfg: Config, doc: PaperDoc, spec: ProbeSpec,
         return spec
     if not spec.finding_id:
         return spec
+    # A target-bound spec is about ONE printed quantity. The generic placebo measures what an
+    # auxiliary term buys on the template's own task — nothing at the target's address — so it
+    # would only attach "accuracy"/"digits" to a claim that names neither.
+    if spec.claim_ref or spec.table_ref:
+        return spec
 
     plan = probe_synth.plan(doc, claim=spec.claim, acq=acq)
     if not plan.keeps_finding:
         spec.finding_id = ""
-    # A target-bound spec keeps the paper's own words and its own quantity label: the
-    # synthesized diagnostic's paraphrase must never become the claim a later admissible
-    # route (a reconstruction) is briefed with and reconciled against.
-    if not spec.claim_ref:
-        spec.claim = plan.claim or spec.claim
-        spec.metric = plan.metric
+    spec.claim = plan.claim or spec.claim
+    spec.metric = plan.metric
     spec.script = plan.script
     spec.arms = plan.arms
     spec.mechanism = plan.mechanism
@@ -437,8 +447,23 @@ def plan_execution(cfg: Config, spec: ProbeSpec, acq: RepoAcquisition,
     spec.backend = backend.name
     is_count = bool(spec.metric_identity and spec.metric_identity.established
                    and spec.metric_identity.cell_quantity == "count")
-    spec.capability = backend.capability(acq, acq.env_path, cfg.python,
-                                         flag="" if is_count else "seed")
+    # The invocation is the one the repository documents: a seed flag is passed only when
+    # the bound program defines one, and capability is judged on THAT program, not on
+    # whichever file happened to be picked as the checkout's nominal entrypoint.
+    bound = (spec.experiment.command if spec.experiment is not None
+             and spec.experiment.established else None)
+    program = experiment_id.target_file(Path(acq.path), bound) if bound else None
+    if program is not None:
+        acq = acq.model_copy(update={"entrypoint": program.relative_to(acq.path).as_posix()})
+    # A seed the README already pins ("--seed 42") is the documented protocol; it is kept,
+    # not overridden, and the run is then as seedless as one with no flag at all.
+    seed_flag = bound.seed_flag if bound and bound.seed_flag not in bound.argv else ""
+    spec.capability = backend.capability(
+        acq, acq.env_path, cfg.python,
+        flag="" if (is_count or (bound and not seed_flag)) else (seed_flag.lstrip("-") or "seed"))
+    if bound is not None and not seed_flag:
+        # ponytail: 3 identical invocations show whether a seedless program is deterministic
+        spec.seeds = spec.seeds[:3]
     spec.commit_state = repo_mod.verify_commit(
         acq.path, spec.commit, tree=backend.commit_tree(acq.path)).state
     proven, _cls, _why = experiment_id.identities_established(
@@ -453,8 +478,7 @@ def plan_execution(cfg: Config, spec: ProbeSpec, acq: RepoAcquisition,
         return spec
 
     command = list(spec.experiment.command.argv) if spec.experiment.command else []
-    seed_flag = spec.experiment.command.seed_flag if spec.experiment.command else ""
-    if seed_flag:
+    if seed_flag and seed_flag not in command:
         command += [seed_flag, "{seed}"]
     spec.command = command
     spec.cwd = acq.path
@@ -528,17 +552,25 @@ def _executable_targets(cfg: Config, pid: str):
     material_questions = {q.question_id for q in ts.questions if q.materiality == "CENTRAL"}
     pairs = [(o, plans[o.target_id]) for o in ts.objects if o.target_id in plans]
     cap = max(1, cfg.max_targets)
-    pursued, deferred, non_material_pursued = [], [], 0
+    # One budget PER ROUTE FAMILY. An exact certificate and an empirical run answer different
+    # questions at different costs; a shared cap let cheap proof fragments, which sort first
+    # on cost, spend the whole budget before any printed result was attempted.
+    # ponytail: two families; a third route kind would get its own pool here.
+    pursued, deferred, spent = [], [], {"certificate": 0, "empirical": 0}
     for obj, plan in pairs:
         basis = getattr(obj, "materiality_basis", "") or "NONE"
+        family = decide.route_family(plan.route)
         if (decide.is_material(basis)
                 or bool(obj.question_id and obj.question_id in material_questions)):
             pursued.append((obj, plan))
-        elif non_material_pursued < cap:
+        elif spent[family] < cap:
             pursued.append((obj, plan))
-            non_material_pursued += 1
+            spent[family] += 1
         else:
             deferred.append((obj, plan))
+    # Empirical first: the run loop's primary slot goes to the paper's printed results, and
+    # certificates follow — each keeps its own relative order.
+    pursued.sort(key=lambda pair: decide.route_family(pair[1].route) == "certificate")
     return ts, pursued, deferred
 
 
@@ -942,8 +974,11 @@ def check_plan_targets(cfg: Config, pid: str) -> list[tuple[str, str, str]]:
     tables = _tables_for_planner(doc)
     units: list[tuple[str, str, str, str, str]] = []   # unit, qid, subject, evidence, ref
     abstract = decide.abstract_section_idx(doc)
+    # The abstract is planned for unless one of its claims is already being TESTED. A
+    # quotation re-check or a no-route target in the abstract tests nothing (invariant 10).
+    executing = {p.target_id for p in ts.plans if p.requires_execution}
     if abstract >= 0 and not any(o.ref is not None and o.ref.section_idx == abstract
-                                 for o in ts.objects):
+                                 and o.target_id in executing for o in ts.objects):
         text = next((" ".join((s.text or "").split()) for s in doc.sections
                      if s.section_idx == abstract), "")
         units.append(("abstract", discover_stage.ABSTRACT_QUESTION,
@@ -1161,9 +1196,9 @@ def attempt_reimplementation_fallback(
         claim=base_spec.claim, claim_ref=base_spec.claim_ref, claim_kind=base_spec.claim_kind,
         table_ref=base_spec.table_ref, claimed_cell_value=base_spec.claimed_cell_value,
         # A label only (the value is read from SH_METRIC). Unset means the target named no
-        # metric, and the schema default "accuracy" would mislabel e.g. a set size.
-        metric=(base_spec.metric if "metric" in base_spec.model_fields_set
-                else f"printed value at {base_spec.table_ref or base_spec.claim_ref}"),
+        # metric; it is then labelled by the printed cell it is compared against.
+        metric=(base_spec.metric
+                or f"printed value at {base_spec.table_ref or base_spec.claim_ref}"),
         seeds=seeds, arms=["reproduction"], script=script, provenance="reimpl_exec",
         interpreter=(acq.env_path if acq is not None else "") or "",
         cwd=(str(checkout) if conf.released_inputs and checkout is not None else ""),
@@ -1437,9 +1472,10 @@ def _review(cfg: Config, pid: str) -> dict:
             outcomes.append(TargetOutcome(
                 target_id=obj.target_id, disposition="BUDGET_DEFERRED",
                 action=plan.action, route=plan.route, launched=0,
-                reason=(f"an experiment is warranted for this target and this run's budget "
-                       f"of {cfg.max_targets} target(s) was already spent on "
-                       f"higher-priority ones. A limit of this run, not of the paper.")))
+                reason=(f"an experiment is warranted for this target and this run's "
+                       f"{decide.route_family(plan.route)} budget of {cfg.max_targets} "
+                       f"target(s) was already spent on higher-priority ones. A limit of this "
+                       f"run, not of the paper.")))
         for out in outcomes:
             odir = state.control_dir(root) / "targets" / out.target_id
             state.write_json(odir / "outcome.json", out.model_dump())
@@ -1520,11 +1556,22 @@ def resync_cached_outcomes(cfg: Config, pid: str) -> dict:
     primary_result = ProbeResult(**state.read_json(primary_path))
     primary_outcome_path = (state.control_dir(root) / "targets" /
                             primary_obj.target_id / "outcome.json")
+    # The cached primary result belongs to whichever target was primary WHEN IT RAN. Target
+    # order can change between passes, so it is attached only to the target it names.
+    rec = primary_result.reconciliation
+    ran_for = (rec.target_id if rec is not None else "") or ""
     if primary_outcome_path.exists():
         outcomes.append(TargetOutcome(**state.read_json(primary_outcome_path)))
-    else:
+    elif ran_for == primary_obj.target_id:
         outcomes.append(outcome_for(primary_obj.target_id, primary_result,
                                     primary_plan.action, primary_plan.route))
+    else:
+        outcomes.append(TargetOutcome(
+            target_id=primary_obj.target_id, disposition="NOT_ATTEMPTED",
+            action=primary_plan.action, route=primary_plan.route, launched=0,
+            reason=(f"the cached primary result was produced for "
+                    f"{ran_for or 'an unrecorded target'}, not for this one, so it is not "
+                    f"attached here; this target has no durable result of its own yet.")))
 
     for obj, plan in pairs[1:]:
         cached_outcome = state.control_dir(root) / "targets" / obj.target_id / "outcome.json"

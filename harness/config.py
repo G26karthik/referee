@@ -114,6 +114,9 @@ class Config:
     exec_backend: str = field(default_factory=lambda: os.environ.get("SH_EXEC_BACKEND", "local"))
 
     allow_network: bool = field(default_factory=lambda: _flag("SH_ALLOW_NETWORK", True))
+    # When the PDF names no repository: search the public code host for one whose README
+    # cites this exact title. Sends only the title; accepted only on README evidence.
+    allow_source_search: bool = field(default_factory=lambda: _flag("SH_ALLOW_SOURCE_SEARCH", True))
     allow_install: bool = field(default_factory=lambda: _flag("SH_ALLOW_INSTALL"))
     allow_repo_exec: bool = field(default_factory=lambda: _flag("SH_ALLOW_REPO_EXEC"))
     allow_synthesis: bool = field(default_factory=lambda: _flag("SH_ALLOW_SYNTHESIS", True))

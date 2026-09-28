@@ -443,7 +443,9 @@ def run_report_stage(cfg: Config, pid: str) -> dict:
                  "self_audit_failed": report.self_audit.failed if report.self_audit else []},
         path=str(md_path),
     )
+    from .decide import scientific_outcome
     return {"paper_id": pid, "reason": report.disposition_reason,
+            "scientific": scientific_outcome(target_set) if target_set is not None else {},
             "scientific_classes": classes,
             "review_path": report.review_path, "artifact_state": report.artifact_state,
             "document_observations": len(report.document_observations),
@@ -469,6 +471,9 @@ def _phase_report(cfg: Config, case: CaseState, **_) -> PhaseOutcome:
     case.disposition = res.get("disposition") or "NOT_REVIEWED"
     case.disposition_basis = res.get("disposition_basis") or "NONE"
     case.report_path = res["report_md"]
+    sci = res.get("scientific") or {}
+    case.scientific_status = sci.get("status") or "NOT_ASSESSED"
+    case.scientific_blocker = sci.get("blocker") or ""
     return PhaseOutcome("ok", res["reason"], res)
 
 

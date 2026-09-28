@@ -1180,8 +1180,8 @@ _DROPPABLE_ORDER = (
     "## Open questions for the reviewer",
     "## Central claims, end to end",
 )
-_UNDROPPABLE = ("## Review outcome", "## Established failures", "## Scientific findings",
-                "## Scope of this review",
+_UNDROPPABLE = ("## Review outcome", "## Scientific check status", "## Established failures",
+                "## Scientific findings", "## Scope of this review",
                 "## What this review guarantees, and what it does not")
 assert not (set(_UNDROPPABLE) & set(_DROPPABLE_ORDER)), (
     "a load-bearing section was made droppable: "
@@ -1270,6 +1270,30 @@ def render_reviewer_report(report: EvalReport, target_set: TargetSet | None = No
     outcome_block = report.outcome or derive_outcome(
         report, target_set, unchecked_central=len(unchecked))
     L += render_outcome(outcome_block)
+    # What was CHECKED, stated apart from the fact that this review finished. A finished
+    # review that concluded no check says so, with where its central claim's check stopped.
+    if ts is not None:
+        sci = decide.scientific_outcome(ts)
+        top = sci.get("central_claim") or {}
+        L += ["## Scientific check status", "",
+              f"- status: `{sci['status']}`"
+              + (" — the workflow finished; no admissible check reached a conclusion about "
+                 "any claim" if sci["status"] == "NO_CONCLUSIVE_CHECK" else ""),
+              f"- top central claim: {_short(top.get('claim', '')) or '(none identified)'}"
+              + (f" (`{top.get('target_id')}`, route `{top.get('route') or 'none'}`, "
+                 f"`{top.get('disposition')}`)" if top else "")]
+        if sci.get("blocker"):
+            L.append(f"- exact blocker: {_short(sci['blocker'])}")
+        acq = report.probe.repo if report.probe is not None else None
+        if acq is not None and acq.url:
+            L.append(f"- code under test: {acq.url} @ `{(acq.commit or 'unpinned')[:12]}`, "
+                     f"attributed by {acq.discovered_by or 'the paper'}"
+                     + (f" ({_short(acq.discovery_evidence)})" if acq.discovery_evidence else ""))
+        for kind in decide.OUTCOME_KINDS:
+            if counts := sci["by_kind"].get(kind):
+                L.append(f"- {kind.replace('_', ' ')}: " + ", ".join(
+                    f"{d} ×{n}" for d, n in sorted(counts.items())))
+        L.append("")
 
     failed = [o for o in outcomes if getattr(o, "establishes_failure", False)]
     if failed:

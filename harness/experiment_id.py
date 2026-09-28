@@ -13,7 +13,9 @@ authorization. Every established identity carries `IdentityEvidence` with a `sou
 """
 from __future__ import annotations
 
+import fnmatch
 import re
+import shlex
 from pathlib import Path
 
 from .schema import (CandidateCommand, ConfigurationIdentity, ExperimentIdentity,
@@ -83,12 +85,77 @@ _LAUNCHED = re.compile(
 # The launcher's own flags sit between it and the program; the program is the first token
 # that names a file the repository could run.
 _PROGRAM = re.compile(r"(?:^|\s)((?:python3?|bash|sh)\s+\S+\.(?:py|sh)|\S+\.(?:py|sh))(?=\s|$)")
+# An environment runner executes the rest of the line unchanged inside the project's own
+# environment, so — unlike a launcher — the command after it is kept whole, flags included.
+_ENV_RUNNER = re.compile(
+    r"^\s*(?:\$\s*)?(?:uv\s+run|poetry\s+run|pipenv\s+run|pdm\s+run|hatch\s+run|pixi\s+run|"
+    r"conda\s+run(?:\s+-n\s+\S+)?)\s+(.*)$")
+_FOR_LOOP = re.compile(r"^for\s+(\w+)\s+in\s+(.+?)\s*$")
+_PLACEHOLDER = re.compile(r"^<([^<>]+)>$")
+
+
+def _argv(command: str) -> list[str]:
+    try:
+        return shlex.split(command, comments=True)
+    except ValueError:
+        return command.split()
+
+
+def _fenced_commands(block: str) -> list[tuple[int, list[str], dict[str, list[str]]]]:
+    """(line offset, argv, slots) for each command a fenced block advertises. A backslash
+    continuation is one command; a `for v in a b c; do ... done` loop documents the values
+    its `$v` takes; a `<a|b|c>` token documents its alternatives and a bare `<name>` none.
+    A slot is only a hole with its DOCUMENTED values — it is filled later, from the cited
+    cell's own text, or the command is refused."""
+    lines, starts, buf, first = [], [], "", None
+    for i, raw in enumerate(block.splitlines()):
+        first = i if first is None else first
+        if raw.rstrip().endswith("\\"):
+            buf += raw.rstrip()[:-1] + " "
+            continue
+        lines.append(buf + raw)
+        starts.append(first)
+        buf, first = "", None
+    out: list[tuple[int, list[str], dict[str, list[str]]]] = []
+    loops: list[tuple[str, list[str]]] = []          # active, innermost last
+    pending: tuple[str, list[str]] | None = None      # `for ...` seen, `do` not yet
+    for i, line in zip(starts, lines):
+        # One line may hold several statements: "for d in a b; do python x.py $d; done".
+        for stmt in (s.strip() for s in line.split(";")):
+            if m := _FOR_LOOP.match(stmt):
+                pending = (m.group(1), _argv(m.group(2)))
+                continue
+            if m := re.match(r"^do\b\s*(.*)$", stmt):
+                if pending is not None:
+                    loops.append(pending)
+                pending, stmt = None, m.group(1)
+            if re.match(r"^done\b", stmt):
+                if loops:
+                    loops.pop()
+                continue
+            advertised = _advertised_line(stmt)
+            if not advertised:
+                continue
+            argv, slots = [], {}
+            for token in _argv(advertised):
+                loop = next((lp for lp in reversed(loops)
+                             if token in (f"${lp[0]}", f"${{{lp[0]}}}")), None)
+                if loop is not None:
+                    slots[token] = list(loop[1])
+                elif p := _PLACEHOLDER.match(token):
+                    slots[token] = ([v for v in p.group(1).split("|") if v]
+                                    if "|" in p.group(1) else [])
+                argv.append(token)
+            out.append((i, argv, slots))
+    return out
 
 
 def _advertised_line(raw: str) -> str:
     """The command a line advertises, or '' — direct form first, then launcher-prefixed.
     Returns the command VERBATIM where already plain, or the program invocation a
     launcher was wrapping. Nothing is synthesised."""
+    if m := _ENV_RUNNER.match(raw):
+        raw = m.group(1)           # "uv run python x.py --a b" runs "python x.py --a b"
     if m := _CMD_LINE.match(raw):
         return m.group(1)
     if m := _LAUNCHED.match(raw):
@@ -97,6 +164,82 @@ def _advertised_line(raw: str) -> str:
             return prog if prog.split()[0] in ("python", "python3", "bash", "sh") else f"python {prog}"
     return ""
 _SEED_FLAG = re.compile(r"--([a-z_]*seed[a-z_]*)(?:[=\s]+(\S+))?", re.I)
+
+# A README that names its programs in prose -- "to train, execute `main.py`", "`/eval_{a/b}
+# .py`: the evaluation code for our results" -- documents them as surely as a fenced command
+# block does. A brace lists alternatives, each matched exactly; a glob is matched against the
+# files that EXIST. A README typo names nothing. Prose names rank below spelled-out commands.
+_CODE_SPAN = re.compile(r"(?<!`)`([^`\n]+)`(?!`)")
+_PROGRAM_NAME = re.compile(r"\.?/?[\w.\-/{}*,]+\.(?:py|sh)")
+_NOT_SOURCE = {".git", "env", ".env", ".venv", "venv", "site-packages", "node_modules",
+               "__pycache__"}
+
+
+_README_LINK = re.compile(r"\]\(\s*\.?/?([\w.\-/]+?)/?(?:README\.md)?\s*\)")
+
+
+def _documented_readmes(repo: Path) -> list[Path]:
+    """The root README, then every README of a directory it links to ("the harness that
+    produced the paper's numbers is in [`benchmarks/`](benchmarks/)"): one hop only."""
+    root = repo / "README.md"
+    if not root.is_file():
+        return []
+    out = [root]
+    text = root.read_text(encoding="utf-8", errors="replace")
+    for m in _README_LINK.finditer(text):
+        nested = repo / m.group(1) / "README.md"
+        if nested.is_file() and nested not in out and repo in nested.resolve().parents:
+            out.append(nested)
+    return out[:6]  # ponytail: a root README linking more sub-guides than this is an index
+
+
+def _program_files(repo: Path, limit: int = 5000) -> list[str]:
+    out: list[str] = []
+    for path in repo.rglob("*"):
+        if len(out) >= limit:  # ponytail: a README names programs near the top of a repo
+            break
+        if path.suffix in (".py", ".sh") and not _NOT_SOURCE & set(path.relative_to(repo).parts):
+            out.append(path.relative_to(repo).as_posix())
+    return sorted(out)
+
+
+def _named_programs(repo: Path, text: str, limit: int = 60) -> list[tuple[int, list[str]]]:
+    """(README line, argv) for every program the README's prose names by an inline code
+    span, and every command an inline span spells out ("`python main.py --cfg a.yaml`")."""
+    blanked = _FENCE.sub(lambda b: "\n" * b.group(0).count("\n"), text)
+    files: list[str] | None = None
+    out: list[tuple[int, list[str]]] = []
+    for m in _CODE_SPAN.finditer(blanked):
+        span, line = m.group(1).strip(), blanked[:m.start()].count("\n") + 1
+        if advertised := _advertised_line(span):
+            out.append((line, _argv(advertised)))
+            continue
+        if not _PROGRAM_NAME.fullmatch(span):
+            continue
+        # A glob with no name of its own ("all `*.py` files are formatted") names nothing.
+        if len(re.sub(r"[*?/{}.,]|\.(?:py|sh)$", "", span)) < 3:
+            continue
+        files = _program_files(repo) if files is None else files
+        for pattern in _expand_braces(span.lstrip("./")):
+            for rel in files:
+                if fnmatch.fnmatchcase(rel, pattern) or (
+                        "/" not in pattern
+                        and fnmatch.fnmatchcase(rel.rsplit("/", 1)[-1], pattern)):
+                    out.append((line, ["bash" if rel.endswith(".sh") else "python", rel]))
+    return out[:limit]  # ponytail: a README naming more programs than this is a package index
+
+
+def _expand_braces(pattern: str, limit: int = 64) -> list[str]:
+    """`calc_{gt/es}{A,B}.py` -> the four names it lists, exactly as spelled."""
+    m = re.search(r"\{([^{}]*)\}", pattern)
+    if not m:
+        return [pattern]
+    out: list[str] = []
+    for alt in re.split(r"[/,|]", m.group(1)):
+        out += _expand_braces(pattern[:m.start()] + alt.strip() + pattern[m.end():], limit)
+    return out[:limit]
+
+
 # A column of ratios always carries its own normaliser: some row reads exactly 100%.
 _HUNDRED = re.compile(r"^\s*100(?:\.0+)?\s*%")
 
@@ -123,9 +266,77 @@ def cell_basis(table: Table, col: int) -> tuple[str, str]:
 
 
 def _header_for(table: Table, col: int) -> str:
-    if col < len(table.header):
-        return table.header[col]
-    return table.caption or ""
+    from .paper import column_header  # deferred: paper imports decide, which is heavier
+    return column_header(table, col) or (table.caption or "")
+
+
+_GREEK = {"τ": "tau", "ρ": "rho", "σ": "sigma", "μ": "mu", "α": "alpha", "β": "beta",
+          "λ": "lambda", "ε": "epsilon", "δ": "delta", "κ": "kappa"}
+
+
+def _key(text: str) -> str:
+    """A name compared as a name: case, punctuation, spacing and Greek spelling ignored."""
+    low = (text or "").lower()
+    for glyph, name in _GREEK.items():
+        low = low.replace(glyph, name)
+    return re.sub(r"[^a-z0-9]", "", low)
+
+
+def _metric_name(table: Table, col: int) -> str:
+    from .paper import metric_name  # deferred: paper imports decide, which is heavier
+    return metric_name(table, col)
+
+
+def _metric_key(table: Table, col: int) -> str:
+    return _key(_metric_name(table, col))
+
+
+def _prefer_fenced(fitting: list[CandidateCommand]) -> list[CandidateCommand]:
+    """A command the README spells out outranks a program its prose merely names: prose
+    names are consulted only when no spelled-out command fits, so they never turn a
+    unique binding into an ambiguous one."""
+    return [c for c in fitting if c.source != "readme_named"] or fitting
+
+
+def cell_context(table: Table, row: int, col: int) -> str:
+    """What the paper itself says a cell is about: its row label, its column header, the
+    table's header row and the caption. Slot values and configuration are read from this
+    text only — never from the harness's idea of what the experiment probably was."""
+    from .paper import column_header
+    caption = re.sub(r"^\s*Table\s+\S+[.:]?\s*", "", table.caption or "", flags=re.I)
+    return " ".join([table.cell(row, 0) or "", column_header(table, col), caption])
+
+
+def instantiate(cmd: CandidateCommand, context: str) -> tuple[CandidateCommand | None, str]:
+    """The documented command with every slot filled by the ONE documented value the cited
+    cell names, or (None, why). A free placeholder, or a slot the cell names zero or several
+    values for, is refused: choosing would be the harness inventing the experiment."""
+    # Whole tokens of the cell's own text only: "Fashion-MNIST" does not name "mnist", and
+    # "trained" does not name "train".
+    words = {w.lower() for w in re.split(r"[\s,;:()\[\]]+", context) if w}
+    bound: dict[str, str] = {}
+    for token, values in cmd.slots.items():
+        flag = cmd.argv[cmd.argv.index(token) - 1] if cmd.argv.index(token) > 0 else ""
+        if "seed" in flag.lower() or "seed" in token.lower():
+            return None, (f"slot {token} is a seed; which seed a printed aggregate came from is "
+                          f"not something the paper's text can name")
+        if not values:
+            return None, f"placeholder {token} has no documented values to choose from"
+        named = [v for v in values
+                 if re.search(r"[^\W\d_]", v) and v.lower() in words]   # never a bare number
+        if len(named) != 1:
+            return None, (f"slot {token} documents {len(values)} value(s) and the cited cell names "
+                          f"{len(named)} of them ({', '.join(named[:4]) or 'none'})")
+        bound[token] = named[0]
+    argv = [bound.get(t, t) for t in cmd.argv]
+    if hole := next((t for t in argv if re.search(r"\$\{?\w", t) or _PLACEHOLDER.match(t)), ""):
+        return None, f"the documented command still has an unfilled hole {hole!r}"
+    if not bound:
+        return cmd, ""
+    filled = cmd.model_copy(deep=True)
+    filled.argv = argv
+    filled.bound_slots, filled.slots = bound, {}
+    return filled, ""
 
 
 # === Candidate discovery — from what the repository advertises, never from filenames ===
@@ -135,16 +346,18 @@ def harvest_candidates(repo: Path, limit: int = 400) -> list[CandidateCommand]:
     README line saying "to finetune X, run Y" does."""
     out: list[CandidateCommand] = []
 
-    readme = repo / "README.md"
-    if readme.is_file():
+    for readme in _documented_readmes(repo):
+        rel = readme.relative_to(repo).as_posix()
         text = readme.read_text(encoding="utf-8", errors="replace")
         for block in _FENCE.finditer(text):
             line_no = text[:block.start()].count("\n") + 1
-            for i, raw in enumerate(block.group(1).splitlines()):
-                if advertised := _advertised_line(raw):
-                    out.append(CandidateCommand(
-                        argv=advertised.split(), source="readme",
-                        source_ref=f"README.md:{line_no + i + 1}"))
+            for i, argv, slots in _fenced_commands(block.group(1)):
+                out.append(CandidateCommand(
+                    argv=argv, slots=slots, source="readme",
+                    source_ref=f"{rel}:{line_no + i + 1}"))
+        for line_no, argv in _named_programs(repo, text):
+            out.append(CandidateCommand(argv=argv, source="readme_named",
+                                        source_ref=f"{rel}:{line_no}"))
 
     run_sh = repo / "run.sh"
     if run_sh.is_file():
@@ -178,11 +391,50 @@ def target_file(repo: Path, cmd: CandidateCommand) -> Path | None:
     """The file on disk a candidate command actually invokes, or None. Public because
     `harness.alignment` needs the same lookup — a script's declared configuration lives
     in the FILE this resolves to, not in `cmd.argv`."""
-    for token in cmd.argv[1:]:
+    argv = cmd.argv[1:]
+    if len(argv) >= 2 and argv[0] == "-m":          # `python -m pkg.mod` runs pkg/mod.py
+        module = repo / Path(*argv[1].split("."))
+        for candidate in (module.with_suffix(".py"), module / "__main__.py"):
+            if candidate.is_file():
+                return candidate
+        return None
+    for token in argv:
         candidate = repo / token
-        if candidate.is_file():
+        # A config or data file an argument names is read BY the program, not the program.
+        if candidate.is_file() and candidate.suffix not in (
+                ".yaml", ".yml", ".json", ".toml", ".txt", ".csv", ".cfg", ".ini", ".md"):
             return candidate
     return None
+
+
+_IMPORT = re.compile(r"^\s*(?:from\s+(\.*[\w.]*)\s+import\s+([\w, ]+)|import\s+([\w.]+))", re.M)
+
+
+def _local_imports(repo: Path, program: Path, limit: int = 12) -> list[Path]:
+    """Repository files `program` imports directly (absolute from the repo root, or relative
+    to its own package), never installed packages."""
+    try:
+        text = program.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out: list[Path] = []
+    for m in _IMPORT.finditer(text):
+        module = m.group(1) if m.group(1) is not None else m.group(3)
+        dots = len(module) - len(module.lstrip("."))
+        base = program.parent
+        for _ in range(max(0, dots - 1)):
+            base = base.parent
+        roots = [base] if dots else [repo, repo / "src"]
+        names = [module.lstrip(".")] if module.lstrip(".") else []
+        if m.group(2) and dots:
+            names += [f"{module.lstrip('.')}.{n.strip()}".lstrip(".") for n in m.group(2).split(",")]
+        for root in roots:
+            for name in names:
+                p = root / Path(*name.split("."))
+                for cand in (p.with_suffix(".py"), p / "__init__.py"):
+                    if cand.is_file() and cand not in out and cand != program:
+                        out.append(cand)
+    return out[:limit]  # ponytail: one hop of a program's own helpers, not the package
 
 
 def describe_command(repo: Path, cmd: CandidateCommand, depth: int = 2) -> CandidateCommand:
@@ -204,6 +456,15 @@ def describe_command(repo: Path, cmd: CandidateCommand, depth: int = 2) -> Candi
     for key, _ in _OUTPUT_QUANTITY:
         if re.search(rf"['\"]{re.escape(key)}['\"]", text):
             emits.append(key)
+    # The keys a program writes are often spelled in the repository modules it imports (a
+    # metrics helper), so those are read too — one hop, repository files only.
+    sources = [text] + [p.read_text(encoding="utf-8", errors="replace")
+                        for p in _local_imports(repo, path)] if path.suffix == ".py" else [text]
+    # Only identifier-shaped literals ("PEHE", "rel_crps", "pass@1") can be output keys; a
+    # message, a format string or an escape ('\t') is not one.
+    cmd.named_keys = sorted({s for src in sources
+                             for s in (lit.strip("'\"") for lit in _STRING_LITERAL.findall(src))
+                             if re.fullmatch(r"[A-Za-z][\w.@\-]{1,39}", s)})[:600]
     if depth > 0 and path.suffix == ".sh":
         for m in re.finditer(r"\b(?:python3?|bash)\s+(\S+\.(?:py|sh))", text):
             nested = repo / m.group(1)
@@ -211,6 +472,7 @@ def describe_command(repo: Path, cmd: CandidateCommand, depth: int = 2) -> Candi
                 inner = describe_command(repo, CandidateCommand(argv=["python", m.group(1)]),
                                          depth - 1)
                 emits += inner.emits
+                cmd.named_keys = sorted(set(cmd.named_keys) | set(inner.named_keys))
                 cmd.seed_flag = cmd.seed_flag or inner.seed_flag
                 cmd.seed_values = cmd.seed_values or inner.seed_values
     cmd.emits = sorted(set(emits))
@@ -247,6 +509,28 @@ def repo_implements(repo: Path, method: str) -> bool:
             continue
         code_only = _STRING_LITERAL.sub(" ", source)
         if token in re.sub(r"[^a-z0-9]", "", code_only.lower()):
+            return True
+    return False
+
+
+def repo_defines(repo: Path, name: str) -> bool:
+    """Does the checkout DEFINE `name` — a class, a function, or a module/package directory
+    of its own? Imports and string mentions do not count."""
+    token = re.sub(r"[^a-z0-9]", "", (name or "").lower())
+    if len(token) < 3:
+        return False
+    define = re.compile(r"^\s*(?:class|def)\s+(\w+)", re.M)
+    for path in list(repo.rglob("*.py"))[:2000]:
+        if _NOT_SOURCE & set(path.relative_to(repo).parts):
+            continue
+        if any(re.sub(r"[^a-z0-9]", "", part.lower().removesuffix(".py")) == token
+               for part in path.relative_to(repo).parts):
+            return True
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if any(re.sub(r"[^a-z0-9]", "", d.lower()) == token for d in define.findall(text)):
             return True
     return False
 
@@ -312,6 +596,29 @@ def resolve_metric(doc: PaperDoc, table_ref: str, cmd: CandidateCommand | None,
         quote=header or (table.caption or "")[:120], source_ref=table_ref,
         note=f"cell quantity '{ident.cell_quantity or 'unknown'}', basis '{ident.cell_basis}'"))
 
+    # By NAME: the paper names the metric ("PEHE", "Kendall's τ") and the invoked program's
+    # own source writes a key spelled exactly that. Any quantity, not only the vocabulary
+    # above — but only an exact name, never a family resemblance.
+    named = _metric_key(table, col)
+    by_name = next((k for k in (cmd.named_keys if cmd else []) if named and _key(k) == named), "")
+    matched_by_class = bool(cmd and ident.cell_quantity and any(
+        q == ident.cell_quantity for k, q in _OUTPUT_QUANTITY if k in cmd.emits))
+    if by_name and not matched_by_class:
+        ident.cell_quantity = ident.cell_quantity or _metric_name(table, col)
+        ident.output_key, ident.output_quantity = by_name, _metric_name(table, col)
+        ident.evidence.append(IdentityEvidence(
+            quote=by_name, source_ref=cmd.source_ref,
+            note=f"the invoked program names the key '{by_name}', the metric the paper names"))
+        if ident.cell_basis == "relative_to_baseline":
+            ident.state = "unsupported"
+            ident.reason = ("the cell is normalised to a baseline run and the program reports "
+                            f"'{by_name}' on its own scale; one run cannot supply both arms")
+            return ident
+        ident.output_basis, ident.state = "absolute", "established"
+        ident.reason = (f"the cell reports {_metric_name(table, col)!r} and the program writes "
+                        f"the identically named key '{by_name}'")
+        return ident
+
     if not ident.cell_quantity:
         ident.state = "unmapped"
         merged = len(re.findall(r"\(\s*[⇓⇑]\s*\)|\bmem\b|\btime\b", header, re.I)) > 1
@@ -369,10 +676,11 @@ def _prose_experiment(repo: Path, quote: str, ref: str, finding_id: str) -> Expe
             "the prose claim does not name a population, so there is no experiment to "
             "identify for it")
         return ident
-    candidates = [describe_command(repo, c) for c in harvest_candidates(repo)]
+    candidates = [describe_command(repo, c) for c in harvest_candidates(repo)
+                  if instantiate(c, "")[0] is not None]     # no command with an unfilled hole
     ident.considered = len(candidates)
-    fitting = [c for c in candidates
-               if any(q == "count" for k, q in _OUTPUT_QUANTITY if k in c.emits)]
+    fitting = _prefer_fenced([c for c in candidates
+                              if any(q == "count" for k, q in _OUTPUT_QUANTITY if k in c.emits)])
     for c in candidates:
         if c not in fitting:
             ident.rejected.append(f"{c.source_ref}: emits {c.label or 'unknown'}")
@@ -419,27 +727,53 @@ def resolve_experiment(doc: PaperDoc, repo: Path, table_ref: str,
         note="the method whose result this cell reports"))
 
     # The row names a method. If the repository does not implement it, no command in the
-    # repository can produce the row, however capable the machine is.
-    if ident.row_method and not repo_implements(repo, ident.row_method):
+    # repository can produce the row, however capable the machine is. A row labelled by a
+    # number (a sample size, a dimension) names no method, so there is nothing to look for.
+    from .paper import table_role  # deferred: see `_metric_name`
+    # "Ours-large (ours)†" names the method "Ours-large". A variant suffix ("Method-flex")
+    # names a configuration of a method, so its leading name also counts — but only when
+    # the checkout DEFINES that name (a class, function or module of its own), never when it
+    # merely imports it: `from transformers import BertModel` does not make BERT theirs.
+    method = re.sub(r"\([^)]*\)|[*†‡§]", "", ident.row_method).strip(" -_")
+    lead = re.split(r"[\s\-_/]+", method)[0] if method else ""
+    if (re.search(r"[^\W\d_]{2,}", method) and not repo_implements(repo, method)
+            and not (len(lead) >= 4 and repo_defines(repo, lead))):
         ident.state = "no_candidate"
-        ident.reason = (f"the cited row reports {ident.row_method!r}, and no .py or .sh file in "
-                        f"this checkout implements it — the cell is a third-party baseline the "
-                        f"authors cited rather than a result their code produces")
+        ident.reason = (
+            f"the cited row names {ident.row_method!r}, a dataset rather than a method, and no "
+            f"advertised program in this checkout is bound to its statistics"
+            if table_role(table) == "data_statistics" else
+            f"the cited row reports {ident.row_method!r}, and no .py or .sh file in this "
+            f"checkout implements it — the cell is a third-party baseline the authors cited "
+            f"rather than a result their code produces")
         return ident
 
-    candidates = [describe_command(repo, c) for c in harvest_candidates(repo)]
-    ident.considered = len(candidates)
-    cell_quantity = _quantity_of(_header_for(table, int(m.group(3)))) or _quantity_of(table.caption or "")
-    fitting = [c for c in candidates
-               if cell_quantity and any(q == cell_quantity for k, q in _OUTPUT_QUANTITY if k in c.emits)]
+    col = int(m.group(3))
+    context = cell_context(table, row, col)
+    candidates = []
+    for c in harvest_candidates(repo):
+        filled, why = instantiate(c, context)
+        if filled is None:
+            ident.rejected.append(f"{c.source_ref}: {why}")
+            continue
+        candidates.append(describe_command(repo, filled))
+    ident.considered = len(candidates) + len(ident.rejected)
+    cell_quantity = _quantity_of(_header_for(table, col)) or _quantity_of(table.caption or "")
+    named = _metric_key(table, col)
+    fitting = _prefer_fenced([c for c in candidates
+               if (cell_quantity and any(q == cell_quantity for k, q in _OUTPUT_QUANTITY
+                                         if k in c.emits))
+               or (named and named in {_key(k) for k in c.named_keys})])
     for c in candidates:
         if c not in fitting:
             ident.rejected.append(f"{c.source_ref}: emits {c.label or 'unknown'}")
 
     if not fitting:
         ident.state = "no_candidate"
-        ident.reason = (f"none of the {len(candidates)} advertised command(s) emits "
-                        f"{cell_quantity or 'the cell’s quantity'}")
+        ident.reason = (f"none of the {ident.considered} advertised command(s) emits "
+                        f"{cell_quantity or _metric_name(table, col) or 'the cell’s quantity'}"
+                        + ("" if _metric_name(table, col) else
+                           " (the paper names no metric for this column, so none can be bound)"))
         return ident
     if len({" ".join(c.argv) for c in fitting}) > 1:
         # Step 7 — before refusing, ask whether the fitting candidates say WHICH
@@ -489,7 +823,8 @@ def resolve_experiment(doc: PaperDoc, repo: Path, table_ref: str,
     ident.evidence.append(IdentityEvidence(
         quote=" ".join(ident.command.argv), source_ref=ident.command.source_ref,
         note=f"the only advertised command emitting {cell_quantity}"))
-    ident.reason = f"one advertised command emits {cell_quantity}: {' '.join(ident.command.argv)}"
+    ident.reason = (f"one advertised command emits {cell_quantity or _metric_name(table, col)}: "
+                    f"{' '.join(ident.command.argv)}")
     return ident
 
 
@@ -520,9 +855,34 @@ def _prose_configuration(quote: str, cmd: CandidateCommand | None,
     return ident
 
 
+_RUN_COUNT = re.compile(
+    r"\b(?:averaged|average|mean|median)\s+(?:over|across|of)\s+(\d+)\s+"
+    r"(?:independent\s+|random\s+)?(?:runs?|seeds?|simulations?|trials?|repetitions?|"
+    r"experiments?|replications?|folds?|splits?)\b", re.I)
+_RUN_KEY = re.compile(
+    r"^\s*[\"']?((?:num|n|number_of)_?(?:exp|exps|experiments?|runs?|seeds?|trials?|"
+    r"simulations?|sims?|reps?|repeats?|repetitions?|replications?|folds?))[\"']?"
+    r"\s*[:=]\s*(\d+)\s*(?:#.*)?,?\s*$", re.I | re.M)
+
+
+def declared_run_counts(repo: Path) -> dict[str, int]:
+    """`file:key` -> the run count a repository's configuration files declare at top level."""
+    out: dict[str, int] = {}
+    for pattern in ("*.yaml", "*.yml", "*.json", "*.toml", "config*.py", "configs/*.yaml",
+                    "config/*.yaml"):
+        for path in sorted(repo.glob(pattern))[:40]:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for m in _RUN_KEY.finditer(text):
+                out[f"{path.relative_to(repo).as_posix()}:{m.group(1)}"] = int(m.group(2))
+    return out
+
+
 def resolve_configuration(doc: PaperDoc, table_ref: str, cmd: CandidateCommand | None,
                           harness_seeds: int = 5, claim_ref: str = "",
-                          claim_quote: str = "") -> ConfigurationIdentity:
+                          claim_quote: str = "", repo: Path | None = None) -> ConfigurationIdentity:
     """Dataset/model/schedule and, above all, the seed policy — matched or explicitly not."""
     ident = ConfigurationIdentity()
     m = re.fullmatch(r"T(\d+):r(\d+):c(\d+)", (table_ref or "").strip())
@@ -542,11 +902,48 @@ def resolve_configuration(doc: PaperDoc, table_ref: str, cmd: CandidateCommand |
             ident.matched[field] = hit.group(1)
             ident.evidence.append(IdentityEvidence(quote=hit.group(1), source_ref=table_ref,
                                                    note=f"{field} recovered from the caption"))
+    # Outside the named benchmarks above, the cell's own text still identifies its setting:
+    # a documented value the README's command takes and the cell names (the slot filled by
+    # `instantiate`) is the dataset; a row label naming a method the checkout implements
+    # (checked by `resolve_experiment`) is the method. Nothing else is inferred.
+    row_label = (table.cell(int(m.group(2)), 0) or "").strip()
+    for slot, value in cmd.bound_slots.items():
+        at = cmd.argv.index(value) if value in cmd.argv else -1
+        flag = cmd.argv[at - 1].lower() if at > 0 else ""
+        if "dataset" in ident.matched or not re.search(r"data|task|benchmark|corpus", flag):
+            continue                     # a slot is the dataset only when its flag says so
+        ident.matched["dataset"] = value
+        ident.evidence.append(IdentityEvidence(
+            quote=f"{flag} {value}", source_ref=cmd.source_ref,
+            note=f"the README documents {value!r} for {slot}, and the cited cell names it"))
+    if "model" not in ident.matched and re.search(r"[^\W\d_]{2,}", row_label):
+        ident.matched["model"] = row_label
+        ident.evidence.append(IdentityEvidence(
+            quote=row_label, source_ref=f"T{m.group(1)}:r{m.group(2)}:c0",
+            note="the cited row names the method the checkout implements"))
     # `sparsity` is REPORTED when the caption states it, never REQUIRED (it exists only
     # in pruning papers). Model and dataset identify a configuration in general.
     for field in ("model", "dataset"):
         if field not in ident.matched:
             ident.unrecoverable.append(field)
+
+    # Protocol: how many runs the printed number aggregates, against how many the
+    # repository's own configuration declares. A different count is a different experiment.
+    paper_runs = _RUN_COUNT.search(caption)
+    declared = declared_run_counts(repo) if repo is not None else {}
+    if paper_runs and declared:
+        wanted = int(paper_runs.group(1))
+        ident.evidence.append(IdentityEvidence(quote=paper_runs.group(0), source_ref=table_ref,
+                                               note="the paper's aggregation protocol"))
+        off = {where: n for where, n in declared.items() if n != wanted}
+        if off and len(off) == len(declared):
+            ident.state = "unsupported"
+            ident.reason = (f"the paper's cell aggregates {paper_runs.group(0)!r} and the "
+                            f"repository declares " + ", ".join(f"{w} = {n}" for w, n in off.items())
+                            + "; running it would reproduce a different protocol"
+                            + (f" (also unrecoverable from the cell: {', '.join(ident.unrecoverable)})"
+                               if ident.unrecoverable else ""))
+            return ident
 
     # Seed policy. The paper's own variance reporting decides what protocol the cell
     # represents; substituting a different one silently is the failure to avoid.
@@ -562,7 +959,10 @@ def resolve_configuration(doc: PaperDoc, table_ref: str, cmd: CandidateCommand |
         ident.seed_policy_repo = "no seed argument found"
 
     single_repo_seed = len(cmd.seed_values) <= 1
-    ident.seed_policy_match = not (single_repo_seed and harness_seeds > 1 and not reported)
+    # A command with no seed argument is run exactly as documented (`routes.plan_execution`
+    # repeats it only to observe determinism), so it passes ONE seed policy: the repo's own.
+    harness_distinct = harness_seeds if cmd.seed_flag and cmd.seed_flag not in cmd.argv else 1
+    ident.seed_policy_match = not (single_repo_seed and harness_distinct > 1 and not reported)
     if not ident.seed_policy_match:
         ident.state = "unsupported"
         ident.reason = (f"the paper's cell is {ident.seed_policy_paper} and the repository pins "
@@ -591,7 +991,7 @@ def resolve(doc: PaperDoc, repo: Path, table_ref: str, finding_id: str = "",
     experiment = resolve_experiment(doc, repo, table_ref, finding_id, claim_ref, claim_quote)
     metric = resolve_metric(doc, table_ref, experiment.command, claim_ref, claim_quote)
     configuration = resolve_configuration(doc, table_ref, experiment.command, harness_seeds,
-                                          claim_ref, claim_quote)
+                                          claim_ref, claim_quote, repo=repo)
     return experiment, metric, configuration
 
 

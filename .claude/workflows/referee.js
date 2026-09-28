@@ -29,6 +29,8 @@ const STATE = {
   properties: {
     paper_id: { type: 'string' }, phase: { type: 'string' }, status: { type: 'string' },
     blocked_reason: { type: 'string' },
+    // `status` is the workflow's; these say what the review actually CHECKED.
+    scientific_status: { type: 'string' }, scientific_blocker: { type: 'string' },
     tasks: { type: 'array', items: { type: 'object', properties: {
       id: { type: 'string' }, role: { type: 'string' }, prompt: { type: 'string' },
       out: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' },
@@ -57,7 +59,8 @@ async function run(kind, prompt, opts) {
 function controller(source, label) {
   return run('controller',
     `Run exactly this shell command (Bash, timeout 600000 ms) and return its JSON stdout ` +
-    `fields verbatim (paper_id, phase, status, blocked_reason, tasks). Do nothing else:\n\n` +
+    `fields verbatim (paper_id, phase, status, blocked_reason, scientific_status, ` +
+    `scientific_blocker, tasks). Do nothing else:\n\n` +
     sh(`run.py tasks "${source}" --json`),
     { label, phase: 'Review', model: 'haiku', effort: 'low', schema: STATE })
 }
@@ -102,8 +105,10 @@ async function review(source) {
     if (dropped.length) log(`${pid}: giving up on ${dropped.join(', ')} after 2 failed rounds`)
     log_.push({ round: round + 1, phase: st && st.phase, sealed, tasks: ready.length })
   }
-  return { source, final: st && { paper_id: st.paper_id, phase: st.phase, status: st.status,
-           blocked_reason: st.blocked_reason, left: (st.tasks || []).map(t => t.id) },
+  return { source, final: st && { paper_id: st.paper_id, phase: st.phase,
+           workflow_status: st.status, blocked_reason: st.blocked_reason,
+           scientific_status: st.scientific_status || 'NOT_ASSESSED',
+           scientific_blocker: st.scientific_blocker || '', left: (st.tasks || []).map(t => t.id) },
            rounds: log_, gave_up: Object.keys(fails).filter(k => fails[k] >= 2) }
 }
 

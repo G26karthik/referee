@@ -645,9 +645,18 @@ def advance(cfg: Config, pid: str) -> dict:
     """
     case = pipeline.open_case(cfg, pid)
     case = pipeline.drive(cfg, case, force_probe=_seal_newer_than_probe(cfg, case.paper_id or pid))
+    from . import decide
+    from . import discover as discover_stage
+
     resolved_pid = case.paper_id or pid
+    ts = discover_stage.load(cfg, resolved_pid)
+    sci = decide.scientific_outcome(ts) if ts is not None else {"status": "NOT_ASSESSED"}
+    # `status` is the workflow's; `scientific_status` is what the review established. A
+    # "complete" case with NO_CONCLUSIVE_CHECK checked nothing, and says so with its blocker.
     return {"paper_id": resolved_pid, "phase": case.phase, "status": case.status,
-           "blocked_reason": case.blocked_reason, "tasks": pending(cfg, resolved_pid)}
+           "blocked_reason": case.blocked_reason,
+           "scientific_status": sci["status"], "scientific_blocker": sci.get("blocker", ""),
+           "tasks": pending(cfg, resolved_pid)}
 
 
 # --------------------------------------------------------------------------- #
@@ -836,7 +845,8 @@ if __name__ == "__main__":       # self-check: python -m harness.tasks
         # ingested, minimally-populated project (whatever it cannot progress past becomes
         # an 'error'/'waiting' PhaseOutcome, not an exception escaping this function) -----
         res = advance(cfg, pid)
-        assert set(res) == {"paper_id", "phase", "status", "blocked_reason", "tasks"}
+        assert set(res) == {"paper_id", "phase", "status", "blocked_reason", "tasks",
+                            "scientific_status", "scientific_blocker"}
         assert res["paper_id"] == pid
 
     print(json.dumps({"self_check": "ok"}, indent=2))

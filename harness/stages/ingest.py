@@ -146,7 +146,7 @@ def run_ingest(cfg: Config, paper_path: str) -> dict:
     # label set. See `harness.artifacts.CrossRef`.
     crossrefs = pdf.extract_crossrefs(sections)
     numbers = pdf.table_numbers(tables) + pdf.prose_numbers(sections)
-    title = pdf.guess_title(pages) or src.stem
+    title = pdf.title_from_layout(src) or pdf.guess_title(pages) or src.stem
 
     if not root.exists():
         # A case is one paper under review. `direction` carries the title so the
@@ -182,6 +182,13 @@ def run_ingest(cfg: Config, paper_path: str) -> dict:
     # `repo_url` is the one it advertises as its own, and a paper that advertises none
     # must end up with "" rather than with the top-ranked link it happened to cite.
     doc.repo_url = repo.official_repo_url(doc)
+    doc.repo_discovery = "pdf_cue: the paper's own availability statement" if doc.repo_url else ""
+    if not doc.repo_url:
+        # No URL in the PDF is not "no code": look for a public repository whose README
+        # attributes itself to this exact paper. Recorded either way, so the report can say
+        # where the code came from or precisely why none was attributed.
+        url, why = repo.discover_public_repo(cfg, doc)
+        doc.repo_url, doc.repo_discovery = url, (f"public_search: {why}" if url else f"none: {why}")
     state.write_json(doc_path, doc.model_dump())
     state.append_log(
         cfg, pid, artifact_type="paper_ingested", phase="ingest",

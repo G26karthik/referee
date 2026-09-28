@@ -112,9 +112,23 @@ def _score(text: str, start: int, host: str, url: str) -> int:
     return score
 
 
+# Authorship stated in any phrasing: "available in our public repository:", "can be found
+# in our GitHub repo", "is publicly available at", "we release ... at".
+_CUE_PATTERNS = (
+    # "our public repository", "our code and data", "our implementation" — first person, and
+    # the thing owned is CODE. "our experiments use the data from …" owns nothing linked.
+    re.compile(r"\bour\s+(?:[\w\-]+\s+){0,3}?(?:code|codes|implementation|repositor(?:y|ies)|"
+               r"repo|codebase|source\s+code|software|toolkit|project\s+page)\b", re.I),
+    re.compile(r"\bwe\s+(?:have\s+)?(?:release|open-?source|publish)(?:d)?\s+(?:our|the|all)?\s*"
+               r"(?:code|implementation|software|repository|codebase)\b", re.I),
+)
+
+
 def _cued(text: str, start: int) -> bool:
-    """Does an availability phrase precede this URL — 'our code is available at', etc.?"""
-    return any(c in text[max(0, start - _CUE_WINDOW):start].lower() for c in _CUES)
+    """Does an availability or authorship phrase precede this URL?"""
+    window = text[max(0, start - _CUE_WINDOW):start]
+    low = window.lower()
+    return any(c in low for c in _CUES) or any(p.search(window) for p in _CUE_PATTERNS)
 
 
 def _reference_spans(doc: PaperDoc, joiner: int = 1) -> list[tuple[int, int]]:
@@ -171,6 +185,166 @@ def official_repo_url(doc: PaperDoc) -> str:
             best[url] = rank
     ranked = sorted(best.items(), key=lambda kv: kv[1], reverse=True)
     return ranked[0][0] if ranked else ""
+
+
+# --------------------------------------------------------------------------- #
+# Sources: what this paper IS (identifiers, version) and where its code/data live
+# --------------------------------------------------------------------------- #
+_ARXIV_ID = re.compile(r"arXiv\s*:\s*(\d{4}\.\d{4,5})(v\d+)?", re.I)
+_OPENREVIEW_ID = re.compile(r"openreview\s*\.\s*net\s*/\s*(?:forum|pdf)\s*\?\s*id\s*=\s*([A-Za-z0-9_\-]{6,})", re.I)
+_DOI = re.compile(r"\b(10\.\d{4,9}/[^\s\"<>]+[A-Za-z0-9])")
+_DATA_HOSTS = re.compile(
+    r"https?\s*:\s*/\s*/\s*(?:www\.)?((?:zenodo\.org|figshare\.com|osf\.io|kaggle\.com|"
+    r"huggingface\.co/datasets|archive\.ics\.uci\.edu|dataverse\.[a-z.]+|physionet\.org|"
+    r"data\.mendeley\.com)[^\s)\]}>,;\"]*)", re.I)
+_README_AUTHORSHIP = re.compile(
+    r"\b(official|our paper|our work|our method|we propose|we introduce)\b", re.I)
+
+
+def _front_matter(doc: PaperDoc) -> str:
+    text = "\n".join(s.text for s in doc.sections[:2])
+    cut = re.search(r"\babstract\b", text, re.I)
+    return text[:cut.start()] if cut else text[:800]
+
+
+def paper_identifiers(doc: PaperDoc) -> dict[str, str]:
+    """The paper's own identifiers as printed in it — never looked up elsewhere."""
+    body = "\n".join(s.text for s in doc.sections[:max(1, doc.body_end_section_idx)]
+                     ) if doc.body_end_section_idx > 0 else "\n".join(s.text for s in doc.sections)
+    front = "\n".join(s.text for s in doc.sections[:3])
+    out = {"title": doc.title, "pdf_sha256_12": doc.content_sha, "source_path": doc.source_path}
+    try:
+        import hashlib
+        out["pdf_sha256"] = hashlib.sha256(Path(doc.source_path).read_bytes()).hexdigest()
+    except (OSError, ValueError):
+        pass
+    if m := _ARXIV_ID.search(front) or _ARXIV_ID.search(body[:4000]):
+        out["arxiv_id"], out["arxiv_version"] = m.group(1), (m.group(2) or "")
+    if m := _OPENREVIEW_ID.search(body):
+        out["openreview_id"] = m.group(1)
+    if m := _DOI.search(front):
+        out["doi"] = m.group(1)
+    return out
+
+
+def data_sources(doc: PaperDoc) -> list[dict[str, str]]:
+    """Dataset archives the paper links outside its reference list, with the quote."""
+    text = "\n".join(s.text for s in doc.sections)
+    refs = _reference_spans(doc)
+    out, seen = [], set()
+    for m in _DATA_HOSTS.finditer(text):
+        url = "https://" + re.sub(r"\s+", "", m.group(1)).rstrip(".")
+        path = url.split("/", 3)[3].strip("/").lower() if url.count("/") >= 3 else ""
+        if path in ("", "datasets", "dataset", "records", "record", "data"):
+            continue                       # a host's front page names no dataset
+        if url in seen or any(lo <= m.start() < hi for lo, hi in refs):
+            continue
+        seen.add(url)
+        out.append({"url": url, "quote": re.sub(r"\s+", " ", text[max(0, m.start() - 120):m.end()])})
+    return out[:20]  # ponytail: a paper linking more archives than this lists them in a table
+
+
+def readme_attributes(readme: str, doc: PaperDoc) -> str:
+    """The README quote that attributes this repository to THIS paper's AUTHORS, or ''.
+    Required: the paper's full title (case/spacing aside, at least four words) in the
+    README's opening; not a list of papers; no "unofficial"/re-implementation wording; and
+    either an author's full name from the paper's front matter or an official/first-person
+    statement next to the title. An identifier alone proves the README is ABOUT the paper,
+    which a re-implementation also is — so it is not evidence here."""
+    def norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+    title = norm(doc.title)
+    body = norm(readme)
+    if len(title.split()) < 4 or title not in body:
+        return ""
+    at = body.index(title)
+    # A repository ABOUT this paper names it up front; a curated list or a daily digest
+    # names it somewhere among many papers. Both are refused: position, then plurality.
+    ids = [v for k, v in paper_identifiers(doc).items()
+           if k in ("arxiv_id", "openreview_id", "doi") and v]
+    if at > 1500:  # ponytail: an own-paper README states its title within its opening
+        return ""
+    others = set(re.findall(r"\b\d{4}\.\d{4,5}\b", readme)) - set(ids)
+    if len(others) > 3:
+        return ""
+    # About the paper is not BY its authors: a re-implementation cites the same title and id.
+    if _NOT_AUTHORS.search(readme[:4000]):
+        return ""
+    window = body[max(0, at - 300):at + len(title) + 300]
+    for first, last in _author_names(doc):
+        if re.search(rf"\b{first.lower()}\s+(?:\w\s+)?{last.lower()}\b|\b{last.lower()}\s+{first.lower()}\b",
+                     body):
+            return f"README cites the title and the author {first} {last}"
+    if _README_AUTHORSHIP.search(window):
+        return "README cites the title with a first-person or official statement: " + window[:200]
+    return ""
+
+
+# A README that says it is someone else's version of the paper.
+_NOT_AUTHORS = re.compile(
+    r"\b(unofficial|non-?official|re-?implementation|reimplementation|reproducibility "
+    r"challenge|replication of|port of|third[- ]party|not affiliated)\b", re.I)
+_NAME_STOP = {"university", "institute", "department", "conference", "international",
+              "proceedings", "abstract", "anonymous", "laboratory", "school", "college",
+              "research", "science", "sciences", "technology", "engineering", "computer",
+              "machine", "learning", "correspondence", "equal", "contribution", "national",
+              "center", "centre", "faculty", "academy", "workshop", "journal", "preprint",
+              "under", "review", "submitted", "accepted", "paper", "email", "google", "meta",
+              "microsoft", "deepmind", "openai", "amazon", "corresponding", "author", "authors",
+              "independent", "researcher", "student", "professor"}
+
+
+def _author_names(doc: PaperDoc) -> list[tuple[str, str]]:
+    """(first, last) name pairs from the front matter, venue/affiliation words excluded."""
+    title = {w.lower() for w in re.findall(r"\w+", doc.title or "")}
+    out = []
+    for first, last in re.findall(
+            r"\b([A-Z][a-z]+(?:-[A-Z][a-z]+)?)\s+(?:[A-Z]\.\s*)*([A-Z][a-z]{2,}(?:-[A-Z][a-z]+)?)\b",
+            _front_matter(doc)):
+        low = {first.lower(), last.lower()}
+        if not (low & _NAME_STOP or low & title) and (first, last) not in out:
+            out.append((first, last))
+    return out[:30]
+
+
+def discover_public_repo(cfg: Config, doc: PaperDoc) -> tuple[str, str]:
+    """(url, evidence) for a public repository whose README attributes itself to this exact
+    paper, or ('', why). Used only when the PDF names none; the search sends the title
+    alone, and a hit is accepted only on `readme_attributes` evidence, never on rank."""
+    import urllib.parse
+    import urllib.request
+
+    if not (cfg.allow_network and cfg.allow_source_search):
+        return "", "public source search is gated off (SH_ALLOW_SOURCE_SEARCH / SH_ALLOW_NETWORK)"
+    title = re.sub(r"\s+", " ", doc.title or "").strip()
+    if len(title.split()) < 4:
+        return "", f"the parsed title {title!r} is too short to search for unambiguously"
+    headers = {"User-Agent": "referee-harness", "Accept": "application/vnd.github+json"}
+
+    def get(url: str, accept: str = "") -> bytes:
+        req = urllib.request.Request(url, headers={**headers, **({"Accept": accept} if accept else {})})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.read()
+
+    query = urllib.parse.quote(f'"{title}" in:readme')
+    try:
+        hits = json.loads(get(f"https://api.github.com/search/repositories?q={query}&per_page=5"))
+    except (OSError, ValueError) as exc:
+        return "", f"public source search failed: {exc}"
+    rejected: list[str] = []
+    for item in (hits.get("items") or [])[:5]:  # ponytail: an exact-title hit ranks in the top 5
+        name = item.get("full_name", "")
+        try:
+            readme = get(f"https://api.github.com/repos/{name}/readme",
+                         "application/vnd.github.raw").decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        if evidence := readme_attributes(readme, doc):
+            return f"https://github.com/{name}", evidence
+        rejected.append(name)
+    return "", (f"no public repository's README is about the exact title {title!r}"
+                + (f" (mention-only or list repositories refused: {', '.join(rejected)})"
+                   if rejected else ""))
 
 
 # --------------------------------------------------------------------------- #
@@ -552,15 +726,20 @@ def acquire(cfg: Config, root: Path, pid: str, doc: PaperDoc,
     # holds every repository link the paper mentions, most belonging to other people.
     url = doc.repo_url or official_repo_url(doc)
     dest = root / "runs" / pid / "repo"
+    # How the URL was attributed is decided once, at ingest (`stages.ingest`), and only read
+    # here: a public-search attribution is recorded with its README evidence.
+    how, _, evidence = (doc.repo_discovery or ("pdf_cue: " if url else "")).partition(": ")
+    discovered_by = how if url else ""
 
     if not url:
         return RepoAcquisition(
-            status="unavailable",
+            status="unavailable", discovery_evidence=evidence,
             reason=("the paper advertises no repository of its own. "
                     + (f"{len(doc.repo_urls)} repository URL(s) appear in the text but none is "
                        f"introduced by an availability cue outside the reference list, so none "
                        f"can be attributed to these authors: {', '.join(doc.repo_urls[:3])}"
-                       if doc.repo_urls else "No repository URL appears in its text.")))
+                       if doc.repo_urls else "No repository URL appears in its text.")
+                    + (f" Public source search: {evidence}." if evidence else "")))
     if dest.exists() and (dest / ".git").exists():
         acq = RepoAcquisition(url=url, status="cached", path=str(dest),
                               reason="clone already present; not re-fetched")
@@ -607,6 +786,7 @@ def acquire(cfg: Config, root: Path, pid: str, doc: PaperDoc,
 
     acq.dependency_files, acq.dependencies, acq.frameworks = inspect_dependencies(dest)
     acq.entrypoint = find_entrypoint(dest)
+    acq.discovered_by, acq.discovery_evidence = discovered_by, evidence
     return acq
 
 
