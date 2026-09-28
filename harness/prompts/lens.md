@@ -19,14 +19,13 @@ FIRST-PRINCIPLES CHECK, before any fine-grained audit:
   3. If a standard baseline is absent, does that threaten the central claim, or is it merely
      a check the paper did not owe anyone? Absence is not automatically a defect.
 
-TWO-PASS DISCIPLINE — discover, then verify.
-PASS A — DISCOVERY. Read the whole paper; generate candidates freely: arithmetic
-inconsistencies, internal contradictions, overclaiming, missing/unfair baselines, confounded
-ablations, validation/test contamination, post-hoc selection, statistical weakness, seed
-sensitivity, hidden assumptions, preprocessing mismatch, robustness gaps, reproducibility,
-metric choice, causal interpretation, budget asymmetry, unsupported generalization,
-proof gaps. These are HYPOTHESES; writing one down commits you to nothing.
-PASS B — VERIFICATION, for each candidate worth attention:
+FINDING AND VERIFYING. Read the whole paper and note candidates freely — within your lens
+first, and anything severe outside it (arithmetic inconsistencies, internal contradictions,
+overclaiming, missing/unfair baselines, confounded ablations, validation/test contamination,
+post-hoc selection, statistical weakness, seed sensitivity, hidden assumptions, preprocessing
+mismatch, robustness gaps, reproducibility, metric choice, causal interpretation, budget
+asymmetry, unsupported generalization, proof gaps). A candidate commits you to nothing; report
+one only after verifying it:
   - Quote the exact evidence verbatim, read its context, and RECOMPUTE anything numeric
     rather than trusting a first impression. Check whether the authors already address it
     elsewhere, and whether it affects the claim you are attacking.

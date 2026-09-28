@@ -66,7 +66,7 @@ function worker(pid, t, prior) {
   const reads = (t.reads || []).map(([f, o, n]) => `${f} (offset ${o}, limit ${n})`).join('\n  ')
   return run('worker',
     `One isolated REFEREE task. Judge independently.\n` +
-    `1. In ONE message, make these parallel Read calls (the task file, then the paper):\n  ${reads}\n` +
+    `1. In ONE message, make these parallel Read calls (the task file first):\n  ${reads}\n` +
     `   Read nothing else except files the task itself tells you to open (page images, the ` +
     `authors' checkout).\n` +
     `2. Create every file with the Write tool, never a shell heredoc or echo. Write your JSON answer, ` +

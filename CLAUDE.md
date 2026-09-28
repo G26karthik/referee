@@ -86,7 +86,7 @@ launch uses the copy cached at session start.
   few papers per run.
 - Inspect `git status` first; preserve unrelated dirty work; never force-reset or force-push.
 - Subagents are read-only unless given explicit, non-overlapping file ownership.
-- Keep token spend visible (`scratchpad/wfusage.py` on a workflow dir); check brief sizes
+- Keep token spend visible (`python tools/wfusage.py <workflow transcript dir>`); check brief sizes
   (`ls -l projects/*/tasks`) before a run spends tokens on them.
 - After a run: `run.py pack <zip> --clean` so clones, venvs and data do not accumulate.
 - There is no adjudicated ground truth here: never claim precision/recall; a self-written

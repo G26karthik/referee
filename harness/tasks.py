@@ -111,12 +111,13 @@ class _Ctx:
                 c["withdrawn"] = r.get("reason", "") or "withdrawn by the critic"
         return out
 
-    def task(self, tid: str, role: str, prompt: str, extra_reads: tuple[Path, ...] = ()) -> dict:
+    def task(self, tid: str, role: str, prompt: str, extra_reads: tuple[Path, ...] = (),
+             paper: bool = True) -> dict:
         path = self.root / "tasks" / f"{_safe(tid)}.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(prompt, encoding="utf-8")
-        reads = [r for p in (path, self.root / "paper" / "paper.md", *extra_reads)
-                 for r in read_ranges(p, self.cfg.read_chunk)]
+        paper_md = (self.root / "paper" / "paper.md",) if paper else ()
+        reads = [r for p in (path, *paper_md, *extra_reads) for r in read_ranges(p, self.cfg.read_chunk)]
         return {"id": tid, "role": role, "prompt": path.as_posix(),
                 "out": (self.root / "out" / f"{_safe(tid)}.json").as_posix(),
                 "effort": _EFFORT[role], "reads": reads, "after": []}
@@ -171,7 +172,8 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
         return "report", [x.task("report", "report", _template(
             "report", title=title, table=report.table(ledger), concerns=_concern_lines(ledger["concerns"]),
             checks=json.dumps(ledger["checks"], ensure_ascii=False, indent=1)[:40_000],
-            central=json.dumps(ledger["central_claims"], ensure_ascii=False, indent=1)))], []
+            central=json.dumps(ledger["central_claims"], ensure_ascii=False, indent=1)),
+            paper=False)], []   # the writer works from the ledger; its quotes are already in it
     report.render(x, ledger, x.sealed("report"))
     return "done", [], []
 

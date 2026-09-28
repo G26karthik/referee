@@ -19,7 +19,8 @@ Paper: {{title}}
 === CENTRAL CLAIMS ===
 {{central}}
 
-Write, in plain Markdown, at most 5000 characters:
+Write, in plain Markdown, a summary a referee can read in a few minutes (the harness cuts
+anything past 8000 characters):
   1. **Summary** — what the paper claims and what this review established, in 3-5 sentences.
   2. **Most important concerns** — the few that bear on central claims, each with its id, the
      paper's own words (quote), and why it matters. Severity and confidence are model

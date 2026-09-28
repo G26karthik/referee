@@ -1,5 +1,5 @@
 ## overclaim
-Audit, in this order:
+Audit for:
   A. PREMISE. Is the stated reason the method should work actually sound? Distinguish a real
      mechanism from a plausible-sounding story. If the premise would equally "explain" the
      opposite result, it explains nothing — judge how much that threatens the central claim.
@@ -31,11 +31,9 @@ Audit for:
      whether the claim is supported.
 
 ## confound
-Work in two passes.
-PASS 1 — classify every variable the paper changed between baseline and proposed arm:
-SCIENTIFIC (claimed responsible for the gain), NUISANCE (tuned per arm for fairness), FIXED.
-Anything the paper changed but did not classify, you classify.
-PASS 2 — attribution:
+Classify every variable the paper changed between baseline and proposed arm: SCIENTIFIC
+(claimed responsible for the gain), NUISANCE (tuned per arm for fairness), FIXED. Anything the
+paper changed but did not classify, you classify. Then check attribution:
   A. CO-MOVEMENT. Did the proposed arm receive MORE of anything besides the mechanism —
      compute, epochs, parameters, data, tuning, schedule, optimizer? Judge how much of the
      claimed effect the confound could plausibly explain.
