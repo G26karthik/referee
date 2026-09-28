@@ -364,10 +364,14 @@ def synthesize_probe(cfg: Config, doc: PaperDoc, spec: ProbeSpec,
     plan = probe_synth.plan(doc, claim=spec.claim, acq=acq)
     if not plan.keeps_finding:
         spec.finding_id = ""
-    spec.claim = plan.claim or spec.claim
+    # A target-bound spec keeps the paper's own words and its own quantity label: the
+    # synthesized diagnostic's paraphrase must never become the claim a later admissible
+    # route (a reconstruction) is briefed with and reconciled against.
+    if not spec.claim_ref:
+        spec.claim = plan.claim or spec.claim
+        spec.metric = plan.metric
     spec.script = plan.script
     spec.arms = plan.arms
-    spec.metric = plan.metric
     spec.mechanism = plan.mechanism
     spec.rationale = plan.rationale
     spec.aux_metrics = plan.aux_metrics

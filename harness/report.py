@@ -1594,7 +1594,8 @@ _DEFAULT_ACTOR = "code this review's ceiling admits"
 
 EXECUTION_GLOSS = {
     "EXECUTION_CONTRADICTED_A_PRINTED_QUANTITY":
-        "{actor} ran and did not produce a quantity the paper prints",
+        "{actor} ran and contradicted what the paper prints (a quantity, a stated bound, "
+        "or a step of its printed proof — the reason says which)",
     "EXECUTION_REPRODUCED_A_PRINTED_QUANTITY":
         "{actor} ran and re-derived a quantity the paper prints",
     "EXECUTION_PRODUCED_NO_ADMISSIBLE_EVIDENCE":

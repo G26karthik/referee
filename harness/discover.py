@@ -111,13 +111,23 @@ def reimplementation_readiness(doc: PaperDoc, target_ref: str = "") -> Reimpleme
     found: list[ReimplementationIngredient] = []
     prefer = target_sections(doc, target_ref)
     table, label = _target_table(doc, target_ref)
+    claim = (locate.resolve(doc, target_ref)
+             if table is None and re.match(r"^[Pp]\d+:", target_ref or "") else None)
     for name, required, needles in INGREDIENTS:
         ref, quote = _find(needles, doc, prefer)
         # A keyword hit OUTSIDE the target's own sections describes another experiment;
-        # the paper's own sentence presenting the target's table is the honest locator.
-        if (label and name in ("method", "dataset", "metric") and ref.startswith("s")
+        # the paper's own sentence presenting the target (its table, or the claim
+        # itself) is the honest locator.
+        if (prefer and name in ("method", "dataset", "metric") and ref.startswith("s")
                 and int(ref[1:]) not in prefer):
-            ref, quote = _find((f"Table {label}",), doc, prefer)
+            if label:
+                ref, quote = _find((f"Table {label}",), doc, prefer)
+            elif claim is not None and claim.resolved:
+                ref, quote = claim.ref, claim.quote[:_MAX_QUOTE]
+        # A prose target's printed quantity names what is measured, whatever else its
+        # section mentions.
+        if name == "metric" and claim is not None and claim.resolved and claim.quantity:
+            ref, quote = claim.ref, claim.quote[:_MAX_QUOTE]
         if name == "method" and not ref:
             if doc.equations:
                 e = doc.equations[0]
@@ -140,11 +150,12 @@ def reimplementation_readiness(doc: PaperDoc, target_ref: str = "") -> Reimpleme
 
     # A comparison target is an ingredient too -- without an addressed cell, any run
     # produces a number in a vacuum. The target's OWN cell when there is one.
-    cell = locate.resolve(doc, target_ref) if table is not None else None
-    if cell is not None and cell.resolved:
+    cell = locate.resolve(doc, target_ref) if table is not None else claim
+    if cell is not None and cell.resolved and (table is not None or cell.quantity):
         found.append(ReimplementationIngredient(
             kind="comparison_target", required=True, present=True, ref=cell.ref,
-            quote=f"{cell.quote} ({(table.caption or '')[:_MAX_QUOTE]})"))
+            quote=(f"{cell.quote} ({(table.caption or '')[:_MAX_QUOTE]})" if table is not None
+                   else cell.quote[:_MAX_QUOTE])))
     else:
         has_target = any(t.rows for t in doc.tables)
         found.append(ReimplementationIngredient(
@@ -348,8 +359,12 @@ def question_for_object(obj: DiscoveredObject) -> ReviewQuestion:
     return ReviewQuestion(
         question_id=f"Q-object-{obj.target_id}", question=question, kind=kind,
         from_finding="", source_finding_ids=[], lens="", why_it_matters=why,
-        what_would_settle_it=("evidence that the quantity at this address is what the "
-                              "paper's own artifact produces"),
+        what_would_settle_it=(
+            "an admissible instance that violates the statement (refuting it) or a step of "
+            "its printed proof (refuting the proof as printed); instances that satisfy it "
+            "never settle it" if kind == "MATHEMATICAL_BOUND" else
+            "evidence that the quantity at this address is what the paper's own artifact "
+            "produces"),
         materiality=obj.centrality if obj.centrality in _MATERIALITY.values() else "UNASSESSED")
 
 

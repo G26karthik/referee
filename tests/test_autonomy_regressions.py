@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from harness import certificate, decide, discover, execute, provenance, reimplement_driver, routes
+from harness import certificate, decide, discover, execute, locate, provenance, reimplement_driver, routes
 from harness.config import Config
 from harness.schema import (
     DiscoveredObject, PaperDoc, PlanDecision, ProbeSpec, ReimplementationConformance,
@@ -126,6 +126,32 @@ def test_reconstruction_ingredients_are_scoped_to_the_target():
     assert by["method"].ref == "s1" and by["dataset"].ref == "s1" and by["metric"].ref == "s1"
     assert by["comparison_target"].ref == "T5:r0:c1"
     assert discover.reimplementation_readiness(doc).ingredients[0].ref == "s0"   # unscoped
+
+
+def test_prose_target_ingredients_quote_the_claim_itself():
+    doc = PaperDoc(paper_id="p", title="t", sections=[
+        Section(section_idx=0, title="2. Attack", text="We propose an attack and report "
+                "accuracy of it on the benchmark dataset."),
+        Section(section_idx=1, title="3. Data", text="We release a corpus of 1,234 labelled "
+                "samples for future work.")])
+    ref = locate.mint(doc, "a corpus of 1,234 labelled samples")
+    r = discover.reimplementation_readiness(doc, ref.ref)
+    by = {i.kind: i for i in r.ingredients}
+    assert by["method"].ref == ref.ref and by["metric"].ref == ref.ref
+    assert by["comparison_target"].ref == ref.ref
+
+
+def test_synthesized_probe_never_rewrites_a_target_bound_claim(monkeypatch):
+    class _Plan:
+        keeps_finding, claim, script, arms, metric = True, "a paraphrase", "x", ["a"], "accuracy"
+        mechanism = rationale = ""
+        aux_metrics: list = []
+    monkeypatch.setattr(routes.probe_synth, "plan", lambda *a, **k: _Plan())
+    spec = ProbeSpec(paper_id="p", finding_id="f", claim="the paper's own words",
+                     claim_ref="P1:0-20")
+    out = routes.synthesize_probe(Config(allow_synthesis=True), PaperDoc(paper_id="p"),
+                                  spec, RepoAcquisition())
+    assert out.claim == "the paper's own words" and "metric" not in out.model_fields_set
 
 
 def test_constant_name_is_an_implementation_locator():

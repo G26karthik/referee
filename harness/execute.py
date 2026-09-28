@@ -1531,18 +1531,28 @@ def reconcile(spec: ProbeSpec, values: list[float], noise_band: float,
             rec.reason = ("the certificate produced no parseable SH_METRIC value for any "
                          "instance, so no verdict is drawn")
             return rec
-        if any(v == 1 for v in values):
+        # WHAT was checked, in the paper's own words: the statement's bound, or one step
+        # its printed proof asserts — a reader must be able to re-derive the verdict.
+        checked = " ".join(next((b.paper_quote for b in conf.bindings
+                                 if b.kind == "claimed_bound"), "").split())[:300]
+        what = (f"the inequality its printed PROOF asserts (\"{checked}\")"
+                if conf.scope == "proof_step" else
+                f"the bound it claims" + (f" (\"{checked}\")" if checked else ""))
+        violated = sum(1 for v in values if v == 1)
+        if violated:
             rec.status = "COUNTEREXAMPLE_FOUND"
             rec.reason = (
-                f"at least one of {len(values)} exact-arithmetic instance(s) satisfied "
-                f"every hypothesis stated at {_addressed(spec)} and violated the bound it "
-                f"claims — a concrete counterexample, checked in exact rational arithmetic.")
+                f"{violated} of {len(values)} exact-arithmetic instance(s) satisfied every "
+                f"hypothesis stated at {_addressed(spec)} and violated {what} — a concrete "
+                f"counterexample, checked in exact rational arithmetic"
+                + (". It refutes that step of the proof as printed, not the statement."
+                   if conf.scope == "proof_step" else "."))
         else:
             rec.status = "NO_VIOLATION_FOUND"
             rec.reason = (
-                f"all {len(values)} exact-arithmetic instance(s) satisfied the bound "
-                f"claimed at {_addressed(spec)}. This checks the tested instances only and "
-                f"is never a proof that the bound holds in general.")
+                f"all {len(values)} exact-arithmetic instance(s) satisfied {what} at "
+                f"{_addressed(spec)}. This checks the tested instances only and is never a "
+                f"proof that it holds in general.")
         return rec
 
     # --- which comparison this is, and whether this system can perform it -------------
