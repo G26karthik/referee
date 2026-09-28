@@ -213,9 +213,14 @@ def _seal_verdict(cfg: Config, pid: str, raw: str) -> dict:
 # for each, exactly as `reimplement_driver.conformance` requires: `generated_by` and
 # `verified_by` must be distinct attributions for `independently_verified` to be True)
 # --------------------------------------------------------------------------- #
-def _readiness(cfg: Config, pid: str, doc: PaperDoc):
+def _readiness(cfg: Config, pid: str, doc: PaperDoc, target_id: str = ""):
+    """The SAME target-scoped readiness `routes.attempt_reimplementation_fallback` built
+    the generator's brief from, so the verifier and the seal bind the same paper quotes."""
     from . import discover
-    return discover.reimplementation_readiness(doc)
+    ts = discover.load(cfg, pid)
+    obj = ts.by_id(target_id) if ts is not None and target_id else None
+    ref = obj.ref.ref if obj is not None and obj.ref is not None else ""
+    return discover.reimplementation_readiness(doc, ref)
 
 
 def _reimpl_generated_path(cfg: Config, pid: str, target_id: str) -> Path:
@@ -264,8 +269,7 @@ def _reimpl_tasks(cfg: Config, pid: str, doc: PaperDoc) -> list[dict]:
         # A GENERATION EXISTS: build (or refresh) the verifier's brief from it, and offer
         # the verify task -- ONLY now, and only to a subagent this generator's own answer
         # was not shown building the brief for (a fresh context reading it below).
-        if readiness is None:
-            readiness = _readiness(cfg, pid, doc)
+        readiness = _readiness(cfg, pid, doc, target_id)
         raw = gen_path.read_text(encoding="utf-8")
         verify_path = reimplement_driver.persist_verification_brief(
             cfg, pid, target_id, readiness, raw)
@@ -311,7 +315,7 @@ def _seal_reimpl_verify(cfg: Config, pid: str, target_id: str, doc: PaperDoc, ra
         raw, reimplement_driver.required_kinds(
             script, bindings, reimplement_driver.load_released(cfg, pid, target_id)))
     _refuse_malformed_verdict(f"reimpl_verify:{target_id}", _notes)
-    readiness = _readiness(cfg, pid, doc)
+    readiness = _readiness(cfg, pid, doc, target_id)
     reimplement_driver.accept_reimplementation(
         cfg, pid, target_id, gen_path.read_text(encoding="utf-8"), readiness,
         reviewer=(REVIEWER + " (verifier)") if approved else "",

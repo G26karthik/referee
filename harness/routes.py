@@ -883,7 +883,8 @@ def attempt_reimplementation_fallback(
 
     if fallback_plan is None or not fallback_plan.requires_execution:
         return None
-    readiness = discover_stage.reimplementation_readiness(doc)
+    readiness = discover_stage.reimplementation_readiness(
+        doc, base_spec.claim_ref or base_spec.table_ref)
     checkout = (Path(acq.path) if acq is not None and acq.path
                 and acq.status in ("cloned", "cached") else None)
     released = reimplement_driver.released_files(checkout) if checkout is not None else []

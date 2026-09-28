@@ -55,9 +55,36 @@ def _needle(n: str) -> re.Pattern:
     return re.compile(r"\b" + re.escape(n) + tail, re.I)
 
 
-def _find(needles: tuple[str, ...], doc: PaperDoc) -> tuple[str, str]:
+def _target_table(doc: PaperDoc, ref: str = ""):
+    """(table, printed label) for a table-cell target, else (None, "")."""
+    m = re.match(r"^T(\d+)", ref or "")
+    t = next((t for t in doc.tables if m and t.table_idx == int(m.group(1))), None)
+    return t, ((t.label if t else "") or "")
+
+
+def target_sections(doc: PaperDoc, ref: str = "") -> tuple[int, ...]:
+    """Sections that belong to ONE target's experiment: those naming its table's printed
+    label ("Table 1"), or the section its prose claim sits in. Empty when unknown."""
+    m = re.match(r"^T(\d+)", ref or "")
+    if m:
+        t = next((t for t in doc.tables if t.table_idx == int(m.group(1))), None)
+        label = (t.label if t else "") or ""
+        if not label:
+            return ()
+        pat = re.compile(rf"\bTable\s+{re.escape(label)}\b", re.I)
+        return tuple(s.section_idx for s in doc.sections if pat.search(s.text or ""))
+    m = re.match(r"^[SsPp](\d+)", ref or "")
+    return (int(m.group(1)),) if m else ()
+
+
+def _find(needles: tuple[str, ...], doc: PaperDoc,
+          prefer: tuple[int, ...] = ()) -> tuple[str, str]:
     """First (locator, quote) matching any needle -- the surrounding sentence."""
-    for s in doc.sections:
+    # A target's own sections first: the first paper-wide keyword hit is usually a
+    # DIFFERENT experiment, and a brief quoting it sends the implementer there.
+    ordered = ([s for s in doc.sections if s.section_idx in prefer]
+               + [s for s in doc.sections if s.section_idx not in prefer])
+    for s in ordered:
         title = (s.title or "").strip().lower()
         if title.startswith(_NOT_THE_PAPER) or (
                 not title and s.section_idx == 0 and len(doc.sections) > 1):
@@ -76,12 +103,21 @@ def _find(needles: tuple[str, ...], doc: PaperDoc) -> tuple[str, str]:
     return "", ""
 
 
-def reimplementation_readiness(doc: PaperDoc) -> ReimplementationReadiness:
+def reimplementation_readiness(doc: PaperDoc, target_ref: str = "") -> ReimplementationReadiness:
     """Is there enough in this paper to rebuild the experiment independently? Every
-    ingredient carries the locator it was found at, so the judgement is auditable."""
+    ingredient carries the locator it was found at, so the judgement is auditable. With
+    `target_ref`, each ingredient is sought in that target's own sections first; WHETHER
+    it is present anywhere in the paper does not change."""
     found: list[ReimplementationIngredient] = []
+    prefer = target_sections(doc, target_ref)
+    table, label = _target_table(doc, target_ref)
     for name, required, needles in INGREDIENTS:
-        ref, quote = _find(needles, doc)
+        ref, quote = _find(needles, doc, prefer)
+        # A keyword hit OUTSIDE the target's own sections describes another experiment;
+        # the paper's own sentence presenting the target's table is the honest locator.
+        if (label and name in ("method", "dataset", "metric") and ref.startswith("s")
+                and int(ref[1:]) not in prefer):
+            ref, quote = _find((f"Table {label}",), doc, prefer)
         if name == "method" and not ref:
             if doc.equations:
                 e = doc.equations[0]
@@ -103,12 +139,18 @@ def reimplementation_readiness(doc: PaperDoc) -> ReimplementationReadiness:
             kind=name, required=required, present=bool(ref), ref=ref, quote=quote))
 
     # A comparison target is an ingredient too -- without an addressed cell, any run
-    # produces a number in a vacuum. Tables, not prose.
-    has_target = any(t.rows for t in doc.tables)
-    found.append(ReimplementationIngredient(
-        kind="comparison_target", required=True, present=has_target,
-        ref=f"T{doc.tables[0].table_idx}" if has_target and doc.tables else "",
-        quote=(doc.tables[0].caption[:_MAX_QUOTE] if has_target and doc.tables else "")))
+    # produces a number in a vacuum. The target's OWN cell when there is one.
+    cell = locate.resolve(doc, target_ref) if table is not None else None
+    if cell is not None and cell.resolved:
+        found.append(ReimplementationIngredient(
+            kind="comparison_target", required=True, present=True, ref=cell.ref,
+            quote=f"{cell.quote} ({(table.caption or '')[:_MAX_QUOTE]})"))
+    else:
+        has_target = any(t.rows for t in doc.tables)
+        found.append(ReimplementationIngredient(
+            kind="comparison_target", required=True, present=has_target,
+            ref=f"T{doc.tables[0].table_idx}" if has_target and doc.tables else "",
+            quote=(doc.tables[0].caption[:_MAX_QUOTE] if has_target and doc.tables else "")))
 
     missing = [i.kind for i in found if i.required and not i.present]
     established = not missing

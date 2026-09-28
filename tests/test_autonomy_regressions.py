@@ -111,6 +111,31 @@ def test_training_stays_required_when_no_released_file_is_opened():
     assert not conf.established and "training" in conf.unbound
 
 
+def test_reconstruction_ingredients_are_scoped_to_the_target():
+    from harness.schema import Table
+    doc = PaperDoc(paper_id="s", title="t", tables=[
+        Table(table_idx=0, label="1", caption="Other experiment", header=["a"], rows=[["9"]]),
+        Table(table_idx=5, label="2", caption="Accuracy of each judge", header=["j", "acc"],
+              rows=[["x", "0.61"]])], sections=[
+        Section(section_idx=0, title="2. Other", text="We propose an attack. We train with "
+                "Adam at learning rate 0.1 on the benchmark dataset and report accuracy."),
+        Section(section_idx=1, title="4. Judges", text="Table 2 reports each judge's "
+                "accuracy on the released benchmark dataset.")])
+    r = discover.reimplementation_readiness(doc, "T5:r0:c1")
+    by = {i.kind: i for i in r.ingredients}
+    assert by["method"].ref == "s1" and by["dataset"].ref == "s1" and by["metric"].ref == "s1"
+    assert by["comparison_target"].ref == "T5:r0:c1"
+    assert discover.reimplementation_readiness(doc).ingredients[0].ref == "s0"   # unscoped
+
+
+def test_constant_name_is_an_implementation_locator():
+    script = "PATH = 'd.csv'\n\ndef f():\n    return 1\n"
+    assert reimplement_driver._implementation_locator_matches(
+        script, "PATH module-level constant", "PATH = 'd.csv'")
+    assert not reimplement_driver._implementation_locator_matches(
+        script, "PATH module-level constant", "return 1")
+
+
 def test_verifier_approval_follows_the_same_required_kinds(tmp_path):
     released = [{"path": "data/labels.csv", "sha256": "0" * 64}]
     need = reimplement_driver.required_kinds(_SCRIPT, _BIND, released)

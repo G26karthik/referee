@@ -82,14 +82,22 @@ def _implementation_locator_matches(script: str, impl_ref: str, impl_quote: str)
             spans.append((start, end))
     names = {a or b for a, b in _NAMED.findall(ref)} | (
         {ref} if re.fullmatch(r"[A-Za-z_]\w*", ref) else set())
-    if names:
-        try:
-            import ast
-            for n in ast.walk(ast.parse(script)):
-                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names:
-                    spans.append((n.lineno, int(getattr(n, "end_lineno", n.lineno))))
-        except SyntaxError:
-            pass
+    words = set(re.findall(r"[A-Za-z_]\w*", ref))
+    try:
+        import ast
+        tree = ast.parse(script)
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names:
+                spans.append((n.lineno, int(getattr(n, "end_lineno", n.lineno))))
+        # A module-level constant named in the locator ("DATASET_PATH constant") is a
+        # location too: its own assignment line(s), never the rest of the file.
+        for n in tree.body:
+            targets = (n.targets if isinstance(n, ast.Assign) else
+                       [n.target] if isinstance(n, ast.AnnAssign) else [])
+            if any(isinstance(t, ast.Name) and t.id in words for t in targets):
+                spans.append((n.lineno, int(getattr(n, "end_lineno", n.lineno))))
+    except SyntaxError:
+        pass
     return any(impl_quote in "\n".join(lines[s - 1:e]) for s, e in spans)
 
 
@@ -241,7 +249,9 @@ def released_files(checkout: Path) -> list[dict]:
             first = ""
             if f.suffix.lower() in (".csv", ".tsv", ".jsonl", ".json"):
                 with f.open("r", encoding="utf-8", errors="replace") as fh:
-                    first = fh.readline().strip()[:300]
+                    # The whole header: a truncated one makes the implementer guess
+                    # which column holds the label.
+                    first = fh.readline().strip()[:4000]
             out.append({"path": f.relative_to(root).as_posix(), "bytes": size,
                         "sha256": h.hexdigest(), "first_line": first})
         except OSError:
@@ -284,7 +294,7 @@ def released_table(released: list[dict]) -> str:
     rows = ["| path (relative to the working directory) | bytes | sha256 | first line |",
             "|---|---|---|---|"]
     for r in released:
-        first = (r.get("first_line") or "").replace("|", "/")[:160]
+        first = (r.get("first_line") or "").replace("|", "/")
         rows.append(f"| `{r['path']}` | {r['bytes']} | {r['sha256'][:16]} | {first} |")
     return "\n".join(rows)
 
