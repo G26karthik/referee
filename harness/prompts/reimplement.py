@@ -88,9 +88,10 @@ RELEASED = """\
 The authors released the files below in their pinned checkout, and your script will run
 with that checkout as its working directory. If the claim is a quantity computed FROM these
 files (a count, a split, a rate, an accuracy/AUROC over released labels or predictions),
-compute it from them by the relative path shown — a RELEASED-DATA RECOMPUTATION. Then:
+compute it from them by relative path (a listed directory + one of its file names) — a
+RELEASED-DATA RECOMPUTATION. Then:
   - bind "dataset" to the line that opens the released file; its impl_quote must contain
-    the file's relative path exactly as listed;
+    that full relative path literally (e.g. "results/eval/a.jsonl"), not a glob;
   - "training" does not apply (nothing is trained; the released files already carry the
     outputs) and may be left unbound — ONLY in this case;
   - apply only the selection/filtering/metric the paper itself states; never regenerate,

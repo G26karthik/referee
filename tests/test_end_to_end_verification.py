@@ -209,3 +209,17 @@ def test_released_data_brief_shows_rows_not_only_the_header(tmp_path):
     (tmp_path / "d.csv").write_text("label,score\n1,0.9\n0,0.2\n", encoding="utf-8")
     first = reimplement_driver.released_files(tmp_path)[0]["first_line"]
     assert "label,score" in first and "1,0.9" in first
+
+
+def test_released_files_brief_stays_small_and_lists_every_directory(tmp_path):
+    # A release of many wide result logs: the brief once pasted each file's rows (~1 MB).
+    record = '{"crps": 0.28, "dataset": "yacht", "trace": "' + "x" * 20000 + '"}\n'
+    for sub, n in (("ablation/eval", 80), ("main/eval", 40)):
+        (tmp_path / sub).mkdir(parents=True)
+        for i in range(n):
+            (tmp_path / sub / f"d{i}__m.jsonl").write_text(record * 3, encoding="utf-8")
+    released = reimplement_driver.released_files(tmp_path)
+    table = reimplement_driver.released_table(released)
+    assert len(released) == 120, "the main logs sort after the ablation logs; both are kept"
+    assert len(table) < 30_000
+    assert "`main/eval/`" in table and "`d39__m.jsonl`" in table and '"crps": 0.28' in table

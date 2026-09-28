@@ -81,7 +81,8 @@ function worker(pid, t, prior) {
     `2. Create every file (your answer, any script you test) with the Write tool, never a ` +
     `shell heredoc or echo: shell quoting corrupts JSON and code. Write your JSON answer, ` +
     `exactly as the prompt specifies, to ${t.out} (if Write asks you to read it first, Read ` +
-    `it, then Write).\n` +
+    `it, then Write). Name any script you test ${t.id.replace(/[^\w.-]+/g, '_')}.py: other ` +
+    `workers run beside you, and a shared name lets them overwrite it.\n` +
     `3. Seal with one Bash call: ${sh(`run.py seal ${pid} "${t.id}" "${t.out}"`)}\n` +
     `4. If sealing fails, fix the JSON, Write it again and re-seal (at most 2 retries). Never ` +
     `invent or weaken evidence to pass validation.\n` +

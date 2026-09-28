@@ -234,9 +234,9 @@ Print only JSON:
 # but only when the harness itself re-finds a released path inside the dataset binding.
 _DATA_SUFFIXES = (".csv", ".tsv", ".json", ".jsonl", ".parquet", ".npy", ".npz", ".pkl",
                   ".h5", ".hdf5", ".xlsx", ".feather", ".arrow")
-# ponytail: 60 files / 2 GB per file hashed; a release beyond that lists only the first 60
-# data files (sorted) — raise both if a real paper ships more and needs a later one.
-_MAX_RELEASED, _MAX_HASH_BYTES = 60, 2 << 30
+# ponytail: 1000 files / 2 GB per file hashed; a release beyond that lists only the first
+# 1000 data files (sorted). 60 hid a real paper's main result logs behind its ablation logs.
+_MAX_RELEASED, _MAX_HASH_BYTES = 1000, 2 << 30
 
 
 def released_files(checkout: Path) -> list[dict]:
@@ -265,8 +265,10 @@ def released_files(checkout: Path) -> list[dict]:
                     # The whole header plus a few rows: a truncated header or unseen value
                     # encoding makes the implementer guess which column holds the label and
                     # how it is coded.
-                    first = "\n".join(fh.readline().rstrip("\r\n")[:4000]
-                                      for _ in range(4)).strip()
+                    # ponytail: header to 2000 chars, rows to 400 — enough to show the
+                    # columns/keys and how values are coded, not a wide log's whole record.
+                    first = "\n".join(fh.readline().rstrip("\r\n")[:2000 if i == 0 else 400]
+                                      for i in range(4)).strip()
             out.append({"path": f.relative_to(root).as_posix(), "bytes": size,
                         "sha256": h.hexdigest(), "first_line": first})
         except OSError:
@@ -303,14 +305,37 @@ def required_kinds(script: str, bindings: list[dict], released: list[dict]) -> t
     return REQUIRED_KINDS
 
 
+# ponytail: one row per directory, with every file name (names share 20k chars, then
+# "+N more") and one preview (previews share 12k): files in one directory share a format.
+# Listing 60 wide result logs file by file once made each generator AND verifier brief ~1 MB.
+_NAME_BUDGET, _PREVIEW_BUDGET = 20_000, 12_000
+
+
 def released_table(released: list[dict]) -> str:
     if not released:
         return ""
-    rows = ["| path (relative to the working directory) | bytes | sha256 | header + first rows |",
-            "|---|---|---|---|"]
+    by_dir: dict[str, list[dict]] = {}
     for r in released:
-        first = (r.get("first_line") or "").replace("|", "/").replace("\n", " <br> ")
-        rows.append(f"| `{r['path']}` | {r['bytes']} | {r['sha256'][:16]} | {first} |")
+        by_dir.setdefault(r["path"].rpartition("/")[0], []).append(r)
+    rows = ["| directory (relative to the working directory) | files | bytes | file names | "
+            "header + first rows of its first file |", "|---|---|---|---|---|"]
+    names_left, preview_left = _NAME_BUDGET, _PREVIEW_BUDGET
+    for d, files in by_dir.items():
+        names = []
+        for r in files:
+            name = f"`{r['path'].rpartition('/')[2]}`"
+            if len(name) + 2 > names_left:
+                break
+            names.append(name)
+            names_left -= len(name) + 2
+        more = f", … +{len(files) - len(names)} more" if len(names) < len(files) else ""
+        first = (files[0].get("first_line") or "").replace("|", "/").replace("\n", " <br> ")
+        if len(first) > preview_left:
+            first = "(not previewed: preview budget spent)"
+        else:
+            preview_left -= len(first)
+        rows.append(f"| `{d + '/' if d else './'}` | {len(files)} | "
+                    f"{sum(r['bytes'] for r in files)} | {', '.join(names)}{more} | {first} |")
     return "\n".join(rows)
 
 
