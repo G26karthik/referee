@@ -38,7 +38,9 @@ from pathlib import Path
 from . import delegation, sealing, state
 from .config import Config
 from .prompts import certificate as CP
-from .reimplement_driver import _implementation_locator_matches
+from .prompts import reimplement as RP
+from .reimplement_driver import (_implementation_locator_matches, parse_verdict, read_revision,
+                                 record_attempt)
 from .schema import PaperDoc, ReimplementationBinding, ReimplementationConformance
 
 # The three elements EVERY certificate must bind — an implementation locator in the script
@@ -123,7 +125,84 @@ def proof_location(doc: PaperDoc, label: str) -> tuple[int, int]:
             # LAST real one wins: a main-text sketch precedes the full appendix proof.
             if not _POINTER.match((sec.text or "")[m.end():m.end() + 60]):
                 last = (sec.section_idx, m.start())
-    return last
+    return last if last[0] >= 0 else _inline_proof(doc, label)
+
+
+# ponytail: an inline proof must begin within this many characters after the statement's
+# header (the statement itself is at most ~1200); a proof printed further away without a
+# "Proof of <label>" heading is not found, and the target reports no proof to audit.
+_INLINE_PROOF_WINDOW = 3200
+
+
+def _inline_proof(doc: PaperDoc, label: str) -> tuple[int, int]:
+    """A proof printed directly after its statement ("Theorem 2. ... Proof. ...") rather
+    than under its own "Proof of Theorem 2" heading."""
+    from .discover import formal_statements
+    st = next((s for s in formal_statements(doc) if s["label"] == label), None)
+    sec = next((x for x in doc.sections if st and x.section_idx == st["section_idx"]), None)
+    if sec is None:
+        return -1, -1
+    text = sec.text or ""
+    head = re.search(rf"\b{re.escape(label)}\s*(?:\([^()]{{0,120}}\))?\s*\.", text)
+    if head is None:
+        return -1, -1
+    p = re.compile(r"\bProof\b\s*[.:]").search(text, head.end(), head.end() + _INLINE_PROOF_WINDOW)
+    return (sec.section_idx, p.start()) if p else (-1, -1)
+
+
+def statement_text(doc: PaperDoc, label: str) -> str:
+    """The statement's own parsed words (whitespace-normalised, up to ~1200 chars) — the
+    text every `paper_quotes` entry about it must be copied from."""
+    from .discover import formal_statements
+    return next((s["text"] for s in formal_statements(doc) if s["label"] == label), "")
+
+
+# DEPENDENCY CONTEXT — a statement or proof that cites "Definition 2.1" or "Eq. (4)" cannot
+# be checked from its own section alone. ponytail: depth 1 (what the statement/proof cites,
+# not what those cite), at most 6 snippets of 1500 chars each.
+_CITED = re.compile(r"\b(Definition|Assumption|Lemma|Proposition|Theorem|Corollary|Algorithm)"
+                    r"\s+([A-Z]?\d+(?:\.\d+)*)")
+_CITED_EQ = re.compile(r"\bEq(?:uation)?s?\.?\s*\((\d+)\)")
+_MAX_CONTEXT, _CONTEXT_CHARS = 6, 1500
+
+
+def _defining_occurrence(doc: PaperDoc, label: str) -> str:
+    kind, num = label.split(" ", 1)
+    head = re.compile(rf"\b{kind}\s+{re.escape(num)}(?![\d.]*\d)\s*(?:\([^()]{{0,120}}\))?"
+                      rf"\s*[.:]?\s+(?=[A-Z(\u2200-\u22ff])")
+    for sec in doc.sections:
+        if (sec.title or "").strip().lower().startswith(("references", "bibliography")):
+            continue
+        text = sec.text or ""
+        for m in head.finditer(text):
+            before = text[:m.start()].rstrip()
+            if before and before[-1] not in ".:;)]\n":
+                continue
+            return " ".join(text[m.start():m.start() + _CONTEXT_CHARS].split())
+    return ""
+
+
+def referenced_context(doc: PaperDoc, text: str, own_label: str = "") -> str:
+    labels: list[str] = []
+    for m in _CITED.finditer(text or ""):
+        lab = f"{m.group(1)} {m.group(2)}"
+        if lab != own_label and lab not in labels:
+            labels.append(lab)
+    eqs = list(dict.fromkeys(m.group(1) for m in _CITED_EQ.finditer(text or "")))
+    out: list[str] = []
+    for lab in labels:
+        if len(out) >= _MAX_CONTEXT:
+            break
+        snippet = _defining_occurrence(doc, lab)
+        if snippet:
+            out.append(f"[{lab}] {snippet}")
+    for n in eqs:
+        if len(out) >= _MAX_CONTEXT:
+            break
+        eq = next((e for e in doc.equations if (e.number or "").strip("() ") == n), None)
+        if eq is not None and (eq.text or "").strip():
+            out.append(f"[Eq. ({n})] {' '.join(eq.text.split())[:_CONTEXT_CHARS]}")
+    return "\n\n".join(out)
 
 
 def proof_excerpt(doc: PaperDoc, label: str) -> str:
@@ -164,25 +243,38 @@ def page_images(cfg: Config, pid: str, doc: PaperDoc, ref=None, claim: str = "")
     return [out[k] for k in sorted(out)]
 
 
+def _given(doc: PaperDoc, claim: str, ref) -> tuple[str, str, str]:
+    """(proof, verbatim statement text, cited context) for one target."""
+    label = statement_label(claim)
+    proof = proof_excerpt(doc, label)
+    verbatim = statement_text(doc, label) or (getattr(ref, "quote", "") or "")
+    return proof, verbatim, referenced_context(doc, f"{verbatim} {proof}", label)
+
+
 def build_brief(doc: PaperDoc, *, claim: str = "", ref=None,
-                images: list[str] | None = None) -> str:
+                images: list[str] | None = None, step: str = "",
+                revision: dict | None = None) -> str:
     """The GENERATOR's prompt — a bounded section excerpt plus the statement's own printed
-    proof, never the full paper."""
-    return CP.build(doc.title, claim, section_excerpt(doc, ref),
-                    proof=proof_excerpt(doc, statement_label(claim)), images=list(images or [])).replace("\x00", "")
+    proof, the definitions it cites and its verbatim text; `step` binds one proof step;
+    `revision` carries a rejected attempt and its verifier's required changes."""
+    proof, verbatim, context = _given(doc, claim, ref)
+    return CP.build(doc.title, claim, section_excerpt(doc, ref), proof=proof,
+                    images=list(images or []), verbatim=verbatim, context=context, step=step,
+                    revision=RP.revision_block(revision or {})).replace("\x00", "")
 
 
 def verification_brief(doc: PaperDoc, *, claim: str = "", ref=None, script: str = "",
                        bindings: list[dict] | None = None,
                        paper_quotes: dict | None = None, scope: str = "",
-                       images: list[str] | None = None) -> str:
+                       images: list[str] | None = None, step: str = "") -> str:
     """The SEPARATE verifier's prompt. Independence is enforced later, at `accept()` time
     (`generated_by != verified_by`) — this function only builds the text; it does not know
     or care who reads it."""
+    proof, verbatim, context = _given(doc, claim, ref)
     return CP.verification_build(doc.title, claim, section_excerpt(doc, ref), script,
                                  list(bindings or []), dict(paper_quotes or {}),
-                                 proof=proof_excerpt(doc, statement_label(claim)),
-                                 scope=scope, images=list(images or [])).replace("\x00", "")
+                                 proof=proof, scope=scope, images=list(images or []),
+                                 verbatim=verbatim, context=context, step=step).replace("\x00", "")
 
 
 def parse_scope(raw: str) -> str:
@@ -302,8 +394,13 @@ def _paths(cfg: Config, pid: str, target_id: str) -> tuple[Path, Path]:
     return out, out.with_suffix(".driver.json")
 
 
+def revision_path(cfg: Config, pid: str, target_id: str) -> Path:
+    return _paths(cfg, pid, target_id)[0].with_suffix(".revision.json")
+
+
 def accept(cfg: Config, pid: str, target_id: str, raw: str, verdict_raw: str | None = None, *,
-          generated_by: str = "", reviewer: str = "", brief_sha256: str = "") -> dict:
+          generated_by: str = "", reviewer: str = "", brief_sha256: str = "",
+          prebound: str = "", base_sha: str = "", max_revisions: int = 2) -> dict:
     """Parse the generator's `raw` output (and, when given, the verifier's `verdict_raw`),
     compute conformance against the ingested paper text, and seal to
     `runs/<pid>/certificates/<target_id>.json` — mode `SESSION_SUBAGENT`, `written_by`
@@ -314,15 +411,24 @@ def accept(cfg: Config, pid: str, target_id: str, raw: str, verdict_raw: str | N
     half so far.
     """
     script, bindings, paper_quotes, notes, instance_count = parse(raw)
+    if prebound:
+        # The harness chose this proof step and re-found it in the proof: what is checked is
+        # the harness's quote, never a generator's re-typing of it.
+        paper_quotes = dict(paper_quotes, claimed_bound=prebound)
     approved, verifier_notes = ((False, "no verifier output supplied") if verdict_raw is None
                                 else parse_verification(verdict_raw))
+    verdict, required = parse_verdict(verdict_raw or "", approved)
     doc_path = state.project_dir(cfg, pid) / "paper" / "doc.json"
     paper_text = (_full_paper_text(PaperDoc(**state.read_json(doc_path)))
                  if doc_path.exists() else "")
     conf = conformance(paper_text, script, bindings, paper_quotes,
                        generated_by=generated_by,
                        verified_by=(reviewer if approved else ""))
-    conf.scope = parse_scope(raw)
+    conf.scope = "proof_step" if prebound else parse_scope(raw)
+    attempt = (record_attempt(revision_path(cfg, pid, target_id), base_sha=base_sha or brief_sha256,
+                              verdict=verdict, script=script, required=required,
+                              notes=verifier_notes, max_revisions=max_revisions)
+               if verdict_raw is not None else 1)
     prov = delegation.provenance_record(mode="SESSION_SUBAGENT", reviewer=reviewer)
     out, _sidecar = _paths(cfg, pid, target_id)
     record = sealing.seal(
@@ -332,6 +438,8 @@ def accept(cfg: Config, pid: str, target_id: str, raw: str, verdict_raw: str | N
         extra={"paper_id": pid, "target_id": target_id, "established": conf.established,
               "generated_by": generated_by, "independent_verification": approved,
               "verifier_notes": verifier_notes, "brief_sha256": brief_sha256,
+              "verdict": verdict, "required_changes": required, "attempt": attempt,
+              "base_sha256": base_sha or brief_sha256,
               "isolation_claim": prov["isolation_claim"],
               "tool_policy_provable": prov["tool_policy_provable"]})
     return record
@@ -374,6 +482,89 @@ def load_accepted(cfg: Config, pid: str, target_id: str
         return str(data.get("script") or ""), conf, instance_count
     except Exception:
         return None
+
+
+# === PROOF MAPS — every checkable step of a printed proof, not one a model happened to pick
+# A `proof_map` subagent lists the explicit steps; the harness keeps only those it re-finds
+# verbatim in the proof, and `harness.discover` turns each into its own certificate target.
+
+def _map_paths(cfg: Config, pid: str, target_id: str) -> tuple[Path, Path]:
+    out = state.project_dir(cfg, pid) / "runs" / pid / "proof_maps" / f"{target_id}.json"
+    return out, out.with_suffix(".driver.json")
+
+
+def proof_map_brief(doc: PaperDoc, *, claim: str = "", ref=None,
+                    images: list[str] | None = None) -> str:
+    """The proof-mapping prompt, or "" when this statement has no located proof."""
+    proof, verbatim, context = _given(doc, claim, ref)
+    if not proof:
+        return ""
+    return CP.proof_map_build(doc.title, verbatim or claim, proof, context=context,
+                              images=list(images or []))
+
+
+def parse_proof_map(raw: str, proof_text: str, max_steps: int) -> tuple[list[dict], list[dict]]:
+    """(kept, dropped). A step is kept only if its quote is re-found verbatim in the proof
+    (invariant 1), it has explicit constants, and it fits the ceiling; each drop says why."""
+    text = (raw or "").strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        raise CertificateError("proof map: no JSON object in the output")
+    try:
+        data = json.loads(text[start:end + 1])
+    except json.JSONDecodeError as e:
+        raise CertificateError(f"proof map: output is not valid JSON: {e}") from e
+    steps = data.get("steps") if isinstance(data, dict) else None
+    if not isinstance(steps, list):
+        raise CertificateError("proof map: output JSON has no 'steps' list")
+    norm = _normalize_ws(proof_text)
+    kept, dropped, seen = [], [], set()
+    for s in steps:
+        if not isinstance(s, dict):
+            continue
+        q = _normalize_ws(str(s.get("quote") or ""))[:400]
+        why = ("not found verbatim in the parsed proof" if not q or q not in norm else
+               "no explicit constants, so no finite instance can violate it"
+               if not s.get("explicit_constants") else
+               "a duplicate" if q in seen else
+               f"beyond the {max_steps}-step ceiling" if len(kept) >= max_steps else "")
+        if why:
+            dropped.append({"quote": q[:200], "why": why})
+            continue
+        seen.add(q)
+        kept.append({"quote": q, "relation": str(s.get("relation") or "")[:40],
+                     "why_doubtful": " ".join(str(s.get("why_doubtful") or "").split())[:300]})
+    return kept, dropped
+
+
+def accept_proof_map(cfg: Config, pid: str, target_id: str, raw: str, *, label: str,
+                     brief: str, max_steps: int, reviewer: str = "") -> dict:
+    doc = PaperDoc(**state.read_json(state.project_dir(cfg, pid) / "paper" / "doc.json"))
+    kept, dropped = parse_proof_map(raw, proof_excerpt(doc, label), max_steps)
+    prov = delegation.provenance_record(mode="SESSION_SUBAGENT", reviewer=reviewer)
+    out, _sidecar = _map_paths(cfg, pid, target_id)
+    return sealing.seal(
+        out, {"statement": label, "steps": kept, "dropped": dropped},
+        mode="SESSION_SUBAGENT", reviewer=prov["reviewer"], tool_policy=prov["tool_policy"],
+        extra={"paper_id": pid, "target_id": target_id, "brief_sha256": brief_sha(brief),
+               "kept": len(kept), "dropped": len(dropped)})
+
+
+def load_proof_maps(cfg: Config, pid: str) -> dict[str, dict]:
+    """{parent target_id: {"statement", "steps", "dropped", "brief_sha256"}} for every
+    validly sealed proof map."""
+    d = state.project_dir(cfg, pid) / "runs" / pid / "proof_maps"
+    out: dict[str, dict] = {}
+    for f in sorted(d.glob("*.json")) if d.is_dir() else []:
+        if f.name.endswith(".driver.json") or not sealing.verify_seal(f, accepted_writers=WRITERS)[0]:
+            continue
+        try:
+            data = state.read_json(f)
+            data["brief_sha256"] = state.read_json(f.with_suffix(".driver.json")).get("brief_sha256", "")
+            out[f.stem] = data
+        except (OSError, ValueError):
+            continue
+    return out
 
 
 # --------------------------------------------------------------------------------------- #

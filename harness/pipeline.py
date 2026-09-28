@@ -492,12 +492,39 @@ def _next_phase(phase: str) -> str:
     return PHASES[min(i + 1, len(PHASES) - 1)]
 
 
+def open_verification(cfg: Config, pid: str) -> list[str]:
+    """Verification tasks still owed for this paper — a certificate, a reconstruction, a
+    revision round, a proof map or a check plan. While any remains, the review has not
+    reached the end of a route it set out on, and must not read as complete. Fails CLOSED:
+    a listing fault keeps the case open, with the fault named."""
+    from . import tasks                            # lazy: `tasks` imports this module
+    try:
+        return tasks.verification_pending(cfg, pid)
+    except Exception as e:                         # noqa: BLE001 — surfaced as the blocker
+        return [f"(verification listing failed: {type(e).__name__}: {e})"]
+
+
+def _hold_open(cfg: Config, case: CaseState, open_: list[str], attempt: int) -> CaseState:
+    case.status = "waiting"
+    case.blocked_reason = (
+        f"{len(open_)} verification task(s) are still owed, so this review has not reached "
+        f"the end of every route it set out on: {', '.join(open_[:8])}"
+        + (f" (+{len(open_) - 8} more)" if len(open_) > 8 else ""))
+    case.history.append(PhaseEvent(
+        phase="done", outcome="waiting", reason=case.blocked_reason,
+        detail={"open_verification": open_}, attempt=attempt, ts=state.now()))
+    return save_case(cfg, case)
+
+
 def step(cfg: Config, case: CaseState, **opts) -> CaseState:
     """Advance one phase. Records exactly one `PhaseEvent`, whatever happens."""
     if case.terminal:
         return case
     with state.project_lock(cfg, case.paper_id):
         if case.phase == "done":
+            open_ = open_verification(cfg, case.paper_id)
+            if open_:
+                return _hold_open(cfg, case, open_, case.attempts.get("done", 0) + 1)
             case.status = "complete"
             return save_case(cfg, case)
 
@@ -537,6 +564,9 @@ def step(cfg: Config, case: CaseState, **opts) -> CaseState:
                         phase="done", outcome="waiting", reason=case.blocked_reason,
                         detail={"missing": missing}, attempt=attempt, ts=state.now()))
                     return save_case(cfg, case)
+                open_ = open_verification(cfg, case.paper_id)
+                if open_:
+                    return _hold_open(cfg, case, open_, attempt)
                 case.status = "complete"
 
         return save_case(cfg, case)
@@ -544,7 +574,9 @@ def step(cfg: Config, case: CaseState, **opts) -> CaseState:
 
 def drive(cfg: Config, case: CaseState, *, max_steps: int = 40, **opts) -> CaseState:
     """Run `step` until the case is terminal or blocked on evidence it cannot obtain."""
-    if case.status == "complete":
+    # A case held open at `done` for owed verification re-derives as soon as a new seal
+    # lands (`force_probe`), exactly as a complete one does.
+    if case.status == "complete" or (case.phase == "done" and opts.get("force_probe")):
         case = rewind(case, "discover" if opts.get("force_probe") else "collect")
     for _ in range(max_steps):
         before = (case.phase, case.status, case.attempts.get(case.phase, 0))

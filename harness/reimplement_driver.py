@@ -214,8 +214,15 @@ absent, smaller, or quotes a sentence that does not state it.
 === PROPOSED REPLICATION (runs = seeds the harness will execute) ===
 {json.dumps(replication or {"runs": None, "paper_quote": ""}, ensure_ascii=False)}
 
+Give a categorical verdict: APPROVE only if every required ingredient is realized as the
+paper states it; REVISE when the attempt is fixable from the paper's own words (name each
+required change, citing the paper); UNCHECKABLE only when the paper itself does not supply
+what this recomputation needs.
+
 Print only JSON:
 {{"approved": true_or_false,
+  "verdict": "APPROVE | REVISE | UNCHECKABLE",
+  "required_changes": "each concrete change, citing the paper's words ('' if APPROVE)",
   "approved_kinds": ["method","training","dataset","metric","comparison_target"],
   "notes": "short reason"}}
 """
@@ -255,9 +262,11 @@ def released_files(checkout: Path) -> list[dict]:
             first = ""
             if f.suffix.lower() in (".csv", ".tsv", ".jsonl", ".json"):
                 with f.open("r", encoding="utf-8", errors="replace") as fh:
-                    # The whole header: a truncated one makes the implementer guess
-                    # which column holds the label.
-                    first = fh.readline().strip()[:4000]
+                    # The whole header plus a few rows: a truncated header or unseen value
+                    # encoding makes the implementer guess which column holds the label and
+                    # how it is coded.
+                    first = "\n".join(fh.readline().rstrip("\r\n")[:4000]
+                                      for _ in range(4)).strip()
             out.append({"path": f.relative_to(root).as_posix(), "bytes": size,
                         "sha256": h.hexdigest(), "first_line": first})
         except OSError:
@@ -297,12 +306,76 @@ def required_kinds(script: str, bindings: list[dict], released: list[dict]) -> t
 def released_table(released: list[dict]) -> str:
     if not released:
         return ""
-    rows = ["| path (relative to the working directory) | bytes | sha256 | first line |",
+    rows = ["| path (relative to the working directory) | bytes | sha256 | header + first rows |",
             "|---|---|---|---|"]
     for r in released:
-        first = (r.get("first_line") or "").replace("|", "/")
+        first = (r.get("first_line") or "").replace("|", "/").replace("\n", " <br> ")
         rows.append(f"| `{r['path']}` | {r['bytes']} | {r['sha256'][:16]} | {first} |")
     return "\n".join(rows)
+
+
+# THE VERIFIER'S CATEGORICAL VERDICT — shared with `harness.certificate`. APPROVE is the
+# caller's own parser's decision (never the verifier's word alone); an unapproved answer is
+# REVISE — its critique earns the generator another bounded round — unless the verifier
+# says the claim cannot be checked this way at all (UNCHECKABLE, terminal).
+VERDICTS = ("APPROVE", "REVISE", "UNCHECKABLE")
+
+
+def parse_verdict(raw: str, approved: bool) -> tuple[str, str]:
+    """(verdict, required_changes). Old answers without a `verdict` read as REVISE."""
+    if approved:
+        return "APPROVE", ""
+    text = (raw or "").strip()
+    try:
+        data = json.loads(text[text.find("{"):text.rfind("}") + 1])
+    except (ValueError, TypeError):
+        data = {}
+    data = data if isinstance(data, dict) else {}
+    required = " ".join(str(data.get("required_changes") or "").split())[:2000]
+    verdict = str(data.get("verdict") or "").strip().upper()
+    return ("UNCHECKABLE" if verdict == "UNCHECKABLE" else "REVISE"), required
+
+
+def read_revision(path: Path, base_sha: str) -> dict:
+    """The revision state a NEXT brief is built from, or {} — only while it belongs to the
+    same base brief: an upstream change to the brief starts the rounds afresh."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except (OSError, ValueError):
+        data = {}
+    return data if isinstance(data, dict) and data.get("base_sha256") == base_sha else {}
+
+
+def record_attempt(path: Path, *, base_sha: str, verdict: str, script: str, required: str,
+                   notes: str, max_revisions: int) -> int:
+    """This sealed attempt's number. A REVISE with budget left persists what the next
+    brief must fix; anything else leaves the file untouched, so the brief stays the one
+    just answered and nothing is asked again — the loop ends by construction."""
+    attempt = int(read_revision(path, base_sha).get("attempt") or 0) + 1
+    if verdict == "REVISE" and attempt < 1 + max(0, int(max_revisions)):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "base_sha256": base_sha, "attempt": attempt, "script": script,
+            "required_changes": required, "verifier_notes": " ".join((notes or "").split())[:2000],
+        }, ensure_ascii=False), encoding="utf-8")
+    return attempt
+
+
+def revision_path(cfg: Config, pid: str, target_id: str) -> Path:
+    return _paths(cfg, pid, target_id)[0].with_suffix(".revision.json")
+
+
+def base_sha_path(cfg: Config, pid: str, target_id: str) -> Path:
+    return _paths(cfg, pid, target_id)[0].with_suffix(".base_sha256")
+
+
+def sealed_record(cfg: Config, pid: str, target_id: str) -> dict:
+    """The sealed sidecar ({} when none): verdict, required changes, attempt, notes."""
+    _out, sidecar = _paths(cfg, pid, target_id)
+    try:
+        return state.read_json(sidecar) if sidecar.is_file() else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def _parse_verification(text: str, required: tuple[str, ...] = REQUIRED_KINDS) -> tuple[bool, str]:
@@ -467,7 +540,9 @@ def _seal(cfg: Config, pid: str, target_id: str, script: str,
 def accept_reimplementation(cfg: Config, pid: str, target_id: str, raw: str,
                             readiness: ReimplementationReadiness, *, reviewer: str = "",
                             generated_by: str = "",
-                            tool_policy: str = "unrecorded", mode: str = "MANUAL") -> dict:
+                            tool_policy: str = "unrecorded", mode: str = "MANUAL",
+                            verdict: str = "", required_changes: str = "",
+                            verifier_notes: str = "", attempt: int = 1) -> dict:
     """Seal a reconstruction produced OUTSIDE this module's own subprocess — the same
     manual-acceptance channel `stages.audit.accept_lens` / `grade_stage.accept_grade` /
     `verdict_driver.accept_verdict` already give their phases, completing the set for
@@ -481,6 +556,8 @@ def accept_reimplementation(cfg: Config, pid: str, target_id: str, raw: str,
         "written_by": prov["written_by"], "delegation_mode": prov["delegation_mode"],
         "reviewer": prov["reviewer"], "generated_by": generated_by,
         "independent_verification": conf.independently_verified,
+        "verdict": verdict, "required_changes": required_changes,
+        "verifier_notes": " ".join((verifier_notes or "").split())[:2000], "attempt": attempt,
         "tool_policy": prov["tool_policy"],
         "isolation_claim": prov["isolation_claim"],
         "tool_policy_provable": prov["tool_policy_provable"]})

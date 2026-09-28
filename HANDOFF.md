@@ -351,6 +351,16 @@ is `harness/decide.py`'s decision (`classify_plan`) and the order is set alongsi
 lowering it drops the least useful targets rather than an arbitrary subset. Raising it costs
 compute and changes no rule.
 
+Verification budgets (all ceilings on Sonnet tasks, none a rule about a paper):
+`SH_MAX_FORMAL_TARGETS` (10) numbered results become certificate targets;
+`SH_MAX_PROOF_STEPS` (4) / `SH_MAX_PROOF_STEP_TARGETS` (12) steps of a mapped proof become
+their own certificate targets; `SH_MAX_REVISIONS` (2) extra generator rounds after a
+verifier's REVISE verdict; `SH_MAX_CHECK_PLANS` (3) dead-end central claims (and the abstract)
+get a check planner. Task roles `proof_map` and `check_plan` PROPOSE addresses only — the
+harness re-finds each in the paper before it becomes a target, and a planner's link reaches
+priority, never materiality. A case stays `waiting` at `done` while any verification task is
+still owed (`pipeline.open_verification`), so "complete" means every route reached its end.
+
 ### Backends
 
 | name | what it is | `can_execute` |

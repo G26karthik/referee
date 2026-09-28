@@ -7,7 +7,7 @@ export const meta = {
 
 // args: { papers: ["papers/x.pdf" | "<paper-id>", ...], repo: "C:/.../single-harness",
 //         python: "../.venv/Scripts/python", env: "PYTHONUTF8=1 SH_PROJECTS_DIR=... ...",
-//         maxRounds: 12 }
+//         maxRounds: 20 }
 // Model work is done ONLY by isolated Sonnet workers (one context per task) and a Haiku
 // controller that runs the harness command. Worker model is clamped to haiku|sonnet: never
 // Opus. Token budget: workers use the minimal `referee-worker` agent type (Read/Write/Bash
@@ -18,7 +18,10 @@ const A = args || {}
 const REPO = A.repo
 const PY = A.python || '../.venv/Scripts/python'
 const ENV = A.env || 'PYTHONUTF8=1'
-const MAX_ROUNDS = A.maxRounds || 12
+// Rounds, not tasks: lenses -> grades -> certificates/reconstructions -> proof maps and check
+// plans -> their step certificates -> up to SH_MAX_REVISIONS revision rounds each. The harness
+// holds a case open while verification is owed, so a round cap is the only stop besides it.
+const MAX_ROUNDS = A.maxRounds || 20
 const sh = cmd => `cd "${REPO}" && ${ENV} ${PY} ${cmd}`
 
 const STATE = {

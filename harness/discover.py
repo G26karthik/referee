@@ -667,6 +667,21 @@ def _mint_statement(doc: PaperDoc, st: dict) -> ClaimRef:
     return ref
 
 
+ABSTRACT_QUESTION = "Q-abstract-claims"     # the same id `harness.routes` plans under
+
+
+def _mint_step(doc: PaperDoc, quote: str, first_section: int) -> ClaimRef:
+    """A proof step's address: inside the proof's own sections first (its words may repeat
+    a statement given elsewhere), then anywhere it is unique."""
+    if first_section >= 0:
+        # ponytail: a proof is searched over at most 8 consecutive sections from its start.
+        for idx in range(first_section, first_section + 8):
+            ref = locate.mint_in(doc, quote, idx)
+            if ref.resolved:
+                return ref
+    return locate.mint(doc, quote)
+
+
 def prose_compositions(doc: PaperDoc) -> list[ClaimRef]:
     """Every prose span stating a composition the harness can re-evaluate, e.g.
     '58 x 5 x 10 = 2,900': the arithmetic is checkable without running anything."""
@@ -688,9 +703,14 @@ def discovered_objects(doc: PaperDoc, findings: list[Finding],
                        questions: list[ReviewQuestion] | None = None, *,
                        repo_available: bool | None = None,
                        specification_complete: bool = False,
-                       max_formal: int = 10) -> tuple[list[DiscoveredObject], dict]:
+                       max_formal: int = 10, proof_maps: dict | None = None,
+                       max_step_targets: int = 12,
+                       check_plans: list[dict] | None = None) -> tuple[list[DiscoveredObject], dict]:
     """(objects, extraction_coverage) for one paper. Deterministic, consults no model,
-    runs before any execution."""
+    runs before any execution. `proof_maps` and `check_plans` are SEALED, harness-validated
+    proposals (see `harness.certificate.load_proof_maps`, `harness.routes.load_check_plans`):
+    every address in them has already been re-found in the paper, and is re-found again
+    here before it becomes a target."""
     questions = questions or []
     if repo_available is None:
         repo_available = bool((doc.repo_url or "").strip())
@@ -780,6 +800,7 @@ def discovered_objects(doc: PaperDoc, findings: list[Finding],
         not _cited_in_summary(doc, st["label"], st["section_idx"], st["text"]),
         _FORMAL_RANK.get(st["label"].split()[0], 4), statements.index(st)))
     targeted = 0
+    parents: list[tuple[DiscoveredObject, dict]] = []
     for st in ranked:
         if targeted >= max(0, max_formal):
             break
@@ -788,12 +809,62 @@ def discovered_objects(doc: PaperDoc, findings: list[Finding],
             continue
         claimed_refs.add(ref.ref)
         central = _cited_in_summary(doc, st["label"], st["section_idx"], st["text"])
-        _add(objects, taken, _object(
+        parents.append((_add(objects, taken, _object(
             "SCIENTIFIC_CLAIM", ref, claim_text=st["text"], n=len(objects),
             repo_available=repo_available, taken=taken, question_kind="MATHEMATICAL_BOUND",
             in_abstract=central, anchored_by_any=True, material_abstract_idx=material_abstract_idx,
-            materiality_doc=doc, specification_complete=specification_complete))
+            materiality_doc=doc, specification_complete=specification_complete)), st))
         targeted += 1
+
+    # (4b) each step of a mapped proof is its own target: the audit covers every explicit
+    # step the proof asserts, not the one a model happened to choose. The child inherits the
+    # parent's centrality and carries the step's words, which the certificate must check.
+    from . import certificate
+    step_targets, steps_unaddressable = 0, 0
+    for parent, st in parents:
+        pm = (proof_maps or {}).get(parent.target_id) or {}
+        first = certificate.proof_location(doc, st["label"])[0]
+        for step in pm.get("steps") or []:
+            if step_targets >= max(0, max_step_targets):
+                break
+            ref = _mint_step(doc, step.get("quote") or "", first)
+            if not ref.resolved or ref.ref in claimed_refs:
+                steps_unaddressable += 0 if ref.resolved else 1
+                continue
+            claimed_refs.add(ref.ref)
+            child = _add(objects, taken, _object(
+                "SCIENTIFIC_CLAIM", ref, claim_text=f"{st['label']} — proof step: {step['quote']}",
+                n=len(objects), repo_available=repo_available, taken=taken,
+                question_kind="MATHEMATICAL_BOUND", in_abstract=parent.centrality == "CENTRAL",
+                anchored_by_any=True, material_abstract_idx=material_abstract_idx,
+                materiality_doc=doc, specification_complete=specification_complete))
+            child.parent_target, child.prebound_quote = parent.target_id, step["quote"]
+            step_targets += 1
+
+    # (4c) a check planner's proposals for a central claim that reached no route: each is
+    # re-resolved here, linked to that claim's question for PRIORITY only, and routed like
+    # any other printed quantity. Its materiality stays whatever the structure says.
+    planned = 0
+    by_ref = {o.ref.ref: o for o in objects if o.ref is not None and o.ref.resolved}
+    for plan in check_plans or []:
+        for item in plan.get("refs") or []:
+            ref = locate.resolve(doc, str(item.get("ref") or ""))
+            if not ref.resolved:
+                continue
+            obj = by_ref.get(ref.ref)
+            if obj is None:
+                obj = _add(objects, taken, _object(
+                    "EXPERIMENTAL_RESULT" if ref.kind == "table_cell" else "SCIENTIFIC_CLAIM",
+                    ref, claim_text=ref.quote, n=len(objects), repo_available=repo_available,
+                    taken=taken, question_kind="PRINTED_QUANTITY", is_reported_result=True,
+                    material_abstract_idx=material_abstract_idx, materiality_doc=doc,
+                    specification_complete=specification_complete))
+                by_ref[ref.ref] = obj
+            # Only a target no question owns yet: a lens's own question, or an earlier plan's
+            # link, is never overwritten or counted twice.
+            if not obj.question_id and not obj.planned_for:
+                obj.question_id = obj.planned_for = str(plan.get("question_id") or "")
+                planned += 1
 
     # (5) the artifact itself is a claim the paper makes
     if repo_available:
@@ -813,6 +884,11 @@ def discovered_objects(doc: PaperDoc, findings: list[Finding],
         "objects_discovered": len(objects),
         "formal_statements_found": len(statements),
         "formal_statements_targeted": targeted,
+        "proof_steps_mapped": sum(len((proof_maps or {}).get(p.target_id, {}).get("steps") or [])
+                                  for p, _st in parents),
+        "proof_step_targets": step_targets,
+        "proof_steps_unaddressable": steps_unaddressable,
+        "check_plan_targets": planned,
         "objects_addressable": sum(1 for o in objects if o.harness_addressable),
         "findings_with_resolved_ref": sum(
             1 for f in findings if locate.address(doc, f.evidence_ref, f.evidence_quote).resolved),
@@ -906,7 +982,7 @@ def _demote_when_a_central_target_is_being_pursued(
         return plans
     out: list[PlanDecision] = []
     for obj, plan in zip(objects, plans):
-        if plan.requires_execution and obj.centrality != "CENTRAL":
+        if plan.requires_execution and obj.centrality != "CENTRAL" and not obj.planned_for:
             out.append(PlanDecision(
                 target_id=plan.target_id, action="NO_EXPERIMENT_NEEDED", route=plan.route,
                 reason=(f"a {obj.centrality.lower()} result, and at least one CENTRAL target "
@@ -1114,8 +1190,12 @@ def run(cfg, pid: str, *, investigation_open: bool = True) -> dict:
 
     prior = load(cfg, pid)
     prior_outcomes = {o.target_id: o for o in prior.outcomes} if prior else None
+    from . import certificate, routes
     ts = build(pid, doc, findings, investigation_open=investigation_open,
-              prior_outcomes=prior_outcomes, max_formal=cfg.max_formal_targets)
+              prior_outcomes=prior_outcomes, max_formal=cfg.max_formal_targets,
+              proof_maps=certificate.load_proof_maps(cfg, pid),
+              max_step_targets=cfg.max_proof_step_targets,
+              check_plans=routes.load_check_plans(cfg, pid))
     path = targets_path(cfg, pid)
     state.write_json(path, ts.model_dump())
 
@@ -1143,7 +1223,8 @@ def run(cfg, pid: str, *, investigation_open: bool = True) -> dict:
 def build(pid: str, doc: PaperDoc, findings: list[Finding], *,
          investigation_open: bool = True,
          prior_outcomes: dict[str, TargetOutcome] | None = None,
-         max_formal: int = 10) -> TargetSet:
+         max_formal: int = 10, proof_maps: dict | None = None, max_step_targets: int = 12,
+         check_plans: list[dict] | None = None) -> TargetSet:
     """The whole target set for one paper. Pure with respect to what is on disk -- takes
     `findings` directly rather than loading them. `investigation_open=False` means a
     material failure is already established, so `decide.plan` refuses every executable
@@ -1159,12 +1240,23 @@ def build(pid: str, doc: PaperDoc, findings: list[Finding], *,
         if ref is not None and ref.resolved and ref.ref:
             minted[f.finding_id] = ref.ref
     qs = questions_from_findings(findings, minted=minted)
+    if any(p.get("question_id") == ABSTRACT_QUESTION and p.get("refs") for p in check_plans or []):
+        # The abstract IS the paper's headline, structurally: a check planned for it answers a
+        # central question. Only its linked targets' PRIORITY follows from this.
+        qs.append(ReviewQuestion(
+            question_id=ABSTRACT_QUESTION, kind="PRINTED_QUANTITY", materiality="CENTRAL",
+            question="Does the evidence the paper prints support the headline claims of its "
+                     "abstract?",
+            why_it_matters="The abstract states what the paper asks a reader to believe.",
+            what_would_settle_it="an admissible reproduction of the printed quantities the "
+                                 "abstract's claims rest on"))
 
     repo_available = bool((doc.repo_url or "").strip())
     readiness = reimplementation_readiness(doc)
     objects, coverage = discovered_objects(
         doc, findings, qs, repo_available=repo_available,
-        specification_complete=readiness.established, max_formal=max_formal)
+        specification_complete=readiness.established, max_formal=max_formal,
+        proof_maps=proof_maps, max_step_targets=max_step_targets, check_plans=check_plans)
 
     ordered = decide.order(objects, artifact_available=repo_available)
 

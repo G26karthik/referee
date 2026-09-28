@@ -1604,6 +1604,13 @@ class DiscoveredObject(_Base):
     question_kind: str = Field(default="", description="WRITTEN BY THE HARNESS: " + " | ".join(QUESTION_KINDS))
     priority: float = Field(default=0.0, description="WRITTEN BY THE HARNESS: see harness.priority")
     priority_reason: str = Field(default="")
+    # WRITTEN BY THE HARNESS. A proof-step target: its parent statement's target id, and the
+    # step's words exactly as the harness re-found them in the printed proof.
+    parent_target: str = Field(default="")
+    prebound_quote: str = Field(default="")
+    # WRITTEN BY THE HARNESS. The question a check planner linked this target to — a
+    # PRIORITY link only; it never reaches `materiality_basis`.
+    planned_for: str = Field(default="")
 
 
 class PlanDecision(_Base):

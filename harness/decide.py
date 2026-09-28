@@ -1047,6 +1047,21 @@ def _attempt_for(q, route: str, objs: list, plans: list, outcomes: list, cfg) ->
         elif outcome.launched > 0 and admits(outcome.provenance) and disposition in (
                 "REPRODUCED", "FAILED_REPRODUCTION"):
             state, attempted, completed, exhausted = "DISCHARGED_RAN", True, True, True
+        # EXACT_CERTIFICATE's own endings. A counterexample ran and settled the target; a
+        # clean run ran and settled nothing; a verifier refusal is terminal only once it is
+        # UNCHECKABLE or its revision budget is spent — until then a revision is still owed.
+        elif (route == "EXACT_CERTIFICATE" and outcome.launched > 0
+              and admits(outcome.provenance) and disposition == "COUNTEREXAMPLE_ESTABLISHED"):
+            state, attempted, completed, exhausted = "DISCHARGED_RAN", True, True, True
+        elif (route == "EXACT_CERTIFICATE" and outcome.launched > 0
+              and disposition == "NO_COUNTEREXAMPLE_FOUND"):
+            state, attempted, completed, exhausted = "COMPLETED_INCONCLUSIVE", True, True, True
+        elif (route == "EXACT_CERTIFICATE" and outcome.launched == 0
+              and "independent verifier did not approve" in (reason or "")):
+            attempted = True
+            if "(UNCHECKABLE" in reason or "revision budget is spent" in reason:
+                state, completed, exhausted = "DISCHARGED_BLOCKED", True, True
+                blocker = "UNCHECKABLE" if "(UNCHECKABLE" in reason else "CERTIFICATE_REFUSED"
         elif disposition == "BUDGET_DEFERRED":
             state, blocker = "DEFERRED_BUDGET", disposition
         elif disposition == "SUPERSEDED_BY_ESTABLISHED_FAILURE":

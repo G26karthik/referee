@@ -66,6 +66,8 @@ _EFFORT: dict[str, tuple[str, str]] = {   # role -> (model, effort)
     "artifact_review": ("sonnet", "medium"),
     "cert_gen": ("sonnet", "high"),
     "cert_verify": ("sonnet", "high"),
+    "proof_map": ("sonnet", "high"),         # lists a proof's checkable steps; harness re-finds each
+    "check_plan": ("sonnet", "medium"),      # proposes addresses; harness re-resolves each
     "extraction_audit": ("sonnet", "low"),   # vision compare: mechanical, needs image input
 }
 
@@ -315,11 +317,19 @@ def _seal_reimpl_verify(cfg: Config, pid: str, target_id: str, doc: PaperDoc, ra
         raw, reimplement_driver.required_kinds(
             script, bindings, reimplement_driver.load_released(cfg, pid, target_id)))
     _refuse_malformed_verdict(f"reimpl_verify:{target_id}", _notes)
+    verdict, required = reimplement_driver.parse_verdict(raw, approved)
+    base_file = reimplement_driver.base_sha_path(cfg, pid, target_id)
+    attempt = reimplement_driver.record_attempt(
+        reimplement_driver.revision_path(cfg, pid, target_id),
+        base_sha=base_file.read_text(encoding="utf-8") if base_file.is_file() else "",
+        verdict=verdict, script=script, required=required, notes=_notes,
+        max_revisions=cfg.max_revisions)
     readiness = _readiness(cfg, pid, doc, target_id)
     reimplement_driver.accept_reimplementation(
         cfg, pid, target_id, gen_path.read_text(encoding="utf-8"), readiness,
         reviewer=(REVIEWER + " (verifier)") if approved else "",
-        generated_by=REVIEWER + " (generator)", mode="SESSION_SUBAGENT")
+        generated_by=REVIEWER + " (generator)", mode="SESSION_SUBAGENT",
+        verdict=verdict, required_changes=required, verifier_notes=_notes, attempt=attempt)
     sealed = reimplement_driver.load_accepted(cfg, pid, target_id)
     if sealed is None:
         raise ValueError(f"reimpl_verify:{target_id}: sealed but refused by load_accepted "
@@ -391,7 +401,9 @@ def _cert_obj(cfg: Config, pid: str, target_id: str):
 def _cert_tasks(cfg: Config, pid: str, doc: PaperDoc) -> list[dict]:
     from . import certificate, routes
     d, out = _cert_dir(cfg, pid), []
-    for tid, brief in routes.certificate_targets(cfg, pid):
+    for tid, brief, base_sha in routes.certificate_targets(cfg, pid):
+        (d / f"cert_gen__{tid}.base_sha256").parent.mkdir(parents=True, exist_ok=True)
+        (d / f"cert_gen__{tid}.base_sha256").write_text(base_sha, encoding="utf-8")
         gen = d / "generated" / f"{tid}.json"
         stamp = gen.with_suffix(".brief_sha256")
         if gen.is_file() and (not stamp.is_file()
@@ -411,8 +423,10 @@ def _cert_tasks(cfg: Config, pid: str, doc: PaperDoc) -> list[dict]:
         claim, ref = getattr(obj, "claim_text", ""), getattr(obj, "ref", None)
         prompt.write_text(certificate.verification_brief(
             doc, claim=claim, ref=ref, script=script, bindings=bindings, paper_quotes=quotes,
-            scope=certificate.parse_scope(raw),
-            images=certificate.page_images(cfg, pid, doc, ref, claim)), encoding="utf-8")
+            scope=("proof_step" if getattr(obj, "prebound_quote", "")
+                   else certificate.parse_scope(raw)),
+            images=certificate.page_images(cfg, pid, doc, ref, claim),
+            step=getattr(obj, "prebound_quote", "")), encoding="utf-8")
         out.append(_task(id=f"cert_verify:{tid}", role="cert_verify", prompt=prompt,
                          out=_staging_out(cfg, pid, "cert_verify", tid),
                          after=[f"cert_gen:{tid}"]))
@@ -437,13 +451,82 @@ def _seal_cert_verify(cfg: Config, pid: str, tid: str, raw: str) -> dict:
     if not gen.is_file():
         raise ValueError(f"cert_verify:{tid}: seal cert_gen:{tid} first")
     _refuse_malformed_verdict(f"cert_verify:{tid}", certificate.parse_verification(raw)[1])
+    base = _cert_dir(cfg, pid) / f"cert_gen__{tid}.base_sha256"
+    obj = _cert_obj(cfg, pid, tid)
     certificate.accept(cfg, pid, tid, gen.read_text(encoding="utf-8"), raw,
                        generated_by=REVIEWER + " (generator)",
                        reviewer=REVIEWER + " (verifier)",
                        brief_sha256=(gen.with_suffix(".brief_sha256").read_text(encoding="utf-8")
-                                     if gen.with_suffix(".brief_sha256").is_file() else ""))
+                                     if gen.with_suffix(".brief_sha256").is_file() else ""),
+                       prebound=getattr(obj, "prebound_quote", "") or "",
+                       base_sha=base.read_text(encoding="utf-8") if base.is_file() else "",
+                       max_revisions=cfg.max_revisions)
     sealed = certificate.load_accepted(cfg, pid, tid)
     return {"target_id": tid, "established": bool(sealed and sealed[1].established)}
+
+
+# --------------------------------------------------------------------------- #
+# PROOF MAPS and CHECK PLANS  (a model proposes WHAT to check; the harness re-finds every
+# proposal in the paper before it becomes a target — `harness.certificate`, `harness.routes`)
+# --------------------------------------------------------------------------- #
+def _proof_map_tasks(cfg: Config, pid: str) -> list[dict]:
+    from . import routes
+    out = []
+    for tid, brief, _label in routes.proof_map_targets(cfg, pid):
+        prompt = _cert_dir(cfg, pid) / f"proof_map__{tid}.md"
+        prompt.parent.mkdir(parents=True, exist_ok=True)
+        prompt.write_text(brief, encoding="utf-8")
+        out.append(_task(id=f"proof_map:{tid}", role="proof_map", prompt=prompt,
+                         out=_staging_out(cfg, pid, "proof_map", tid)))
+    return out
+
+
+def _seal_proof_map(cfg: Config, pid: str, tid: str, raw: str) -> dict:
+    from . import certificate
+    prompt = _cert_dir(cfg, pid) / f"proof_map__{tid}.md"
+    obj = _cert_obj(cfg, pid, tid)
+    if obj is None or not prompt.is_file():
+        raise ValueError(f"proof_map:{tid}: no such pending proof map for '{pid}'")
+    record = certificate.accept_proof_map(
+        cfg, pid, tid, raw, label=certificate.statement_label(obj.claim_text),
+        brief=prompt.read_text(encoding="utf-8"), max_steps=cfg.max_proof_steps,
+        reviewer=REVIEWER)
+    return {"target_id": tid, "kept": record.get("kept"), "dropped": record.get("dropped")}
+
+
+def _check_plan_tasks(cfg: Config, pid: str) -> list[dict]:
+    from . import routes
+    out = []
+    for unit, brief, qid in routes.check_plan_targets(cfg, pid):
+        prompt = state.project_dir(cfg, pid) / "tasks" / f"check_plan__{unit}.md"
+        prompt.parent.mkdir(parents=True, exist_ok=True)
+        prompt.write_text(brief, encoding="utf-8")
+        prompt.with_suffix(".question").write_text(qid, encoding="utf-8")
+        out.append(_task(id=f"check_plan:{unit}", role="check_plan", prompt=prompt,
+                         out=_staging_out(cfg, pid, "check_plan", unit)))
+    return out
+
+
+def _seal_check_plan(cfg: Config, pid: str, unit: str, raw: str) -> dict:
+    from . import routes
+    prompt = state.project_dir(cfg, pid) / "tasks" / f"check_plan__{unit}.md"
+    if not prompt.is_file():
+        raise ValueError(f"check_plan:{unit}: no such pending check plan for '{pid}'")
+    qfile = prompt.with_suffix(".question")
+    record = routes.accept_check_plan(
+        cfg, pid, unit, raw, brief=prompt.read_text(encoding="utf-8"), reviewer=REVIEWER,
+        question_id=qfile.read_text(encoding="utf-8") if qfile.is_file() else "")
+    return {"unit": unit, "sealed": bool(record)}
+
+
+# Roles whose pending tasks mean a claim this review set out to check has not yet reached
+# the end of its route (`pipeline.step` holds a case open while any remains).
+VERIFICATION_ROLES = ("cert_gen", "cert_verify", "reimpl_gen", "reimpl_verify",
+                      "proof_map", "check_plan")
+
+
+def verification_pending(cfg: Config, pid: str) -> list[str]:
+    return [t["id"] for t in pending(cfg, pid) if t["role"] in VERIFICATION_ROLES]
 
 
 # --------------------------------------------------------------------------- #
@@ -482,6 +565,8 @@ def pending(cfg: Config, pid: str) -> list[dict]:
         a = _artifact_review_task(cfg, pid)
         out += [a] if a is not None else []
         out += _cert_tasks(cfg, pid, doc)
+        out += _proof_map_tasks(cfg, pid)
+        out += _check_plan_tasks(cfg, pid)
     if at >= PHASES.index("report"):
         v = _verdict_task(cfg, pid)
         out += [v] if v is not None else []
@@ -519,6 +604,8 @@ def seal(cfg: Config, pid: str, task_id: str, path: str | Path) -> dict:
             cfg, pid, _require_doc(doc, pid, "artifact_review"), raw),
         "cert_gen": lambda: _seal_cert_gen(cfg, pid, sub, raw),
         "cert_verify": lambda: _seal_cert_verify(cfg, pid, sub, raw),
+        "proof_map": lambda: _seal_proof_map(cfg, pid, sub, raw),
+        "check_plan": lambda: _seal_check_plan(cfg, pid, sub, raw),
         "extraction_audit": lambda: EA.seal(cfg, pid, raw),
     }
     handler = handlers.get(role)
@@ -542,7 +629,8 @@ def _seal_newer_than_probe(cfg: Config, pid: str) -> bool:
         return False
     since = probe.stat().st_mtime
     runs = root / "runs" / pid
-    seals = [*runs.glob("certificates/*.driver.json"), *runs.glob("reimplementation/*.driver.json")]
+    seals = [*runs.glob("certificates/*.driver.json"), *runs.glob("reimplementation/*.driver.json"),
+             *runs.glob("proof_maps/*.driver.json"), *runs.glob("check_plans/*.driver.json")]
     return any(s.stat().st_mtime > since for s in seals)
 
 

@@ -18,6 +18,7 @@ module pursues that list, in that order, up to `cfg.max_targets`, and writes one
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -824,10 +825,12 @@ def attempt_certificate_check(
     return execute.run_probe(cfg, root, cspec, out_dir=cdir)
 
 
-def certificate_targets(cfg: Config, pid: str) -> list[tuple[str, str]]:
-    """(target_id, generator_brief) for every EXACT_CERTIFICATE-routed target that has no
-    sealed certificate yet -- the pure, read-only helper a controlling session's task
-    protocol consults. Spends no model call and writes nothing."""
+def certificate_targets(cfg: Config, pid: str) -> list[tuple[str, str, str]]:
+    """(target_id, generator_brief, base_brief_sha) for every EXACT_CERTIFICATE-routed
+    target still owed an answer -- the pure, read-only helper a controlling session's task
+    protocol consults. Spends no model call. A target is owed one when it has no seal for
+    its CURRENT brief: the first brief, or a REVISION brief carrying a rejected attempt and
+    its verifier's required changes (`reimplement_driver.record_attempt` bounds the rounds)."""
     from . import discover as discover_stage
 
     root = state.project_dir(cfg, pid)
@@ -846,24 +849,206 @@ def certificate_targets(cfg: Config, pid: str) -> list[tuple[str, str]]:
     for obj in ts.objects:
         if obj.target_id not in routed:
             continue
-        brief = certificate.build_brief(
-            doc, claim=obj.claim_text, ref=obj.ref,
-            images=certificate.page_images(cfg, pid, doc, obj.ref, obj.claim_text))
+        kw = dict(claim=obj.claim_text, ref=obj.ref, step=obj.prebound_quote,
+                  images=certificate.page_images(cfg, pid, doc, obj.ref, obj.claim_text))
+        base = certificate.brief_sha(certificate.build_brief(doc, **kw))
+        revision = reimplement_driver.read_revision(
+            certificate.revision_path(cfg, pid, obj.target_id), base)
+        brief = certificate.build_brief(doc, revision=revision, **kw) if revision else \
+            certificate.build_brief(doc, **kw)
         # A sealed certificate answers only the brief it was given: when that brief has
-        # since changed, the question is asked again (until then the old seal still runs).
+        # since changed (upstream, or a revision round), the question is asked again.
         if certificate.load_accepted(cfg, pid, obj.target_id) is not None and (
                 certificate.sealed_record(cfg, pid, obj.target_id).get("brief_sha256")
                 == certificate.brief_sha(brief)):
             continue
-        out.append((obj.target_id, brief))
+        out.append((obj.target_id, brief, base))
     return out
+
+
+def proof_map_targets(cfg: Config, pid: str) -> list[tuple[str, str, str]]:
+    """(parent target_id, proof-map brief, statement label) for every pursued numbered
+    result with a located proof and no proof map sealed for its current brief."""
+    from . import discover as discover_stage
+
+    root = state.project_dir(cfg, pid)
+    doc_path = root / "paper" / "doc.json"
+    ts = discover_stage.load(cfg, pid)
+    if not doc_path.exists() or ts is None:
+        return []
+    doc = PaperDoc(**state.read_json(doc_path))
+    pursued = {p.target_id for p in decide.current_plans(ts.plans) if p.requires_execution}
+    sealed = certificate.load_proof_maps(cfg, pid)
+    out: list[tuple[str, str, str]] = []
+    for obj in ts.objects:
+        if (obj.target_id not in pursued or obj.question_kind != "MATHEMATICAL_BOUND"
+                or obj.parent_target or not certificate.statement_label(obj.claim_text)):
+            continue
+        brief = certificate.proof_map_brief(
+            doc, claim=obj.claim_text, ref=obj.ref,
+            images=certificate.page_images(cfg, pid, doc, obj.ref, obj.claim_text))
+        if not brief or sealed.get(obj.target_id, {}).get("brief_sha256") == certificate.brief_sha(brief):
+            continue
+        out.append((obj.target_id, brief, certificate.statement_label(obj.claim_text)))
+    return out
+
+
+# === CHECK PLANS — dead-end central claims turned into checkable addresses ==============
+# ScientistTwo's rebuttal planner, bounded to what REFEREE may do: a model PROPOSES which
+# printed cell or number would settle a central concern (or the abstract's claims); the
+# harness re-resolves it (invariant 1), routes it, and never lets the link reach
+# materiality (invariants 7, 9).
+
+def _plan_paths(cfg: Config, pid: str, unit: str) -> tuple[Path, Path]:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", unit)
+    out = state.project_dir(cfg, pid) / "runs" / pid / "check_plans" / f"{safe}.json"
+    return out, out.with_suffix(".driver.json")
+
+
+def _tables_for_planner(doc: PaperDoc) -> str:
+    # ponytail: 12 tables x 4 rows, 8000 chars — enough to name a headline cell; a planner
+    # needing a deeper row cites the table and the review reports it unresolved.
+    lines: list[str] = []
+    # A figure's axis labels parse as a "table" of mostly empty cells: real tables — those
+    # with a caption or printed label and mostly filled cells — are listed first.
+    def filled(t) -> float:
+        cells = [c for row in t.rows for c in row]
+        return sum(1 for c in cells if str(c).strip()) / max(1, len(cells))
+    ranked = sorted((t for t in doc.tables if t.rows and filled(t) >= 0.5),
+                    key=lambda t: (not (t.caption or t.label), t.table_idx))
+    for t in ranked[:12]:
+        lines.append(f"T{t.table_idx} ({(t.caption or t.label or '').strip()[:160]})")
+        if t.header:
+            lines.append("  header: " + " | ".join(str(h) for h in t.header))
+        for r, row in enumerate(t.rows[:4]):
+            lines.append(f"  r{r}: " + " | ".join(f"[{t.ref(r, c)}] {cell}"
+                                                  for c, cell in enumerate(row)))
+    return "\n".join(lines)[:8000]
+
+
+def check_plan_targets(cfg: Config, pid: str) -> list[tuple[str, str, str]]:
+    """(unit, brief, question_id) for the abstract (when nothing in it is a target yet)
+    and each CENTRAL question whose every bound target reached no route — capped at
+    `cfg.max_check_plans`, skipping any unit already planned for its current brief."""
+    from . import discover as discover_stage
+    from .prompts import certificate as CP
+
+    root = state.project_dir(cfg, pid)
+    doc_path = root / "paper" / "doc.json"
+    ts = discover_stage.load(cfg, pid)
+    if not doc_path.exists() or ts is None:
+        return []
+    doc = PaperDoc(**state.read_json(doc_path))
+    tables = _tables_for_planner(doc)
+    units: list[tuple[str, str, str, str, str]] = []   # unit, qid, subject, evidence, ref
+    abstract = decide.abstract_section_idx(doc)
+    if abstract >= 0 and not any(o.ref is not None and o.ref.section_idx == abstract
+                                 for o in ts.objects):
+        text = next((" ".join((s.text or "").split()) for s in doc.sections
+                     if s.section_idx == abstract), "")
+        units.append(("abstract", discover_stage.ABSTRACT_QUESTION,
+                      "The paper's headline claims, as its abstract states them.", text, ""))
+    for q in sorted(ts.questions, key=lambda q: q.question_id):
+        bound = [o for o in ts.objects if o.question_id == q.question_id]
+        if q.materiality == "CENTRAL" and bound and all(o.routes == ["NONE"] for o in bound):
+            ref = bound[0].ref
+            units.append((q.question_id, q.question_id, f"{q.question} {bound[0].claim_text}",
+                          getattr(ref, "quote", "") or "", getattr(ref, "ref", "") or ""))
+    out: list[tuple[str, str, str]] = []
+    for unit, qid, subject, evidence, ref in units[:max(0, cfg.max_check_plans)]:
+        brief = CP.check_plan_build(doc.title, subject, evidence, tables,
+                                    _scoped_paper_text(doc, claim_ref=ref, cap=20_000))
+        brief = brief.replace(chr(0), "")
+        out_path, sidecar = _plan_paths(cfg, pid, unit)
+        try:
+            done = sidecar.is_file() and state.read_json(sidecar).get("brief_sha256") \
+                == certificate.brief_sha(brief)
+        except (OSError, ValueError):
+            done = False
+        if not done:
+            out.append((unit, brief, qid))
+    return out
+
+
+def accept_check_plan(cfg: Config, pid: str, unit: str, raw: str, *, question_id: str,
+                      brief: str, reviewer: str = "") -> dict:
+    """Validate and seal one planner answer. A proposal is KEPT only when the harness
+    re-resolves it to a table cell or a printed quantity; every drop says why."""
+    from . import delegation, sealing
+
+    text = (raw or "").strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError(f"check_plan:{unit}: no JSON object in the output")
+    try:
+        data = json.loads(text[start:end + 1])
+    except json.JSONDecodeError as e:
+        raise ValueError(f"check_plan:{unit}: output is not valid JSON: {e}") from e
+    doc = PaperDoc(**state.read_json(state.project_dir(cfg, pid) / "paper" / "doc.json"))
+    kept, dropped = [], []
+    for p in (data.get("proposals") or [])[:2] if isinstance(data, dict) else []:
+        if not isinstance(p, dict):
+            continue
+        ref_s, quote = str(p.get("ref") or "").strip(), str(p.get("quote") or "").strip()
+        got = (locate.resolve(doc, ref_s) if ref_s else locate.mint(doc, quote)) \
+            if (ref_s or quote) else None
+        ok = got is not None and got.resolved and (
+            got.kind == "table_cell" or (got.quantity is not None and got.quantity.value is not None))
+        (kept if ok else dropped).append({
+            "ref": got.ref if ok else (ref_s or quote[:120]),
+            "why": " ".join(str(p.get("why") or "").split())[:300],
+            **({} if ok else {"dropped": "not re-resolved to a printed cell or quantity"})})
+    prov = delegation.provenance_record(mode="SESSION_SUBAGENT", reviewer=reviewer)
+    out, _sidecar = _plan_paths(cfg, pid, unit)
+    return sealing.seal(
+        out, {"unit": unit, "question_id": question_id, "refs": kept, "dropped": dropped,
+              "none": str(data.get("none") or "")[:500] if isinstance(data, dict) else ""},
+        mode="SESSION_SUBAGENT", reviewer=prov["reviewer"], tool_policy=prov["tool_policy"],
+        extra={"paper_id": pid, "unit": unit, "brief_sha256": certificate.brief_sha(brief)})
+
+
+def load_check_plans(cfg: Config, pid: str) -> list[dict]:
+    from . import delegation, sealing
+
+    d = state.project_dir(cfg, pid) / "runs" / pid / "check_plans"
+    out = []
+    for f in sorted(d.glob("*.json")) if d.is_dir() else []:
+        if f.name.endswith(".driver.json") or not sealing.verify_seal(
+                f, accepted_writers=tuple(delegation.WRITTEN_BY.values()))[0]:
+            continue
+        try:
+            out.append(state.read_json(f))
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def _certificate_refusal(cfg: Config, pid: str, obj, plan) -> TargetOutcome:
+    """A target whose certificate is not (yet) conformant. UNCHECKABLE is a limit of this
+    method for this relation — NO_ROUTE_AVAILABLE, never a finding about the paper; any
+    other refusal stays NOT_ATTEMPTED and its reason says whether a revision is owed."""
+    rec = certificate.sealed_record(cfg, pid, obj.target_id)
+    disposition = ("NO_ROUTE_AVAILABLE" if rec and not rec.get("established")
+                   and rec.get("verdict") == "UNCHECKABLE" else "NOT_ATTEMPTED")
+    return _not_started(obj, plan, _certificate_pending_reason(cfg, pid, obj.target_id),
+                        disposition)
 
 
 def _certificate_pending_reason(cfg: Config, pid: str, target_id: str) -> str:
     rec = certificate.sealed_record(cfg, pid, target_id)
     if rec and not rec.get("established"):
-        return ("the independent verifier did not approve the certificate generated for this "
-                "target, so nothing ran and no verdict may be drawn. Verifier: "
+        verdict = rec.get("verdict") or "REVISE"
+        attempt = int(rec.get("attempt") or 1)
+        tail = ("the verifier judged this relation not finitely checkable by this method"
+                if verdict == "UNCHECKABLE" else
+                f"a revision is owed (attempt {attempt} of {1 + max(0, cfg.max_revisions)})"
+                if attempt < 1 + max(0, cfg.max_revisions) else
+                f"the revision budget is spent ({attempt} attempt(s))")
+        return (f"the independent verifier did not approve the certificate generated for this "
+                f"target ({verdict}; {tail}), so nothing ran and no verdict may be drawn. "
+                f"Required changes: "
+                + " ".join(str(rec.get("required_changes") or "none given").split())[:400]
+                + ". Verifier: "
                 + " ".join(str(rec.get("verifier_notes") or "no reason recorded").split())[:600])
     return ("no sealed, conformant EXACT_CERTIFICATE exists yet for this target; awaiting one "
             "from the controlling session's task list.")
@@ -910,6 +1095,17 @@ def attempt_reimplementation_fallback(
             doc, table_ref=base_spec.table_ref, claim_ref=base_spec.claim_ref,
             ingredient_refs=tuple(i.ref for i in readiness.ingredients)),
         released=released)
+    # The base brief's sha is what a revision round is keyed to; a REVISE verdict with
+    # budget left appends the rejected attempt and its required changes.
+    base_sha = certificate.brief_sha(brief)
+    base_file = reimplement_driver.base_sha_path(cfg, pid, target_id)
+    base_file.parent.mkdir(parents=True, exist_ok=True)
+    base_file.write_text(base_sha, encoding="utf-8")
+    revision = reimplement_driver.read_revision(
+        reimplement_driver.revision_path(cfg, pid, target_id), base_sha)
+    if revision:
+        from .prompts import reimplement as RP
+        brief += RP.revision_block(revision)
     stale = (sealed is not None and not sealed[1].established
              and not reimplement_driver.answered_brief(cfg, pid, target_id, brief))
     if sealed is None or stale:
@@ -918,6 +1114,12 @@ def attempt_reimplementation_fallback(
             reimplement_driver.persist_brief(cfg, pid, target_id, brief)
         return None
     script, conf = sealed
+    if not conf.established:
+        rec = reimplement_driver.sealed_record(cfg, pid, target_id)
+        conf = conf.model_copy(update={"reason": (
+            f"{conf.reason}. The independent verifier ({rec.get('verdict') or 'REVISE'}, "
+            f"attempt {rec.get('attempt') or 1}): "
+            f"{' '.join(str(rec.get('verifier_notes') or 'no reason recorded').split())[:600]}")})
     # Cells of one table share one experiment's protocol. If an independent verifier
     # refused a sibling reconstruction of that table, this one may not settle a cell.
     table = re.match(r"T\d+", base_spec.table_ref or "")
@@ -926,7 +1128,7 @@ def attempt_reimplementation_fallback(
         for f in sorted(rdir.glob(f"TGT-*-{table.group()}r*.json")):
             sib = f.stem
             if sib == target_id or sib.endswith((".driver", ".spec", ".superseded",
-                                                 ".inputs")):
+                                                 ".inputs", ".revision")):
                 continue
             other = reimplement_driver.load_accepted(cfg, pid, sib)
             if other is not None and not other[1].established:
@@ -1110,9 +1312,7 @@ def _review(cfg: Config, pid: str) -> dict:
             outcomes.append(outcome_for(pairs[0][0].target_id, certificate_result,
                                         original_plan.action, original_plan.route))
         elif direct_certificate:
-            outcomes.append(_not_started(
-                pairs[0][0], pairs[0][1],
-                _certificate_pending_reason(cfg, pid, pairs[0][0].target_id), "NOT_ATTEMPTED"))
+            outcomes.append(_certificate_refusal(cfg, pid, pairs[0][0], pairs[0][1]))
         elif reconstruction_result is not None and reconstruction_plan is not None:
             outcomes.append(outcome_for(pairs[0][0].target_id, reconstruction_result,
                                         reconstruction_plan.action, reconstruction_plan.route))
@@ -1166,9 +1366,7 @@ def _review(cfg: Config, pid: str) -> dict:
                         outcomes.append(outcome_for(obj.target_id, cert_result,
                                                     plan.action, plan.route))
                     else:
-                        outcomes.append(_not_started(
-                            obj, plan, _certificate_pending_reason(cfg, pid, obj.target_id),
-                            "NOT_ATTEMPTED"))
+                        outcomes.append(_certificate_refusal(cfg, pid, obj, plan))
                     continue
                 other = build_spec(cfg, pid, doc, obj)
                 other.written_by = "harness"

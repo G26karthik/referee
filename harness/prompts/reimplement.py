@@ -98,6 +98,28 @@ compute it from them by the relative path shown — a RELEASED-DATA RECOMPUTATIO
 If the claim cannot be computed from these files, ignore this section."""
 
 
+def revision_block(revision: dict) -> str:
+    """Appended to a generator brief when an independent verifier rejected the previous
+    attempt with REVISE. Shared by the reconstruction and certificate routes."""
+    if not revision:
+        return ""
+    return f"""
+
+=== REVISION {int(revision.get('attempt') or 0) + 1}: THE PREVIOUS ATTEMPT WAS REJECTED ===
+An independent verifier rejected the attempt below. Fix exactly what it names, from the
+paper's own words: never by weakening the claim, a hypothesis or a binding, and never by
+inventing a detail the paper omits. If a required change cannot be made from the paper, say
+so in `notes` and refuse honestly. A NEW independent verifier will judge your answer.
+
+Verifier's required changes: {revision.get('required_changes') or '(none given)'}
+Verifier's notes: {revision.get('verifier_notes') or '(none)'}
+
+--- the rejected script ---
+```python
+{revision.get('script') or ''}
+```"""
+
+
 def build(paper_title: str, claim: str, table_ref: str, claimed_cell_value: str,
           ingredients_table: str, paper_text: str, released_table: str = "") -> str:
     released = (f"\n=== THE AUTHORS' RELEASED FILES ===\n{RELEASED}\n\n{released_table}\n"

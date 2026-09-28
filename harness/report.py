@@ -1178,7 +1178,7 @@ _DROPPABLE_ORDER = (
     "## Experiments triggered",
     "## Central claims an experiment ran for and did not settle",
     "## Open questions for the reviewer",
-    "## Central claims this review did not check",
+    "## Central claims, end to end",
 )
 _UNDROPPABLE = ("## Review outcome", "## Established failures", "## Scientific findings",
                 "## Scope of this review",
@@ -1468,17 +1468,37 @@ def render_reviewer_report(report: EvalReport, target_set: TargetSet | None = No
         if len(open_qs) > _MAX_OPEN:
             L.append(f"- …and {len(open_qs) - _MAX_OPEN} more; see `discovery/targets.json`.")
 
-    if unchecked:
-        L += ["", "## Central claims this review did not check", "",
-              f"{len(unchecked)} central claim(s) were structurally checkable and nothing was "
-              f"run for them. This is the boundary of the assessment above, not a criticism "
-              f"of the paper:"]
-        for obj in unchecked[:_MAX_OPEN]:
+    # EVERY central claim, end to end: the route it took, where it ended, the exact blocker,
+    # and — for a numbered result — how many steps of its printed proof were checked. The
+    # unchecked come first: they are the boundary of everything above.
+    central = [o for o in objects if getattr(o, "centrality", "") == "CENTRAL"
+               and getattr(o, "harness_addressable", False) and not getattr(o, "parent_target", "")]
+    if central:
+        unchecked_ids = {getattr(o, "target_id", "") for o in unchecked}
+        rows = ([o for o in central if o.target_id in unchecked_ids]
+                + [o for o in central if o.target_id not in unchecked_ids])
+        L += ["", "## Central claims, end to end", "",
+              f"{len(central)} central claim(s); {len(unchecked)} were structurally checkable "
+              f"and no admissible run checked them. That is the boundary of the assessment "
+              f"above, not a criticism of the paper:"]
+        for obj in rows[:_MAX_OPEN]:
             o = by_target.get(obj.target_id)
-            L.append(f"- **{obj.target_id}** — {_short(getattr(obj, 'claim_text', ''), 140)}"
+            kids = [c for c in objects if getattr(c, "parent_target", "") == obj.target_id]
+            steps = ""
+            if kids:
+                outs = [by_target.get(c.target_id) for c in kids]
+                ran = sum(1 for x in outs if x is not None and taxonomy.claim_was_checked(x.evidence_state))
+                bad = sum(1 for x in outs if x is not None and x.disposition == "COUNTEREXAMPLE_ESTABLISHED")
+                steps = (f" · proof steps: {ran} of {len(kids)} checked"
+                         + (f", {bad} violated" if bad else ""))
+            ended = getattr(o, "disposition", "") or "not reached"
+            kind = getattr(o, "evidence_kind", "NONE") or "NONE"
+            L.append(f"- **{obj.target_id}** — {_short(getattr(obj, 'claim_text', ''), 120)}"
+                     f" · route `{getattr(o, 'route', '') or 'NONE'}`, ended `{ended}`"
+                     f"{'' if kind == 'NONE' else ' as ' + kind}{steps}"
                      f" ({_short(getattr(o, 'reason', '') or 'no experiment was run', 160)})")
-        if len(unchecked) > _MAX_OPEN:
-            L.append(f"- …and {len(unchecked) - _MAX_OPEN} more; see `discovery/targets.json`.")
+        if len(rows) > _MAX_OPEN:
+            L.append(f"- …and {len(rows) - _MAX_OPEN} more; see `discovery/targets.json`.")
 
     eff = report.review_efficiency or {}
     fun = {
@@ -4504,7 +4524,7 @@ def _self_check_render_caps() -> None:
     assert "more; see `discovery/targets.json`." in open_body, (
         "_MAX_OPEN must trigger (open questions) and say so")
 
-    unchecked_body = sections.get("## Central claims this review did not check", "")
+    unchecked_body = sections.get("## Central claims, end to end", "")
     assert unchecked_body.count("- **U") == _MAX_OPEN
     assert "more; see `discovery/targets.json`." in unchecked_body, (
         "_MAX_OPEN must trigger (unchecked central) and say so")

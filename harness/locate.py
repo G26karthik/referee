@@ -418,6 +418,32 @@ def mint(doc: PaperDoc, quote: str) -> ClaimRef:
     return _unresolved("", "", "not_found", "the quote does not occur in the parsed paper")
 
 
+def mint_in(doc: PaperDoc, quote: str, section_idx: int) -> ClaimRef:
+    """`mint`, restricted to ONE section: a proof step may repeat words the paper states
+    elsewhere (a restated theorem, a recalled bound), and the section the harness found it
+    in is the one it is about. Still refuses on anything but exactly one occurrence there."""
+    flat_quote = _flat(quote)
+    if len(flat_quote) < _QUOTE_MIN:
+        return _unresolved("", "", "malformed",
+                           f"a {len(flat_quote)}-character quote addresses nothing in particular")
+    hits: list[ClaimRef] = []
+    for idx, flat, offsets, original, page in section_units(doc):
+        if idx != section_idx:
+            continue
+        start = flat.find(flat_quote)
+        while start != -1 and len(hits) < 2:
+            end = start + len(flat_quote)
+            text = _verbatim(original, offsets, start, end)
+            hits.append(ClaimRef(ref=f"P{idx}:{start}-{end}", kind="prose_claim", quote=text,
+                                 section_idx=idx, span=(start, end), page=page,
+                                 resolution="resolved", quantity=parse_quantity(text)))
+            start = flat.find(flat_quote, start + 1)
+    if len(hits) == 1:
+        return hits[0]
+    return _unresolved("", "prose_claim", "ambiguous" if hits else "not_found",
+                       f"the quote occurs {len(hits)} time(s) in section {section_idx}")
+
+
 def address(doc: PaperDoc, ref: str = "", quote: str = "") -> ClaimRef:
     """The one entry point the rest of the harness should use. A supplied address is
     re-derived; when it does not resolve (including a `p7`-style page citation, which

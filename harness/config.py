@@ -45,6 +45,19 @@ class Config:
     # positive-verification targets, beside whatever the lenses questioned.
     max_formal_targets: int = field(
         default_factory=lambda: int(os.environ.get("SH_MAX_FORMAL_TARGETS", "10")))
+    # ponytail: verification budgets, each a hard ceiling on Sonnet tasks per paper. A
+    # REVISE verdict earns at most `max_revisions` further generator rounds; a located proof
+    # yields at most `max_proof_steps` step targets (and `max_proof_step_targets` per paper);
+    # at most `max_check_plans` dead-end central claims get a check planner. Raise them when a
+    # paper's refusals are all REVISE / its proofs longer — never by paper.
+    max_revisions: int = field(
+        default_factory=lambda: int(os.environ.get("SH_MAX_REVISIONS", "2")))
+    max_proof_steps: int = field(
+        default_factory=lambda: int(os.environ.get("SH_MAX_PROOF_STEPS", "4")))
+    max_proof_step_targets: int = field(
+        default_factory=lambda: int(os.environ.get("SH_MAX_PROOF_STEP_TARGETS", "12")))
+    max_check_plans: int = field(
+        default_factory=lambda: int(os.environ.get("SH_MAX_CHECK_PLANS", "3")))
 
     # --- S3 code-reproduction gates, graded by risk since fetching and running code are
     # different acts: network (clone, read-only, for the static audit), install (resolves

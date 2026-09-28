@@ -150,11 +150,32 @@ def _extra(proof: str, images: list[str]) -> str:
     return out
 
 
+def _given(verbatim: str = "", context: str = "", step: str = "") -> str:
+    """The harness's own blocks: the exact parsed words quotes must be copied from, the
+    definitions/equations the statement cites, and — for a proof-step target — the one
+    step to check, already bound by the harness."""
+    out = ""
+    if step:
+        out += ("\n=== CHECK EXACTLY THIS PROOF STEP (bound by the harness) ===\n" + step +
+                "\nYour `checked_statement` is \"proof_step\" and `paper_quotes.claimed_bound` "
+                "is this text: the harness binds it. Check THIS relation, on an instance that "
+                "satisfies what the proof has assumed or established at that point.\n")
+    if verbatim:
+        out += ("\n=== VERBATIM PARSED TEXT — copy every `paper_quotes` entry only from here "
+                "or from the excerpt below ===\n" + verbatim + "\n")
+    if context:
+        out += ("\n=== DEFINITIONS, ASSUMPTIONS AND EQUATIONS THE STATEMENT OR PROOF CITES "
+                "(parsed text) ===\n" + context + "\n")
+    return out
+
+
 def build(paper_title: str, claim: str, section_excerpt: str, *, proof: str = "",
-          images: list[str] | None = None) -> str:
+          images: list[str] | None = None, verbatim: str = "", context: str = "",
+          step: str = "", revision: str = "") -> str:
     """The generator's prompt. `section_excerpt` is BOUNDED — the section(s) stating the
     claimed theorem and its hypotheses, never the whole paper (see
-    `harness.certificate.build_brief`) — plus the statement's own printed proof."""
+    `harness.certificate.build_brief`) — plus the statement's own printed proof, the
+    definitions it cites, and (on a revision round) the rejected attempt."""
     return f"""{SECURITY}
 
 You are writing an EXACT_CERTIFICATE for one theorem/bound claim from a published paper.
@@ -168,8 +189,8 @@ Paper: {paper_title or "(title not detected)"}
 
 === THE RELEVANT SECTION(S) OF THE PAPER ===
 {section_excerpt}
-{_extra(proof, list(images or []))}
-{_RETURN}"""
+{_given(verbatim, context, step)}{_extra(proof, list(images or []))}
+{_RETURN}{revision}"""
 
 
 _VERIFIER_RULES = """\
@@ -192,15 +213,24 @@ reject anything that does not hold up:
      statement's own conclusion, and it is finitely checkable (not an asymptotic O/Ω/Θ
      claim with unstated constants). "proof_step": `claimed_bound` is an inequality or
      identity the PRINTED PROOF of this statement asserts, with the proof's own constants,
-     and `hypotheses` are exactly what the proof has at that point.
+     and `hypotheses` are exactly what the proof has at that point. When the harness bound
+     a proof step, the script must check exactly that step.
 
-Reject if ANY of the four fails, or if a binding's `impl_quote` does not look like it
-actually appears in the script."""
+Reject if ANY of the five fails, or if a binding's `impl_quote` does not look like it
+actually appears in the script.
+
+Then give a categorical verdict. APPROVE: all five hold. REVISE: the attempt is fixable
+from the paper's own words — name each required change concretely, citing the paper (a
+dropped hypothesis, a wrong constant, an inadmissible instance, a quote not copied from the
+parsed text). UNCHECKABLE: this relation cannot be violated by any finite instance as stated
+(an asymptotic claim with unstated constants), or the paper does not define what it needs —
+say which. A REVISE goes back to a fresh generator; an UNCHECKABLE ends this route."""
 
 
 def verification_build(paper_title: str, claim: str, section_excerpt: str, script: str,
                        bindings: list[dict], paper_quotes: dict, *, proof: str = "",
-                       scope: str = "", images: list[str] | None = None) -> str:
+                       scope: str = "", images: list[str] | None = None,
+                       verbatim: str = "", context: str = "", step: str = "") -> str:
     """The SEPARATE verifier's prompt — a different subagent from the one that wrote
     `script`, exactly as `reimplement_driver`'s verifier is independent of its generator
     (`harness.certificate.accept`'s `generated_by != verified_by` rule)."""
@@ -216,7 +246,7 @@ Paper: {paper_title or "(title not detected)"}
 
 === THE RELEVANT SECTION(S) OF THE PAPER ===
 {section_excerpt}
-{_extra(proof, list(images or []))}
+{_given(verbatim, context, step)}{_extra(proof, list(images or []))}
 === DECLARED checked_statement ===
 {scope or "conclusion"}
 
@@ -233,8 +263,83 @@ Paper: {paper_title or "(title not detected)"}
 
 Print only JSON:
 {{"approved": true_or_false,
+  "verdict": "APPROVE | REVISE | UNCHECKABLE",
+  "required_changes": "each concrete change, citing the paper ('' if APPROVE)",
   "approved_kinds": ["hypotheses","claimed_bound","instance"],
   "notes": "short reason"}}"""
+
+
+# === PLANNING PROMPTS — what to check, proposed by a model, validated by the harness ====
+# Neither prompt lets a model choose a route or a verdict: it proposes ADDRESSES (verbatim
+# text the harness re-finds), and `harness.certificate`/`harness.routes` decide the rest.
+
+_PROOF_MAP = """You are MAPPING the printed proof of one mathematical statement into the individual steps
+a careful referee would check. You do not check them; a separate exact-arithmetic check
+will be run on each step you list.
+
+List every step the proof ASSERTS that is an explicit relation — an inequality, identity,
+probability/expectation bound, or case claim — whose constants and quantities are explicit
+(no unstated O/Ω/Θ constants). For each step give:
+  - "quote": the step copied VERBATIM from the PARSED proof text below — one contiguous
+    substring (at most 400 characters) containing the relation and enough words to locate
+    it. Copy the parsed text even where it is garbled; the harness re-finds the quote there
+    and drops any it cannot find.
+  - "relation": "inequality" | "identity" | "probability_bound" | "case_claim"
+  - "explicit_constants": true | false
+  - "why_doubtful": one sentence — what would make this step fail (a constant, a missing
+    factor, a normalisation or unit change, a case not covered, a quantifier).
+Order the list most doubtful first. List a textbook fact (triangle inequality, expanding a
+square) only if nothing else is asserted."""
+
+
+def proof_map_build(paper_title: str, statement: str, proof: str, *, context: str = "",
+                    images: list[str] | None = None) -> str:
+    return f"""{SECURITY}
+
+{_PROOF_MAP}
+
+Paper: {paper_title or "(title not detected)"}
+
+=== THE STATEMENT ===
+{statement or "(not recovered)"}
+{_given("", context, "")}{_extra(proof, list(images or []))}
+Print only JSON:
+{{"steps": [{{"quote": "...", "relation": "inequality", "explicit_constants": true,
+              "why_doubtful": "..."}}],
+  "notes": "anything about the proof you could not map, or ''"}}"""
+
+
+_CHECK_PLAN = """You are PLANNING which printed evidence would settle one claim or concern about a paper.
+You do not judge the claim. Propose at most 2 places in the paper whose printed content an
+independent check could reproduce or refute: a table cell (give its "ref" exactly as listed
+below, e.g. "T3:r2:c1") or a sentence stating a specific number (give it as "quote", copied
+VERBATIM from the paper text). Each proposal must be something the claim actually turns on,
+not merely related. If nothing printed could settle it, say so in "none"."""
+
+
+def check_plan_build(paper_title: str, subject: str, evidence: str, tables: str,
+                     paper_text: str) -> str:
+    return f"""{SECURITY}
+
+{_CHECK_PLAN}
+
+Paper: {paper_title or "(title not detected)"}
+
+=== THE CLAIM OR CONCERN ===
+{subject}
+
+=== ITS CITED EVIDENCE ===
+{evidence or "(none)"}
+
+=== TABLES (cell refs you may propose) ===
+{tables or "(no tables extracted)"}
+
+=== THE PAPER (bounded) ===
+{paper_text}
+
+Print only JSON:
+{{"proposals": [{{"ref": "T3:r2:c1 or ''", "quote": "verbatim sentence or ''", "why": "..."}}],
+  "none": "reason nothing printed could settle it, or ''"}}"""
 
 
 # --------------------------------------------------------------------------------------- #
