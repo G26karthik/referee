@@ -402,7 +402,8 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
             proposal = json.dumps({"script": (cdir / f"script.{r}.py").read_text(encoding="utf-8"), **{
                 k: g.get(k) for k in ("runs", "runs_quote", "metric", "outputs", "bindings", "deviations",
                                       "checked_statement", "premise_argument")}}, ensure_ascii=False, indent=1)
-            smoke = (f"returncode {sm.get('returncode')}, {sm.get('seconds')}s"
+            smoke = f"(not run: {sm['skipped']})" if sm.get("skipped") else (
+                     f"returncode {sm.get('returncode')}, {sm.get('seconds')}s"
                      + (" (stopped at the draft time limit: it was still running)" if sm.get("timed_out") else "")
                      + (f", infrastructure: {sm['infra_error']}" if sm.get("infra_error") else "")
                      + f"\n--- stdout (result lines masked) ---\n{sm.get('stdout', '')[-2000:]}\n--- stderr ---\n"
@@ -611,6 +612,18 @@ def _target(x: _Ctx, t: dict, errors: list[str], cid: str) -> dict | None:
 _SOURCE = re.compile(r"https?://[^\s\"'<>]+|hf://(?:datasets|models)/[\w.-]+/[\w.-]+(?:@[\w.-]+)?")
 
 
+def _cites(text: str, src: str) -> bool:
+    """Does `text` cite exactly this source — a whole URL (scheme aside; a PDF may break it
+    across lines) or a whole `owner/name` hub id — not merely contain it inside a longer name?"""
+    if src.startswith("hf://"):
+        kind, _, rid = src[5:].partition("/")
+        needle, before = rid.split("@")[0], r"(?:(?<![\w./-])|(?<=huggingface\.co/" + kind + r"/))"
+    else:
+        needle, before = src.split("://", 1)[1].rstrip("/"), r"(?<![\w.-])"
+    pat = before + r"\s*".join(map(re.escape, needle)) + r"/?(?![\w%/-]|\.\w)"   # a sentence's full stop may follow
+    return bool(needle) and re.search(pat, text or "", re.I) is not None
+
+
 def _acquire(x: _Ctx, c: dict, errs: list[str], cid: str) -> list[dict]:
     """Public artifacts a check needs that the checkout does not ship: each source must be cited
     verbatim by the paper or by a tracked checkout file (a cited dataset page may be followed to
@@ -625,11 +638,12 @@ def _acquire(x: _Ctx, c: dict, errs: list[str], cid: str) -> list[dict]:
         if any(d in src.lower() for d in x.cfg.deny_sources):
             errs.append(f"{cid}: acquire source {src[:120]!r} is a denied source")
             continue
-        needle = src[5:].split("/", 1)[1] if src.startswith("hf://") else src.split("://", 1)[1]
-        needle = needle.split("@")[0].rstrip("/")
+        if not src.startswith("hf://") and "@" in src.split("://", 1)[1].split("/", 1)[0]:
+            errs.append(f"{cid}: acquire source {src[:120]!r} carries user info before its host; refused")
+            continue
         text = x.paper.text if cited == "paper" else (
             f.read_text(encoding="utf-8", errors="replace") if (f := _repo_file(x, cited)) and f.is_file() else "")
-        if not text or flat(needle) not in flat(text):
+        if not _cites(text, src):
             errs.append(f"{cid}: acquire source {src[:120]!r} is not cited verbatim in {cited or '(nothing)'!r} (give "
                         "cited_in: 'paper' or a tracked checkout path whose text contains it)")
             continue
@@ -642,7 +656,10 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     concern_ids = {c["id"] for c in x.concerns()}
     base = x.sealed("plan") if tid == "plan:2" else None      # a follow-up round adds to the first plan
     attributed = base["repo_is_authors"] if base else (x.checkout / ".git").is_dir() and obj.get("repo_is_authors") is True
-    cap, n0 = (x.cfg.max_followup_checks, len(base["checks"])) if base else (x.cfg.max_checks, 0)
+    # Follow-up ids continue after every id the first round used (a check dropped there left a gap).
+    used = [int(m.group(1)) for c in (base or {}).get("checks", []) + (base or {}).get("dropped", [])
+            if (m := re.fullmatch(r"C(\d+)", str(c.get("id") or c.get("check") or "")))]
+    cap, n0 = (x.cfg.max_followup_checks, max(used + [x.cfg.max_checks])) if base else (x.cfg.max_checks, 0)
     proposed = [c for c in obj.get("checks") or [] if isinstance(c, dict)]
     # Central claims get the budget first: a check no central claim cites is incidental, is
     # cut before any central one, and must say why no central claim could use its slot.

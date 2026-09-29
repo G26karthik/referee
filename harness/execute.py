@@ -9,6 +9,7 @@ it was hashed. A draft run (`try`) is recorded with mode="try" and never counts.
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -261,10 +262,12 @@ def classify(rec: dict) -> dict:
     setup = next((s for s in _SETUP if s in low), "")
     both = (rec.get("stdout") or "") + "\n" + err
     # The burden is on showing it started: a result or progress line in either stream shows it;
-    # otherwise only a long, talkative, clean run does. An unproven start accuses nobody.
+    # otherwise only a long, talkative, clean run does — talk before its traceback, not the
+    # traceback itself. An unproven start accuses nobody.
     marked = any(t in both for t in ("REFEREE_RESULT ", "REFEREE_PROGRESS ", "REFEREE_DATA "))
+    talk = both.rsplit("Traceback (most recent call last)", 1)[0]
     reached = marked or (not setup and not rec.get("timed_out") and not rec.get("error")
-                         and rec.get("seconds", 0) >= 30 and len(both.splitlines()) >= 5)
+                         and rec.get("seconds", 0) >= 30 and len(talk.splitlines()) >= 6)
     frames = re.findall(r'File "([^"]+)", line \d+', err.rsplit("Traceback (most recent call last)", 1)[-1])
     own = frames[-1] if frames and frames[-1].startswith(f"{MOUNT}/repo/") and "site-packages" not in frames[-1] else ""
     return {"infra_error": infra, "setup_error": setup, "reached": reached, "own_code_crash": own,
@@ -288,7 +291,9 @@ def json_lines(text: str, tag: str) -> list[dict]:
 
 
 def _num(d: dict) -> dict:
-    return {k: float(v) for k, v in d.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    """The finite numeric fields (a NaN or infinity is no measurement)."""
+    return {k: float(v) for k, v in d.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)}
 
 
 def _results(stdout: str) -> list[dict]:
@@ -352,7 +357,8 @@ def markers(st: dict, rec: dict) -> set[str]:
     for d in json_lines(both, "REFEREE_DATA")[:20]:            # ponytail: 20 datasets per run
         name = str(d.get("dataset") or "")[:120]
         if name and name not in ids:
-            ids[name] = json.loads(json.dumps({k: d[k] for k in list(d)[:16]}, default=str)[:4000])
+            s = json.dumps({k: d[k] for k in list(d)[:16]}, default=str)
+            ids[name] = json.loads(s) if len(s) <= 4000 else {"truncated": s[:4000]}   # ponytail: 4 kB each
     started = {str(d.get("stage"))[:80] for d in json_lines(both, "REFEREE_PROGRESS") if d.get("stage")}
     if started and "stage_times" not in st:                   # the pilot's own timing, by stage
         st["stage_times"] = [{"stage": str(d.get("stage"))[:80], "t": d.get("t")}
@@ -563,12 +569,16 @@ def get(url, dest):
     global total
     if denied(url): raise RuntimeError("source denied by SH_DENY_SOURCES")
     key = hashlib.sha256(url.encode()).hexdigest()[:16]
-    name = urllib.parse.unquote(urllib.parse.urlparse(url).path.rstrip("/").split("/")[-1]) or "index.html"
+    name = os.path.basename(urllib.parse.unquote(urllib.parse.urlparse(url).path.rstrip("/").split("/")[-1]))
+    name = name if name not in ("", ".", "..") else "index.html"      # never a path out of the folder
     cpath, info = f"{cache}/{key}/{name}", {"url": url}
+    if os.path.exists(cpath + ".ctype"):
+        info["content_type"] = open(cpath + ".ctype").read()
     if not os.path.exists(cpath):
         os.makedirs(os.path.dirname(cpath), exist_ok=True)
         with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "referee"}), timeout=120) as r:
             info["http_status"], info["content_type"] = r.status, r.headers.get("Content-Type", "")
+            open(cpath + ".ctype", "w").write(info["content_type"])
             n = int(r.headers.get("Content-Length") or 0)
             if total + n > cap: raise RuntimeError(f"{n} bytes would pass the storage cap ({cap} bytes, SH_MAX_DATA_GB)")
             got = 0
@@ -650,8 +660,8 @@ for root, _, fs in os.walk("/data"):
             heads += 1
             with open(p, encoding="utf-8", errors="replace") as fh: row["head"] = fh.read(400)
         files.append(row)
-print("REFEREE_MANIFEST " + json.dumps({"sources": out, "files": files[:5000], "n_files": len(files),
-                                        "bytes": sum(r["bytes"] for r in files)}))
+print("REFEREE_MANIFEST " + json.dumps({"sources": out, "files": files[:2000], "n_files": len(files),
+                                        "bytes": sum(r["bytes"] for r in files)}))   # ponytail: 2000 listed
 '''
 
 
@@ -710,42 +720,59 @@ def smoke(cfg: state.Config, root: Path, cid: str, r: int, kind: str, attributed
     st = state.read_json(f) or {}
     if "returncode" in st:
         return st
+    scratch = _cname("smoke-ckpt", cdir.resolve(), r)          # a throwaway /work/ckpt for the draft
     if st.get("rec"):
         done = collect(st["rec"], cfg.try_timeout_s)
         if done is None:
             return None
         state.append_jsonl(Path(root) / "execution.jsonl", done)
+        _docker(["docker", "volume", "rm", "-f", scratch], 60)
         ev = classify(done)
+        if (str(done.get("error", "")).startswith("could not start") or _vanished(done)) and st.get("starts", 0) < 3:
+            state.write_json(f, {"starts": st.get("starts", 0) + 1})   # an infrastructure event: start it again
+            return None
+        infra = ev["infra_error"] or ("the container could not start" if done.get("error", "").startswith("could not")
+                                      or _vanished(done) else "")
         res = {"returncode": done.get("returncode"), "timed_out": done.get("timed_out"), "seconds": done.get("seconds"),
-               "reached": ev["reached"], "infra_error": ev["infra_error"],
+               "reached": ev["reached"], "infra_error": infra,
                "failed": ev["failed"] and not done.get("timed_out"), "failure": failure_text(done) if ev["failed"] else "",
                "stdout": mask(done.get("stdout") or "")[-3000:], "stderr": mask(done.get("stderr") or "")[-3000:]}
         state.write_json(f, res)
         return res
     script = (cdir / f"script.{r}.py").read_text(encoding="utf-8")
+    skip = lambda why: {"returncode": None, "skipped": why, "failed": False, "reached": False, "stdout": "", "stderr": ""}
+    if not cfg.allow_script_exec:              # the one gate holds for the harness's own draft too
+        return skip("SH_ALLOW_SCRIPT_EXEC is not set, so no model-written script runs")
+    if not docker_status()[0]:
+        return None                            # the daemon is away: wait for it
+    base_dir, base = script_env(cfg, root, kind, attributed)
+    if base is None:
+        return None
+    if not base["ok"]:                         # not the author's to fix: the check will be BLOCKED at execution
+        return skip(f"its environment did not build: {base['detail'][-400:]}")
     try:
-        env_dir, envinfo = with_packages(cfg, root, *script_env(cfg, root, kind, attributed), script)
+        env_dir, envinfo = with_packages(cfg, root, base_dir, base, script)
     except ValueError as e:
         env_dir, envinfo = None, {"ok": False, "detail": str(e)}
     if envinfo is None:
         return None
-    if not envinfo["ok"]:
-        res = {"returncode": None, "failed": True, "failure": f"the environment did not build: {envinfo['detail'][-600:]}",
-               "reached": False, "stdout": "", "stderr": ""}
+    if not envinfo["ok"]:                      # the packages it declares: the author's to fix
+        res = {"returncode": None, "failed": True, "reached": False, "stdout": "", "stderr": "",
+               "failure": f"the environment with its REFEREE_PACKAGES did not build: {envinfo['detail'][-600:]}"}
         state.write_json(f, res)
         return res
     sdir = cdir / f"smoke{r}"
     sdir.mkdir(parents=True, exist_ok=True)
     (sdir / "script.py").write_bytes(script.encode("utf-8"))
     has_repo = (Path(root) / "repo" / ".git").is_dir()
-    mounts = [(sdir, f"{MOUNT}/check", True), (volume(env_dir), "/env", True)] + (
+    mounts = [(sdir, f"{MOUNT}/check", True), (volume(env_dir), "/env", True), (scratch, f"{MOUNT}/ckpt", False)] + (
         [(Path(root) / "repo", f"{MOUNT}/repo", True)] if has_repo else []) + data_mount(root, cid)
-    rec = start(_cname(cdir.resolve(), "smoke", r, state.sha256(script)),
+    rec = start(_cname(cdir.resolve(), "smoke", r, state.sha256(script), st.get("starts", 0)),
                 ["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", "0"], mounts=mounts,
                 workdir=f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check", image=envinfo.get("image", DEFAULT_IMAGE),
                 network=False, gpus=kind == "RECONSTRUCTION" and gpu(cfg), mode="try", target=cid,
                 meta={"script_sha256": state.sha256(script), "smoke": r})
-    state.write_json(f, {"rec": rec})
+    state.write_json(f, {"rec": rec, "starts": st.get("starts", 0)})
     return None
 
 
@@ -862,24 +889,25 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             v, note = parse_metric(done["stdout"], check.get("metric", ""))
             vs = [v] if v is not None and not (ev["failed"] and "text" in note) else []
         elif kind == "CERTIFICATE":
-            rows = cert_rows(done["stdout"])
+            # A crashed instance is inadmissible: rows it printed before crashing count for nothing.
+            rows = [] if ev["failed"] else cert_rows(done["stdout"])
             vs = [r["violated"] for r in rows]
         else:   # bound by name: the relation's outputs or the generator's compared output, per stage
             staged = staged_values(done["stdout"], rel, check.get("metric", ""))
             vs = [v for _, v in staged]
-        failed_stages = {}
-        if ev["failed"]:
-            err = failure_text(done)
-            if kind == "AUTHOR_CODE" or not (vs or st.get("done_seeds")):
-                return _finish(cfg, root, check, {**_cancel(root, st), "ev": ev, "failure": err})
+        # A stage that started and printed no result is not completed, whether or not the run failed.
+        failed_stages = {s: (failure_text(done) if ev["failed"] else "the stage started and printed no result line")
+                         for s in started - {t for t, _ in staged}} if kind in ("RECONSTRUCTION", "RELEASED_DATA") else {}
+        for s, e in failed_stages.items():
+            st.setdefault("stage_errors", {}).setdefault(s, e)
+        if ev["failed"] or not vs:
+            err = failure_text(done) if ev["failed"] else f"exit 0 after {done.get('seconds', 0):.0f}s with no result line"
+            if kind == "AUTHOR_CODE" or not st.get("done_seeds") and not vs:
+                return _finish(cfg, root, check, {**_cancel(root, st), "ev": ev, "failure": err} if ev["failed"]
+                               else {**_cancel(root, st), "values": []})   # a clean exit with nothing establishes nothing
             # A later stage (or a later seed) failed: what the run measured before it failed is kept
             # and the remaining seeds still run, so completed stages accumulate their replicates.
             st.setdefault("failed_seeds", {})[key] = err
-            failed_stages = {s: err for s in started - {t for t, _ in staged}}
-            for s, e in failed_stages.items():
-                st.setdefault("stage_errors", {}).setdefault(s, e)
-        elif not vs:              # a clean exit with no bound metric establishes nothing
-            return _finish(cfg, root, check, {**_cancel(root, st), "values": []})
         st["values"] += vs
         st.setdefault("cert", []).extend(rows)
         st.setdefault("staged", []).extend(staged)
@@ -1159,12 +1187,14 @@ def try_script(cfg: state.Config, pid: str, cid: str, script: str, c: dict) -> d
     if not envinfo["ok"]:
         return {"error": envinfo["detail"]}
     has_repo = (root / "repo" / ".git").is_dir()
-    mounts = [(tdir, f"{MOUNT}/check", False), (volume(env_dir), "/env", True)] + (
+    scratch = _cname("try-ckpt", tdir.resolve(), time.time())        # a throwaway /work/ckpt for the draft
+    mounts = [(tdir, f"{MOUNT}/check", False), (volume(env_dir), "/env", True), (scratch, f"{MOUNT}/ckpt", False)] + (
         [(root / "repo", f"{MOUNT}/repo", True)] if has_repo else []) + data_mount(root, cid)
     rec = run(["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", "0"], mounts=mounts,
               workdir=f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check", image=envinfo.get("image", DEFAULT_IMAGE),
               network=False, timeout=cfg.try_timeout_s, mode="try", target=cid,
               gpus=c.get("kind") == "RECONSTRUCTION" and gpu(cfg), meta={"script_sha256": state.sha256(script)})
+    _docker(["docker", "volume", "rm", "-f", scratch], 60)
     state.append_jsonl(root / "execution.jsonl", rec)
     return {"environment": envinfo["detail"], "returncode": rec.get("returncode"), "timed_out": rec.get("timed_out"),
             "error": rec.get("error", ""), "stdout": mask(rec.get("stdout") or "")[-4000:],

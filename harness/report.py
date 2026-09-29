@@ -264,11 +264,13 @@ def _check_rows(checks: list[dict], led: dict) -> list[str]:
         if c.get("stages"):
             got = "; ".join(f"{s}: " + (f"{p.get('margin', p.get('reproduced', ''))} n={p['n']}" if p.get("n") else
                                          p["status"]) for s, p in c["stages"].items())
-        why = _cell(c["rule"] if c["status"] in SUPPORT + FAILURE else c["reason"] or c["rule"], 160)
-        # Harness-written rules and reasons state facts; only model-written text is screened.
+        # A harness rule states a fact and is shown as is; a reason may carry a script's or a model's
+        # own words (a stderr tail, a refusal), so it is screened for status words.
+        rule = c["status"] in SUPPORT + FAILURE and c["rule"]
+        why = _cell(c["rule"] if rule else c["reason"] or c["rule"], 160)
         rows.append(f"| {c['id']} | {c['kind']} ({c['evidence']}) | {_cell(c['claim'], 70)} | {_cell(target, 40)} | "
                     f"{_cell(got, 80)} | **{c['status']}** ({c.get('state', '')}) | {len(c['deviations']) or ''} | "
-                    f"{_said(why, led) if c.get('reason_by') == 'model' else why} |")
+                    f"{why if rule else _said(why, led)} |")
     return rows
 
 
@@ -378,9 +380,10 @@ def render(x, led: dict, rep: dict | None) -> str:
                          + (f"; on what completed: {c['status_on_completed']}" if c.get("status_on_completed") else ""))
             lines += [f"  - stage {st}: {pr['status']}" + (f", n={pr['n']}" if pr.get("n") else "")
                       + (f", margin {pr['margin']}, t*SE {pr['band']}" if "margin" in pr and "band" in pr else "")
-                      + (f", mean {pr['reproduced']}" if "reproduced" in pr else "") + f" — {_cell(pr['reason'], 200)}"
+                      + (f", mean {pr['reproduced']}" if "reproduced" in pr else "") + f" — {_said(_cell(pr['reason'], 200), led)}"
                       for st, pr in (c.get("stages") or {}).items()]
-            lines += [f"  - seed {k} failed: {_cell(v, 220)}" for k, v in sorted((c.get("failed_seeds") or {}).items())]
+            lines += [f"  - seed {k} did not complete: {_said(_cell(v, 220), led)}"
+                      for k, v in sorted((c.get("failed_seeds") or {}).items())]
         lines.append("")
     got = [c for c in led["checks"] if c.get("acquire") or c.get("data_identity")]
     if got:
@@ -398,7 +401,7 @@ def render(x, led: dict, rep: dict | None) -> str:
                 lines.append(f"  - {d.get('n_files')} files, {d.get('bytes')} bytes, each with sha256 in "
                              f"`checks/{c['id']}/data.json` (fetched {d.get('fetched_at', '?')})")
             for name, ident in (c.get("data_identity") or {}).items():
-                lines.append(f"  - dataset {name}: {_cell(json.dumps(ident, ensure_ascii=False), 300)}")
+                lines.append(f"  - dataset {name}: {_said(_cell(json.dumps(ident, ensure_ascii=False), 300), led)}")
         lines.append("")
     hist = [(c["id"], h) for c in led["checks"] for h in c.get("history") or []]
     if hist:

@@ -142,7 +142,7 @@ def _partial(res: dict, failed: dict, stages: dict | None = None, extra: str = "
     """The protocol did not complete: what completed is kept as `status_on_completed`."""
     errs = "; ".join(f"seed {k}: {v[:160]}" for k, v in sorted(failed.items())[:3])
     return {**res, "status": PARTIAL, "status_on_completed": res["status"],
-            "reason": (f"partial: {len(failed)} seed(s) failed after measuring ({errs}){extra}. On what completed: "
+            "reason": (f"partial: {len(failed)} seed(s) did not complete ({errs}){extra}. On what completed: "
                        f"{res['reason']}" if failed else f"partial{extra}. On what completed: {res['reason']}"),
             "failed_seeds": failed, **({"stages": stages} if stages else {})}
 
@@ -159,14 +159,15 @@ def _staged(kind, printed, rel, seeded, staged, stages, failed, stage_errors) ->
     sts = [p["status"] for p in per.values()]
     brief = "; ".join(f"{s}: {p['status']}" + (f" (n={p['n']})" if p.get("n") else "") for s, p in per.items())
     fail = next((s for s, p in per.items() if p["status"] in FAILURE), None)
-    if fail:
-        return _r(per[fail]["status"], f"stage {fail}: {per[fail]['reason']} [{brief}]", rule=per[fail].get("rule", ""),
-                  stages=per, **({"failed_seeds": failed} if failed else {}))
-    if "NOT_COMPLETED" in sts or failed:
+    if "NOT_COMPLETED" in sts or failed:     # the protocol did not complete: what completed is kept, decides nothing
         done = [p["status"] for p in per.values() if p["status"] != "NOT_COMPLETED"]
-        best = next((x for x in done if x not in SUPPORT), done[0] if done else "INCONCLUSIVE")
+        best = per[fail]["status"] if fail else next((x for x in done if x not in SUPPORT), done[0] if done else
+                                                     "INCONCLUSIVE")
         return _partial(_r(best, brief, stages=per), failed, per,
                         extra=f"; stages not completed: {', '.join(s for s, p in per.items() if p['status'] == 'NOT_COMPLETED') or 'none'}")
+    if fail:
+        return _r(per[fail]["status"], f"stage {fail}: {per[fail]['reason']} [{brief}]", rule=per[fail].get("rule", ""),
+                  stages=per)
     if all(x in SUPPORT for x in sts):
         return _r(sts[0], f"every stage holds [{brief}]", rule=next(iter(per.values())).get("rule", ""), stages=per)
     return _r("INCONCLUSIVE", f"not every stage is decided [{brief}]", stages=per)

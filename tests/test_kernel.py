@@ -519,7 +519,13 @@ def test_measurements_survive_a_later_stage_failure():
     assert part["status"] == PARTIAL and part["status_on_completed"] == "RELATION_HOLDS"
     assert part["stages"]["political"]["n"] == 3 and part["stages"]["movies"]["status"] == "NOT_COMPLETED"
     bad = st([["political", -m] for m in (0.70, 0.72, 0.69)], {"movies": "exit 1"}, {"0": "exit 1"})
-    assert bad["status"] == "RELATION_VIOLATED"                              # a failure found in a completed stage stands
+    assert bad["status"] == PARTIAL and bad["status_on_completed"] == "RELATION_VIOLATED"   # kept, not the verdict
+    assert st([["political", -m] for m in (0.70, 0.72, 0.69)], {}, {})["status"] == "RELATION_VIOLATED"
+    assert execute._num({"a": float("nan"), "b": 1, "c": True}) == {"b": 1.0}   # a NaN is no measurement
+    long_id = {}
+    execute.markers(long_id, {"stdout": "REFEREE_DATA " + __import__("json").dumps(
+        {"dataset": "d", "observed": {"labels": ["x" * 20] * 600}}), "stderr": ""})
+    assert "truncated" in long_id["data_identity"]["d"]                    # a long identity line never crashes
     assert st(pol + [["movies", m] for m in (0.3, 0.31, 0.32)], {}, {})["status"] == "RELATION_HOLDS"
     mixed = st(pol + [["movies", m] for m in (0.3, -0.31, 0.02)], {}, {})
     assert mixed["status"] == "INCONCLUSIVE"                                 # every stage must hold
@@ -607,6 +613,10 @@ def test_a_cited_public_artifact_outside_the_checkout_is_acquirable_with_provena
         assert not ok("https://www.example.org/lab/dataset.php", "../outside.md")   # not a tracked file
         assert not ok("hf://datasets/ICML-2026-agent-repro/verdicts", "analyze.py")  # denied, cited or not
         assert not ok("file:///etc/passwd", "paper")
+        assert not ok("https://www.example.org@evil.example/x.gz", "README.md")    # user info hides the host
+        assert not ok("https://www.example.org/", "README.md")                     # a prefix is not the citation
+        assert not ok("https://example.org/lab/dataset.php", "README.md")          # inside another host name
+        assert not ok("hf://datasets/nai/some-results", "analyze.py")              # inside another hub id
         assert execute.data_mount(td / pid, "C1") == []                       # nothing acquired, nothing mounted
         state.write_json(td / pid / "checks" / "C1" / "data.json", {"n_files": 2, "files": []})
         assert execute.data_mount(td / pid, "C1")[0][1:] == (execute.DATA_MOUNT, True)   # read-only
@@ -637,11 +647,11 @@ def test_every_claim_scope_item_is_covered_or_omitted_with_a_reason_and_undecide
         _seal(cfg, pid, "plan:2", {"checks": [{**chk, "id": "F1", "covers": []}],
                                    "central_claims": [{"quote": claim["quote"], "checks": ["F1"]}]}, td)
         plan = tasks._Ctx(cfg, pid).plan()
-        assert [c["id"] for c in plan["checks"]] == ["C1", "C2"] and plan["central_claims"][0]["checks"] == ["C1", "C2"]
+        assert [c["id"] for c in plan["checks"]] == ["C1", "C7"] and plan["central_claims"][0]["checks"] == ["C1", "C7"]
         led = report.ledger(tasks._Ctx(cfg, pid))
         assert led["central_claims"][0]["omitted"][0]["item"] == "RPC"
         assert report.scientific_status(td / pid) == "CHECKS_PENDING"      # the follow-up check is still owed
-        state.write_json(td / pid / "checks" / "C2" / "outcome.json", {"status": "NOT_CHECKABLE", "reason": "x"})
+        state.write_json(td / pid / "checks" / "C7" / "outcome.json", {"status": "NOT_CHECKABLE", "reason": "x"})
         phase, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
         assert phase == "report"                                             # one follow-up round, not a loop
 
