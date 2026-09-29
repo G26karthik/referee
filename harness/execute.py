@@ -211,6 +211,11 @@ def collect(rec: dict, timeout: int) -> dict | None:
             **({"error": f"timeout after {timeout}s"} if timed_out else {"error": "out of memory"} if st.get("OOMKilled") else {})}
 
 
+def _vanished(rec: dict) -> bool:
+    """The step's container was removed before it was collected: an infrastructure event."""
+    return (rec.get("error") or "").startswith("the container disappeared")
+
+
 def _cname(*parts) -> str:
     return "referee-" + state.sha256("|".join(str(x) for x in parts))[:16]
 
@@ -397,7 +402,8 @@ def ensure_env(cfg: state.Config, root: Path, env_dir: Path, image: str, checkou
             b["rec"] = None
             err = (done.get("stderr") or "") + (done.get("error") or "")
             fix = recover(err, b["image"], checkout) if done.get("returncode") != 0 else None
-            if not fix and done.get("returncode") != 0 and (infra := classify(done)["infra_error"]):
+            if not fix and done.get("returncode") != 0 and (
+                    infra := classify(done)["infra_error"] or ("the container vanished" if _vanished(done) else "")):
                 fix = (b["image"], f"an infrastructure failure ('{infra}'): rebuilt unchanged")
             if done.get("returncode") == 0 or not fix or b["attempt"] > MAX_RECOVERIES:
                 ok = done.get("returncode") == 0
@@ -488,13 +494,16 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         if done is None:
             return True
         state.append_jsonl(root / "execution.jsonl", done)
-        st["rec"], st["records"] = None, st.get("records", 0) + (done["mode"] == "evidence")
-        if st["stage"] == "prepare":
+        st["rec"] = None
+        if _vanished(done) and st.get("restarts", 0) < 2:          # ponytail: two restarts of a vanished step
+            st["restarts"] = st.get("restarts", 0) + 1                # infrastructure, never a result: run it again
+        elif st["stage"] == "prepare":
             if done.get("returncode") != 0:
                 return _finish(cfg, root, check, {**st, "authorized": False, "why": "prepare step: " + (
                     done.get("stderr") or done.get("error") or "")[-300:]})
             st["stage"] = "run"
         else:
+            st["records"] = st.get("records", 0) + 1
             ev = classify(done)
             rel = (check.get("target") or {}).get("relation", "")
             if kind == "AUTHOR_CODE":

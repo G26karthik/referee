@@ -375,6 +375,9 @@ def test_detached_steps_outlive_their_poller():
             break
         time.sleep(1)
     assert done and done["timed_out"] and done["returncode"] is None
+    gone = execute.start(execute._cname("kernel-gone", time.time()), ["sleep", "30"], **spec)
+    execute._docker(["docker", "rm", "-f", gone["container"]], 60)       # removed by hand, uncollected
+    assert execute._vanished(execute.collect(gone, 60))                  # an infrastructure event, restarted
     with tempfile.TemporaryDirectory() as t:        # an env is a named volume, built by polls, never blocking
         cfg = state.Config()
         cfg.allow_install = cfg.allow_network = True
