@@ -48,6 +48,8 @@ class Config:
     max_runs: int = field(default_factory=lambda: _int("SH_MAX_RUNS", 100))
     # ponytail: 3 seeded replicates give a reconstruction a noise band; raise via env for tighter ones.
     replicates: int = field(default_factory=lambda: _int("SH_REPLICATES", 3))
+    # ponytail: 2 concurrent script seeds fit a 6-CPU Docker VM; raise via env on a bigger host.
+    parallel: int = field(default_factory=lambda: _int("SH_PARALLEL", 2))
     run_timeout_s: int = field(default_factory=lambda: _int("SH_RUN_TIMEOUT_S", 3600))
     install_timeout_s: int = field(default_factory=lambda: _int("SH_INSTALL_TIMEOUT_S", 3600))
     try_timeout_s: int = field(default_factory=lambda: _int("SH_TRY_TIMEOUT_S", 300))

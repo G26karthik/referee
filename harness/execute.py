@@ -523,54 +523,88 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         mounts = [(cdir / "run", f"{MOUNT}/check", True), (volume(env_dir), "/env", True)] + (
             [(checkout, f"{MOUNT}/repo", True)] if has_repo else [])
         workdir, env = (f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check"), {}
-    if st["rec"]:
-        done = collect(st["rec"], cfg.install_timeout_s if st["stage"] == "prepare" else cfg.run_timeout_s)
+    # Steps in flight, by seed ("-1" is the prepare step). Independent seeds of a script run
+    # SH_PARALLEL at a time (private /tmp, read-only mounts); author code one at a time (it
+    # writes into one work copy, and may hold the GPU). Parallel is scheduling, never a downscale.
+    fly = st.setdefault("fly", {})
+    if st.get("rec"):                                        # one in-flight step, from before parallel seeds
+        fly["-1" if st["stage"] == "prepare" else str(st["seed"])] = st["rec"]
+        st.setdefault("next", st["seed"] + (st["stage"] == "run"))
+    st["rec"] = None
+    st.setdefault("next", st.get("seed", 0))
+    runs, width = int(check.get("runs") or 1), 1 if kind == "AUTHOR_CODE" else max(1, cfg.parallel)
+    timeout = cfg.install_timeout_s if st["stage"] == "prepare" else cfg.run_timeout_s
+    for key, rec in sorted(fly.items(), key=lambda kv: int(kv[0])):
+        done = collect(rec, timeout)
         if done is None:
-            return True
+            continue
         state.append_jsonl(root / "execution.jsonl", done)
-        st["rec"] = None
+        del fly[key]
         if _vanished(done) and st.get("restarts", 0) < 2:          # ponytail: two restarts of a vanished step
             st["restarts"] = st.get("restarts", 0) + 1                # infrastructure, never a result: run it again
-        elif st["stage"] == "prepare":
+            st.setdefault("redo", []).append(int(key))
+            continue
+        if st["stage"] == "prepare":
             if done.get("returncode") != 0:
                 return _finish(cfg, root, check, {**st, "authorized": False, "why": "prepare step: " + (
                     done.get("stderr") or done.get("error") or "")[-300:]})
             st["stage"] = "run"
+            continue
+        st["records"] = st.get("records", 0) + 1
+        ev = classify(done)
+        rel = (check.get("target") or {}).get("relation", "")
+        if kind == "AUTHOR_CODE":
+            v, note = parse_metric(done["stdout"], check.get("metric", ""))
+            vs = [v] if v is not None and not (ev["failed"] and "text" in note) else []
+        else:   # bound by name: the relation's outputs, the generator's compared output, or `violated`
+            vs = (relation_margins(done["stdout"], rel) if rel else
+                  result_values(done["stdout"], "violated" if kind == "CERTIFICATE" else check.get("metric", "")))
+            st["literal"] += result_values(done["stdout"], "literal_violated") if kind == "CERTIFICATE" else []
+        if ev["failed"]:
+            return _finish(cfg, root, check, {**_cancel(root, st), "ev": ev, "failure": (
+                done.get("error") or (done.get("stderr") or "")[-400:] or f"exit {done.get('returncode')}").strip()})
+        if not vs:                # a clean exit with no bound metric establishes nothing
+            return _finish(cfg, root, check, {**_cancel(root, st), "values": []})
+        st["values"] += vs
+        st["seed"] += 1
+    if st["stage"] == "run" and st["seed"] >= runs and not fly:
+        return _finish(cfg, root, check, st)
+    todo = []
+    if st["stage"] == "prepare" and not fly:
+        todo = [-1]
+    while st["stage"] == "run" and len(fly) + len(todo) < width and (st.get("redo") or st["next"] < runs):
+        if st.get("redo"):
+            todo.append(st["redo"].pop(0))
         else:
-            st["records"] = st.get("records", 0) + 1
-            ev = classify(done)
-            rel = (check.get("target") or {}).get("relation", "")
-            if kind == "AUTHOR_CODE":
-                v, note = parse_metric(done["stdout"], check.get("metric", ""))
-                vs = [v] if v is not None and not (ev["failed"] and "text" in note) else []
-            else:   # bound by name: the relation's outputs, the generator's compared output, or `violated`
-                vs = (relation_margins(done["stdout"], rel) if rel else
-                      result_values(done["stdout"], "violated" if kind == "CERTIFICATE" else check.get("metric", "")))
-                st["literal"] += result_values(done["stdout"], "literal_violated") if kind == "CERTIFICATE" else []
-            if ev["failed"]:
-                return _finish(cfg, root, check, {**st, "ev": ev, "failure": (
-                    done.get("error") or (done.get("stderr") or "")[-400:] or f"exit {done.get('returncode')}").strip()})
-            if not vs:            # a clean exit with no bound metric establishes nothing
-                return _finish(cfg, root, check, {**st, "values": []})
-            st["values"] += vs
-            st["seed"] += 1
-            if st["seed"] >= int(check.get("runs") or 1):
-                return _finish(cfg, root, check, st)
-    step = f"{st['stage']}{st['seed']}"
-    if st["stage"] == "prepare":
-        argv, network, mode, meta = ["sh", "-c", check["prepare"]], True, "prepare", {}
-    elif kind == "AUTHOR_CODE":
-        cmd, st["seeded"] = seeded_command(check["command"], check.get("seed_flag", ""), st["seed"])
-        argv, network, mode = ["sh", "-c", cmd], False, "evidence"
-    else:
-        argv, network, mode = ["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", str(st["seed"])], False, "evidence"
-    meta = {"commit": src.get("commit", "") if has_repo else "", "seed": st["seed"],
-            "script_sha256": check.get("script_sha256", "")} if mode == "evidence" else {}
-    st["rec"] = start(_cname(cdir.resolve(), st.get("token", ""), step), argv, mounts=mounts, workdir=workdir,
-                      image=image, network=network, env=env, gpus=(kind == "AUTHOR_CODE" or env_dir == root / "env")
-                      and gpu(cfg), mode=mode, target=cid, meta=meta)
+            todo.append(st["next"])
+            st["next"] += 1
+    for seed in todo:
+        if seed < 0:
+            argv, network, mode = ["sh", "-c", check["prepare"]], True, "prepare"
+        elif kind == "AUTHOR_CODE":
+            cmd, st["seeded"] = seeded_command(check["command"], check.get("seed_flag", ""), seed)
+            argv, network, mode = ["sh", "-c", cmd], False, "evidence"
+        else:
+            argv, network, mode = ["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", str(seed)], False, "evidence"
+        meta = {"commit": src.get("commit", "") if has_repo else "", "seed": seed,
+                "script_sha256": check.get("script_sha256", "")} if mode == "evidence" else {}
+        fly[str(seed)] = start(_cname(cdir.resolve(), st.get("token", ""), f"{mode}{seed}"), argv, mounts=mounts,
+                               workdir=workdir, image=image, network=network, env=env,
+                               gpus=(kind == "AUTHOR_CODE" or env_dir == root / "env") and gpu(cfg),
+                               mode=mode, target=cid, meta=meta)
     state.write_json(cdir / "exec.json", st)
     return True
+
+
+def _cancel(root: Path, st: dict) -> dict:
+    """End the seeds still in flight once one seed decided the check; each leaves a record."""
+    for rec in st.get("fly", {}).values():
+        _docker(["docker", "rm", "-f", rec["container"]], 60)
+        state.append_jsonl(root / "execution.jsonl", {**rec, "returncode": None, "timed_out": False, "stdout": "",
+                                                       "stderr": "", "ended_at": state.now(), "seconds": 0,
+                                                       "error": "cancelled: another seed of this check ended it"})
+    st["fly"] = {}
+    return st
 
 
 def _finish(cfg: state.Config, root: Path, check: dict, st: dict) -> bool:
