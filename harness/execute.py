@@ -529,7 +529,7 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             st["cert"] += row.get("cert") or []
             st["done_seeds"].append(row["seed"])
             st.setdefault("pilot_s", row.get("seconds") or 0)
-        st["seed"] = len(st["done_seeds"])
+        st["seed"], st["reused"] = len(st["done_seeds"]), len(st["done_seeds"])
         log = root / "execution.jsonl"          # this exact script was killed for memory before: one seed at a time
         if check.get("script_sha256") and log.exists() and any(
                 r.get("script_sha256") == check["script_sha256"] and r.get("returncode") == 137
@@ -614,15 +614,13 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
                                                    "seconds": done.get("seconds")})
         if "pilot_s" not in st:                           # the first completed run is the pilot
             st["pilot_s"] = done.get("seconds") or 0
-            w = 1 if kind == "AUTHOR_CODE" else max(1, min(cfg.parallel, st.get("width", cfg.parallel)))
-            hours = st["pilot_s"] * (runs - st["seed"]) / w / 3600
-            if hours > cfg.check_budget_s / 3600:
-                return _finish(cfg, root, check, {**_cancel(root, st), "blocker": (
-                    f"the {runs} runs need about {hours:.1f} h more at the pilot's {st['pilot_s'] / 60:.1f} min per "
-                    f"run ({w} at a time); this host's per-check budget is {cfg.check_budget_s / 3600:.1f} h "
-                    "(SH_CHECK_BUDGET_S). The run count is not reduced: the completed run(s) are recorded as a "
-                    "pilot and decide nothing.")})
+            if (why := _over_budget(cfg, check, st, runs)):
+                return _finish(cfg, root, check, {**_cancel(root, st), "blocker": why})
     _sample_memory(st, fly)
+    if st.get("reused") and not st.get("budget_checked") and st["seed"] < runs:   # a pilot from a checkpoint
+        st["budget_checked"] = True
+        if (why := _over_budget(cfg, check, st, runs)):
+            return _finish(cfg, root, check, {**_cancel(root, st), "blocker": why})
     if st["stage"] == "run" and st["seed"] >= runs and not fly:
         return _finish(cfg, root, check, st)
     todo = []
@@ -688,6 +686,18 @@ def resource_action(done: dict, st: dict, key: str, timeout: int) -> tuple[str, 
     return "", ""
 
 
+def _over_budget(cfg: state.Config, check: dict, st: dict, runs: int) -> str:
+    """The documented blocker when the timed pilot projects the remaining runs past the budget."""
+    w = 1 if check["kind"] == "AUTHOR_CODE" else max(1, min(cfg.parallel, st.get("width", cfg.parallel)))
+    need = st.get("pilot_s", 0) * (runs - st["seed"]) / w
+    if need <= cfg.check_budget_s:
+        return ""
+    fmt = lambda sec: f"{sec / 3600:.1f} h" if sec >= 3600 else f"{sec / 60:.0f} min" if sec >= 60 else f"{sec:.0f} s"
+    return (f"the {runs} runs need about {fmt(need)} more at the pilot's {fmt(st['pilot_s'])} per run ({w} at a "
+            f"time); this host's per-check budget is {fmt(cfg.check_budget_s)} (SH_CHECK_BUDGET_S). The run count "
+            "is not reduced: the completed run(s) are recorded as a pilot and decide nothing.")
+
+
 def _ckpt_key(check: dict) -> str:
     return check.get("script_sha256") or f"{check.get('command', '')}|{check.get('seed_flag', '')}"
 
@@ -745,7 +755,7 @@ def protocol(check: dict, st: dict, rule: str) -> dict:
             "supplied_by_referee": [d["used"] for d in devs if not d.get("printed")],
             "claim_changes": [d["used"] for d in devs if d.get("changes_claim")],
             **({"pilot_seconds": st["pilot_s"]} if st.get("pilot_s") else {}),
-            **({"seeds_reused_from_checkpoints": len(st.get("done_seeds", []))} if st.get("done_seeds") else {})}
+            **({"seeds_reused_from_checkpoints": st["reused"]} if st.get("reused") else {})}
 
 
 def stop(cfg: state.Config, pid: str, cid: str, why: str) -> dict:
