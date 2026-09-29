@@ -218,6 +218,13 @@ def _vanished(rec: dict) -> bool:
     return (rec.get("error") or "").startswith("the container disappeared")
 
 
+def _volume_gone(name: str) -> bool:
+    """Docker no longer holds this named volume (its storage was reset or pruned): what it held
+    must be rebuilt, never mounted empty. A daemon that cannot answer is not an answer."""
+    rc, out = _docker(["docker", "volume", "inspect", name], 60)
+    return rc != 0 and "no such volume" in out.lower()
+
+
 def _cname(*parts) -> str:
     return "referee-" + state.sha256("|".join(str(x) for x in parts))[:16]
 
@@ -505,7 +512,9 @@ def ensure_env(cfg: state.Config, root: Path, env_dir: Path, image: str, checkou
     ExecutionRecord."""
     marker, build = env_dir / "referee-env.json", env_dir.parent / f".{env_dir.name}.build.json"
     if (m := state.read_json(marker)) and "ok" in m:
-        return m
+        if not (m["ok"] and any(_volume_gone(v) for v in (m.get("volume") or volume(env_dir), m.get("base")) if v)):
+            return m
+        marker.replace(env_dir / "referee-env.vanished.json")   # kept; the same build runs again
     if not (cfg.allow_install and cfg.allow_network):
         return {"ok": False, "detail": "the install or network gate is shut, so no environment was built", "image": image}
     if not docker_status()[0]:
@@ -699,7 +708,10 @@ def fetch(cfg: state.Config, root: Path, cid: str, sources: list[dict]) -> dict 
     cdir = Path(root) / "checks" / cid
     f = cdir / "data.json"
     if (d := state.read_json(f)) and "n_files" in d:
-        return d
+        if not (d["n_files"] and _volume_gone(d.get("volume") or data_volume(root, cid))):
+            return d
+        f.replace(cdir / "data.vanished.json")    # kept (its hashes); the same sources are acquired again
+        d = None
     if not (cfg.allow_network and cfg.allow_install):
         d = {"sources": [{"source": s["source"], "error": "the network or install gate is shut"} for s in sources],
              "files": [], "n_files": 0, "bytes": 0, "fetched_at": state.now()}
@@ -711,7 +723,8 @@ def fetch(cfg: state.Config, root: Path, cid: str, sources: list[dict]) -> dict 
     if not st.get("rec"):   # the same sources, already acquired for another check of this paper: shared, read-only
         for other in sorted(Path(root).glob("checks/*/data.json")):
             o = state.read_json(other) or {}
-            if other.parent.name != cid and o.get("fetched_at") and o.get("n_files") and [
+            if other.parent.name != cid and o.get("fetched_at") and o.get("n_files") and not _volume_gone(
+                    o.get("volume") or data_volume(root, other.parent.name)) and [
                     {k: s.get(k) for k in ("source", "include")} for s in o.get("sources", [])] == [
                     {k: s.get(k) for k in ("source", "include")} for s in sources]:
                 state.write_json(f, {**o, "shared_with": other.parent.name})
@@ -823,6 +836,8 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
     kind, has_repo = check["kind"], (checkout / ".git").is_dir()
     src = state.read_json(root / "source.json", {})
     if "env" not in st:                                      # first poll: the gate, then the environment
+        if check.get("acquire") and "n_files" not in (state.read_json(cdir / "data.json") or {}):
+            return True                                      # its cited data is (re-)acquiring
         commit_ok = repo_mod.verify_commit(checkout, src.get("commit", "")) if kind == "AUTHOR_CODE" else (True, "")
         ok, why = authorize(cfg, check, commit_ok)
         if not ok:
@@ -986,6 +1001,17 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             st["next"] += 1
             while st["next"] in done_set:
                 st["next"] += 1
+    if todo and any(_volume_gone(v) for v in [st["env"].get("volume") or volume(env_dir), st["env"].get("base")]
+                    + [m[0] for m in data_mount(root, cid)] if v):
+        # Docker's storage was reset under a running check: every in-flight step is recorded as
+        # vanished, the environment and data are rebuilt, and the ended seeds are reused.
+        for rec in fly.values():
+            state.append_jsonl(root / "execution.jsonl", {**rec, "returncode": None, "timed_out": False, "stdout": "",
+                                                           "stderr": "", "ended_at": state.now(), "seconds": 0,
+                                                           "error": "the container disappeared before it was collected "
+                                                                    "(Docker's volumes were gone)"})
+        state.write_json(cdir / "exec.json", {"token": st.get("token", ""), "storage_lost_at": state.now()})
+        return True
     for seed in todo:
         if seed < 0:
             argv, network, mode = ["sh", "-c", check["prepare"]], True, "prepare"

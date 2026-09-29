@@ -693,6 +693,37 @@ def test_extra_packages_are_a_thin_layer_not_a_copy_of_the_environment():
     assert execute.env_mounts(Path("x"), {"ok": True})[0] == [(execute.volume(Path("x")), "/env", True)]
 
 
+def test_a_vanished_volume_is_rebuilt_never_mounted_empty():
+    """Sep-30: Docker's storage was reset under a paused run; every 'built' marker then named a
+    volume that no longer existed. The marker is set aside and the same build or download runs
+    again; a daemon that cannot answer is not taken as 'gone'."""
+    saved = execute._volume_gone, execute.docker_status
+    try:
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            cfg = state.Config()
+            cfg.projects, cfg.allow_install, cfg.allow_network = td, True, True
+            env_dir = td / "env"
+            state.write_json(env_dir / "referee-env.json", {"ok": True, "volume": "referee-x", "image": "i"})
+            state.write_json(td / "checks" / "C1" / "data.json", {"n_files": 2, "volume": "referee-d", "files": []})
+            execute.docker_status = lambda: (False, "away")          # nothing starts in this test
+            execute._volume_gone = lambda v: False
+            assert execute.ensure_env(cfg, td, env_dir, "i", None)["ok"]
+            assert execute.fetch(cfg, td, "C1", [{"source": "u"}])["n_files"] == 2
+            execute._volume_gone = lambda v: True
+            assert execute.ensure_env(cfg, td, env_dir, "i", None) is None
+            assert (env_dir / "referee-env.vanished.json").exists() and not (env_dir / "referee-env.json").exists()
+            assert execute.fetch(cfg, td, "C1", [{"source": "u"}]) is None
+            assert (td / "checks" / "C1" / "data.vanished.json").exists()
+        execute._docker, real = (lambda a, t: (1, "Cannot connect to the Docker daemon")), execute._docker
+        try:
+            assert not saved[0]("referee-x")
+        finally:
+            execute._docker = real
+    finally:
+        execute._volume_gone, execute.docker_status = saved
+
+
 def test_a_run_that_measures_then_fails_keeps_its_measurements_live():
     """Live (Docker): a script measures stage `a`, then fails in stage `b`, on every seed. The check
     runs all its seeds, keeps stage a's three results, and ends PARTIAL — never 'did not begin'."""

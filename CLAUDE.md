@@ -123,8 +123,10 @@ attempt is an ExecutionRecord (`mode=install`, `recovery`); the outcome carries
 `environment.recovery`; anything else stays BLOCKED with the pip/uv error. A RECONSTRUCTION
 runs in the authors' environment when it builds (started as soon as a plan needs it), else on
 the fixed baseline; a script may declare extra packages (`# REFEREE_PACKAGES:`, sha-covered) and
-runs in a copy of its environment with them. Every long step is a detached, named container that
-each `tasks` call polls (no host process must survive); venvs live in Docker named volumes.
+runs with them in a thin layer (`pip --target`, its own volume) over its read-only environment,
+never a copy. Every long step is a detached, named container that
+each `tasks` call polls (no host process must survive); venvs live in Docker named volumes. A
+marker (env or data) whose volume Docker no longer holds is set aside and rebuilt, never mounted empty.
 A reconstruction runs at least SH_REPLICATES (3) seeds; a script that cannot start goes back to
 its author with the error (within SH_MAX_REVISIONS = 3).
 
