@@ -1001,10 +1001,10 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             st["next"] += 1
             while st["next"] in done_set:
                 st["next"] += 1
-    if todo and any(_volume_gone(v) for v in [st["env"].get("volume") or volume(env_dir), st["env"].get("base")]
-                    + [m[0] for m in data_mount(root, cid)] if v):
-        # Docker's storage was reset under a running check: every in-flight step is recorded as
-        # vanished, the environment and data are rebuilt, and the ended seeds are reused.
+    if todo and _storage_changed(st, env_dir, root, check):
+        # Docker's storage was reset under a running check (a volume is gone, or its environment
+        # or data is being rebuilt under the same name): every in-flight step is recorded as
+        # vanished, the check waits for the rebuild, and the ended seeds are reused.
         for rec in fly.values():
             state.append_jsonl(root / "execution.jsonl", {**rec, "returncode": None, "timed_out": False, "stdout": "",
                                                            "stderr": "", "ended_at": state.now(), "seconds": 0,
@@ -1029,6 +1029,19 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
                                mode=mode, target=cid, meta=meta)
     state.write_json(cdir / "exec.json", st)
     return True
+
+
+def _storage_changed(st: dict, env_dir: Path, root: Path, check: dict) -> bool:
+    """Is what this running check started on still there, unchanged? Its env marker must still be
+    the one it started with (a rebuild sets it aside first), its data must not be re-acquiring,
+    and Docker must still hold every volume it mounts."""
+    now = state.read_json(env_dir / "referee-env.json") or {}
+    if not str(st["env"].get("detail", "")).startswith(str(now.get("detail") or "\0")):
+        return True                  # script_env may append to the detail, never change it
+    if check.get("acquire") and "n_files" not in (state.read_json(root / "checks" / check["id"] / "data.json") or {}):
+        return True
+    return any(_volume_gone(v) for v in [st["env"].get("volume") or volume(env_dir), st["env"].get("base")]
+               + [m[0] for m in data_mount(root, check["id"])] if v)
 
 
 def resource_action(done: dict, st: dict, key: str, timeout: int) -> tuple[str, str]:

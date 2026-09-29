@@ -715,6 +715,14 @@ def test_a_vanished_volume_is_rebuilt_never_mounted_empty():
             assert (env_dir / "referee-env.vanished.json").exists() and not (env_dir / "referee-env.json").exists()
             assert execute.fetch(cfg, td, "C1", [{"source": "u"}]) is None
             assert (td / "checks" / "C1" / "data.vanished.json").exists()
+            # A running check's env being rebuilt under the same volume name (Sep-30: two seeds ran
+            # against a half-built env) is a change, though the volume exists again.
+            execute._volume_gone = lambda v: False
+            st = {"env": {"ok": True, "volume": "referee-x", "detail": "built v; freeze 1 (the authors' env did not build)"}}
+            assert execute._storage_changed(st, env_dir, td, {"id": "C1"})            # marker set aside: rebuilding
+            state.write_json(env_dir / "referee-env.json", {"ok": True, "volume": "referee-x", "detail": "built v; freeze 1"})
+            assert not execute._storage_changed(st, env_dir, td, {"id": "C1"})        # the same env, detail appended
+            assert execute._storage_changed(st, env_dir, td, {"id": "C1", "acquire": [{"source": "u"}]})  # data re-acquiring
         execute._docker, real = (lambda a, t: (1, "Cannot connect to the Docker daemon")), execute._docker
         try:
             assert not saved[0]("referee-x")
