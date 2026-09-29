@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 from . import execute, paper, reconcile, report, state
-from .evidence import command, documented, flat, has_word, interval, relation, value_in
+from .evidence import command, documented, flat, has_word, interval, mask, printed_form, relation, value_in
 from .repo import listing, released
 
 LENSES = ("overclaim", "protocol", "confound", "contradiction")
@@ -26,7 +26,7 @@ REQUIRED = {"CERTIFICATE": ("hypotheses", "claimed_bound", "instance"),
 SEVERITY = ("NOTE", "MINOR", "MAJOR", "FATAL")
 CLASSES = ("CONFIRMED_FINDING", "PLAUSIBLE_CONCERN", "OPEN_QUESTION", "DISMISSED")
 PROMPTS = Path(__file__).parent / "prompts"
-_EFFORT = {"lens": "high", "critic": "high", "plan": "high", "bind": "high", "gen": "high",
+_EFFORT = {"lens": "high", "critic": "high", "plan": "high", "bind": "high", "gen": "high", "vision": "medium",
            "verify": "high", "report": "medium"}
 
 
@@ -106,6 +106,16 @@ class _Ctx:
                 c["severity"], c["critic"] = r["severity"], r.get("reason", "")   # only ever lowered
             if r.get("withdraw"):
                 c["withdrawn"] = r.get("reason", "") or "withdrawn by the critic"
+            if isinstance(c.get("calculation"), dict) and c["class"] == "CONFIRMED_FINDING":
+                # An arithmetic error read from extracted text stands only once the page image agrees.
+                chk = _image_check(self, "vision:concerns", _calc_items(self, c["id"], c["calculation"]))
+                if chk and chk["agrees"]:
+                    c["image_check"] = "every number was read off the page image and agrees with the extracted text"
+                elif chk:
+                    c["class"], c["image_check"] = "OPEN_QUESTION", "the page image disagrees: " + chk["disagree"]
+                    c["severity"] = SEVERITY[min(SEVERITY.index(c["severity"]), SEVERITY.index("MINOR"))]
+                else:
+                    c["class"], c["image_check"] = "PLAUSIBLE_CONCERN", "not yet read off the page image"
         return out
 
     def task(self, tid: str, role: str, prompt: str, extra_reads: tuple[Path, ...] = (),
@@ -118,6 +128,49 @@ class _Ctx:
         return {"id": tid, "role": role, "prompt": path.as_posix(),
                 "out": (self.root / "out" / f"{_safe(tid)}.json").as_posix(),
                 "effort": _EFFORT[role], "reads": reads, "after": []}
+
+
+def _calc_items(x: "_Ctx", prefix: str, calc: dict) -> list[dict]:
+    """The printed numbers an arithmetic claim rests on, each masked in its re-found context."""
+    items = []
+    parts = [(o.get("name"), o) for o in calc.get("operands") or [] if isinstance(o, dict)]
+    if isinstance(calc.get("paper_result"), dict):
+        parts.append(("result", calc["paper_result"]))
+    elif isinstance(calc.get("target"), dict):
+        parts.append(("result", calc["target"]))
+    for name, o in parts:
+        hit = x.paper.find(str(o.get("quote") or ""))[0]
+        ctx = mask(hit["quote"], str(o.get("value") or "")) if hit else None
+        items.append({"id": f"{prefix}:{name}", "page": hit and hit["page"], "context": ctx,
+                      "extracted": str(o.get("value") or "")})
+    return items
+
+
+def _image_check(x: "_Ctx", tid: str, items: list[dict]) -> dict | None:
+    """The transcriber's reading of each item against the extraction; None until it is sealed.
+    An item that cannot be located or masked cannot be confirmed."""
+    read = (x.sealed(tid) or {}).get("read") if items else None
+    if read is None:
+        return None
+    bad = [f"{i['id']}: image {read.get(i['id'], '')!r} vs extracted {i['extracted']!r}" for i in items
+           if not i["context"] or printed_form(read.get(i["id"], "")) != printed_form(i["extracted"])]
+    return {"agrees": not bad, "disagree": "; ".join(bad)[:600], "read": {i["id"]: read.get(i["id"]) for i in items}}
+
+
+def _vision_task(x: "_Ctx", tid: str, items: list[dict]) -> list[dict]:
+    todo = [i for i in items if i["context"]]
+    if not todo or x.sealed(tid) is not None:
+        return []
+    lines = "\n".join(f"- id: {i['id']} | page image: {x.pages_dir}/p{i['page']:03d}.png | context: {i['context']!r}"
+                      for i in todo)
+    return [x.task(tid, "vision", _template("vision", title=x.meta["title"], pages_dir=x.pages_dir, items=lines),
+                   paper=False)]
+
+
+def _concern_vision(x: "_Ctx") -> list[dict]:
+    raw = [c for lens in LENSES for c in (x.sealed(f"lens:{lens}") or {}).get("concerns", [])
+           if isinstance(c.get("calculation"), dict) and c.get("class") == "CONFIRMED_FINDING"]
+    return _vision_task(x, "vision:concerns", [i for c in raw for i in _calc_items(x, c["id"], c["calculation"])])
 
 
 def _concern_lines(concerns: list[dict]) -> str:
@@ -156,8 +209,8 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
         return "plan", [x.task("plan", "plan", _template(
             "plan", title=title, pages_dir=x.pages_dir, repo=repo_line, checkout=x.checkout.as_posix(),
             gpu="unknown until first use", concerns=_concern_lines(x.concerns()), listing=lst,
-            max_checks=x.cfg.max_checks), rows)], []
-    tasks = []
+            max_checks=x.cfg.max_checks), rows)] + _concern_vision(x), []
+    tasks = _concern_vision(x)
     # Environments start as soon as an unfinished check needs them; each advance moves them one step.
     open_ = [c for c in plan["checks"] if not (x.root / "checks" / c["id"] / "outcome.json").exists()]
     if (x.checkout / ".git").is_dir() and plan["repo_is_authors"] and any(
@@ -217,6 +270,20 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
                 {k: c[k] for k in ("operands", "expression", "target")}, ensure_ascii=False, indent=1), "")]
         if v["verdict"] == "APPROVE":
             out = reconcile.arithmetic(*c["interval"], c["printed"])
+            if out["status"] == "ARITHMETIC_CONTRADICTION":   # asserted only once the page images agree
+                calc = {"operands": c["operands"], "target": {"quote": (c["target"] or {}).get("quote") or (
+                    c["target"] or {}).get("row", ""), "value": c["printed"]}}
+                items = _calc_items(x, cid, calc)
+                chk = _image_check(x, f"vision:{cid}", items)
+                if chk is None:
+                    return _vision_task(x, f"vision:{cid}", items) or _terminal(
+                        cdir, c, "INCONCLUSIVE", "the extracted numbers disagree, but they could not be located on "
+                        "the page image, so no arithmetic error is asserted")
+                out = ({**out, "image_check": chk, "reason": out["reason"] + "; every number was read off the page "
+                        "image and agrees with the extraction"} if chk["agrees"] else
+                       {"status": "INCONCLUSIVE", "image_check": chk, "reason": "the extracted numbers disagree, but the "
+                        f"page image disagrees with the extraction ({chk['disagree']}): no error is asserted from "
+                        "garbled text"})
         else:
             out = {"status": "NOT_CHECKABLE", "reason": f"verifier {v['verdict']}: {v['required_changes'] or v['notes']}"}
         state.write_json(cdir / "outcome.json", {"check": cid, "kind": kind, "evidence": "PAPER_ARITHMETIC",
@@ -268,7 +335,9 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
             # An experiment is decided over independent seeded replicates: never fewer than the
             # paper states, and at least enough for a noise band (more is never a downscale).
             runs = max(g["runs"], x.cfg.replicates) if kind == "RECONSTRUCTION" else g["runs"]
-            check = {**c, "runs": runs, "script_sha256": g["script_sha256"], "metric": g.get("metric", c["metric"]),
+            source = "paper" if g.get("runs_quote") else ("referee_floor" if runs > g["runs"] else "referee")
+            check = {**c, "runs": runs, "runs_quote": g.get("runs_quote", ""), "runs_source": source,
+                     "script_sha256": g["script_sha256"], "metric": g.get("metric", c["metric"]),
                      "deviations": g.get("deviations", []),
                      "approval": {"approved": True, "script_sha256": v["script_sha256"]}}
             shutil.copyfile(cdir / f"script.{r}.py", cdir / "script.py")
@@ -642,8 +711,20 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         h = _find(x, str(d["printed"]), errors, "deviation `printed`") if d.get("printed") else None
         if not str(d.get("used") or "").strip():
             errors.append("each deviation needs `used`: what the script does instead of the printed text")
+        if not isinstance(d.get("changes_claim"), bool):
+            errors.append("each deviation needs `changes_claim`: true if it changes what the printed claim says (a "
+                          "premise dropped or added, the conclusion, an index or a definition), false if it only fixes "
+                          "a detail the claim leaves open")
         deviations.append({"printed": h["quote"] if h else "", "page": h["page"] if h else None,
-                           "used": str(d.get("used") or "")[:600], "why": str(d.get("why") or "")[:600]})
+                           "used": str(d.get("used") or "")[:600], "why": str(d.get("why") or "")[:600],
+                           "changes_claim": d.get("changes_claim") is True})
+    if c["kind"] == "CERTIFICATE":   # a counterexample must satisfy every premise of the exact claim
+        if "premises_hold" not in script:
+            errors.append("each result line reports `premises_hold`: 1 if every premise of the claim being tested holds "
+                          "on the instance (evaluated exactly), else 0 — never drop a premise to get a violation")
+        if any(d["changes_claim"] for d in deviations) and not re.search(r"""["']literal["']""", script):
+            errors.append("a certificate that changes the claim's reading also reports `literal` (holds, fails, "
+                          "undefined or premise_not_met) for the text exactly as printed")
     if errors and final:
         return {"refused": True, "notes": "; ".join(errors)[:2000]}
     _fail_or_drop(errors, final)
@@ -671,12 +752,17 @@ def _seal_verify(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
             "notes": str(obj.get("notes") or "")[:2000], "quotes": quotes, "script_sha256": g.get("script_sha256", "")}
 
 
+def _seal_vision(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
+    return {"read": {str(i.get("id")): str(i.get("printed") or "")[:120] for i in obj.get("items") or []
+                     if isinstance(i, dict)}, "notes": str(obj.get("notes") or "")[:1000]}
+
+
 def _seal_report(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     return {"summary_md": str(obj.get("summary_md") or "")[:8000]}
 
 
 VALIDATORS = {"lens": _seal_lens, "critic": _seal_critic, "plan": _seal_plan, "bind": _seal_bind,
-              "gen": _seal_gen, "verify": _seal_verify, "report": _seal_report}
+              "gen": _seal_gen, "verify": _seal_verify, "report": _seal_report, "vision": _seal_vision}
 _EMPTY = {"lens": {"concerns": [], "dropped": []}, "critic": {"reviews": []},
           "plan": {"checks": [], "central_claims": [], "dropped": [], "repo_is_authors": False, "repo_note": ""},
           "bind": {"identity": {"established": False, "reason": "malformed binding answer"}, "command": "",
@@ -684,7 +770,7 @@ _EMPTY = {"lens": {"concerns": [], "dropped": []}, "critic": {"reviews": []},
           "gen": {"refused": True, "notes": "malformed answer"},
           "verify": {"verdict": "UNCHECKABLE", "required_changes": "", "notes": "malformed verifier answer",
                      "quotes": [], "script_sha256": ""},
-          "report": {"summary_md": ""}}
+          "report": {"summary_md": ""}, "vision": {"read": {}, "notes": "malformed answer"}}
 
 
 def try_(cfg: state.Config, pid: str, tid: str, script_path: str) -> dict:

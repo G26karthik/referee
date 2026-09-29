@@ -5,10 +5,14 @@ instances in EXACT ARITHMETIC. Not a reproduction of experiments; a formal check
   - Use `fractions.Fraction` (never float) for the comparison that decides the result.
   - For the instance indexed by `--seed`: construct ONE concrete instance inside the
     statement's own domain (different seeds -> different instances, via a small seeded
-    generator); `assert` EVERY stated hypothesis on it in exact arithmetic and let a failed
-    assertion raise (the harness reads that as an inadmissible instance, never as a
-    counterexample); evaluate the checked relation exactly; print
-    `REFEREE_RESULT {"violated": 1 or 0, "lhs": <float>, "rhs": <float>}`.
+    generator). Evaluate EVERY premise of the exact claim being tested (for a proof step: the
+    step's own "if" and every hypothesis in force at that point) in exact arithmetic and report
+    `premises_hold` (1 only if all hold). NEVER drop, weaken or skip a premise to obtain a
+    violation: a violation on an instance whose premises fail is not a counterexample, and
+    when no instance you can construct meets the premises, report `premises_hold: 0` — the
+    harness records PREMISE_NOT_MET, which is itself a finding for the referee. Evaluate the
+    conclusion exactly and print
+    `REFEREE_RESULT {"premises_hold": 1 or 0, "violated": 1 or 0, "lhs": <float>, "rhs": <float>}`.
   - SEARCH WHERE A VIOLATION WOULD BE: hypotheses at their edges (boundary points, degenerate
     or rank-deficient matrices, equality cases, parameters at their limits); a bound claimed
     for all t along a LONG horizon, every step, not a few early ones.
@@ -38,14 +42,20 @@ is what is being checked: follow the paper, and state the code's difference in `
 finding for the referee).
 
 ## verify CERTIFICATE
-  1. Does `hypotheses` carry EVERY hypothesis the statement (or, for a proof step, the proof at
-     that point) states — nothing missing, nothing weakened?
+  1. Does `premises_hold` evaluate EVERY premise of the exact claim tested (for a proof step: the
+     step's own condition and every hypothesis in force) — nothing dropped, weakened or asserted
+     away? A violation counted on an instance where a premise fails is a REJECTION; an
+     unsatisfiable premise must be reported (`premises_hold: 0`), not removed.
   2. Does `claimed_bound` match the paper's relation EXACTLY — constants, direction, quantifier
      order? A different, easier inequality proves nothing about the printed one.
   3. Are the constructed instances admissible, and do they probe the edges where a violation
      would be?
   4. Is the decisive comparison exact (`Fraction`), and is `violated` computed from it?
   5. Is `checked_statement` honest (an asymptotic conclusion is not finitely checkable)?
+  6. Is `changes_claim` true for every deviation that alters what the printed claim says (a
+     premise, the conclusion, an index range, a definition), and does `literal` separate
+     `fails` (premises hold and the conclusion fails as printed) from `undefined` (the printed
+     text is not well-defined on the instance, e.g. an index out of range)?
 
 ## verify RELEASED_DATA
   1. Does the script open the right released file(s) for THIS printed number, by literal path?

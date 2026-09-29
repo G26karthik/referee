@@ -21,7 +21,10 @@ THE SCRIPT CONTRACT
     {{metric}}. Values are read by NAME only.
   - It never reads the paper's printed result to produce its own, and never compares with it:
     it computes; the harness compares.
-  - Keep one run under about 30 minutes.
+  - Keep one run under about 30 minutes. The harness times the first run as a pilot and stops
+    with a documented blocker if the stated run count cannot finish on this host; a long run may
+    save progress under /work/ckpt (a per-seed scratch volume) and resume from it after a
+    restart — it is never evidence.
 
 BINDINGS. For each required kind below, give `paper_quote` (the paper's own words, copied
 verbatim from the parsed text — the harness re-finds it) and `impl_quote` (the literal line(s)
@@ -33,13 +36,17 @@ binding is not.
 
 DEVIATIONS. Every departure from the paper's printed text goes in `deviations`, each as
 {"printed": the paper's words verbatim ("" if the paper is silent), "used": what the script
-does instead, "why": ...}: a changed index range or convention (0- vs 1-based), a hypothesis
-added, dropped or strengthened, a substituted function or constant, a detail the paper leaves
-open that you had to fix. An unlisted departure gets the check rejected. For a CERTIFICATE
-whose deviation changes the printed statement or step itself (not merely fills a gap), ALSO
-evaluate the text exactly as printed on the same instance and add `"literal_violated": 1 or 0`
-to the result line (1 if as printed it fails or is undefined, e.g. an index out of range):
-the harness records both readings side by side and never picks one.
+does instead, "why": ..., "changes_claim": true|false}: a changed index range or convention
+(0- vs 1-based), a hypothesis added, dropped or strengthened, a substituted function or
+constant, a detail the paper leaves open that you had to fix. `changes_claim` is true when the
+deviation changes what the printed claim says (a premise, the conclusion, an index, a
+definition) and false when it only fixes a detail the claim leaves open (a distribution, a
+threshold, a seed) — those are protocol choices REFEREE supplied and are reported as such. An
+unlisted departure gets the check rejected. For a CERTIFICATE with a claim-changing deviation,
+ALSO evaluate the text exactly as printed on the same instance and add `"literal": "holds" |
+"fails" | "undefined" | "premise_not_met"` to the result line (fails = its premises hold and
+its conclusion fails as printed; undefined = the printed text is not well-defined there): the
+harness records both readings and never picks one.
 
 REPLICATION. If the paper states how many seeds/runs/instances this used, set `runs` to it and
 copy the sentence into `runs_quote`; never fewer than the paper used. A RECONSTRUCTION is run at least 3 times (seeds

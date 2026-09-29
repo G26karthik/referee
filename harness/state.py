@@ -50,6 +50,8 @@ class Config:
     replicates: int = field(default_factory=lambda: _int("SH_REPLICATES", 3))
     # ponytail: 2 concurrent script seeds fit a 6-CPU Docker VM; raise via env on a bigger host.
     parallel: int = field(default_factory=lambda: _int("SH_PARALLEL", 2))
+    # ponytail: a check projected (from its timed pilot run) past 2 h is a documented blocker, not downscaled.
+    check_budget_s: int = field(default_factory=lambda: _int("SH_CHECK_BUDGET_S", 7200))
     run_timeout_s: int = field(default_factory=lambda: _int("SH_RUN_TIMEOUT_S", 3600))
     install_timeout_s: int = field(default_factory=lambda: _int("SH_INSTALL_TIMEOUT_S", 3600))
     try_timeout_s: int = field(default_factory=lambda: _int("SH_TRY_TIMEOUT_S", 300))

@@ -66,9 +66,24 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     keys). Scripts: the author's named `metric`, a stated `relation` over named outputs, or
     `violated` for a certificate — never a flag computed against the printed number.
 15. **Deviations are recorded; readings are never chosen.** Every departure from the printed
-    text (indexing, a hypothesis, a substitution, a filled gap) is declared, re-found and
-    shown with the result. Readings of one printed object that disagree (a certificate's own
-    as-printed reading, or two checks) are recorded as a conflict: claim status CONFLICTING.
+    text is declared, re-found and flagged `changes_claim` (it alters a premise, conclusion,
+    index or definition) or not (it fixes a detail the claim leaves open: a protocol choice
+    REFEREE supplied, reported as such with runs, seeds and decision rule). Two checks of one
+    printed object that disagree are CHECKS_DISAGREE.
+16. **A counterexample satisfies every premise of the exact claim.** Certificates report
+    `premises_hold` per instance; a violation on an inadmissible instance is nothing, one found
+    only under a changed reading is VIOLATION_UNDER_CHANGED_READING, no admissible instance is
+    PREMISE_NOT_MET (claim status READING_CHANGED / PREMISE_NOT_MET, never a failure).
+17. **Small samples are decided with Student-t** (two-sided 95%): a relation beyond t·SE; a
+    reproduction RESOLVED inside the CI of the mean, FAILED outside the prediction interval.
+18. **No arithmetic error from extracted math without the page image.** An independent
+    transcriber reads every number of an ARITHMETIC_CONTRADICTION or a CONFIRMED arithmetic
+    concern off the page PNG (masked context); disagreement withdraws the assertion.
+19. **Resources end in a documented blocker, never a loop.** The first run is a timed pilot;
+    a projection past SH_CHECK_BUDGET_S, an out-of-memory kill of a lone run, or a run past
+    SH_RUN_TIMEOUT_S is a BLOCKED "RESOURCE BLOCKER" with the measurement, not repeated and
+    never downscaled. Completed seeds are checkpointed (seeds.jsonl) and reused; each seed has
+    a scratch volume at /work/ckpt.
 
 ## Dependency recovery (documented, isolated, recorded)
 

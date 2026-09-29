@@ -105,6 +105,34 @@ def _canon(tok: str) -> str:
     return tok.replace(",", "").replace("−", "-").lstrip("+")
 
 
+def mask(text: str, value: str) -> str | None:
+    """`text` with the standalone number `value` replaced by [?] (None if it is not printed there):
+    what an independent transcriber sees, so they read the number off the page, not off us."""
+    v = _canon(value.strip())
+    for m in _NUMBER.finditer(text or ""):
+        if _canon(m.group()) == v:
+            return text[:m.start()] + "[?]" + text[m.end():]
+    return None
+
+
+_SUP = dict(zip("⁰¹²³⁴⁵⁶⁷⁸⁹⁻⁺", "0123456789-+"))
+
+
+def printed_form(s: str) -> str:
+    """A number as printed, normalized for comparison: superscripts become ^exponent (10³ ->
+    10^3), minus signs and spaces fold; it never folds a superscript into a plain digit."""
+    out, sup = [], False
+    for ch in (s or "").strip():
+        if ch in _SUP:
+            out.append(("" if sup else "^") + _SUP[ch])
+            sup = True
+            continue
+        sup = False
+        out.append(ch)
+    t = "".join(out).replace("−", "-").replace("×", "x").replace("·", "x").replace("*", "x")
+    return re.sub(r"[\s,{}]", "", t).lower()
+
+
 def value_in(text: str, value: str) -> bool:
     """Is `value` printed in `text` as a standalone number (not a subscript, an index, or
     part of a fused token like "0.12.3")?"""

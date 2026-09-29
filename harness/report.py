@@ -26,13 +26,18 @@ _RANK = {"FATAL": 3, "MAJOR": 2, "MINOR": 1, "NOTE": 0}
 _TESTED = SUPPORT + FAILURE + ("NO_VIOLATION_FOUND",)
 
 
+def _changed(c: dict) -> bool:
+    return any(d.get("changes_claim") for d in c.get("deviations") or [])
+
+
 def _claim_status(cs: list[dict], conflicted: bool = False) -> str:
     """What the checks of one central claim FOUND. A failed step of a printed proof is a gap in
-    the proof, never a refutation of the statement."""
+    the proof, never a refutation of the statement; a premise no tested instance met, or a
+    result that holds only for a changed reading of the claim, is neither support nor failure."""
     if not cs:
         return "NOT_CHECKED"
     if conflicted:
-        return "READINGS_DISAGREE"
+        return "CHECKS_DISAGREE"
     fails = [c for c in cs if c["status"] in FAILURE]
     if any(c["evidence"] != "PROOF_AUDIT" for c in fails):
         return "FAILURE_FOUND"
@@ -40,6 +45,11 @@ def _claim_status(cs: list[dict], conflicted: bool = False) -> str:
         return "PROOF_GAP_FOUND"
     if any(c["status"] in SUPPORT for c in cs):
         return "SUPPORT_FOUND"
+    if any(c["status"] == "PREMISE_NOT_MET" for c in cs):
+        return "PREMISE_NOT_MET"
+    if any(c["status"] == "VIOLATION_UNDER_CHANGED_READING" or (c["status"] == "NO_VIOLATION_FOUND" and _changed(c))
+           for c in cs):
+        return "READING_CHANGED"
     if any(c["status"] == "NO_VIOLATION_FOUND" for c in cs):
         return "NO_VIOLATION_FOUND"
     return "PENDING" if any(c["status"] == "PENDING" for c in cs) else "NOTHING_DECIDED"
@@ -48,9 +58,12 @@ def _claim_status(cs: list[dict], conflicted: bool = False) -> str:
 def _done(c: dict) -> str:
     """What one check did, in a few words, and its status."""
     n = len(c.get("values") or [])
-    what = {"CERTIFICATE": f"{n} exact instance(s)", "ARITHMETIC": "the paper's own operands"}.get(
+    adm = f", {c['admissible']} admissible" if c.get("admissible") is not None else ""
+    lit = "".join(f", as printed {v} {k}" for k, v in (c.get("literal") or {}).items() if v)
+    what = {"CERTIFICATE": f"{n} exact instance(s){adm}{lit}", "ARITHMETIC": "the paper's own operands"}.get(
         c["kind"], f"{c.get('runs') or 0} run(s), {n} result(s)")
-    return f"{c['id']} {c['kind']}{' proof step' if c['evidence'] == 'PROOF_AUDIT' else ''} on {what}: {c['status']}"
+    return (f"{c['id']} {c['kind']}{' proof step' if c['evidence'] == 'PROOF_AUDIT' else ''} on {what}"
+            f"{' (claim reading changed)' if _changed(c) else ''}: {c['status']}")
 
 
 def _checks(root: Path, plan: dict) -> list[dict]:
@@ -70,6 +83,8 @@ def _checks(root: Path, plan: dict) -> list[dict]:
                     "command": run.get("command", ""), "identity": run.get("identity"),
                     "script_sha256": run.get("script_sha256", ""), "deviations": run.get("deviations", []),
                     "runs": o.get("runs"), "values": o.get("values"), "literal": o.get("literal"),
+                    "admissible": o.get("admissible"), "protocol": o.get("protocol"),
+                    "image_check": o.get("image_check"), "pilot_values": o.get("pilot_values"),
                     "status": o.get("status"), "reason": o.get("reason", ""), "rule": o.get("rule", ""),
                     "environment": o.get("environment"), "authorization": o.get("authorization", ""),
                     "commit": o.get("commit", ""), "records": "execution.jsonl" if o.get("runs") else ""})
@@ -77,17 +92,13 @@ def _checks(root: Path, plan: dict) -> list[dict]:
 
 
 def _readings(c: dict) -> list[dict]:
-    """Each reading of its printed object a check evaluated: its own (with its recorded
-    deviations) and, when it also evaluated the text exactly as printed, that one."""
+    """The reading of its printed object a check decided (the text as printed, or as changed by
+    its recorded claim-changing deviations). A check's own as-printed evaluation is part of its
+    status (COUNTEREXAMPLE_FOUND, READING_CHANGED with its literal counts), not a conflict."""
     res = "holds" if c["status"] in SUPPORT + ("NO_VIOLATION_FOUND",) else "fails" if c["status"] in FAILURE else ""
-    if not res:
-        return []
-    out = [{"check": c["id"], "reading": "with recorded deviations" if c["deviations"] else "as printed",
-            "result": res, "deviations": c["deviations"]}]
-    if c["deviations"] and (lit := c.get("literal") or {}).get("n"):
-        out.append({"check": c["id"], "reading": "as printed", "result": "fails" if lit["violated"] else "holds",
-                    "deviations": [], "instances": f"{lit['violated']} of {lit['n']} instances fail or are undefined"})
-    return out
+    devs = [d for d in c["deviations"] if d.get("changes_claim")]
+    return [{"check": c["id"], "reading": "with claim-changing deviations" if devs else "as printed",
+             "result": res, "deviations": devs}] if res else []
 
 
 def conflicts(checks: list[dict]) -> list[dict]:
@@ -129,7 +140,7 @@ def _headline(checks: list[dict], claims: list[dict]) -> str:
     if any(c["status"] == "PENDING" for c in checks):
         return "CHECKS_PENDING"
     st = [c["claim_status"] for c in claims]
-    for found, head in (("FAILURE_FOUND", "CENTRAL_FAILURE_FOUND"), ("READINGS_DISAGREE", "CENTRAL_READINGS_DISAGREE"),
+    for found, head in (("FAILURE_FOUND", "CENTRAL_FAILURE_FOUND"), ("CHECKS_DISAGREE", "CENTRAL_CHECKS_DISAGREE"),
                         ("PROOF_GAP_FOUND", "CENTRAL_PROOF_GAP_FOUND")):
         if found in st:
             return head
@@ -137,7 +148,10 @@ def _headline(checks: list[dict], claims: list[dict]) -> str:
         return "CENTRAL_SUPPORT_FOUND"
     if "SUPPORT_FOUND" in st:
         return "SOME_CENTRAL_SUPPORT_FOUND"
-    return "CENTRAL_NO_VIOLATION_FOUND" if "NO_VIOLATION_FOUND" in st else "NO_CENTRAL_FINDING"
+    for found in ("PREMISE_NOT_MET", "READING_CHANGED", "NO_VIOLATION_FOUND"):
+        if found in st:
+            return f"CENTRAL_{found}"
+    return "NO_CENTRAL_FINDING"
 
 
 def scientific_status(root: Path) -> str:
@@ -288,9 +302,20 @@ def render(x, led: dict, rep: dict | None) -> str:
     recs = led["workflow"]["environment_recoveries"]
     if devs or recs:
         lines += ["## Recorded deviations and environment recoveries", ""] + [
-            f"- {cid}: " + (f"printed \"{_cell(d['printed'], 120)}\" (p{d['page']})" if d["printed"] else "the paper is silent")
+            f"- {cid}{' **(changes the claim)**' if d.get('changes_claim') else ''}: "
+            + (f"printed \"{_cell(d['printed'], 120)}\" (p{d['page']})" if d["printed"] else "the paper is silent")
             + f" -> used: {_cell(d['used'], 200)}. Why: {_cell(d['why'], 200)}" for cid, d in devs] + [
             f"- {cid} environment: {r['action']}" for cid, rs in recs.items() for r in rs] + [""]
+    prot = [(c["id"], c["protocol"]) for c in led["checks"] if c.get("protocol")]
+    if prot:
+        lines += ["## Protocol choices (what the paper stated, what REFEREE supplied)", ""]
+        for cid, pr in prot:
+            lines.append(f"- **{cid}**: runs {pr['runs']} ({pr['runs_from']}); seeds {pr['seeds']}; rule: "
+                         f"{_cell(pr['decision_rule'], 220)}" + (f"; relation {pr['relation']}" if pr.get("relation") else "")
+                         + (f"; pilot {pr['pilot_seconds']:.0f}s" if pr.get("pilot_seconds") else ""))
+            lines += [f"  - REFEREE supplied: {_cell(u, 220)}" for u in pr.get("supplied_by_referee", [])]
+            lines += [f"  - changes the claim: {_cell(u, 220)}" for u in pr.get("claim_changes", [])]
+        lines.append("")
     lines += ["## Summary (model-written from the ledger)", "",
               summary if summary and not bad else
               f"_Withheld: the summary used status language no check earns: {bad[:2]}_" if bad else "_No summary._", ""]
@@ -298,14 +323,15 @@ def render(x, led: dict, rep: dict | None) -> str:
     for c in [c for c in led["concerns"] if not c.get("withdrawn")][:15]:   # ponytail: 15 shown, all in the ledger
         q = "; ".join(f"\"{_cell(e['quote'], 160)}\" (p{e['page']})" for e in c["evidence"][:2])
         lines.append(f"- **{c['id']} {c['severity']}/{c['confidence']}** {_said(c['title'], led)} — "
-                     f"{_said(_cell(c['statement'], 300), led)} Evidence: {q}")
+                     f"{_said(_cell(c['statement'], 300), led)} Evidence: {q}"
+                     + (f" _Page-image check: {_cell(c['image_check'], 240)}._" if c.get("image_check") else ""))
     withdrawn = [c for c in led["concerns"] if c.get("withdrawn")]
     if withdrawn:
         lines += ["", f"_{len(withdrawn)} concern(s) withdrawn by the critic, with reasons, are in `ledger.json`._"]
     dropped = led["dropped"]
     lines += ["", "## Not checked", ""] + [
         f"- {_cell(cc['quote'], 140)}: {_said(cc['why_unchecked'], led) or 'no check reached a conclusion'}"
-        for cc in led["central_claims"] if cc["claim_status"] in ("NOT_CHECKED", "NOTHING_DECIDED")] + [
+        for cc in led["central_claims"] if cc["claim_status"] in ("NOT_CHECKED", "NOTHING_DECIDED", "PENDING")] + [
         f"- planned check {d['check']} dropped: {_cell(d['why'], 200)}" for d in dropped["checks"]] + [
         f"- {len(dropped['concerns_unresolved_quotes'])} concern(s) dropped because a quote did not resolve (ledger)."]
     text = "\n".join(lines) + "\n"

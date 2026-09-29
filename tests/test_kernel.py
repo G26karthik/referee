@@ -83,7 +83,7 @@ def test_reconcile_never_convicts_on_environment_or_refusal():
     assert execute.classify({**run, "stderr": tb.format("/work/repo/model.py")})["own_code_crash"]
     assert reconcile("RECONSTRUCTION", "61.4", [], "crash", {"reached": True}, True, True, "")["status"] == "INCONCLUSIVE"
     assert reconcile("CERTIFICATE", "", [], "AssertionError", {}, False, True, "")["status"] == "INCONCLUSIVE"
-    assert reconcile("CERTIFICATE", "", [0, 1, 0], "", {}, False, True, "")["status"] == "COUNTEREXAMPLE_FOUND"
+    assert reconcile("CERTIFICATE", "", [0, 1, 0], "", {}, False, True, "")["status"] == "INCONCLUSIVE"  # premises unsaid
     assert reconcile("CERTIFICATE", "", [0, 0], "", {}, False, True, "")["status"] == "NO_VIOLATION_FOUND"
     assert reconcile("TRY", "61.4", [61.4], "", {}, False, True, "")["status"] == "INCONCLUSIVE"   # not admissible
 
@@ -273,10 +273,11 @@ def test_the_compared_output_is_bound_by_name_by_the_script_author():
         g = {"script": script, "runs": 1, "outputs": ["n_no_cp", "violated"], "bindings": binds}
         for metric in ("", "violated", "n_other"):
             assert "`metric`" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {**g, "metric": metric}, final=False))
-        bad_dev = {"printed": "a sentence the paper never printed", "used": "x"}
+        bad_dev = {"printed": "a sentence the paper never printed", "used": "x", "changes_claim": False}
         assert "deviation" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {**g, "metric": "n_no_cp",
                                                                                "deviations": [bad_dev]}, final=False))
-        dev = {"printed": "We report the mean over 5 random seeds", "used": "one pass over the file", "why": "no seeds"}
+        dev = {"printed": "We report the mean over 5 random seeds", "used": "one pass over the file", "why": "no seeds",
+               "changes_claim": False}
         rec = tasks._seal_gen(x, "gen:C1.1", {**g, "metric": "n_no_cp", "deviations": [dev]}, final=False)
         assert rec["metric"] == "n_no_cp" and rec["deviations"][0]["page"] == 1
         out = 'REFEREE_RESULT {"violated": 0, "n_no_cp": 17, "n_all": 83}'
@@ -334,19 +335,22 @@ def test_status_is_about_central_claims_and_conflicting_readings_are_recorded():
             state.write_json(root / "checks" / "C2" / "outcome.json", {"status": s})
             assert report.scientific_status(root) == "CENTRAL_NO_VIOLATION_FOUND"
         assert report._central(plan, report._checks(root, plan), [])[0]["claim_status"] == "NO_VIOLATION_FOUND"
-        dev = {"printed": "for j = 1..J", "used": "j = 0..J-1", "why": "1-based leaves the range", "page": 6}
+        dev = {"printed": "for j = 1..J", "used": "j = 0..J-1", "why": "1-based leaves the range", "page": 6,
+               "changes_claim": True}
         state.write_json(root / "checks" / "C1" / "check.json", {"deviations": [dev]})
         state.write_json(root / "checks" / "C1" / "outcome.json",
-                         {"status": "NO_VIOLATION_FOUND", "literal": {"n": 36, "violated": 36}})
-        conf = report.conflicts(report._checks(root, plan))
-        assert len(conf) == 1 and conf[0]["explained"] and conf[0]["checks"] == ["C1"]
-        assert {r["reading"]: r["result"] for r in conf[0]["readings"]} == {"with recorded deviations": "holds",
-                                                                              "as printed": "fails"}
-        assert report.scientific_status(root) == "CENTRAL_READINGS_DISAGREE"
+                         {"status": "NO_VIOLATION_FOUND", "literal": {"undefined": 36}})
+        assert report._central(plan, report._checks(root, plan), [])[0]["claim_status"] == "READING_CHANGED"
+        assert report.scientific_status(root) == "CENTRAL_READING_CHANGED"      # a changed reading: not support
+        state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "PREMISE_NOT_MET"})
+        assert report.scientific_status(root) == "CENTRAL_PREMISE_NOT_MET"      # an unmet premise: not a failure
         plan["checks"].append({"id": "C3", "kind": "CERTIFICATE", "concerns": [], "claim": "x", "statement": "Theorem 1"})
         plan["central_claims"][1]["checks"] = ["C3"]
         state.write_json(root / "checks" / "C1" / "check.json", {})
         state.write_json(root / "checks" / "C3" / "outcome.json", {"status": "COUNTEREXAMPLE_FOUND"})
+        conf = report.conflicts(report._checks(root, plan))       # same reading, opposite results
+        assert conf == []                                         # C1's premise was never met: nothing to disagree
+        state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "NO_VIOLATION_FOUND"})
         conf = report.conflicts(report._checks(root, plan))       # same reading, opposite results
         assert len(conf) == 1 and not conf[0]["explained"] and conf[0]["checks"] == ["C1", "C3"]
         plan["checks"] = plan["checks"][:2] + [{**plan["checks"][2], "statement": "Lemma 2", "step": "hence x < 1"}]
@@ -354,6 +358,99 @@ def test_status_is_about_central_claims_and_conflicting_readings_are_recorded():
         assert claims[1]["claim_status"] == "PROOF_GAP_FOUND" and report._headline([], claims) == "CENTRAL_PROOF_GAP_FOUND"
         plan["central_claims"][1]["checks"] = []
         assert report._central(plan, report._checks(root, plan), [])[1]["claim_status"] == "NOT_CHECKED"
+
+
+def test_a_counterexample_satisfies_every_premise_of_the_exact_claim():
+    """Sep-29 central audit: changepoint C3's 'counterexample' dropped the step's premise (it was
+    unsatisfiable), and GRACE/label-ranking held only under changed indexing."""
+    from harness.reconcile import certificate
+    row = lambda v, p, lit=None: {"violated": v, "premises": p, "literal": lit}
+    assert certificate([row(1, 0)] * 15, False, True)["status"] == "PREMISE_NOT_MET"          # premise never met
+    assert certificate([row(1, 1), row(0, 1)], False, False)["status"] == "COUNTEREXAMPLE_FOUND"
+    assert certificate([row(1, 1)], True, False)["status"] == "VIOLATION_UNDER_CHANGED_READING"
+    assert certificate([row(0, 1, "fails")], True, False)["status"] == "COUNTEREXAMPLE_FOUND"  # fails exactly as printed
+    und = certificate([row(0, 1, "undefined")] * 36, True, False)
+    assert und["status"] == "NO_VIOLATION_FOUND" and und["literal"]["undefined"] == 36 and und["reading"].startswith("changed")
+    assert certificate([row(1, None)], False, False)["status"] == "INCONCLUSIVE"               # premises unsaid
+    assert certificate([row(0, 0), row(0, 1)], False, False)["admissible"] == 1
+    rows = execute.cert_rows('REFEREE_RESULT {"violated": 1, "premises_hold": 0}\nREFEREE_RESULT {"violated": 0}')
+    assert rows == [row(1, 0), row(0, None)]
+    with tempfile.TemporaryDirectory() as t:                  # the seal demands premises and honest deviations
+        cfg = state.Config()
+        plan = {"checks": [{"id": "C1", "kind": "CERTIFICATE", "metric": "", "statement": "Lemma 1", "step": ""}]}
+        x = type("X", (), {"root": Path(t), "paper": Paper(PAGES, ROWS), "cfg": cfg, "sealed": lambda self, tid: plan})()
+        script = "n = 1\nassert n\nok = n > 0\nprint('REFEREE_RESULT', {'violated': 0})\n"
+        b = [{"kind": k, "impl_quote": q, "paper_quote": "reaches 61.4 accuracy"} for k, q in
+             (("hypotheses", "assert n"), ("claimed_bound", "ok = n > 0"), ("instance", "n = 1"))]
+        g = {"script": script, "runs": 1, "outputs": ["violated"], "bindings": b}
+        assert "premises_hold" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", g, final=False))
+        g["script"] = script.replace("{'violated': 0}", "{'violated': 0, 'premises_hold': 1}")
+        dev = {"printed": "", "used": "j from 0", "why": "range"}
+        assert "changes_claim" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {**g, "deviations": [dev]}, final=False))
+        assert "literal" in _refused(lambda: tasks._seal_gen(
+            x, "gen:C1.1", {**g, "deviations": [{**dev, "changes_claim": True}]}, final=False))
+        assert tasks._seal_gen(x, "gen:C1.1", {**g, "deviations": [{**dev, "changes_claim": False}]}, final=False)["deviations"]
+
+
+def test_small_samples_are_decided_with_student_t():
+    """Sep-29 central audit: changepoint C1 held 'beyond 2 SE' on 3 replicates; t(2)=4.30 says no."""
+    from harness.reconcile import t975
+    rel = "err_km < err_lb"
+    st = lambda kind, ms: reconcile(kind, "", ms, "", {}, False, True, "", rel)["status"]
+    assert st("RECONSTRUCTION", [0.2417, 0.1411, 0.0821]) == "INCONCLUSIVE"
+    assert st("RECONSTRUCTION", [0.30, 0.31, 0.29]) == "RELATION_HOLDS"
+    assert t975(2) == 4.303 and t975(29) == 2.086 and t975(5000) == 1.96
+    ok = lambda printed, values: reconcile("RECONSTRUCTION", printed, values, "", {}, True, True, "")["status"]
+    assert ok("61.4", [61.0, 61.8, 61.5]) == "RESOLVED_VERIFIED"          # inside the CI of the mean
+    assert ok("61.4", [70.0, 70.1, 69.9]) == "FAILED_REPRODUCTION"        # outside the prediction interval
+    assert ok("61.4", [62.2, 63.0, 62.6]) == "INCONCLUSIVE"               # between: consistent, not pinned down
+
+
+def test_arithmetic_errors_from_extracted_text_need_the_page_image():
+    """Sep-29 central audit: a CONFIRMED 'arithmetic error' ('about 103 (= 51326/83)') was almost
+    surely 10^3 flattened by text extraction."""
+    from harness.evidence import mask, printed_form
+    assert mask("about 103(= 51326/83) times", "103") == "about [?](= 51326/83) times"
+    assert printed_form("10³") == printed_form("10^3") != printed_form("103")
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid = _project(td)
+        calc = {"operands": [{"name": "a", "quote": "reaches 61.4 accuracy", "value": "61.4"}], "expression": "a",
+                "paper_result": {"quote": "The baseline reaches 59.3", "value": "59.3"}}
+        concern = {"title": "sum", "severity": "MAJOR", "confidence": "HIGH", "class": "CONFIRMED_FINDING",
+                   "evidence": [{"quote": "reaches 61.4 accuracy"}], "calculation": calc}
+        _seal(cfg, pid, "lens:overclaim", {"concerns": [concern]}, td)
+        for lens in tasks.LENSES[1:]:
+            _seal(cfg, pid, f"lens:{lens}", {"concerns": []}, td)
+        x = tasks._Ctx(cfg, pid)
+        assert x.concerns()[0]["class"] == "PLAUSIBLE_CONCERN"            # not yet read off the page image
+        _seal(cfg, pid, "critic", {"reviews": []}, td)
+        assert "vision:concerns" in {t["id"] for t in tasks._plan(tasks._Ctx(cfg, pid))[1]}
+        _seal(cfg, pid, "vision:concerns", {"items": [{"id": "overclaim-01:a", "printed": "61.4"},
+                                                      {"id": "overclaim-01:result", "printed": "59.8"}]}, td)
+        c = tasks._Ctx(cfg, pid).concerns()[0]
+        assert c["class"] == "OPEN_QUESTION" and c["severity"] == "MINOR" and "59.8" in c["image_check"]
+
+
+def test_resource_limits_end_in_one_documented_blocker():
+    st = {}
+    oom = {"mode": "evidence", "error": "out of memory", "seconds": 40}
+    assert execute.resource_action(oom, st, "0", 3600)[0] == "retry" and st["width"] == 1   # alone, once
+    act, why = execute.resource_action(oom, st, "0", 3600)
+    assert act == "blocker" and "not repeated" in why                                      # never a third time
+    assert execute.resource_action({"mode": "evidence", "timed_out": True}, {}, "0", 60)[0] == "blocker"
+    assert execute.resource_action({"mode": "evidence", "returncode": 255}, {}, "0", 60) == ("", "")
+    with tempfile.TemporaryDirectory() as t:                  # completed seeds of the same script are reused
+        cdir = Path(t)
+        for k, sha in ((0, "a"), (1, "a"), (0, "b")):
+            state.append_jsonl(cdir / "seeds.jsonl", {"key": sha, "seed": k, "values": [k], "seconds": 5})
+        assert [r["seed"] for r in execute._checkpoints(cdir, {"script_sha256": "a", "runs": 3})] == [0, 1]
+    pr = execute.protocol({"kind": "RECONSTRUCTION", "runs": 3, "runs_source": "referee_floor",
+                           "target": {"relation": "a < b"}, "deviations": [
+                               {"printed": "", "used": "thresholds 50..700", "changes_claim": False},
+                               {"printed": "x", "used": "0-based j", "changes_claim": True}]}, {"pilot_s": 8}, "t-test")
+    assert "REFEREE" in pr["runs_from"] and pr["supplied_by_referee"] == ["thresholds 50..700"]
+    assert pr["claim_changes"] == ["0-based j"] and "planner" in pr["relation"] and pr["pilot_seconds"] == 8
 
 
 def test_detached_steps_outlive_their_poller():

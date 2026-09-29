@@ -78,8 +78,10 @@ result", "value": "4.2"}}. Classify a numeric discrepancy honestly: arithmetic e
 definitional mismatch, different denominator, unclear reporting, genuine contradiction, or
 not a discrepancy — most are reporting-clarity NOTEs.
 
-SOURCE FIDELITY — text extraction is lossy for tables, equations and sub/superscripts. Before
-a finding depends on one, open that page's PNG. The image can kill a candidate (an apparent
+SOURCE FIDELITY — text extraction is lossy for tables, equations and sub/superscripts (10³
+arrives as "103", a minus or a decimal point vanishes). Before a finding depends on one, open
+that page's PNG; an arithmetic error you mark CONFIRMED_FINDING is re-read number by number off
+the page images by an independent transcriber, and is downgraded if the image disagrees. The image can kill a candidate (an apparent
 contradiction is an extraction artifact) but cannot itself be the evidence: quotes must be
 copied from the parsed text you read.
 

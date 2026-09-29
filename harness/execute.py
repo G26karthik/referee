@@ -289,6 +289,25 @@ def result_values(stdout: str, key: str) -> list[float]:
     return [d[key] for d in _results(stdout) if key in d]
 
 
+def cert_rows(stdout: str) -> list[dict]:
+    """A certificate's instances: `violated`, `premises` (1/0 when the script evaluated every
+    premise of the exact claim; None when it did not say), `literal` (the text as printed)."""
+    rows = []
+    for line in (stdout or "").splitlines():
+        if not line.startswith("REFEREE_RESULT "):
+            continue
+        try:
+            d = json.loads(line[len("REFEREE_RESULT "):])
+        except ValueError:
+            continue
+        if isinstance(d, dict) and d.get("violated") in (0, 1):
+            rows.append({"violated": int(d["violated"]),
+                         "premises": int(d["premises_hold"]) if d.get("premises_hold") in (0, 1) else None,
+                         "literal": d.get("literal") if d.get("literal") in ("holds", "fails", "undefined",
+                                                                             "premise_not_met") else None})
+    return rows
+
+
 def relation_margins(stdout: str, rel: str) -> list[float]:
     """One paired margin per result line that carries every output the relation names."""
     names = relation(rel)[3]
@@ -503,8 +522,14 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
                                           (cdir / "script.py").read_text(encoding="utf-8")))
         if envinfo is None:
             return True
-        st.update(env=envinfo, env_dir=str(env_dir), why=why, seed=0, values=[], literal=[], rec=None,
-                  stage="prepare" if check.get("prepare") else "run")
+        st.update(env=envinfo, env_dir=str(env_dir), why=why, seed=0, values=[], cert=[], rec=None,
+                  stage="prepare" if check.get("prepare") else "run", done_seeds=[])
+        for row in _checkpoints(cdir, check):          # completed seeds of this exact script/command are kept
+            st["values"] += row["values"]
+            st["cert"] += row.get("cert") or []
+            st["done_seeds"].append(row["seed"])
+            st.setdefault("pilot_s", row.get("seconds") or 0)
+        st["seed"] = len(st["done_seeds"])
         log = root / "execution.jsonl"          # this exact script was killed for memory before: one seed at a time
         if check.get("script_sha256") and log.exists() and any(
                 r.get("script_sha256") == check["script_sha256"] and r.get("returncode") == 137
@@ -546,13 +571,17 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             continue
         state.append_jsonl(root / "execution.jsonl", done)
         del fly[key]
+        act, text = resource_action(done, st, key, timeout)
+        if act == "retry":
+            st.setdefault("redo", []).append(int(key))
+            continue
+        if act == "blocker":
+            return _finish(cfg, root, check, {**_cancel(root, st), "blocker": text})
         per = st.setdefault("restarts_by_seed", {})
         if (_vanished(done) or (done["mode"] == "evidence" and classify(done)["infra_error"])) and per.get(key, 0) < 3:
             per[key] = per.get(key, 0) + 1
-            st["restarts"] = st.get("restarts", 0) + 1   # ponytail: 3 restarts per seed; a vanished or OS-killed step is
-            st.setdefault("redo", []).append(int(key))   # infrastructure, never a result: run that seed again
-            if done.get("returncode") == 137 or "memory" in (done.get("error") or "").lower():
-                st["width"] = 1                          # killed for memory: its seeds then run one at a time
+            st["restarts"] = st.get("restarts", 0) + 1   # ponytail: 3 restarts per seed; a vanished or daemon-killed
+            st.setdefault("redo", []).append(int(key))   # step is infrastructure, never a result: run that seed again
             continue
         if st["stage"] == "prepare":
             if done.get("returncode") != 0:
@@ -566,10 +595,12 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         if kind == "AUTHOR_CODE":
             v, note = parse_metric(done["stdout"], check.get("metric", ""))
             vs = [v] if v is not None and not (ev["failed"] and "text" in note) else []
-        else:   # bound by name: the relation's outputs, the generator's compared output, or `violated`
-            vs = (relation_margins(done["stdout"], rel) if rel else
-                  result_values(done["stdout"], "violated" if kind == "CERTIFICATE" else check.get("metric", "")))
-            st["literal"] += result_values(done["stdout"], "literal_violated") if kind == "CERTIFICATE" else []
+        elif kind == "CERTIFICATE":
+            rows = cert_rows(done["stdout"])
+            vs = [r["violated"] for r in rows]
+            st.setdefault("cert", []).extend(rows)
+        else:   # bound by name: the relation's outputs or the generator's compared output
+            vs = (relation_margins(done["stdout"], rel) if rel else result_values(done["stdout"], check.get("metric", "")))
         if ev["failed"]:
             return _finish(cfg, root, check, {**_cancel(root, st), "ev": ev, "failure": (
                 done.get("error") or (done.get("stderr") or "")[-400:] or f"exit {done.get('returncode')}").strip()})
@@ -577,6 +608,21 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             return _finish(cfg, root, check, {**_cancel(root, st), "values": []})
         st["values"] += vs
         st["seed"] += 1
+        st.setdefault("done_seeds", []).append(int(key))
+        state.append_jsonl(cdir / "seeds.jsonl", {"key": _ckpt_key(check), "seed": int(key), "values": vs,
+                                                   "cert": rows if kind == "CERTIFICATE" else [],
+                                                   "seconds": done.get("seconds")})
+        if "pilot_s" not in st:                           # the first completed run is the pilot
+            st["pilot_s"] = done.get("seconds") or 0
+            w = 1 if kind == "AUTHOR_CODE" else max(1, min(cfg.parallel, st.get("width", cfg.parallel)))
+            hours = st["pilot_s"] * (runs - st["seed"]) / w / 3600
+            if hours > cfg.check_budget_s / 3600:
+                return _finish(cfg, root, check, {**_cancel(root, st), "blocker": (
+                    f"the {runs} runs need about {hours:.1f} h more at the pilot's {st['pilot_s'] / 60:.1f} min per "
+                    f"run ({w} at a time); this host's per-check budget is {cfg.check_budget_s / 3600:.1f} h "
+                    "(SH_CHECK_BUDGET_S). The run count is not reduced: the completed run(s) are recorded as a "
+                    "pilot and decide nothing.")})
+    _sample_memory(st, fly)
     if st["stage"] == "run" and st["seed"] >= runs and not fly:
         return _finish(cfg, root, check, st)
     todo = []
@@ -589,6 +635,11 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
     # ...and shared fairly: with several checks running, each holds at most an equal share of the slots.
     active = [e for e in cfg.projects.glob("*/checks/*/exec.json") if not (e.parent / "outcome.json").exists()]
     width = min(width, max(1, cfg.parallel // max(1, len(active))), st.get("width", width))
+    if "pilot_s" not in st:
+        width = 1                                          # a bounded pilot: one run first, timed, then the rest
+    done_set = set(st.get("done_seeds", []))
+    while st["next"] in done_set:
+        st["next"] += 1
     while st["stage"] == "run" and len(fly) + len(todo) < width and len(todo) < free and (
             st.get("redo") or st["next"] < runs):
         if st.get("redo"):
@@ -596,6 +647,8 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         else:
             todo.append(st["next"])
             st["next"] += 1
+            while st["next"] in done_set:
+                st["next"] += 1
     for seed in todo:
         if seed < 0:
             argv, network, mode = ["sh", "-c", check["prepare"]], True, "prepare"
@@ -606,12 +659,93 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             argv, network, mode = ["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", str(seed)], False, "evidence"
         meta = {"commit": src.get("commit", "") if has_repo else "", "seed": seed,
                 "script_sha256": check.get("script_sha256", "")} if mode == "evidence" else {}
-        fly[str(seed)] = start(_cname(cdir.resolve(), st.get("token", ""), f"{mode}{seed}"), argv, mounts=mounts,
+        ckpt = [(ckpt_volume(cdir, seed), f"{MOUNT}/ckpt", False)] if kind != "AUTHOR_CODE" and seed >= 0 else []
+        fly[str(seed)] = start(_cname(cdir.resolve(), st.get("token", ""), f"{mode}{seed}"), argv, mounts=mounts + ckpt,
                                workdir=workdir, image=image, network=network, env=env,
                                gpus=kind in ("AUTHOR_CODE", "RECONSTRUCTION") and gpu(cfg),   # an experiment may use it
                                mode=mode, target=cid, meta=meta)
     state.write_json(cdir / "exec.json", st)
     return True
+
+
+def resource_action(done: dict, st: dict, key: str, timeout: int) -> tuple[str, str]:
+    """What a run that hit a resource limit leads to: ("retry", "") once alone after an
+    out-of-memory kill that may have shared memory; ("blocker", why) when the same failure
+    would repeat (killed out of memory alone, or past the per-run limit); ("", "") otherwise."""
+    if done.get("mode") != "evidence":
+        return "", ""
+    if done.get("error") == "out of memory":
+        if not st.get("oom_retry"):
+            st.update(width=1, oom_retry=True)
+            return "retry", ""
+        return "blocker", (f"a single run was killed out of memory after {done.get('seconds', 0):.0f}s even when "
+                           f"running alone (peak observed {st.get('peak_mb', {}).get(key, '?')} MB; this host's "
+                           f"Docker VM has {_vm_mb()} MB). The same run fails the same way, so it is not repeated; "
+                           "it needs a host with more memory.")
+    if done.get("timed_out"):
+        return "blocker", (f"a single run exceeded this host's per-run limit of {timeout}s (SH_RUN_TIMEOUT_S); the "
+                           "protocol is not shortened, so it is not repeated.")
+    return "", ""
+
+
+def _ckpt_key(check: dict) -> str:
+    return check.get("script_sha256") or f"{check.get('command', '')}|{check.get('seed_flag', '')}"
+
+
+def _checkpoints(cdir: Path, check: dict) -> list[dict]:
+    """Seeds of this exact approved script (or documented command) that already completed."""
+    f, key, seen, out = cdir / "seeds.jsonl", _ckpt_key(check), set(), []
+    for row in map(json.loads, f.read_text(encoding="utf-8").splitlines() if f.exists() else []):
+        if row.get("key") == key and row["seed"] not in seen and row["seed"] < int(check.get("runs") or 1):
+            seen.add(row["seed"])
+            out.append(row)
+    return out
+
+
+def ckpt_volume(cdir: Path, seed: int) -> str:
+    """A per-seed scratch volume mounted at /work/ckpt: a long run may save progress there and
+    resume from it after an infrastructure restart (it never holds evidence)."""
+    return _cname("ckpt", Path(cdir).resolve(), seed)
+
+
+def _vm_mb() -> str:
+    rc, out = _docker(["docker", "info", "--format", "{{.MemTotal}}"], 30)
+    return str(int(out.strip()) // 2 ** 20) if rc == 0 and out.strip().isdigit() else "?"
+
+
+def _sample_memory(st: dict, fly: dict) -> None:
+    """The peak memory seen for each run in flight (sampled at each poll)."""
+    if not fly:
+        return
+    rc, out = _docker(["docker", "stats", "--no-stream", "--format", "{{.Name}} {{.MemUsage}}",
+                       *[r["container"] for r in fly.values()]], 30)
+    units = {"b": 1 / 2 ** 20, "kib": 1 / 1024, "kb": 1 / 1024, "mib": 1, "mb": 1, "gib": 1024, "gb": 1024}
+    names = {r["container"]: k for k, r in fly.items()}
+    for line in out.splitlines() if rc == 0 else []:
+        m = re.match(r"(\S+)\s+([\d.]+)\s*([A-Za-z]+)", line)
+        if m and m.group(1) in names and m.group(3).lower() in units:
+            mb = round(float(m.group(2)) * units[m.group(3).lower()])
+            peak = st.setdefault("peak_mb", {})
+            peak[names[m.group(1)]] = max(mb, peak.get(names[m.group(1)], 0))
+
+
+def protocol(check: dict, st: dict, rule: str) -> dict:
+    """Which protocol choices the paper stated and which REFEREE supplied, per check."""
+    runs, rel = int(check.get("runs") or 1), (check.get("target") or {}).get("relation", "")
+    src = check.get("runs_source") or ("paper" if check.get("runs_quote") else "referee")
+    devs = check.get("deviations") or []
+    return {"runs": runs, "runs_from": {"paper": f"the paper: {check.get('runs_quote', '')!r}",
+                                        "referee_floor": "REFEREE: at least SH_REPLICATES seeded replicates",
+                                        "referee": "REFEREE: the paper states no run count"}.get(src, src),
+            "seeds": "0..n-1 passed as --seed (REFEREE)" if check["kind"] != "AUTHOR_CODE"
+            else (f"the documented {check.get('seed_flag')} flag (REFEREE varies only its value)"
+                  if check.get("seed_flag") else "none (one documented run)"),
+            "decision_rule": rule,
+            **({"relation": f"{rel} (written by REFEREE's planner for the quoted sentence)"} if rel else {}),
+            "supplied_by_referee": [d["used"] for d in devs if not d.get("printed")],
+            "claim_changes": [d["used"] for d in devs if d.get("changes_claim")],
+            **({"pilot_seconds": st["pilot_s"]} if st.get("pilot_s") else {}),
+            **({"seeds_reused_from_checkpoints": len(st.get("done_seeds", []))} if st.get("done_seeds") else {})}
 
 
 def stop(cfg: state.Config, pid: str, cid: str, why: str) -> dict:
@@ -647,18 +781,24 @@ def _finish(cfg: state.Config, root: Path, check: dict, st: dict) -> bool:
     why = st.get("why", "")
     outcome = {"check": check["id"], "kind": kind, "evidence": EVIDENCE.get(kind, "NONE"), "authorized": authorized,
                "authorization": why, "commit": src.get("commit", "") if (root / "repo" / ".git").is_dir() else ""}
-    outcome.update(reconcile(kind, check.get("printed", ""), st.get("values", []), st.get("failure", ""),
-                             st.get("ev", {}), bool(st.get("seeded")) or (kind == "RECONSTRUCTION" and st.get("seed", 0) > 1),
-                             authorized, why,
-                             (check.get("target") or {}).get("relation", "")),
-                   values=st.get("values", []), runs=st.get("records", 0), records="execution.jsonl",
-                   finished_at=state.now())
+    if st.get("blocker"):         # a documented final blocker of this host: nothing about the paper is established
+        outcome.update(status="BLOCKED", reason=f"RESOURCE BLOCKER: {st['blocker']}", rule="bounded pilot and resources",
+                       values=[], pilot_values=st.get("values", []), runs=st.get("records", 0),
+                       records="execution.jsonl", finished_at=state.now())
+    else:
+        outcome.update(reconcile(kind, check.get("printed", ""), st.get("values", []), st.get("failure", ""),
+                                 st.get("ev", {}), bool(st.get("seeded")) or (kind == "RECONSTRUCTION" and st.get("seed", 0) > 1),
+                                 authorized, why, (check.get("target") or {}).get("relation", ""),
+                                 cert=st.get("cert") if kind == "CERTIFICATE" and st.get("cert") else None,
+                                 changed=any(d.get("changes_claim") for d in check.get("deviations") or []),
+                                 step=bool(check.get("step"))),
+                       values=st.get("values", []), runs=st.get("records", 0), records="execution.jsonl",
+                       finished_at=state.now())
+    outcome["protocol"] = protocol(check, st, outcome.get("rule", ""))
     if st.get("env"):
         outcome["environment"] = {k: st["env"].get(k) for k in ("detail", "image", "builder", "recovery")}
     if (st.get("ev") or {}).get("setup_error") and kind != "AUTHOR_CODE":   # the script never started: revisable
         outcome.update(setup_error=st["ev"]["setup_error"], setup_log=st.get("failure", "")[-1500:])
-    if st.get("literal"):  # the printed text evaluated exactly as printed, beside the recorded deviations
-        outcome["literal"] = {"n": len(st["literal"]), "violated": sum(1 for v in st["literal"] if v == 1)}
     state.write_json(root / "checks" / check["id"] / "outcome.json", outcome)
     return False
 
