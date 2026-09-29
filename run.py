@@ -127,7 +127,8 @@ def pack(cfg: state.Config, out: Path, pids: list[str], clean: bool) -> int:
             execute._docker(["docker", "volume", "rm", "-f", execute.volume(e)], 120)
         ckpts = [execute.ckpt_volume(c.parent, k) for root in roots for c in root.glob("checks/*/check.json")
                  for k in range(int((state.read_json(c) or {}).get("runs") or 1))] + [
-            execute.data_volume(root, d.name) for root in roots for d in root.glob("checks/*") if (d / "data.json").exists()]
+            (state.read_json(d / "data.json") or {}).get("volume") or execute.data_volume(root, d.name)
+            for root in roots for d in root.glob("checks/*") if (d / "data.json").exists()]
         for v in ckpts + ([execute.DOWNLOAD_CACHE] if not pids else []):
             execute._docker(["docker", "volume", "rm", "-f", v], 120)
         for h in heavy + ([cfg.projects / ".script-env"] if not pids else []):

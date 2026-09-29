@@ -672,7 +672,7 @@ def data_volume(root: Path, cid: str) -> str:
 def data_mount(root: Path, cid: str) -> list:
     """The acquired data of a check, read-only at /work/data, once it has any file."""
     d = state.read_json(Path(root) / "checks" / cid / "data.json") or {}
-    return [(data_volume(root, cid), DATA_MOUNT, True)] if d.get("n_files") else []
+    return [(d.get("volume") or data_volume(root, cid), DATA_MOUNT, True)] if d.get("n_files") else []
 
 
 def fetch(cfg: state.Config, root: Path, cid: str, sources: list[dict]) -> dict | None:
@@ -691,6 +691,14 @@ def fetch(cfg: state.Config, root: Path, cid: str, sources: list[dict]) -> dict 
     if not docker_status()[0]:
         return None
     st = d or {}
+    if not st.get("rec"):   # the same sources, already acquired for another check of this paper: shared, read-only
+        for other in sorted(Path(root).glob("checks/*/data.json")):
+            o = state.read_json(other) or {}
+            if other.parent.name != cid and o.get("fetched_at") and o.get("n_files") and [
+                    {k: s.get(k) for k in ("source", "include")} for s in o.get("sources", [])] == [
+                    {k: s.get(k) for k in ("source", "include")} for s in sources]:
+                state.write_json(f, {**o, "shared_with": other.parent.name})
+                return state.read_json(f)
     if st.get("rec"):
         done = collect(st["rec"], cfg.install_timeout_s)
         if done is None:
