@@ -40,7 +40,8 @@ to the result line (1 if as printed it fails or is undefined, e.g. an index out 
 the harness records both readings side by side and never picks one.
 
 REPLICATION. If the paper states how many seeds/runs/instances this used, set `runs` to it and
-copy the sentence into `runs_quote`; never fewer than the paper used.
+copy the sentence into `runs_quote`; never fewer than the paper used. A RECONSTRUCTION is run at least 3 times (seeds
+0, 1, 2): each seed must be an independent replicate (all randomness drawn from `--seed`).
 
 TESTING. You may run a draft (at most {{max_tries}} times; result lines are masked; drafts never
 count as evidence): write the script to a file, then run

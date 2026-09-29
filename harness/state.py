@@ -46,6 +46,8 @@ class Config:
     max_tries: int = field(default_factory=lambda: _int("SH_MAX_TRIES", 3))
     # ponytail: a paper stating more runs than this is refused, never downscaled.
     max_runs: int = field(default_factory=lambda: _int("SH_MAX_RUNS", 100))
+    # ponytail: 3 seeded replicates give a reconstruction a noise band; raise via env for tighter ones.
+    replicates: int = field(default_factory=lambda: _int("SH_REPLICATES", 3))
     run_timeout_s: int = field(default_factory=lambda: _int("SH_RUN_TIMEOUT_S", 3600))
     install_timeout_s: int = field(default_factory=lambda: _int("SH_INSTALL_TIMEOUT_S", 3600))
     try_timeout_s: int = field(default_factory=lambda: _int("SH_TRY_TIMEOUT_S", 300))

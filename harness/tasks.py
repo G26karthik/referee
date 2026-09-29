@@ -248,7 +248,10 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
                                       "checked_statement")}}, ensure_ascii=False, indent=1)
             return [_verify_task(x, c, r, spec, proposal, tries)]
         if v["verdict"] == "APPROVE":
-            check = {**c, "runs": g["runs"], "script_sha256": g["script_sha256"], "metric": g.get("metric", c["metric"]),
+            # An experiment is decided over independent seeded replicates: never fewer than the
+            # paper states, and at least enough for a noise band (more is never a downscale).
+            runs = max(g["runs"], x.cfg.replicates) if kind == "RECONSTRUCTION" else g["runs"]
+            check = {**c, "runs": runs, "script_sha256": g["script_sha256"], "metric": g.get("metric", c["metric"]),
                      "deviations": g.get("deviations", []),
                      "approval": {"approved": True, "script_sha256": v["script_sha256"]}}
             shutil.copyfile(cdir / f"script.{r}.py", cdir / "script.py")

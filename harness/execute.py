@@ -547,7 +547,8 @@ def _finish(cfg: state.Config, root: Path, check: dict, st: dict) -> bool:
     outcome = {"check": check["id"], "kind": kind, "evidence": EVIDENCE.get(kind, "NONE"), "authorized": authorized,
                "authorization": why, "commit": src.get("commit", "") if (root / "repo" / ".git").is_dir() else ""}
     outcome.update(reconcile(kind, check.get("printed", ""), st.get("values", []), st.get("failure", ""),
-                             st.get("ev", {}), bool(st.get("seeded")), authorized, why,
+                             st.get("ev", {}), bool(st.get("seeded")) or (kind == "RECONSTRUCTION" and st.get("seed", 0) > 1),
+                             authorized, why,
                              (check.get("target") or {}).get("relation", "")),
                    values=st.get("values", []), runs=st.get("records", 0), records="execution.jsonl",
                    finished_at=state.now())
