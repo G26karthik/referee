@@ -42,7 +42,7 @@ class Config:
     allow_source_search: bool = field(default_factory=lambda: _flag("SH_ALLOW_SOURCE_SEARCH"))
     # ponytail: token caps sized for a few papers per run; raise per invocation via env.
     max_checks: int = field(default_factory=lambda: _int("SH_MAX_CHECKS", 3))
-    max_revisions: int = field(default_factory=lambda: _int("SH_MAX_REVISIONS", 1))
+    max_revisions: int = field(default_factory=lambda: _int("SH_MAX_REVISIONS", 2))
     max_tries: int = field(default_factory=lambda: _int("SH_MAX_TRIES", 3))
     # ponytail: a paper stating more runs than this is refused, never downscaled.
     max_runs: int = field(default_factory=lambda: _int("SH_MAX_RUNS", 100))

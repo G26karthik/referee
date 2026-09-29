@@ -332,8 +332,8 @@ def test_status_is_about_central_claims_and_conflicting_readings_are_recorded():
         state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "NO_VIOLATION_FOUND"})
         for s in ("ARITHMETIC_CONSISTENT", "ARITHMETIC_CONTRADICTION"):   # incidental: never lifts or sinks it
             state.write_json(root / "checks" / "C2" / "outcome.json", {"status": s})
-            assert report.scientific_status(root) == "NO_CENTRAL_CLAIM_VERIFIED"
-        assert report._central(plan, report._checks(root, plan), [])[0]["claim_status"] == "TESTED_NO_VIOLATION"
+            assert report.scientific_status(root) == "CENTRAL_NO_VIOLATION_FOUND"
+        assert report._central(plan, report._checks(root, plan), [])[0]["claim_status"] == "NO_VIOLATION_FOUND"
         dev = {"printed": "for j = 1..J", "used": "j = 0..J-1", "why": "1-based leaves the range", "page": 6}
         state.write_json(root / "checks" / "C1" / "check.json", {"deviations": [dev]})
         state.write_json(root / "checks" / "C1" / "outcome.json",
@@ -342,13 +342,18 @@ def test_status_is_about_central_claims_and_conflicting_readings_are_recorded():
         assert len(conf) == 1 and conf[0]["explained"] and conf[0]["checks"] == ["C1"]
         assert {r["reading"]: r["result"] for r in conf[0]["readings"]} == {"with recorded deviations": "holds",
                                                                               "as printed": "fails"}
-        assert report.scientific_status(root) == "CENTRAL_CLAIM_CONFLICTING"
+        assert report.scientific_status(root) == "CENTRAL_READINGS_DISAGREE"
         plan["checks"].append({"id": "C3", "kind": "CERTIFICATE", "concerns": [], "claim": "x", "statement": "Theorem 1"})
         plan["central_claims"][1]["checks"] = ["C3"]
         state.write_json(root / "checks" / "C1" / "check.json", {})
         state.write_json(root / "checks" / "C3" / "outcome.json", {"status": "COUNTEREXAMPLE_FOUND"})
         conf = report.conflicts(report._checks(root, plan))       # same reading, opposite results
         assert len(conf) == 1 and not conf[0]["explained"] and conf[0]["checks"] == ["C1", "C3"]
+        plan["checks"] = plan["checks"][:2] + [{**plan["checks"][2], "statement": "Lemma 2", "step": "hence x < 1"}]
+        claims = report._central(plan, report._checks(root, plan), [])   # a failed proof STEP is a gap, not a refutation
+        assert claims[1]["claim_status"] == "PROOF_GAP_FOUND" and report._headline([], claims) == "CENTRAL_PROOF_GAP_FOUND"
+        plan["central_claims"][1]["checks"] = []
+        assert report._central(plan, report._checks(root, plan), [])[1]["claim_status"] == "NOT_CHECKED"
 
 
 def test_detached_steps_outlive_their_poller():

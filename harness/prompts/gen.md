@@ -12,7 +12,9 @@ The claim it bears on: {{claim}}
 {{contract}}
 
 THE SCRIPT CONTRACT
-  - Environment: {{environment}}. Write scratch files only under /tmp.
+  - Environment: {{environment}}. A package beyond it (e.g. a baseline's library) is declared on
+    ONE line `# REFEREE_PACKAGES: name==version other` (plain pip requirements, at most 10): drafts
+    and the evidence run then use a copy of the environment with them. Scratch files: /tmp only.
   - It accepts `--seed <int>`; the harness runs it once per seed 0..runs-1.
   - It prints `REFEREE_RESULT {"<name>": <number>, ...}` (JSON) lines — one per run, or one
     per replication the paper states when one run performs them all — carrying at least

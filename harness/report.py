@@ -26,14 +26,31 @@ _RANK = {"FATAL": 3, "MAJOR": 2, "MINOR": 1, "NOTE": 0}
 _TESTED = SUPPORT + FAILURE + ("NO_VIOLATION_FOUND",)
 
 
-def _claim_status(statuses: list[str], conflicted: bool = False) -> str:
+def _claim_status(cs: list[dict], conflicted: bool = False) -> str:
+    """What the checks of one central claim FOUND. A failed step of a printed proof is a gap in
+    the proof, never a refutation of the statement."""
+    if not cs:
+        return "NOT_CHECKED"
     if conflicted:
-        return "CONFLICTING"
-    if any(s in FAILURE for s in statuses):
-        return "VERIFIED_FAILURE"
-    if any(s in SUPPORT for s in statuses):
-        return "VERIFIED_SUPPORT"
-    return "TESTED_NO_VIOLATION" if "NO_VIOLATION_FOUND" in statuses else "NOT_VERIFIED"
+        return "READINGS_DISAGREE"
+    fails = [c for c in cs if c["status"] in FAILURE]
+    if any(c["evidence"] != "PROOF_AUDIT" for c in fails):
+        return "FAILURE_FOUND"
+    if fails:
+        return "PROOF_GAP_FOUND"
+    if any(c["status"] in SUPPORT for c in cs):
+        return "SUPPORT_FOUND"
+    if any(c["status"] == "NO_VIOLATION_FOUND" for c in cs):
+        return "NO_VIOLATION_FOUND"
+    return "PENDING" if any(c["status"] == "PENDING" for c in cs) else "NOTHING_DECIDED"
+
+
+def _done(c: dict) -> str:
+    """What one check did, in a few words, and its status."""
+    n = len(c.get("values") or [])
+    what = {"CERTIFICATE": f"{n} exact instance(s)", "ARITHMETIC": "the paper's own operands"}.get(
+        c["kind"], f"{c.get('runs') or 0} run(s), {n} result(s)")
+    return f"{c['id']} {c['kind']}{' proof step' if c['evidence'] == 'PROOF_AUDIT' else ''} on {what}: {c['status']}"
 
 
 def _checks(root: Path, plan: dict) -> list[dict]:
@@ -101,7 +118,7 @@ def conflicts(checks: list[dict]) -> list[dict]:
 def _central(plan: dict, checks: list[dict], conf: list[dict]) -> list[dict]:
     by_id, conflicted = {c["id"]: c for c in checks}, {k for x in conf for k in x["checks"]}
     return [{**cc, "statuses": {k: by_id[k]["status"] for k in cc["checks"] if k in by_id},
-             "claim_status": _claim_status([by_id[k]["status"] for k in cc["checks"] if k in by_id],
+             "claim_status": _claim_status([by_id[k] for k in cc["checks"] if k in by_id],
                                            bool(conflicted & set(cc["checks"]))),
              "deviations": sum(len(by_id[k]["deviations"]) for k in cc["checks"] if k in by_id)}
             for cc in plan["central_claims"]]
@@ -112,13 +129,15 @@ def _headline(checks: list[dict], claims: list[dict]) -> str:
     if any(c["status"] == "PENDING" for c in checks):
         return "CHECKS_PENDING"
     st = [c["claim_status"] for c in claims]
-    if "VERIFIED_FAILURE" in st:
-        return "CENTRAL_CLAIM_FAILED"
-    if "CONFLICTING" in st:
-        return "CENTRAL_CLAIM_CONFLICTING"
-    if st and all(s == "VERIFIED_SUPPORT" for s in st):
-        return "CENTRAL_CLAIMS_SUPPORTED"
-    return "SOME_CENTRAL_CLAIMS_SUPPORTED" if "VERIFIED_SUPPORT" in st else "NO_CENTRAL_CLAIM_VERIFIED"
+    for found, head in (("FAILURE_FOUND", "CENTRAL_FAILURE_FOUND"), ("READINGS_DISAGREE", "CENTRAL_READINGS_DISAGREE"),
+                        ("PROOF_GAP_FOUND", "CENTRAL_PROOF_GAP_FOUND")):
+        if found in st:
+            return head
+    if st and all(s == "SUPPORT_FOUND" for s in st):
+        return "CENTRAL_SUPPORT_FOUND"
+    if "SUPPORT_FOUND" in st:
+        return "SOME_CENTRAL_SUPPORT_FOUND"
+    return "CENTRAL_NO_VIOLATION_FOUND" if "NO_VIOLATION_FOUND" in st else "NO_CENTRAL_FINDING"
 
 
 def scientific_status(root: Path) -> str:
@@ -181,9 +200,10 @@ def _check_rows(checks: list[dict], led: dict) -> list[str]:
 def table(led: dict) -> str:
     """The deterministic status block: central claims, their checks, incidental checks, and
     workflow completion, each apart."""
-    rows = ["| Central claim | Checks | Claim status | Deviations | Why unchecked |", "|---|---|---|---|---|"]
+    by_id = {c["id"]: c for c in led["checks"]}
+    rows = ["| Central claim | What was done | Found | Deviations | Why unchecked |", "|---|---|---|---|---|"]
     rows += [f"| {_cell(cc['quote'], 110)} (p{cc['page']}) | "
-             f"{', '.join(f'{k} {s}' for k, s in cc['statuses'].items()) or '—'} | **{cc['claim_status']}** | "
+             f"{'; '.join(_done(by_id[k]) for k in cc['statuses']) or '—'} | **{cc['claim_status']}** | "
              f"{cc.get('deviations') or ''} | {_said(_cell(cc['why_unchecked'], 140), led)} |" for cc in led["central_claims"]]
     if not led["central_claims"]:
         rows.append("| — the planner listed no central claim | | | | |")
@@ -250,11 +270,12 @@ def render(x, led: dict, rep: dict | None) -> str:
                 "; no author repository attributed"),
              "", "_A first-pass review aid for a human referee. It makes no accept/reject recommendation; "
                  "severities and interpretations are model judgments, statuses are computed by the harness._",
-             "", f"## Central claims — status computed by the harness: {led['scientific_status']}", "", table(led), ""]
+             "", f"## Central claims — what the harness found: {led['scientific_status']}", "", table(led), ""]
     if fails:
-        lines += ["## Established failures", ""] + [
+        lines += ["## Failures found", ""] + [
             f"- **{c['id']}** {c['status']} ({c['evidence']}{', central' if c['central'] else ', incidental'}): "
-            f"{c['reason']} — see `ledger.json`, `{c['records'] or 'outcome'}`" for c in fails] + [""]
+            + ("a step of the printed proof fails; the statement itself is not refuted. " if c["evidence"] == "PROOF_AUDIT"
+               else "") + f"{c['reason']} — see `ledger.json`, `{c['records'] or 'outcome'}`" for c in fails] + [""]
     if led["conflicts"]:
         lines += ["## Conflicting readings of one printed object (recorded, not resolved)", ""]
         for cf in led["conflicts"]:
@@ -284,7 +305,7 @@ def render(x, led: dict, rep: dict | None) -> str:
     dropped = led["dropped"]
     lines += ["", "## Not checked", ""] + [
         f"- {_cell(cc['quote'], 140)}: {_said(cc['why_unchecked'], led) or 'no check reached a conclusion'}"
-        for cc in led["central_claims"] if cc["claim_status"] == "NOT_VERIFIED"] + [
+        for cc in led["central_claims"] if cc["claim_status"] in ("NOT_CHECKED", "NOTHING_DECIDED")] + [
         f"- planned check {d['check']} dropped: {_cell(d['why'], 200)}" for d in dropped["checks"]] + [
         f"- {len(dropped['concerns_unresolved_quotes'])} concern(s) dropped because a quote did not resolve (ledger)."]
     text = "\n".join(lines) + "\n"

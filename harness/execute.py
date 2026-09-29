@@ -354,9 +354,39 @@ UV_RUN = {"UV_PROJECT_ENVIRONMENT": "/env", "UV_NO_SYNC": "1", "UV_FROZEN": "1",
           "UV_PYTHON_DOWNLOADS": "never", "UV_CACHE_DIR": "/tmp/uv-cache"}   # `uv run` uses /env, never syncs
 
 
-def _env_steps(checkout: Path | None, packages: tuple[str, ...]) -> tuple[str, list[str], bool]:
+_PKG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]+\])?((==|>=|<=|~=|!=|<|>)[A-Za-z0-9.*+!-]+)?$")
+
+
+def packages(script: str) -> tuple[str, ...]:
+    """Extra pip packages a script declares on a `# REFEREE_PACKAGES: a b==1.2` line. The line
+    is part of the approved script (its sha covers it); only plain requirement specs pass."""
+    m = re.search(r"(?m)^#\s*REFEREE_PACKAGES:\s*(.*)$", script or "")
+    specs = tuple(sorted(set(re.split(r"[\s,]+", m.group(1).strip())) - {""})) if m else ()
+    bad = [x for x in specs if not _PKG.match(x)]
+    if bad or len(specs) > 10:                                    # ponytail: 10 extra packages
+        raise ValueError(f"REFEREE_PACKAGES lists at most 10 plain pip requirements (no URLs, paths or "
+                         f"options); refused: {bad[:3] or len(specs)}")
+    return specs
+
+
+def with_packages(cfg: state.Config, root: Path, env_dir: Path, envinfo: dict | None,
+                  script: str) -> tuple[Path, dict | None]:
+    """A derived environment for a script that declares packages: a copy of the built one plus
+    those packages (recorded like any build); otherwise the environment itself."""
+    extra = packages(script)
+    if not extra or not envinfo or not envinfo.get("ok"):
+        return env_dir, envinfo
+    d = root / "env-extra" / state.sha256(f"{volume(env_dir)}|{' '.join(extra)}")[:12]
+    return d, ensure_env(cfg, root, d, envinfo.get("image", DEFAULT_IMAGE), None, extra, base=volume(env_dir))
+
+
+def _env_steps(checkout: Path | None, packages: tuple[str, ...], base: str = "") -> tuple[str, list[str], bool]:
     uv = bool(checkout and not packages and (checkout / "uv.lock").is_file())
     reqs = sorted(p.name for p in checkout.glob("requirements*.txt")) if checkout else []
+    if base:
+        return f"a copy of {base} plus {' '.join(packages)}", [
+            "cp -a /base/. /env/", "/env/bin/python -m pip install --quiet " + " ".join(packages),
+            "echo REFEREE_FREEZE", "/env/bin/python -m pip freeze"], False
     if packages:
         builder, add = "baseline packages", ["/env/bin/python -m pip install --quiet " + " ".join(packages)]
     elif uv:
@@ -375,7 +405,7 @@ def _env_steps(checkout: Path | None, packages: tuple[str, ...]) -> tuple[str, l
 
 
 def ensure_env(cfg: state.Config, root: Path, env_dir: Path, image: str, checkout: Path | None,
-               packages: tuple[str, ...] = ()) -> dict | None:
+               packages: tuple[str, ...] = (), base: str = "") -> dict | None:
     """A venv built inside a container (network on), once, from what the checkout declares:
     its uv lockfile (path sources included), else requirements*.txt, else its package.
     Non-blocking: returns the marker (ok, detail, image, builder, uv, recovery) once the
@@ -392,7 +422,7 @@ def ensure_env(cfg: state.Config, root: Path, env_dir: Path, image: str, checkou
     with state.lock(env_dir.parent / f".{env_dir.name}.lock"):
         if (m := state.read_json(marker)) and "ok" in m:
             return m
-        builder, steps, uv = _env_steps(checkout, packages)
+        builder, steps, uv = _env_steps(checkout, packages, base)
         b = state.read_json(build) or {"image": image, "attempt": 0, "recovery": [], "rec": None}
         if b["rec"]:
             done = collect(b["rec"], cfg.install_timeout_s)
@@ -421,7 +451,8 @@ def ensure_env(cfg: state.Config, root: Path, env_dir: Path, image: str, checkou
         _docker(["docker", "volume", "rm", "-f", volume(env_dir)], 120)   # isolated: every attempt starts empty
         env_dir.mkdir(parents=True, exist_ok=True)
         b["rec"] = start(_cname(env_dir.resolve(), b["attempt"]), ["sh", "-c", " && ".join(steps)],
-                         mounts=[(volume(env_dir), "/env", False)] + ([(checkout, "/repo", True)] if checkout else []),
+                         mounts=[(volume(env_dir), "/env", False)] + ([(checkout, "/repo", True)] if checkout else [])
+                         + ([(base, "/base", True)] if base else []),
                          workdir="/", image=b["image"], network=True, mode="install", target=env_dir.name,
                          meta={"builder": builder, "recovery": list(b["recovery"])})
         state.write_json(build, b)
@@ -465,7 +496,8 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
                 return True                                  # wait for the daemon; never a verdict
             return _finish(cfg, root, check, {**st, "authorized": False, "why": why})
         env_dir, envinfo = ((root / "env", author_env(cfg, root)) if kind == "AUTHOR_CODE" else
-                            script_env(cfg, root, kind, bool(check.get("repo_attributed"))))
+                            with_packages(cfg, root, *script_env(cfg, root, kind, bool(check.get("repo_attributed"))),
+                                          (cdir / "script.py").read_text(encoding="utf-8")))
         if envinfo is None:
             return True
         st.update(env=envinfo, env_dir=str(env_dir), why=why, seed=0, values=[], literal=[], rec=None,
@@ -554,6 +586,8 @@ def _finish(cfg: state.Config, root: Path, check: dict, st: dict) -> bool:
                    finished_at=state.now())
     if st.get("env"):
         outcome["environment"] = {k: st["env"].get(k) for k in ("detail", "image", "builder", "recovery")}
+    if (st.get("ev") or {}).get("setup_error") and kind != "AUTHOR_CODE":   # the script never started: revisable
+        outcome.update(setup_error=st["ev"]["setup_error"], setup_log=st.get("failure", "")[-1500:])
     if st.get("literal"):  # the printed text evaluated exactly as printed, beside the recorded deviations
         outcome["literal"] = {"n": len(st["literal"]), "violated": sum(1 for v in st["literal"] if v == 1)}
     state.write_json(root / "checks" / check["id"] / "outcome.json", outcome)
@@ -581,7 +615,11 @@ def try_script(cfg: state.Config, pid: str, cid: str, script: str) -> dict:
     if not ok:
         return {"error": why}
     c = next((k for k in (state.read_json(root / "sealed" / "plan.json") or {}).get("checks", []) if k["id"] == cid), {})
-    env_dir, envinfo = script_env(cfg, root, c.get("kind", ""), bool(c.get("repo_attributed")))
+    try:
+        env_dir, envinfo = with_packages(cfg, root, *script_env(cfg, root, c.get("kind", ""),
+                                                              bool(c.get("repo_attributed"))), script)
+    except ValueError as e:
+        return {"error": str(e)}
     if envinfo is None:
         return {"error": "the environment is still being built in the background: retry the draft in a few "
                          "minutes, or finish without one"}

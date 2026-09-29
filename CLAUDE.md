@@ -57,7 +57,9 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
 11. **No paper-specific logic**, names, thresholds or special cases.
 12. **Report != trace; no acceptance layer.** The status table is deterministic; model prose
     is published only if every status word it uses is earned by a cited check.
-13. **Central claims first.** The paper-level status is computed over central claims only.
+13. **Central claims first; statuses say what was found.** The paper-level status is computed over
+    central claims only (FAILURE_FOUND, PROOF_GAP_FOUND — a failed proof step is never a refuted
+    statement —, READINGS_DISAGREE, SUPPORT_FOUND, NO_VIOLATION_FOUND, NOTHING_DECIDED, NOT_CHECKED).
     A check no central claim cites is incidental: cut first from the budget, it must say why
     (`incidental_why`), and is reported apart; workflow completion is reported apart again.
 14. **Compared values are bound by name, once.** AUTHOR_CODE: the planner's metric key (two
@@ -78,8 +80,12 @@ of the same Python; every release of a dependency needing a newer Python -> that
 if the project's declared range admits it. No requirement is edited, added or dropped. Every
 attempt is an ExecutionRecord (`mode=install`, `recovery`); the outcome carries
 `environment.recovery`; anything else stays BLOCKED with the pip/uv error. A RECONSTRUCTION
-runs in the authors' environment when it builds (started in the background once a plan needs
-it), else on the fixed baseline.
+runs in the authors' environment when it builds (started as soon as a plan needs it), else on
+the fixed baseline; a script may declare extra packages (`# REFEREE_PACKAGES:`, sha-covered) and
+runs in a copy of its environment with them. Every long step is a detached, named container that
+each `tasks` call polls (no host process must survive); venvs live in Docker named volumes.
+A reconstruction runs at least SH_REPLICATES (3) seeds; a script that cannot start goes back to
+its author with the error (within SH_MAX_REVISIONS = 2).
 
 ## Commands (repo venv; on Windows set PYTHONUTF8=1)
 

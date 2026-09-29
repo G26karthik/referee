@@ -22,7 +22,7 @@ from pathlib import Path
 
 from harness import execute, state, tasks
 
-HEAVY = ("repo", "env", "script-env")      # clones, venvs, datasets: rebuilt on demand, never packed
+HEAVY = ("repo", "env", "env-extra", "script-env")      # clones, venvs, datasets: rebuilt on demand, never packed
 
 
 def main(argv: list[str]) -> int:
@@ -116,7 +116,8 @@ def pack(cfg: state.Config, out: Path, pids: list[str], clean: bool) -> int:
     freed, left = 0, []
     if clean:
         heavy = [root / h for root in roots for h in HEAVY] + [w for root in roots for w in root.glob("checks/*/work")]
-        envs = [root / "env" for root in roots] + ([cfg.projects / ".script-env"] if not pids else [])
+        envs = [root / "env" for root in roots] + [d for root in roots for d in root.glob("env-extra/*")] + (
+            [cfg.projects / ".script-env"] if not pids else [])
         for e in envs:                    # the venvs themselves live in Docker named volumes
             execute._docker(["docker", "volume", "rm", "-f", execute.volume(e)], 120)
         for h in heavy + ([cfg.projects / ".script-env"] if not pids else []):

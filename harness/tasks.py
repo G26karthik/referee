@@ -186,7 +186,17 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
     """The tasks owed for one check now (starting its execution when it is ready)."""
     cid, kind = c["id"], c["kind"]
     cdir = x.root / "checks" / cid
-    if (cdir / "outcome.json").exists() or (cdir / "exec.json").exists():
+    rounds = 1 + x.cfg.max_revisions
+    o = state.read_json(cdir / "outcome.json")
+    if o and o.get("setup_error") and kind in SCRIPT_KINDS:   # an approved script that could not start goes
+        r0 = max((r for r in range(1, rounds + 1)                # back to its author with the error, not a verdict
+                  if (x.sealed(f"verify:{cid}.{r}") or {}).get("verdict") == "APPROVE"), default=0)
+        if 0 < r0 < rounds:
+            (cdir / f"setup.{r0}.txt").write_text(o.get("setup_log") or o.get("reason", ""), encoding="utf-8")
+            (cdir / "outcome.json").replace(cdir / f"outcome.setup.{r0}.json")
+            (cdir / "exec.json").unlink(missing_ok=True)
+            o = None
+    if o or (cdir / "exec.json").exists():
         return []
     spec = _spec_text(c)
     if kind == "AUTHOR_CODE":
@@ -200,7 +210,6 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
                 page_png=f"{x.pages_dir}/p{t['page']:03d}.png", checkout=x.checkout.as_posix(), listing=lst))]
         check = {**c, **b, "repo_attributed": c["repo_attributed"]}
         return _start(x, check)
-    rounds = 1 + x.cfg.max_revisions
     if kind == "ARITHMETIC":
         v = x.sealed(f"verify:{cid}.1")
         if v is None:
@@ -217,7 +226,13 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
         g = x.sealed(f"gen:{cid}.{r}")
         if g is None:
             prev = x.sealed(f"verify:{cid}.{r - 1}") if r > 1 else None
+            setup = cdir / f"setup.{r - 1}.txt"
             revision = "" if not prev else (
+                f"\n=== REVISION {r}: the approved script FAILED TO START in the sandbox ===\nFix only what "
+                f"stopped it (a module missing from the environment: declare it on a `# REFEREE_PACKAGES:` line; "
+                f"a path or argument error). The error:\n{setup.read_text(encoding='utf-8')[-1500:]}\n"
+                f"--- the script ---\n{(cdir / f'script.{r - 1}.py').read_text(encoding='utf-8')}\n"
+                if setup.exists() else
                 f"\n=== REVISION {r}: an independent verifier rejected the previous attempt ===\nFix exactly "
                 f"this, from the paper's own words (never by weakening the claim or inventing a detail):\n"
                 f"{prev['required_changes'] or prev['notes']}\n--- the rejected script ---\n"
@@ -247,6 +262,8 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
                 k: g.get(k) for k in ("runs", "runs_quote", "metric", "outputs", "bindings", "deviations",
                                       "checked_statement")}}, ensure_ascii=False, indent=1)
             return [_verify_task(x, c, r, spec, proposal, tries)]
+        if v["verdict"] == "APPROVE" and (cdir / f"setup.{r}.txt").exists():
+            continue                                             # it could not start: the next round revises it
         if v["verdict"] == "APPROVE":
             # An experiment is decided over independent seeded replicates: never fewer than the
             # paper states, and at least enough for a noise band (more is never a downscale).
@@ -580,22 +597,29 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     c = next(k for k in x.sealed("plan")["checks"] if k["id"] == cid)
     script = str(obj.get("script") or "")
     need = REQUIRED[c["kind"]]
-    binds = {b.get("kind"): b for b in obj.get("bindings") or [] if isinstance(b, dict)}
-    if not script.strip() or any(not (binds.get(k) or {}).get("impl_quote") for k in need):
+    # Any number of bindings per kind (a method with two ingredients binds both); each kind needs one.
+    given = [b for b in obj.get("bindings") or [] if isinstance(b, dict) and b.get("kind") in need][:12]  # ponytail: 12
+    if not script.strip() or any(not any(b.get("kind") == k and b.get("impl_quote") for b in given) for k in need):
         return {"refused": True, "notes": str(obj.get("notes") or "the script or a required binding is missing")[:2000]}
     errors, out = [], []
     rel = [f["path"] for f in state.read_json(x.root / "released.json", [])]
-    for k in need:
-        b = binds[k]
-        if flat(b["impl_quote"]) not in flat(script):
+    for b in given:
+        k = b["kind"]
+        if flat(str(b.get("impl_quote") or "")) not in flat(script):
             errors.append(f"binding {k}: impl_quote is not in the script")
         h = None if k == "instance" else _find(x, b.get("paper_quote", ""), errors, f"binding {k} paper_quote")
-        out.append({"kind": k, "impl_quote": b["impl_quote"][:1000], "paper_quote": h["quote"] if h else "",
+        out.append({"kind": k, "impl_quote": str(b.get("impl_quote") or "")[:1000], "paper_quote": h["quote"] if h else "",
                     "page": h["page"] if h else None})
-    if c["kind"] == "RELEASED_DATA" and not any(p in binds["dataset"]["impl_quote"] and p in script for p in rel):
+    of = lambda k: [b for b in out if b["kind"] == k]
+    if c["kind"] == "RELEASED_DATA" and not any(p in b["impl_quote"] and p in script for b in of("dataset") for p in rel):
         errors.append("the dataset binding must open a released file by its full relative path")
-    if c["kind"] == "CERTIFICATE" and c.get("step") and flat(c["step"]) not in flat(binds["claimed_bound"].get("paper_quote", "")):
+    if c["kind"] == "CERTIFICATE" and c.get("step") and not any(flat(c["step"]) in flat(b["paper_quote"])
+                                                                for b in of("claimed_bound")):
         errors.append("claimed_bound must be the proof step the harness bound")
+    try:
+        execute.packages(script)
+    except ValueError as e:
+        errors.append(str(e))
     runs = obj.get("runs") if isinstance(obj.get("runs"), int) and not isinstance(obj.get("runs"), bool) else 1
     cap = 200 if c["kind"] == "CERTIFICATE" else x.cfg.max_runs     # ponytail: instances are cheap
     if not 1 <= runs <= cap:

@@ -18,7 +18,8 @@ printed text (a changed index range or convention, a hypothesis added or dropped
 substituted function, a filled gap) listed in `deviations`? An unlisted one is REVISE; a
 listed one is acceptable when it is the only coherent reading, and is then reported next to
 the result. Does the compared output (`metric`, or the relation's names) carry the computed
-quantity the claim is about — never a flag computed against the printed number?
+quantity the claim is about — never a flag computed against the printed number? Does a
+`# REFEREE_PACKAGES:` line declare only what the script imports beyond its environment?
 
 === PROPOSED CHECK ===
 {{proposal}}
