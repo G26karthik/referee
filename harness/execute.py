@@ -980,11 +980,13 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             st["pilot_s"] = done.get("seconds") or 0
             if (why := _over_budget(cfg, check, st, runs)):
                 return _finish(cfg, root, check, {**_cancel(root, st), "blocker": why})
+            st["budget_s"] = cfg.check_budget_s          # the budget the projection was admitted under
     _sample_memory(st, fly)
     if st.get("reused") and not st.get("budget_checked") and st["seed"] < runs:   # a pilot from a checkpoint
         st["budget_checked"] = True
         if (why := _over_budget(cfg, check, st, runs)):
             return _finish(cfg, root, check, {**_cancel(root, st), "blocker": why})
+        st["budget_s"] = cfg.check_budget_s
     if st["stage"] == "run" and st["seed"] >= runs and not fly:
         return _finish(cfg, root, check, st)
     todo = []
@@ -1173,6 +1175,7 @@ def protocol(check: dict, st: dict, rule: str) -> dict:
             "supplied_by_referee": [d["used"] for d in devs if not d.get("printed")],
             "claim_changes": [d["used"] for d in devs if d.get("changes_claim")],
             **({"pilot_seconds": st["pilot_s"]} if st.get("pilot_s") else {}),
+            **({"admitted_under_check_budget_s": st["budget_s"]} if st.get("budget_s") else {}),
             **({"seeds_reused_from_checkpoints": st["reused"]} if st.get("reused") else {})}
 
 
