@@ -230,11 +230,12 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
     if tasks or running:
         return "verify", tasks, running
     ledger = report.ledger(x)
-    # Coverage: a central claim still undecided after every check ended gets one follow-up plan,
-    # which sees what each check found and why, and may add checks (or say why none can decide it).
+    # Coverage: once every check ended, one follow-up plan sees what each check found and why; it
+    # may add checks for central claims still undecided, and for any headline claim the first plan
+    # never listed (or say why none can decide them).
     undecided = [cc for cc in ledger["central_claims"]
                  if cc["claim_status"] in ("NOT_CHECKED", "NOTHING_DECIDED", "PARTIAL_EVIDENCE")]
-    if undecided and x.cfg.max_followup_checks > 0 and x.sealed("plan:2") is None:
+    if x.cfg.max_followup_checks > 0 and x.sealed("plan:2") is None:
         return "plan", [_plan_task(x, "plan:2", _followup_text(ledger, undecided))], []
     if x.sealed("report") is None:
         return "report", [x.task("report", "report", _template(
@@ -258,15 +259,20 @@ def _plan_task(x: _Ctx, tid: str, followup: str) -> dict:
 def _followup_text(ledger: dict, undecided: list[dict]) -> str:
     done = [{k: c.get(k) for k in ("id", "kind", "claim", "status", "reason", "stages", "data_identity")}
             for c in ledger["checks"]]
-    return ("\n=== FOLLOW-UP ROUND: these central claims are still undecided after every planned check ended ===\n"
-            + "\n".join(f"- {cc['quote']!r}: {cc['claim_status']} (checks {', '.join(cc['checks']) or 'none'}; "
-                        f"why unchecked: {cc.get('why_unchecked') or '-'})" for cc in undecided)
+    listed = "\n".join(f"- {cc['quote']!r}: {cc['claim_status']}" for cc in ledger["central_claims"])
+    return ("\n=== FOLLOW-UP ROUND (every planned check has ended) ===\nCentral claims the first plan listed, and what "
+            f"was found:\n{listed}\nStill undecided:\n"
+            + ("\n".join(f"- {cc['quote']!r}: {cc['claim_status']} (checks {', '.join(cc['checks']) or 'none'}; "
+                         f"why unchecked: {cc.get('why_unchecked') or '-'})" for cc in undecided) or "- none")
             + "\n=== WHAT EACH CHECK FOUND (harness statuses and reasons) ===\n"
             + json.dumps(done, ensure_ascii=False, indent=1)[:20_000]
-            + "\nPropose NEW checks only (ids F1, F2, ...) for these claims, where a different route, a cited public "
-              "artifact to acquire, or a narrower but still paper-faithful test can decide what the first round could "
-              "not; repeat nothing that already ran. `central_claims` lists ONLY the undecided claims above (same "
-              "quotes) with the new check ids, or a concrete `why_unchecked` naming the blocker the outcomes show.\n")
+            + "\nPropose NEW checks only (ids F1, F2, ...), up to the budget, for (a) the undecided claims above, where a "
+              "different route, a cited public artifact to acquire, or a narrower but still paper-faithful test can decide "
+              "what the first round could not, and (b) any headline claim of the abstract, the contribution list or the "
+              "conclusion that the list above does not contain (re-read them). Repeat nothing that already ran. "
+              "`central_claims` lists ONLY those claims (the same quote for (a); a new verbatim quote with its scope for "
+              "(b)), each with the new check ids or a concrete `why_unchecked` naming the blocker. Proposing nothing is "
+              "correct when nothing more can be decided.\n")
 
 
 def _data_text(x: _Ctx, cid: str) -> str:
