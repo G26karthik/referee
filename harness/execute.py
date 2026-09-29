@@ -424,8 +424,8 @@ def script_env(cfg: state.Config, root: Path, kind: str, attributed: bool) -> tu
     base = cfg.projects / ".script-env"
     if kind == "RECONSTRUCTION" and attributed and (root / "repo" / ".git").is_dir():
         env = author_env(cfg, root)
-        if env is None or env.get("ok"):
-            return root / "env", env
+        if env is None or (env.get("ok") and env.get("builder") != "no declared dependencies"):
+            return root / "env", env      # a checkout that declares nothing has no environment of its own
         b = ensure_env(cfg, root, base, DEFAULT_IMAGE, None, SCRIPT_PACKAGES)
         return base, b and {**b, "detail": f"{b['detail']} (the authors' environment did not build: {env['detail'][-200:]})"}
     return base, ensure_env(cfg, root, base, DEFAULT_IMAGE, None, SCRIPT_PACKAGES)
