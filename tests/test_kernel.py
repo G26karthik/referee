@@ -351,6 +351,32 @@ def test_status_is_about_central_claims_and_conflicting_readings_are_recorded():
         assert len(conf) == 1 and not conf[0]["explained"] and conf[0]["checks"] == ["C1", "C3"]
 
 
+def test_detached_steps_outlive_their_poller():
+    """Sep-29 central run: every host process a tool call started died with that call, and a
+    second env build wrote into the same dir as the orphaned first (a corrupt venv). A step is
+    now a named container: a second start adopts it, and any later poll collects it."""
+    if not execute.docker_status()[0]:
+        return
+    import time
+    spec = {"mounts": [], "workdir": "/", "image": execute.DEFAULT_IMAGE, "network": False, "mode": "try", "target": "t"}
+    name = execute._cname("kernel", time.time())
+    rec = execute.start(name, ["sh", "-c", 'echo \'REFEREE_RESULT {"x": 1}\'; echo oops >&2'], **spec)
+    assert "returncode" not in execute.start(name, ["sh", "-c", "echo second writer"], **spec)   # adopted
+    done = None
+    for _ in range(90):
+        if (done := execute.collect(rec, 60)):
+            break
+        time.sleep(1)
+    assert done and done["returncode"] == 0 and execute.result_values(done["stdout"], "x") == [1.0]
+    assert "oops" in done["stderr"] and "second writer" not in done["stdout"]
+    slow = execute.start(execute._cname("kernel-slow", time.time()), ["sleep", "60"], **spec)
+    for _ in range(90):
+        if (done := execute.collect(slow, 2)):
+            break
+        time.sleep(1)
+    assert done and done["timed_out"] and done["returncode"] is None
+
+
 def test_verify_commit_fails_closed():
     from harness.repo import verify_commit
     with tempfile.TemporaryDirectory() as t:

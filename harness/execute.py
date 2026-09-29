@@ -148,6 +148,73 @@ def _text(b) -> str:
     return b.decode("utf-8", "replace") if isinstance(b, bytes) else (b or "")
 
 
+# --- detached steps: the Docker daemon owns every long process. A host process started by a
+# tool call does not outlive that call, so an install or an evidence run is started detached
+# under a deterministic name and collected by a later poll: idempotent (a second start adopts
+# the running container instead of writing beside it) and immune to the poller dying.
+def _secs(ts: str) -> float:
+    import datetime
+    m = re.match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", ts or "")
+    return datetime.datetime.strptime(m.group(), "%Y-%m-%dT%H:%M:%S").replace(
+        tzinfo=datetime.timezone.utc).timestamp() if m else 0.0
+
+
+def start(name: str, argv: list[str], *, mounts: list[tuple[Path, str, bool]], workdir: str, image: str,
+          network: bool, env: dict | None = None, gpus: bool = False, mode: str, target: str,
+          meta: dict | None = None) -> dict:
+    """Start one step detached; returns its pending record (the caller persists it)."""
+    launch = ["docker", "run", "-d", "--name", name, "--label", "referee=1", "-w", workdir]
+    for host, inside, ro in mounts:
+        launch += ["-v", f"{Path(host).resolve()}:{inside}{':ro' if ro else ''}"]
+    launch += (["--network", "none"] if not network else []) + (["--gpus", "all"] if gpus else [])
+    for k, v in sorted((env or {}).items()):
+        launch += ["-e", f"{k}={v}"]
+    launch += [image, *argv]
+    rec = {"mode": mode, "target": target, "argv": argv, "launch_argv": launch, "cwd": workdir, "image": image,
+           "network": network, **(meta or {}), "container": name, "started_at": state.now()}
+    rc, out = _docker(launch, 480)          # ponytail: includes an image pull; 8 min fits one tool call
+    if rc != 0 and _docker(["docker", "inspect", name], 60)[0] != 0:
+        rec.update(returncode=None, timed_out=False, stdout="", stderr="", ended_at=state.now(), seconds=0,
+                   error=f"could not start: {out.strip()[-300:]}")
+    return rec
+
+
+def collect(rec: dict, timeout: int) -> dict | None:
+    """The finished record of a started step, or None while it runs (or while the daemon is
+    away). A step past `timeout` is killed and recorded as timed out."""
+    if "returncode" in rec:
+        return rec
+    name = rec["container"]
+    rc, out = _docker(["docker", "inspect", "-f", "{{json .State}}", name], 60)
+    if rc != 0:
+        if not docker_status()[0]:
+            return None
+        return {**rec, "returncode": None, "timed_out": False, "stdout": "", "stderr": "", "ended_at": state.now(),
+                "seconds": 0, "error": "the container disappeared before it was collected"}
+    st = json.loads(out)
+    if st.get("Running"):
+        if time.time() - _secs(st.get("StartedAt", "")) > timeout:
+            _docker(["docker", "kill", name], 60)
+        return None
+    try:
+        p = subprocess.run(["docker", "logs", name], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=300)
+        so, se = p.stdout or "", p.stderr or ""
+    except (OSError, subprocess.SubprocessError) as e:
+        so, se = "", f"logs unavailable: {e}"
+    t0, t1 = _secs(st.get("StartedAt", "")), _secs(st.get("FinishedAt", ""))
+    timed_out = t1 - t0 >= timeout
+    _docker(["docker", "rm", "-f", name], 60)
+    return {**rec, "returncode": None if timed_out else st.get("ExitCode"), "timed_out": timed_out,
+            "stdout": so[-_OUT_CAP:], "stderr": se[-_OUT_CAP:], "ended_at": st.get("FinishedAt", state.now())[:19] + "Z",
+            "seconds": round(max(0.0, t1 - t0), 2),
+            **({"error": f"timeout after {timeout}s"} if timed_out else {"error": "out of memory"} if st.get("OOMKilled") else {})}
+
+
+def _cname(*parts) -> str:
+    return "referee-" + state.sha256("|".join(str(x) for x in parts))[:16]
+
+
 # --- environment failure is not scientific failure (invariant 5) ------------------------
 _SETUP = ("modulenotfounderror", "importerror", "cannot import name", "unrecognized arguments",
           "the following arguments are required", "invalid choice", "no such file or directory",
@@ -272,162 +339,205 @@ UV_RUN = {"UV_PROJECT_ENVIRONMENT": "/env", "UV_NO_SYNC": "1", "UV_FROZEN": "1",
           "UV_PYTHON_DOWNLOADS": "never", "UV_CACHE_DIR": "/tmp/uv-cache"}   # `uv run` uses /env, never syncs
 
 
-def build_env(cfg: state.Config, root: Path, env_dir: Path, image: str, checkout: Path | None,
-              packages: tuple[str, ...] = ()) -> dict:
-    """A venv built inside the container (network on), once, from what the checkout declares:
-    its uv lockfile (path sources included), else requirements*.txt, else its package. A
-    failed build is rebuilt from scratch only along `recover`; every attempt is an
-    ExecutionRecord. Returns the marker: ok, detail, image, builder, uv, recovery."""
-    marker = env_dir / "referee-env.json"
-    if not (cfg.allow_install and cfg.allow_network) and not (state.read_json(marker) or {}).get("ok"):
-        return {"ok": False, "detail": "the install or network gate is shut, so no environment was built", "image": image}
-    with state.lock(env_dir.parent / f".{env_dir.name}.lock"):      # parallel checks build it once
-        if (m := state.read_json(marker)) and "ok" in m:            # ponytail: a failed build is not retried per check
-            return m
-        uv = bool(checkout and not packages and (checkout / "uv.lock").is_file())
-        reqs = sorted(p.name for p in checkout.glob("requirements*.txt")) if checkout else []
-        if packages:
-            builder, add = "baseline packages", ["/env/bin/python -m pip install --quiet " + " ".join(packages)]
-        elif uv:
-            builder = "uv sync --frozen (the authors' lockfile)"
-            add = ["/env/bin/python -m pip install --quiet uv", "cp -r /repo /tmp/src && cd /tmp/src && "
-                   "UV_PROJECT_ENVIRONMENT=/env UV_PYTHON=/env/bin/python UV_PYTHON_DOWNLOADS=never "
-                   "/env/bin/uv sync --frozen --inexact --no-editable"]
-        elif reqs:
-            builder, add = f"pip -r {reqs[0]}", [f"/env/bin/python -m pip install -r /repo/{reqs[0]}"]
-        elif checkout and ((checkout / "pyproject.toml").exists() or (checkout / "setup.py").exists()):
-            builder, add = "pip install of the package", ["cp -r /repo /tmp/src && /env/bin/python -m pip install /tmp/src"]
-        else:
-            builder, add = "no declared dependencies", []
-        steps = ["python -m venv /env", "/env/bin/python -m pip install --quiet --upgrade pip", *add,
-                 "/env/bin/python -m pip freeze > /env/freeze.txt"]
-        recovery: list[dict] = []
-        rec: dict = {}
-        for _ in range(1 + MAX_RECOVERIES):
-            shutil.rmtree(env_dir, ignore_errors=True)               # isolated: every attempt starts empty
-            env_dir.mkdir(parents=True, exist_ok=True)
-            mounts = [(env_dir, "/env", False)] + ([(checkout, "/repo", True)] if checkout else [])
-            rec = run(["sh", "-c", " && ".join(steps)], mounts=mounts, workdir="/", image=image, network=True,
-                      timeout=cfg.install_timeout_s, mode="install", target=str(env_dir.name),
-                      meta={"builder": builder, "recovery": list(recovery)})
-            state.append_jsonl(root / "execution.jsonl", rec)
-            if rec.get("returncode") == 0 or not (fix := recover(rec.get("stderr", ""), image, checkout)):
-                break
-            recovery.append({"failure": (rec.get("stderr") or "")[-300:], "action": fix[1], "image": fix[0]})
-            image = fix[0]
-        ok = rec.get("returncode") == 0
-        detail = (f"built {image} venv by {builder}; freeze sha256 {state.sha256((env_dir / 'freeze.txt').read_bytes())[:12]}"
-                  if ok else f"environment build failed: {(rec.get('stderr') or rec.get('error') or '')[-300:]}")
-        m = {"ok": ok, "detail": detail, "image": image, "builder": builder, "uv": uv, "recovery": recovery}
-        state.write_json(marker, m)
+def _env_steps(checkout: Path | None, packages: tuple[str, ...]) -> tuple[str, list[str], bool]:
+    uv = bool(checkout and not packages and (checkout / "uv.lock").is_file())
+    reqs = sorted(p.name for p in checkout.glob("requirements*.txt")) if checkout else []
+    if packages:
+        builder, add = "baseline packages", ["/env/bin/python -m pip install --quiet " + " ".join(packages)]
+    elif uv:
+        builder = "uv sync --frozen (the authors' lockfile)"
+        add = ["/env/bin/python -m pip install --quiet uv", "cp -r /repo /tmp/src && cd /tmp/src && "
+               "UV_PROJECT_ENVIRONMENT=/env UV_PYTHON=/env/bin/python UV_PYTHON_DOWNLOADS=never "
+               "/env/bin/uv sync --frozen --inexact --no-editable"]
+    elif reqs:
+        builder, add = f"pip -r {reqs[0]}", [f"/env/bin/python -m pip install -r /repo/{reqs[0]}"]
+    elif checkout and ((checkout / "pyproject.toml").exists() or (checkout / "setup.py").exists()):
+        builder, add = "pip install of the package", ["cp -r /repo /tmp/src && /env/bin/python -m pip install /tmp/src"]
+    else:
+        builder, add = "no declared dependencies", []
+    return builder, ["python -m venv /env", "/env/bin/python -m pip install --quiet --upgrade pip", *add,
+                     "/env/bin/python -m pip freeze > /env/freeze.txt"], uv
+
+
+def ensure_env(cfg: state.Config, root: Path, env_dir: Path, image: str, checkout: Path | None,
+               packages: tuple[str, ...] = ()) -> dict | None:
+    """A venv built inside a container (network on), once, from what the checkout declares:
+    its uv lockfile (path sources included), else requirements*.txt, else its package.
+    Non-blocking: returns the marker (ok, detail, image, builder, uv, recovery) once the
+    build ended, None while it runs. A failed attempt is rebuilt from an empty dir only along
+    `recover` (or unchanged after an infrastructure failure); every attempt is an
+    ExecutionRecord."""
+    marker, build = env_dir / "referee-env.json", env_dir.parent / f".{env_dir.name}.build.json"
+    if (m := state.read_json(marker)) and "ok" in m:
         return m
+    if not (cfg.allow_install and cfg.allow_network):
+        return {"ok": False, "detail": "the install or network gate is shut, so no environment was built", "image": image}
+    if not docker_status()[0]:
+        return None                       # the daemon is away: wait for it, never conclude
+    with state.lock(env_dir.parent / f".{env_dir.name}.lock"):
+        if (m := state.read_json(marker)) and "ok" in m:
+            return m
+        builder, steps, uv = _env_steps(checkout, packages)
+        b = state.read_json(build) or {"image": image, "attempt": 0, "recovery": [], "rec": None}
+        if b["rec"]:
+            done = collect(b["rec"], cfg.install_timeout_s)
+            if done is None:
+                return None
+            state.append_jsonl(root / "execution.jsonl", done)
+            b["rec"] = None
+            err = (done.get("stderr") or "") + (done.get("error") or "")
+            fix = recover(err, b["image"], checkout) if done.get("returncode") != 0 else None
+            if not fix and done.get("returncode") != 0 and (infra := classify(done)["infra_error"]):
+                fix = (b["image"], f"an infrastructure failure ('{infra}'): rebuilt unchanged")
+            if done.get("returncode") == 0 or not fix or b["attempt"] > MAX_RECOVERIES:
+                ok = done.get("returncode") == 0
+                freeze = env_dir / "freeze.txt"
+                m = {"ok": ok, "image": b["image"], "builder": builder, "uv": uv, "recovery": b["recovery"],
+                     "detail": f"built {b['image']} venv by {builder}; freeze sha256 "
+                               f"{state.sha256(freeze.read_bytes())[:12] if freeze.exists() else '?'}" if ok else
+                               f"environment build failed: {err[-300:]}"}
+                state.write_json(marker, m)
+                build.unlink(missing_ok=True)
+                return m
+            b["recovery"].append({"failure": err[-300:], "action": fix[1], "image": fix[0]})
+            b["image"] = fix[0]
+        b["attempt"] += 1
+        shutil.rmtree(env_dir, ignore_errors=True)                 # isolated: every attempt starts empty
+        env_dir.mkdir(parents=True, exist_ok=True)
+        b["rec"] = start(_cname(env_dir.resolve(), b["attempt"]), ["sh", "-c", " && ".join(steps)],
+                         mounts=[(env_dir, "/env", False)] + ([(checkout, "/repo", True)] if checkout else []),
+                         workdir="/", image=b["image"], network=True, mode="install", target=env_dir.name,
+                         meta={"builder": builder, "recovery": list(b["recovery"])})
+        state.write_json(build, b)
+        return None
 
 
-def author_env(cfg: state.Config, pid: str) -> dict:
+def author_env(cfg: state.Config, root: Path) -> dict | None:
     """The authors' environment (root/env): used by AUTHOR_CODE and by reconstructions that
-    drive the authors' code; built in the background as soon as a plan needs it."""
-    root = state.pdir(cfg, pid)
-    return build_env(cfg, root, root / "env", image_for(root / "repo"), root / "repo")
+    drive the authors' code; started as soon as a plan needs it."""
+    return ensure_env(cfg, root, root / "env", image_for(root / "repo"), root / "repo")
 
 
-def script_env(cfg: state.Config, root: Path, kind: str, attributed: bool) -> tuple[Path, dict]:
+def script_env(cfg: state.Config, root: Path, kind: str, attributed: bool) -> tuple[Path, dict | None]:
     """A RECONSTRUCTION runs where the authors' code runs (their environment) when that
     builds; every other script, or a failed build, runs on the fixed baseline."""
     base = cfg.projects / ".script-env"
     if kind == "RECONSTRUCTION" and attributed and (root / "repo" / ".git").is_dir():
-        env = author_env(cfg, root.name)
-        if env.get("ok"):
+        env = author_env(cfg, root)
+        if env is None or env.get("ok"):
             return root / "env", env
-        b = build_env(cfg, root, base, DEFAULT_IMAGE, None, SCRIPT_PACKAGES)
-        return base, {**b, "detail": f"{b['detail']} (the authors' environment did not build: {env['detail'][-200:]})"}
-    return base, build_env(cfg, root, base, DEFAULT_IMAGE, None, SCRIPT_PACKAGES)
+        b = ensure_env(cfg, root, base, DEFAULT_IMAGE, None, SCRIPT_PACKAGES)
+        return base, b and {**b, "detail": f"{b['detail']} (the authors' environment did not build: {env['detail'][-200:]})"}
+    return base, ensure_env(cfg, root, base, DEFAULT_IMAGE, None, SCRIPT_PACKAGES)
 
 
-def execute(cfg: state.Config, pid: str, check: dict) -> dict:
-    """Run one authorized check to completion and reconcile it; writes outcome.json."""
-    from .reconcile import reconcile
-
+def poll(cfg: state.Config, pid: str, cid: str) -> bool:
+    """Advance one started check by at most one container step; True while it still runs.
+    State lives in checks/<id>/exec.json, so any caller may poll and none needs to survive."""
     root = state.pdir(cfg, pid)
-    cdir, checkout = root / "checks" / check["id"], root / "repo"
-    has_repo = (checkout / ".git").is_dir()
+    cdir, checkout = root / "checks" / cid, root / "repo"
+    if (cdir / "outcome.json").exists() or not (cdir / "exec.json").exists():
+        return False
+    check, st = state.read_json(cdir / "check.json"), state.read_json(cdir / "exec.json")
+    kind, has_repo = check["kind"], (checkout / ".git").is_dir()
     src = state.read_json(root / "source.json", {})
-    kind, runs, values, recs = check["kind"], int(check.get("runs") or 1), [], []
-    commit_ok = repo_mod.verify_commit(checkout, src.get("commit", "")) if kind == "AUTHOR_CODE" else (True, "")
-    ok, why = authorize(cfg, check, commit_ok)
-    outcome = {"check": check["id"], "kind": kind, "evidence": EVIDENCE.get(kind, "NONE"), "authorized": ok,
-               "authorization": why, "commit": src.get("commit", "") if has_repo else ""}
-    failure, ev, seeded, literal, envinfo = "", {}, False, [], {}
-    rel = (check.get("target") or {}).get("relation", "")
-    if ok:
-        if kind == "AUTHOR_CODE":
-            envinfo = author_env(cfg, pid)
-            ok, why, image, gpus = envinfo["ok"], envinfo["detail"], envinfo["image"], gpu(cfg)
-            # The authors' code writes into its own copy of the checkout (no .git), never into
-            # the pinned checkout that released-data hashes and host `git` read.
-            work = cdir / "work"
-            shutil.rmtree(work, ignore_errors=True)
-            shutil.copytree(checkout, work, ignore=shutil.ignore_patterns(".git"))
-            mounts, workdir = [(work, f"{MOUNT}/repo", False), (root / "env", "/env", False)], f"{MOUNT}/repo"
-            env = {"PATH": "/env/bin:/usr/local/bin:/usr/bin:/bin", "VIRTUAL_ENV": "/env",
-                   **(UV_RUN if envinfo.get("uv") else {})}
-            if ok and check.get("prepare"):
-                rec = run(["sh", "-c", check["prepare"]], mounts=mounts, workdir=workdir, image=image, network=True,
-                          timeout=cfg.install_timeout_s, env=env, mode="prepare", target=check["id"])
-                recs.append(rec)
-                ok, why = rec.get("returncode") == 0, "prepare step: " + (rec.get("stderr") or rec.get("error") or "")[-300:]
-        else:
-            env_dir, envinfo = script_env(cfg, root, kind, bool(check.get("repo_attributed")))
-            ok, why, image = envinfo["ok"], envinfo["detail"], envinfo.get("image", DEFAULT_IMAGE)
-            gpus = env_dir == root / "env" and gpu(cfg)
-            # The script sees only its own approved copy, read-only (a run cannot rewrite what
-            # later seeds execute); scratch space is the container's own /tmp.
-            rundir = cdir / "run"
-            rundir.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(cdir / "script.py", rundir / "script.py")
-            if state.sha256((rundir / "script.py").read_bytes()) != check.get("script_sha256"):
-                ok, why = False, "the script on disk is not the approved script"
-            mounts = [(rundir, f"{MOUNT}/check", True), (env_dir, "/env", True)] + (
-                [(checkout, f"{MOUNT}/repo", True)] if has_repo else [])
-            workdir, env = (f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check"), {}
+    if "env" not in st:                                      # first poll: the gate, then the environment
+        commit_ok = repo_mod.verify_commit(checkout, src.get("commit", "")) if kind == "AUTHOR_CODE" else (True, "")
+        ok, why = authorize(cfg, check, commit_ok)
         if not ok:
-            outcome.update(authorized=False, authorization=why)
-        for seed in (range(runs) if ok else ()):
+            if why.startswith("no container runtime"):
+                return True                                  # wait for the daemon; never a verdict
+            return _finish(cfg, root, check, {**st, "authorized": False, "why": why})
+        env_dir, envinfo = ((root / "env", author_env(cfg, root)) if kind == "AUTHOR_CODE" else
+                            script_env(cfg, root, kind, bool(check.get("repo_attributed"))))
+        if envinfo is None:
+            return True
+        st.update(env=envinfo, env_dir=str(env_dir), why=why, seed=0, values=[], literal=[], rec=None,
+                  stage="prepare" if check.get("prepare") else "run")
+        if not envinfo["ok"]:
+            return _finish(cfg, root, check, {**st, "authorized": False, "why": envinfo["detail"]})
+        if kind == "AUTHOR_CODE":   # the authors' code writes into its own copy (no .git), never the pinned checkout
+            shutil.rmtree(cdir / "work", ignore_errors=True)
+            shutil.copytree(checkout, cdir / "work", ignore=shutil.ignore_patterns(".git"))
+        else:                       # the script sees only its approved copy, read-only
+            (cdir / "run").mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(cdir / "script.py", cdir / "run" / "script.py")
+            if state.sha256((cdir / "run" / "script.py").read_bytes()) != check.get("script_sha256"):
+                return _finish(cfg, root, check, {**st, "authorized": False, "why": "the script on disk is not the approved script"})
+        state.write_json(cdir / "exec.json", st)
+    env_dir, image = Path(st["env_dir"]), st["env"].get("image", DEFAULT_IMAGE)
+    if kind == "AUTHOR_CODE":
+        mounts, workdir = [(cdir / "work", f"{MOUNT}/repo", False), (env_dir, "/env", False)], f"{MOUNT}/repo"
+        env = {"PATH": "/env/bin:/usr/local/bin:/usr/bin:/bin", "VIRTUAL_ENV": "/env", **(UV_RUN if st["env"].get("uv") else {})}
+    else:
+        mounts = [(cdir / "run", f"{MOUNT}/check", True), (env_dir, "/env", True)] + (
+            [(checkout, f"{MOUNT}/repo", True)] if has_repo else [])
+        workdir, env = (f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check"), {}
+    if st["rec"]:
+        done = collect(st["rec"], cfg.install_timeout_s if st["stage"] == "prepare" else cfg.run_timeout_s)
+        if done is None:
+            return True
+        state.append_jsonl(root / "execution.jsonl", done)
+        st["rec"], st["records"] = None, st.get("records", 0) + (done["mode"] == "evidence")
+        if st["stage"] == "prepare":
+            if done.get("returncode") != 0:
+                return _finish(cfg, root, check, {**st, "authorized": False, "why": "prepare step: " + (
+                    done.get("stderr") or done.get("error") or "")[-300:]})
+            st["stage"] = "run"
+        else:
+            ev = classify(done)
+            rel = (check.get("target") or {}).get("relation", "")
             if kind == "AUTHOR_CODE":
-                cmd, seeded = seeded_command(check["command"], check.get("seed_flag", ""), seed)
-                argv = ["sh", "-c", cmd]
-            else:
-                argv = ["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", str(seed)]
-            rec = run(argv, mounts=mounts, workdir=workdir, image=image, network=False, timeout=cfg.run_timeout_s,
-                      env=env, gpus=gpus, mode="evidence", target=check["id"],
-                      meta={"commit": outcome["commit"], "seed": seed, "script_sha256": check.get("script_sha256", "")})
-            recs.append(rec)
-            ev = classify(rec)
-            if kind == "AUTHOR_CODE":
-                v, note = parse_metric(rec["stdout"], check.get("metric", ""))
+                v, note = parse_metric(done["stdout"], check.get("metric", ""))
                 vs = [v] if v is not None and not (ev["failed"] and "text" in note) else []
             else:   # bound by name: the relation's outputs, the generator's compared output, or `violated`
-                vs = (relation_margins(rec["stdout"], rel) if rel else
-                      result_values(rec["stdout"], "violated" if kind == "CERTIFICATE" else check.get("metric", "")))
-                literal += result_values(rec["stdout"], "literal_violated") if kind == "CERTIFICATE" else []
+                vs = (relation_margins(done["stdout"], rel) if rel else
+                      result_values(done["stdout"], "violated" if kind == "CERTIFICATE" else check.get("metric", "")))
+                st["literal"] += result_values(done["stdout"], "literal_violated") if kind == "CERTIFICATE" else []
             if ev["failed"]:
-                failure = (rec.get("error") or (rec.get("stderr") or "")[-400:] or f"exit {rec.get('returncode')}").strip()
-                break
+                return _finish(cfg, root, check, {**st, "ev": ev, "failure": (
+                    done.get("error") or (done.get("stderr") or "")[-400:] or f"exit {done.get('returncode')}").strip()})
             if not vs:            # a clean exit with no bound metric establishes nothing
-                values = []
-                break
-            values += vs
-    for rec in recs:
-        state.append_jsonl(root / "execution.jsonl", rec)
-    outcome.update(reconcile(kind, check.get("printed", ""), values, failure, ev, seeded,
-                             ok and outcome["authorized"], outcome["authorization"], rel),
-                   values=values, runs=len([r for r in recs if r["mode"] == "evidence"]),
-                   records="execution.jsonl", finished_at=state.now())
-    if envinfo:
-        outcome["environment"] = {k: envinfo.get(k) for k in ("detail", "image", "builder", "recovery")}
-    if literal:           # the printed text evaluated exactly as printed, beside the recorded deviations
-        outcome["literal"] = {"n": len(literal), "violated": sum(1 for v in literal if v == 1)}
-    state.write_json(cdir / "outcome.json", outcome)
-    return outcome
+                return _finish(cfg, root, check, {**st, "values": []})
+            st["values"] += vs
+            st["seed"] += 1
+            if st["seed"] >= int(check.get("runs") or 1):
+                return _finish(cfg, root, check, st)
+    step = f"{st['stage']}{st['seed']}"
+    if st["stage"] == "prepare":
+        argv, network, mode, meta = ["sh", "-c", check["prepare"]], True, "prepare", {}
+    elif kind == "AUTHOR_CODE":
+        cmd, st["seeded"] = seeded_command(check["command"], check.get("seed_flag", ""), st["seed"])
+        argv, network, mode = ["sh", "-c", cmd], False, "evidence"
+    else:
+        argv, network, mode = ["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", str(st["seed"])], False, "evidence"
+    meta = {"commit": src.get("commit", "") if has_repo else "", "seed": st["seed"],
+            "script_sha256": check.get("script_sha256", "")} if mode == "evidence" else {}
+    st["rec"] = start(_cname(cdir.resolve(), st.get("token", ""), step), argv, mounts=mounts, workdir=workdir,
+                      image=image, network=network, env=env, gpus=(kind == "AUTHOR_CODE" or env_dir == root / "env")
+                      and gpu(cfg), mode=mode, target=cid, meta=meta)
+    state.write_json(cdir / "exec.json", st)
+    return True
+
+
+def _finish(cfg: state.Config, root: Path, check: dict, st: dict) -> bool:
+    from .reconcile import reconcile
+    kind, src = check["kind"], state.read_json(root / "source.json", {})
+    authorized = st.get("authorized", True)
+    why = st.get("why", "")
+    outcome = {"check": check["id"], "kind": kind, "evidence": EVIDENCE.get(kind, "NONE"), "authorized": authorized,
+               "authorization": why, "commit": src.get("commit", "") if (root / "repo" / ".git").is_dir() else ""}
+    outcome.update(reconcile(kind, check.get("printed", ""), st.get("values", []), st.get("failure", ""),
+                             st.get("ev", {}), bool(st.get("seeded")), authorized, why,
+                             (check.get("target") or {}).get("relation", "")),
+                   values=st.get("values", []), runs=st.get("records", 0), records="execution.jsonl",
+                   finished_at=state.now())
+    if st.get("env"):
+        outcome["environment"] = {k: st["env"].get(k) for k in ("detail", "image", "builder", "recovery")}
+    if st.get("literal"):  # the printed text evaluated exactly as printed, beside the recorded deviations
+        outcome["literal"] = {"n": len(st["literal"]), "violated": sum(1 for v in st["literal"] if v == 1)}
+    state.write_json(root / "checks" / check["id"] / "outcome.json", outcome)
+    return False
 
 
 def seeded_command(command: str, flag: str, seed: int) -> tuple[str, bool]:
@@ -451,10 +561,10 @@ def try_script(cfg: state.Config, pid: str, cid: str, script: str) -> dict:
     if not ok:
         return {"error": why}
     c = next((k for k in (state.read_json(root / "sealed" / "plan.json") or {}).get("checks", []) if k["id"] == cid), {})
-    if c.get("kind") == "RECONSTRUCTION" and c.get("repo_attributed") and not (root / "env" / "referee-env.json").exists():
-        return {"error": "the authors' environment is still being built in the background: retry the draft in a "
-                         "few minutes, or finish without one"}
     env_dir, envinfo = script_env(cfg, root, c.get("kind", ""), bool(c.get("repo_attributed")))
+    if envinfo is None:
+        return {"error": "the environment is still being built in the background: retry the draft in a few "
+                         "minutes, or finish without one"}
     if not envinfo["ok"]:
         return {"error": envinfo["detail"]}
     has_repo = (root / "repo" / ".git").is_dir()

@@ -72,7 +72,7 @@ function worker(pid, t, prior) {
     `2. Create every file with the Write tool, never a shell heredoc or echo. Write your JSON answer, ` +
     `exactly as the task specifies, to ${t.out}. Seal only after that Write succeeded. ` +
     `Name any script you draft ${t.id.replace(/[^\w.-]+/g, '_')}.py.\n` +
-    `3. Use Bash ONLY for the draft-run command the task gives you (if any) and to seal: ` +
+    `3. Use Bash ONLY for the draft-run command the task gives you (if any; Bash timeout 600000 ms) and to seal: ` +
     `${sh(`run.py seal ${pid} "${t.id}" "${t.out}"`)}\n` +
     `4. If sealing is refused, fix exactly what it names (copy the paper's parsed text exactly), ` +
     `Write again and re-seal (at most 2 retries). Never invent or weaken evidence to pass.\n` +

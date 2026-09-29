@@ -1,5 +1,5 @@
 """REFEREE CLI. The workflow (.claude/workflows/referee.js) uses `tasks` and `seal`;
-workers writing a check script use `try`; `exec` is started by the harness itself.
+workers writing a check script use `try`; `exec` and `env` poll to completion by hand.
 
   python run.py tasks <paper.pdf|paper-id> [--json] [--wait SECONDS]
   python run.py seal <paper-id> <task-id> <answer.json>
@@ -16,6 +16,7 @@ import os
 import shutil
 import stat
 import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -56,11 +57,14 @@ def main(argv: list[str]) -> int:
             return 2
     elif a.cmd == "try":
         print(json.dumps(tasks.try_(cfg, a.pid, a.task, a.script), indent=1))
-    elif a.cmd == "exec":
-        check = state.read_json(state.pdir(cfg, a.pid) / "checks" / a.check / "check.json")
-        print(json.dumps({k: v for k, v in execute.execute(cfg, a.pid, check).items() if k != "values"}))
+    elif a.cmd == "exec":             # poll one started check to its end (the harness polls it anyway)
+        while execute.poll(cfg, a.pid, a.check):
+            time.sleep(10)
+        print(json.dumps(state.read_json(state.pdir(cfg, a.pid) / "checks" / a.check / "outcome.json")))
     elif a.cmd == "env":
-        print(json.dumps(execute.author_env(cfg, a.pid)))
+        while (env := execute.author_env(cfg, state.pdir(cfg, a.pid))) is None:
+            time.sleep(10)
+        print(json.dumps(env))
     elif a.cmd == "status":
         for d in sorted(cfg.projects.glob(f"{a.pid or '*'}/ledger.json")) or []:
             led = state.read_json(d)

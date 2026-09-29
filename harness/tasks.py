@@ -8,11 +8,8 @@ Phases: read (4 lenses) -> critic -> plan -> verify (per check) -> report -> don
 from __future__ import annotations
 
 import json
-import os
-import shutil
 import re
-import subprocess
-import sys
+import shutil
 import time
 from pathlib import Path
 
@@ -160,17 +157,20 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
             "plan", title=title, pages_dir=x.pages_dir, repo=repo_line, checkout=x.checkout.as_posix(),
             gpu="unknown until first use", concerns=_concern_lines(x.concerns()), listing=lst,
             max_checks=x.cfg.max_checks), rows)], []
-    tasks, spawn = [], []
-    if (x.checkout / ".git").is_dir() and plan["repo_is_authors"] and not (x.root / "env.started").exists() and any(
-            c["kind"] in ("AUTHOR_CODE", "RECONSTRUCTION") for c in plan["checks"]):
-        (x.root / "env.started").write_text(state.now(), encoding="utf-8")   # the authors' env builds once, early
-        _spawn(x.cfg, x.pid, "env")
+    tasks = []
+    # Environments start as soon as an unfinished check needs them; each advance moves them one step.
+    open_ = [c for c in plan["checks"] if not (x.root / "checks" / c["id"] / "outcome.json").exists()]
+    if (x.checkout / ".git").is_dir() and plan["repo_is_authors"] and any(
+            c["kind"] in ("AUTHOR_CODE", "RECONSTRUCTION") for c in open_):
+        execute.author_env(x.cfg, x.root)
+    if any(c["kind"] in SCRIPT_KINDS for c in open_):
+        execute.ensure_env(x.cfg, x.root, x.cfg.projects / ".script-env", execute.DEFAULT_IMAGE, None,
+                           execute.SCRIPT_PACKAGES)
     for c in plan["checks"]:
-        t, s = _step(x, c)
-        tasks += t
-        spawn += s
-    if tasks or spawn or any(_running(x, c["id"]) for c in plan["checks"]):
-        return "verify", tasks, spawn
+        tasks += _step(x, c)
+    running = [c["id"] for c in plan["checks"] if execute.poll(x.cfg, x.pid, c["id"])]
+    if tasks or running:
+        return "verify", tasks, running
     ledger = report.ledger(x)
     if x.sealed("report") is None:
         return "report", [x.task("report", "report", _template(
@@ -182,41 +182,12 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
     return "done", [], []
 
 
-def _running(x: _Ctx, cid: str) -> bool:
-    cdir = x.root / "checks" / cid
-    if (cdir / "outcome.json").exists() or not (run := state.read_json(cdir / "running.json")):
-        return False
-    if _alive(run["os_pid"]):
-        return True
-    state.write_json(cdir / "outcome.json", {"check": cid, "status": "INCONCLUSIVE", "authorized": True,
-                                             "reason": "the execution process ended without writing an outcome "
-                                                       "(killed or crashed): nothing was established"})
-    return False
-
-
-def _alive(os_pid: int) -> bool:
-    if sys.platform == "win32":
-        import ctypes
-        h = ctypes.windll.kernel32.OpenProcess(0x100000, False, os_pid)      # SYNCHRONIZE
-        if not h:
-            return False
-        try:
-            return ctypes.windll.kernel32.WaitForSingleObject(h, 0) == 0x102  # WAIT_TIMEOUT
-        finally:
-            ctypes.windll.kernel32.CloseHandle(h)
-    try:
-        os.kill(os_pid, 0)
-        return True
-    except OSError:
-        return False
-
-
-def _step(x: _Ctx, c: dict) -> tuple[list[dict], list[dict]]:
-    """The next thing owed for one check: a task, an execution, or nothing (done)."""
+def _step(x: _Ctx, c: dict) -> list[dict]:
+    """The tasks owed for one check now (starting its execution when it is ready)."""
     cid, kind = c["id"], c["kind"]
     cdir = x.root / "checks" / cid
-    if (cdir / "outcome.json").exists() or _running(x, cid):
-        return [], []
+    if (cdir / "outcome.json").exists() or (cdir / "exec.json").exists():
+        return []
     spec = _spec_text(c)
     if kind == "AUTHOR_CODE":
         b = x.sealed(f"bind:{cid}")
@@ -226,7 +197,7 @@ def _step(x: _Ctx, c: dict) -> tuple[list[dict], list[dict]]:
             return [x.task(f"bind:{cid}", "bind", _template(
                 "bind", title=x.meta["title"], pages_dir=x.pages_dir, claim=c["claim"],
                 target=json.dumps(t, ensure_ascii=False), page=t["page"],
-                page_png=f"{x.pages_dir}/p{t['page']:03d}.png", checkout=x.checkout.as_posix(), listing=lst))], []
+                page_png=f"{x.pages_dir}/p{t['page']:03d}.png", checkout=x.checkout.as_posix(), listing=lst))]
         check = {**c, **b, "repo_attributed": c["repo_attributed"]}
         return _start(x, check)
     rounds = 1 + x.cfg.max_revisions
@@ -234,14 +205,14 @@ def _step(x: _Ctx, c: dict) -> tuple[list[dict], list[dict]]:
         v = x.sealed(f"verify:{cid}.1")
         if v is None:
             return [_verify_task(x, c, 1, spec, json.dumps(
-                {k: c[k] for k in ("operands", "expression", "target")}, ensure_ascii=False, indent=1), "")], []
+                {k: c[k] for k in ("operands", "expression", "target")}, ensure_ascii=False, indent=1), "")]
         if v["verdict"] == "APPROVE":
             out = reconcile.arithmetic(*c["interval"], c["printed"])
         else:
             out = {"status": "NOT_CHECKABLE", "reason": f"verifier {v['verdict']}: {v['required_changes'] or v['notes']}"}
         state.write_json(cdir / "outcome.json", {"check": cid, "kind": kind, "evidence": "PAPER_ARITHMETIC",
                                                  "authorized": True, **out})
-        return [], []
+        return []
     for r in range(1, rounds + 1):
         g = x.sealed(f"gen:{cid}.{r}")
         if g is None:
@@ -266,7 +237,7 @@ def _step(x: _Ctx, c: dict) -> tuple[list[dict], list[dict]]:
             return [x.task(f"gen:{cid}.{r}", "gen", _template(
                 "gen", title=x.meta["title"], pages_dir=x.pages_dir, check_id=cid, kind=kind, claim=c["claim"],
                 spec=spec + extra, contract=_section("contracts", f"gen {kind}"), metric=metric, environment=env,
-                required=", ".join(REQUIRED[kind]), max_tries=x.cfg.max_tries, try_cmd=try_cmd, revision=revision))], []
+                required=", ".join(REQUIRED[kind]), max_tries=x.cfg.max_tries, try_cmd=try_cmd, revision=revision))]
         if g.get("refused"):
             return _terminal(cdir, c, "NOT_CHECKABLE", f"the script author refused: {g['notes'][:400]}")
         v = x.sealed(f"verify:{cid}.{r}")
@@ -275,7 +246,7 @@ def _step(x: _Ctx, c: dict) -> tuple[list[dict], list[dict]]:
             proposal = json.dumps({"script": (cdir / f"script.{r}.py").read_text(encoding="utf-8"), **{
                 k: g.get(k) for k in ("runs", "runs_quote", "metric", "outputs", "bindings", "deviations",
                                       "checked_statement")}}, ensure_ascii=False, indent=1)
-            return [_verify_task(x, c, r, spec, proposal, tries)], []
+            return [_verify_task(x, c, r, spec, proposal, tries)]
         if v["verdict"] == "APPROVE":
             check = {**c, "runs": g["runs"], "script_sha256": g["script_sha256"], "metric": g.get("metric", c["metric"]),
                      "deviations": g.get("deviations", []),
@@ -285,26 +256,24 @@ def _step(x: _Ctx, c: dict) -> tuple[list[dict], list[dict]]:
         if v["verdict"] == "UNCHECKABLE" or r == rounds:
             why = "unCheckable" if v["verdict"] == "UNCHECKABLE" else f"{rounds} rounds rejected"
             return _terminal(cdir, c, "NOT_CHECKABLE", f"verifier: {why}: {(v['required_changes'] or v['notes'])[:400]}")
-    return [], []
+    return []
 
 
-def _terminal(cdir: Path, c: dict, status: str, reason: str) -> tuple[list, list]:
+def _terminal(cdir: Path, c: dict, status: str, reason: str) -> list:
     state.write_json(cdir / "outcome.json", {"check": c["id"], "kind": c["kind"], "status": status,
                                              "authorized": False, "reason": reason})
-    return [], []
+    return []
 
 
-def _start(x: _Ctx, check: dict) -> tuple[list, list]:
-    """Authorize now; a refusal is recorded at once, an authorized run starts in the background."""
+def _start(x: _Ctx, check: dict) -> list:
+    """Record the check and hand it to the daemon-owned executor (the gate runs at its first poll)."""
     cdir = x.root / "checks" / check["id"]
     state.write_json(cdir / "check.json", check)
     if check["kind"] == "AUTHOR_CODE" and not check.get("identity", {}).get("established"):
         return _terminal(cdir, check, "BLOCKED", "not run: experiment identity is not established: "
                          + check.get("identity", {}).get("reason", ""))
-    ok, why = execute.authorize(x.cfg, check, (True, "the commit is re-verified at run time"))
-    if not ok:
-        return _terminal(cdir, check, "BLOCKED", f"not run: {why}")
-    return [], [check]
+    state.write_json(cdir / "exec.json", {"token": state.now()})
+    return []
 
 
 def _verify_task(x: _Ctx, c: dict, r: int, spec: str, proposal: str, tries: str) -> dict:
@@ -335,34 +304,16 @@ def advance(cfg: state.Config, source: str, wait: int = 0) -> dict:
     while True:
         with state.lock(root / ".lock"):
             x = _Ctx(cfg, pid)
-            phase, tasks, spawn = _plan(x)
+            phase, tasks, running = _plan(x)
             for t in tasks:   # an answer left by an earlier attempt must never be sealed as this one's
                 if (out := Path(t["out"])).exists():
                     out.replace(out.with_suffix(".stale.json"))
-            for check in spawn:
-                _spawn(cfg, pid, check["id"])
         if tasks or phase == "done" or time.time() >= deadline:
             break
         time.sleep(15)
-    running = [p.parent.name for p in (root / "checks").glob("*/running.json")
-               if not (p.parent / "outcome.json").exists()]
     return {"paper_id": pid, "phase": phase, "status": "complete" if phase == "done" else "waiting",
             "blocked_reason": f"executions running: {', '.join(running)}" if running and not tasks else "",
             "scientific_status": report.scientific_status(root), "tasks": tasks}
-
-
-def _spawn(cfg: state.Config, pid: str, cid: str) -> None:
-    """A detached `run.py exec <pid> <cid>`, or `run.py env <pid>` for cid == "env"."""
-    cdir = state.pdir(cfg, pid) / ("." if cid == "env" else f"checks/{cid}")
-    cdir.mkdir(parents=True, exist_ok=True)
-    log = (cdir / ("env.log" if cid == "env" else "exec.log")).open("ab")
-    flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if sys.platform == "win32" else 0
-    argv = ["env", pid] if cid == "env" else ["exec", pid, cid]
-    p = subprocess.Popen([cfg.python, str(state.ROOT / "run.py"), *argv], cwd=state.ROOT,
-                         stdout=log, stderr=log, stdin=subprocess.DEVNULL, creationflags=flags,
-                         start_new_session=sys.platform != "win32")
-    if cid != "env":
-        state.write_json(cdir / "running.json", {"os_pid": p.pid, "started_at": state.now()})
 
 
 # --- sealing ----------------------------------------------------------------------------
