@@ -14,7 +14,7 @@ from . import state
 from .execute import EVIDENCE
 from .reconcile import FAILURE, SUPPORT
 
-_SUPPORT_WORDS = ("verif(?!ier)", "reproduc", "confirm", "validat", "replicat", "corroborat")
+_SUPPORT_WORDS = ("verif(?!ier)", "reproduc", "confirm", "validat(?!ion)", "replicat", "corroborat")  # a validation set is data
 _FAILURE_WORDS = ("refut", "disprov", "counterexampl", "contradict", "falsif", "failed to reproduc",
                   "failed reproduc")
 _RANK = {"FATAL": 3, "MAJOR": 2, "MINOR": 1, "NOTE": 0}
@@ -111,6 +111,8 @@ def unearned(text: str, led: dict) -> list[str]:
     norm = re.sub(r"[*_`~]", "", re.sub(r"\b[A-Z]+(?:_[A-Z]+)+\b", " ", text))
     bad = []
     for sentence in re.split(r"(?<=[.!?])\s+|\n+", norm):
+        if sentence.rstrip().endswith("?"):
+            continue                    # a question asserts no status
         low, ids = sentence.lower(), set(re.findall(r"\bC\d+\b", sentence))
         for stems, earned in ((_SUPPORT_WORDS, SUPPORT), (_FAILURE_WORDS, FAILURE)):
             for m in re.finditer(r"\b(?:un)?(?:" + "|".join(stems) + r")\w*", low):

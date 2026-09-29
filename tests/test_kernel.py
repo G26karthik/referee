@@ -220,6 +220,8 @@ def test_report_status_words_must_be_earned():
     led["concerns"] = [{"id": "contradiction-02"}]
     assert not report.unearned("- contradiction-02 (MAJOR, model judgment).", led)   # an id is a name
     assert report.unearned("contradiction-02: the table contradicts the abstract.", led)
+    assert not report.unearned("Was the schedule validated? How is the validation set carved out?", led)
+    assert report.unearned("The schedule was validated on the validation set.", led)
 
 
 def test_verify_commit_fails_closed():
