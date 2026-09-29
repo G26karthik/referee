@@ -505,6 +505,11 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             return True
         st.update(env=envinfo, env_dir=str(env_dir), why=why, seed=0, values=[], literal=[], rec=None,
                   stage="prepare" if check.get("prepare") else "run")
+        log = root / "execution.jsonl"          # this exact script was killed for memory before: one seed at a time
+        if check.get("script_sha256") and log.exists() and any(
+                r.get("script_sha256") == check["script_sha256"] and r.get("returncode") == 137
+                for r in map(json.loads, log.read_text(encoding="utf-8").splitlines())):
+            st["width"] = 1
         if not envinfo["ok"]:
             return _finish(cfg, root, check, {**st, "authorized": False, "why": envinfo["detail"]})
         if kind == "AUTHOR_CODE":   # the authors' code writes into its own copy (no .git), never the pinned checkout
