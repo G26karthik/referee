@@ -82,6 +82,12 @@ class Paper:
                 return {"quote": self.text[lo:hi], "page": self.page_of(lo), "span": [lo, hi]}, ""
         return None, "the quote does not occur (as whole words) in the parsed paper"
 
+    def occurs(self, quote: str) -> bool:
+        """Is the quote in the paper at all (once or more)? Prose citing the paper needs only this;
+        evidence needs `find` (a unique place)."""
+        hit, why = self.find(quote)
+        return hit is not None or why.startswith("the quote occurs more than once")
+
     def masked_context(self, hit: dict, value: str, width: int = 80) -> str | None:
         """The printed words around a re-found quote with `value` masked inside the quote only:
         enough context for a transcriber to find the spot on the page image."""

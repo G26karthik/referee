@@ -22,6 +22,9 @@ from .reconcile import FAILURE, PARTIAL, SUPPORT
 _SUPPORT_WORDS = ("verif(?!ier)", "reproduc", "confirm", "validat(?!ion)", "replicat", "corroborat")  # a validation set is data
 _FAILURE_WORDS = ("refut", "disprov", "counterexampl", "contradict", "falsif", "failed to reproduc",
                   "failed reproduc")
+# Protocol nouns ("replicate count", "3 seeded replicates") name units of a run, not a replication.
+_NOUNS = re.compile(r"\b(?:\d+|seeded|independent|per|of)\s+replicates?\b|\breplicates?\s+(?:count|number)s?\b", re.I)
+_STAGES_SHOWN = 40   # ponytail: stages listed per check in review.md; every stage is in ledger.json
 _RANK = {"FATAL": 3, "MAJOR": 2, "MINOR": 1, "NOTE": 0}
 _TESTED = SUPPORT + FAILURE + ("NO_VIOLATION_FOUND",)
 
@@ -103,11 +106,19 @@ def _done(c: dict) -> str:
     lit = "".join(f", as printed {v} {k}" for k, v in (c.get("literal") or {}).items() if v)
     what = {"CERTIFICATE": f"{n} exact instance(s){adm}{lit}", "ARITHMETIC": "the paper's own operands"}.get(
         c["kind"], f"{c.get('runs') or 0} run(s), {n} result(s)")
+    st = c.get("stages") or {}
     stages = "".join(f"; {s}: {p['status']}" + (f" n={p['n']}" if p.get("n") else "")
-                     for s, p in (c.get("stages") or {}).items())
+                     for s, p in st.items()) if len(st) <= 6 else f"; {len(st)} stages: {_counts(st)} (see Stages)"
     extra = (f" (on what completed: {c['status_on_completed']})" if c.get("status_on_completed") else "")
     return (f"{c['id']} {c['kind']}{' proof step' if c['evidence'] == 'PROOF_AUDIT' else ''} on {what}{stages}"
             f"{' (claim reading changed)' if _changed(c) else ''}: {c['status']}{extra}")
+
+
+def _counts(stages: dict) -> str:
+    n: dict = {}
+    for p in stages.values():
+        n[p["status"]] = n.get(p["status"], 0) + 1
+    return ", ".join(f"{v} {k}" for k, v in sorted(n.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
 def _checks(root: Path, plan: dict) -> list[dict]:
@@ -133,7 +144,9 @@ def _checks(root: Path, plan: dict) -> list[dict]:
                     "script_sha256": run.get("script_sha256", ""), "deviations": run.get("deviations", []),
                     "premise_argument": run.get("premise_argument", ""),
                     "state": _state(root, c["id"], state.read_json(cdir / "outcome.json", {}) or {}),
-                    "runs": o.get("runs"), "values": o.get("values"), "literal": o.get("literal"),
+                    # an outcome decided from checkpointed seeds before they counted as runs says so in its protocol
+                    "runs": o.get("runs") or (o.get("protocol") or {}).get("seeds_reused_from_checkpoints"),
+                    "values": o.get("values"), "literal": o.get("literal"),
                     "admissible": o.get("admissible"), "protocol": o.get("protocol"),
                     "image_check": o.get("image_check"), "pilot_values": o.get("pilot_values"),
                     "status": o.get("status"), "reason": o.get("reason", ""), "reason_by": o.get("reason_by", "harness"),
@@ -142,7 +155,8 @@ def _checks(root: Path, plan: dict) -> list[dict]:
                     "resource": o.get("resource"), "stage_times": o.get("stage_times"), "peak_mb": o.get("peak_mb"),
                     "environment": o.get("environment"), "authorization": o.get("authorization", ""),
                     "commit": o.get("commit", ""), "history": history,
-                    "records": "execution.jsonl" if o.get("runs") else ""})
+                    "records": "execution.jsonl" if o.get("runs") or (o.get("protocol") or {}).get(
+                        "seeds_reused_from_checkpoints") else ""})
     return out
 
 
@@ -263,7 +277,8 @@ def _check_rows(checks: list[dict], led: dict) -> list[str]:
                                               + f"{sum(c['values']) / len(c['values']):.6g} (n={len(c['values'])})")
         if c.get("stages"):
             got = "; ".join(f"{s}: " + (f"{p.get('margin', p.get('reproduced', ''))} n={p['n']}" if p.get("n") else
-                                         p["status"]) for s, p in c["stages"].items())
+                                         p["status"]) for s, p in c["stages"].items()) \
+                if len(c["stages"]) <= 6 else f"{len(c['stages'])} stages: {_counts(c['stages'])}"
         # A harness rule states a fact and is shown as is; a reason may carry a script's or a model's
         # own words (a stderr tail, a refusal), so it is screened for status words.
         rule = c["status"] in SUPPORT + FAILURE and c["rule"]
@@ -310,7 +325,7 @@ def unearned(text: str, led: dict) -> list[str]:
     text = flat_text(text)
     for cid in sorted((c["id"] for c in led.get("concerns", [])), key=len, reverse=True):
         text = text.replace(cid, " ")
-    norm = re.sub(r"[*_`~]", "", re.sub(r"\b[A-Z]+(?:_[A-Z]+)+\b", " ", text))
+    norm = re.sub(r"[*_`~]", "", _NOUNS.sub(" ", re.sub(r"\b[A-Z]+(?:_[A-Z]+)+\b", " ", text)))
     bad = []
     for sentence in re.split(r"(?<=[.!?])\s+|\n+", norm):
         if sentence.rstrip().endswith("?"):
@@ -324,6 +339,14 @@ def unearned(text: str, led: dict) -> list[str]:
                     bad.append(sentence.strip()[:200])
                     break
     return bad
+
+
+def unquoted(text: str, paper) -> list[str]:
+    """Quotes (20+ characters) in model prose that occur nowhere in the paper. Quote marks pair in
+    order, so a short quote's closing mark never opens the text up to the next quote; a quote copied
+    with the paper's line break escaped ("incompara-\\nble") is the same quote."""
+    return [q for q in re.findall(r'"([^"\n]*)"', text or "")
+            if len(q) >= 20 and not paper.occurs(q.replace("\\n", "\n"))]
 
 
 def flat_text(s: str) -> str:
@@ -340,9 +363,7 @@ def render(x, led: dict, rep: dict | None) -> str:
     p, s = led["paper"], led["source"]
     summary = (rep or {}).get("summary_md", "")
     # A quote copied with the paper's line break escaped ("incompara-\nble") is the same quote.
-    bad = unearned(summary, led) + [f"quote not in the paper: {q[:80]!r}"
-                                    for q in re.findall(r'"([^"\n]{20,})"', summary)
-                                    if x.paper.find(q.replace("\\n", "\n"))[0] is None]
+    bad = unearned(summary, led) + [f"quote not in the paper: {q[:80]!r}" for q in unquoted(summary, x.paper)]
     fails = [c for c in led["checks"] if c["status"] in FAILURE]
     lines = [f"# Review: {p['title']}", "",
              f"PDF sha256 `{p['sha256'][:16]}`" + (f", arXiv {p['arxiv_id']}{p['arxiv_version']}" if p["arxiv_id"] else "")
@@ -376,12 +397,17 @@ def render(x, led: dict, rep: dict | None) -> str:
     if staged:
         lines += ["## Stages and partial results (completed measurements are kept when a later stage fails)", ""]
         for c in staged:
+            sts = c.get("stages") or {}
             lines.append(f"- **{c['id']}** {c['status']} ({c.get('state')})"
-                         + (f"; on what completed: {c['status_on_completed']}" if c.get("status_on_completed") else ""))
+                         + (f"; on what completed: {c['status_on_completed']}" if c.get("status_on_completed") else "")
+                         + (f"; {len(sts)} stages: {_counts(sts)}" if len(sts) > 6 else ""))
             lines += [f"  - stage {st}: {pr['status']}" + (f", n={pr['n']}" if pr.get("n") else "")
                       + (f", margin {pr['margin']}, t*SE {pr['band']}" if "margin" in pr and "band" in pr else "")
                       + (f", mean {pr['reproduced']}" if "reproduced" in pr else "") + f" — {_said(_cell(pr['reason'], 200), led)}"
-                      for st, pr in (c.get("stages") or {}).items()]
+                      for st, pr in list(sts.items())[:_STAGES_SHOWN]]
+            if len(sts) > _STAGES_SHOWN:
+                lines.append(f"  - … {len(sts) - _STAGES_SHOWN} more stages, each with its status and reason in "
+                             f"`ledger.json` (checks[{c['id']}].stages)")
             lines += [f"  - seed {k} did not complete: {_said(_cell(v, 220), led)}"
                       for k, v in sorted((c.get("failed_seeds") or {}).items())]
         lines.append("")

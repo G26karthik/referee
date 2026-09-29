@@ -26,6 +26,9 @@ def test_quotes_resolve_uniquely_or_not_at_all():
     hit, _ = p.find("reaches 61.4 accuracy")
     assert hit and hit["page"] == 1 and hit["quote"] == "reaches 61.4 accuracy"
     assert p.find("accuracy on CIFAR")[0] is None                   # twice: ambiguous
+    assert p.occurs("accuracy on CIFAR") and not p.occurs("reaches 99.9 accuracy")   # prose citing the paper
+    assert report.unquoted('It says "a short one" (p1) and then "reaches 61.4 accuracy" and "accuracy on CIFAR".', p) == []
+    assert report.unquoted('The paper says "reaches 99.9 accuracy here".', p) == ["reaches 99.9 accuracy here"]
     assert p.find("reaches 99.9 accuracy")[0] is None               # absent
     assert p.find("the")[0] is None                                 # too short to address anything
     assert p.find("We use generation of samples")[0]                # line-break hyphen, after exact fails
@@ -213,6 +216,9 @@ def test_report_status_words_must_be_earned():
     assert report.unearned("contradiction-02: the table contradicts the abstract.", led)
     assert not report.unearned("Was the schedule validated? How is the validation set carved out?", led)
     assert report.unearned("The schedule was validated on the validation set.", led)
+    assert not report.unearned("protocol-04 (replicate count and SEM basis not stated).", led)   # protocol nouns
+    assert not report.unearned("Each stage ran 3 seeded replicates.", led)
+    assert report.unearned("The ordering was replicated.", led) and report.unearned("This replicates Fig. 2.", led)
 
 
 def _refused(fn) -> str:
