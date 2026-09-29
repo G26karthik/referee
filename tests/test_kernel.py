@@ -700,7 +700,8 @@ def test_a_run_that_measures_then_fails_keeps_its_measurements_live():
             cdir.mkdir(parents=True)
             state.write_json(td / "p" / "source.json", {})
             script = ("import argparse, json, sys\np = argparse.ArgumentParser(); p.add_argument('--seed', type=int)\n"
-                      "s = p.parse_args().seed\nprint('REFEREE_PROGRESS ' + json.dumps({'stage': 'a'}), flush=True)\n"
+                      "s = p.parse_args().seed\nprint('REFEREE_PROGRESS ' + json.dumps({'units': ['a', 'b']}))\n"
+                      "print('REFEREE_PROGRESS ' + json.dumps({'stage': 'setup'}), flush=True)\n"
                       "print('REFEREE_RESULT ' + json.dumps({'stage': 'a', 'gap': 0.5 + s / 100}), flush=True)\n"
                       "print('REFEREE_PROGRESS ' + json.dumps({'stage': 'b'}), file=sys.stderr, flush=True)\n"
                       "sys.exit('stage b: the parsed data do not match the paper')\n")
@@ -717,6 +718,7 @@ def test_a_run_that_measures_then_fails_keeps_its_measurements_live():
             assert o["status"] == "PARTIAL" and o["status_on_completed"] == "RELATION_HOLDS", o
             assert o["stages"]["a"]["n"] == 3 and o["stages"]["b"]["status"] == "NOT_COMPLETED"
             assert "do not match the paper" in o["stages"]["b"]["reason"] and len(o["failed_seeds"]) == 3
+            assert "setup" not in o["stages"] and "(during b)" in o["failed_seeds"]["0"]   # a step is not a unit
             env_dir = td / ".script-env"                     # a draft mounts the env's named volume by name
             rec = execute.run(["/env/bin/python", "-c", "print('ok')"], mounts=[(execute.volume(env_dir), "/env", True)],
                               workdir="/", image=execute.DEFAULT_IMAGE, network=False, timeout=120, mode="try", target="t")

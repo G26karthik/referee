@@ -25,8 +25,10 @@ THE SCRIPT CONTRACT
     settings, panels), print one result line PER UNIT with `"stage": "<unit name>"`, as soon as that
     unit finishes (flush): the harness decides each stage over the seeds, and keeps a finished
     stage even if a later one fails.
-  - Before each unit starts, print `REFEREE_PROGRESS {"stage": "<unit>", "t": <seconds so far>}`
-    (either stream): it shows what ran, and times the pilot.
+  - At the start, declare the units that will each print a result line, once:
+    `REFEREE_PROGRESS {"units": ["<unit>", ...]}` — a declared unit that prints no result counts as
+    NOT COMPLETED. Before each step, print `REFEREE_PROGRESS {"stage": "<step>", "t": <seconds so
+    far>}` (either stream): it shows how far a failed run got and times the pilot.
   - DATA IDENTITY: for each dataset you load, print `REFEREE_DATA {"dataset": "<name>", "source":
     "<file path>", "observed": {...counts, shape, distinct labels...}, "expected": {...what the
     paper prints, with its quote...}, "matches": true|false}`. A mismatch is a finding: report it
@@ -37,7 +39,8 @@ THE SCRIPT CONTRACT
     stops with a documented blocker if the stated run count cannot finish; a long run may save
     progress under /work/ckpt (a per-seed scratch volume) and resume from it after a restart. Use
     the GPU when the host has one and the method trains a network (e.g. pass the authors' own
-    GPU switch); say which device ran in a REFEREE_PROGRESS line.
+    GPU switch); say which device ran: `REFEREE_PROGRESS {"note": "device <name>"}`.
+  - For a claim over several units, the result lines carry `"stage": "<unit>"` (the declared name).
 
 BINDINGS. For each required kind below, give `paper_quote` (the paper's own words, copied
 verbatim from the parsed text — the harness re-finds it) and `impl_quote` (the literal line(s)

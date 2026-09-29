@@ -349,9 +349,16 @@ def failure_text(rec: dict) -> str:
             + (tail or "no error output"))
 
 
+def units(rec: dict) -> set[str]:
+    """The result units a run declared (`REFEREE_PROGRESS {"units": [...]}`): each must print a result."""
+    both = (rec.get("stdout") or "") + "\n" + (rec.get("stderr") or "")
+    return {str(u)[:80] for d in json_lines(both, "REFEREE_PROGRESS") if isinstance(d.get("units"), list)
+            for u in d["units"][:50]}                               # ponytail: 50 units per check
+
+
 def markers(st: dict, rec: dict) -> set[str]:
-    """Record a run's dataset identities (first report per dataset) and the stages it started;
-    returns those stages."""
+    """Record a run's dataset identities (first report per dataset) and the stages it started
+    (progress markers: they locate a failure, they are not units); returns those stages."""
     both = (rec.get("stdout") or "") + "\n" + (rec.get("stderr") or "")
     ids = st.setdefault("data_identity", {})
     for d in json_lines(both, "REFEREE_DATA")[:20]:            # ponytail: 20 datasets per run
@@ -825,8 +832,10 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             st["done_seeds"].append(row["seed"])
             if row.get("error"):
                 st["failed_seeds"][str(row["seed"])] = row["error"]
-            for s, e in (row.get("stage_errors") or {}).items():
-                st.setdefault("stage_errors", {}).setdefault(s, e)
+            st["units"] = sorted(set(st.get("units") or []) | set(row.get("units") or []))
+            for s, e in (row.get("stage_errors") or {}).items():    # only a declared unit can be incomplete
+                if s in (row.get("units") or []):
+                    st.setdefault("stage_errors", {}).setdefault(s, e)
             st.setdefault("pilot_s", row.get("seconds") or 0)
         st["seed"], st["reused"] = len(st["done_seeds"]), len(st["done_seeds"])
         log = root / "execution.jsonl"          # this exact script was killed for memory before: one seed at a time
@@ -903,13 +912,18 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         else:   # bound by name: the relation's outputs or the generator's compared output, per stage
             staged = staged_values(done["stdout"], rel, check.get("metric", ""))
             vs = [v for _, v in staged]
-        # A stage that started and printed no result is not completed, whether or not the run failed.
-        failed_stages = {s: (failure_text(done) if ev["failed"] else "the stage started and printed no result line")
-                         for s in started - {t for t, _ in staged}} if kind in ("RECONSTRUCTION", "RELEASED_DATA") else {}
+        # A declared result unit that printed no result is not completed, whether or not the run failed.
+        declared = units(done) if kind in ("RECONSTRUCTION", "RELEASED_DATA") else set()
+        st["units"] = sorted(set(st.get("units") or []) | declared)
+        last = next((s for s in reversed([str(d.get("stage")) for d in json_lines(
+            (done.get("stdout") or "") + "\n" + (done.get("stderr") or ""), "REFEREE_PROGRESS") if d.get("stage")])), "")
+        failed_stages = {s: (failure_text(done) if ev["failed"] else "a declared unit printed no result line")
+                         for s in declared - {t for t, _ in staged}}
         for s, e in failed_stages.items():
             st.setdefault("stage_errors", {}).setdefault(s, e)
         if ev["failed"] or not vs:
-            err = failure_text(done) if ev["failed"] else f"exit 0 after {done.get('seconds', 0):.0f}s with no result line"
+            err = (failure_text(done) + (f" (during {last})" if last else "")) if ev["failed"] else \
+                f"exit 0 after {done.get('seconds', 0):.0f}s with no result line"
             if kind == "AUTHOR_CODE" or not st.get("done_seeds") and not vs:
                 return _finish(cfg, root, check, {**_cancel(root, st), "ev": ev, "failure": err} if ev["failed"]
                                else {**_cancel(root, st), "values": []})   # a clean exit with nothing establishes nothing
@@ -924,7 +938,7 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         state.append_jsonl(cdir / "seeds.jsonl", {"key": _ckpt_key(check), "seed": int(key), "values": vs,
                                                    "cert": rows, "staged": staged, "seconds": done.get("seconds"),
                                                    "error": st.get("failed_seeds", {}).get(key, ""),
-                                                   "stage_errors": failed_stages})
+                                                   "stage_errors": failed_stages, "units": sorted(declared)})
         if "pilot_s" not in st:                           # the first completed run is the pilot
             st["pilot_s"] = done.get("seconds") or 0
             if (why := _over_budget(cfg, check, st, runs)):
