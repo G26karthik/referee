@@ -17,13 +17,31 @@ from pathlib import Path
 from . import state
 from .evidence import flat
 from .execute import EVIDENCE
-from .reconcile import FAILURE, SUPPORT
+from .reconcile import FAILURE, PARTIAL, SUPPORT
 
 _SUPPORT_WORDS = ("verif(?!ier)", "reproduc", "confirm", "validat(?!ion)", "replicat", "corroborat")  # a validation set is data
 _FAILURE_WORDS = ("refut", "disprov", "counterexampl", "contradict", "falsif", "failed to reproduc",
                   "failed reproduc")
 _RANK = {"FATAL": 3, "MAJOR": 2, "MINOR": 1, "NOTE": 0}
 _TESTED = SUPPORT + FAILURE + ("NO_VIOLATION_FOUND",)
+
+
+def merged(plan: dict | None, follow: dict | None) -> dict | None:
+    """The first plan with its follow-up round: the follow-up's checks appended, its links and
+    reasons joined onto the same central claims (matched by quote)."""
+    if not plan or not follow:
+        return plan
+    claims = [dict(cc) for cc in plan["central_claims"]]
+    for f in follow.get("central_claims", []):
+        cc = next((c for c in claims if flat(c["quote"]) == flat(f["quote"])), None)
+        if cc is None:
+            claims.append(f)
+            continue
+        cc["checks"] = cc["checks"] + [k for k in f["checks"] if k not in cc["checks"]]
+        cc["why_unchecked"] = f.get("why_unchecked") or cc.get("why_unchecked", "")
+        cc["omitted"] = (cc.get("omitted") or []) + (f.get("omitted") or [])
+    return {**plan, "checks": plan["checks"] + follow["checks"], "central_claims": claims,
+            "dropped": plan.get("dropped", []) + follow.get("dropped", [])}
 
 
 def _changed(c: dict) -> bool:
@@ -33,26 +51,49 @@ def _changed(c: dict) -> bool:
 def _claim_status(cs: list[dict], conflicted: bool = False) -> str:
     """What the checks of one central claim FOUND. A failed step of a printed proof is a gap in
     the proof, never a refutation of the statement; a premise no tested instance met, or a
-    result that holds only for a changed reading of the claim, is neither support nor failure."""
+    result obtained only after changing what the claim says (a premise, a definition, the
+    method's tuning or training data...), is neither support nor failure of the printed claim;
+    a check whose protocol did not complete is partial evidence, whatever its completed part says."""
     if not cs:
         return "NOT_CHECKED"
     if conflicted:
         return "CHECKS_DISAGREE"
-    fails = [c for c in cs if c["status"] in FAILURE]
+    # A certificate separates its readings itself (COUNTEREXAMPLE_FOUND is always about the text as
+    # printed); any other check's result under a claim-changing deviation is about the changed claim.
+    moved = lambda c: _changed(c) and c["kind"] != "CERTIFICATE"
+    fails = [c for c in cs if c["status"] in FAILURE and not moved(c)]
     if any(c["evidence"] != "PROOF_AUDIT" for c in fails):
         return "FAILURE_FOUND"
     if fails:
         return "PROOF_GAP_FOUND"
-    if any(c["status"] in SUPPORT for c in cs):
+    if any(c["status"] in SUPPORT and not moved(c) for c in cs):
         return "SUPPORT_FOUND"
     if any(c["status"] == "PREMISE_NOT_MET" for c in cs):
         return "PREMISE_NOT_MET"
-    if any(c["status"] == "VIOLATION_UNDER_CHANGED_READING" or (c["status"] == "NO_VIOLATION_FOUND" and _changed(c))
-           for c in cs):
+    if any(c["status"] == "VIOLATION_UNDER_CHANGED_READING" or (c["status"] in SUPPORT + FAILURE and moved(c))
+           or (c["status"] == "NO_VIOLATION_FOUND" and _changed(c)) for c in cs):
         return "READING_CHANGED"
     if any(c["status"] == "NO_VIOLATION_FOUND" for c in cs):
         return "NO_VIOLATION_FOUND"
+    if any(c["status"] == PARTIAL for c in cs):
+        return "PARTIAL_EVIDENCE"
     return "PENDING" if any(c["status"] == "PENDING" for c in cs) else "NOTHING_DECIDED"
+
+
+def _state(root: Path, cid: str, o: dict) -> str:
+    """Where a check is: not started, running, partially completed, completed, failed, resource-limited."""
+    if not o:
+        return "RUNNING" if (root / "checks" / cid / "exec.json").exists() else "NOT_STARTED"
+    s = o.get("status")
+    if s == PARTIAL:
+        return "PARTIALLY_COMPLETED"
+    if s == "BLOCKED":
+        return "RESOURCE_LIMITED" if str(o.get("reason", "")).startswith("RESOURCE BLOCKER") else "REFUSED_BY_GATE"
+    if s == "NOT_CHECKABLE":
+        return "NOT_RUN"
+    if s == "INCONCLUSIVE" and not o.get("values"):
+        return "FAILED"
+    return "COMPLETED"
 
 
 def _done(c: dict) -> str:
@@ -62,8 +103,11 @@ def _done(c: dict) -> str:
     lit = "".join(f", as printed {v} {k}" for k, v in (c.get("literal") or {}).items() if v)
     what = {"CERTIFICATE": f"{n} exact instance(s){adm}{lit}", "ARITHMETIC": "the paper's own operands"}.get(
         c["kind"], f"{c.get('runs') or 0} run(s), {n} result(s)")
-    return (f"{c['id']} {c['kind']}{' proof step' if c['evidence'] == 'PROOF_AUDIT' else ''} on {what}"
-            f"{' (claim reading changed)' if _changed(c) else ''}: {c['status']}")
+    stages = "".join(f"; {s}: {p['status']}" + (f" n={p['n']}" if p.get("n") else "")
+                     for s, p in (c.get("stages") or {}).items())
+    extra = (f" (on what completed: {c['status_on_completed']})" if c.get("status_on_completed") else "")
+    return (f"{c['id']} {c['kind']}{' proof step' if c['evidence'] == 'PROOF_AUDIT' else ''} on {what}{stages}"
+            f"{' (claim reading changed)' if _changed(c) else ''}: {c['status']}{extra}")
 
 
 def _checks(root: Path, plan: dict) -> list[dict]:
@@ -76,18 +120,29 @@ def _checks(root: Path, plan: dict) -> list[dict]:
         ev = EVIDENCE.get(c["kind"], "NONE")
         if c["kind"] == "CERTIFICATE" and c.get("step"):
             ev = "PROOF_AUDIT"
+        # Superseded outcomes (an earlier run of this check that a later one replaced) stay visible.
+        history = [{"file": f.name, "status": (state.read_json(f) or {}).get("status"),
+                    "reason": str((state.read_json(f) or {}).get("reason", ""))[:300]}
+                   for f in sorted(cdir.glob("outcome.*.json"))]
         out.append({"id": c["id"], "kind": c["kind"], "evidence": ev, "concerns": c["concerns"],
                     "central": c["id"] in central, "incidental_why": c.get("incidental_why", ""),
                     "claim": c["claim"], "target": c.get("target"), "statement": c.get("statement", ""),
                     "step": c.get("step", ""), "printed": c.get("printed", ""), "metric": run.get("metric", c.get("metric", "")),
+                    "covers": c.get("covers", []), "acquire": c.get("acquire", []),
                     "command": run.get("command", ""), "identity": run.get("identity"),
                     "script_sha256": run.get("script_sha256", ""), "deviations": run.get("deviations", []),
+                    "premise_argument": run.get("premise_argument", ""),
+                    "state": _state(root, c["id"], state.read_json(cdir / "outcome.json", {}) or {}),
                     "runs": o.get("runs"), "values": o.get("values"), "literal": o.get("literal"),
                     "admissible": o.get("admissible"), "protocol": o.get("protocol"),
                     "image_check": o.get("image_check"), "pilot_values": o.get("pilot_values"),
-                    "status": o.get("status"), "reason": o.get("reason", ""), "rule": o.get("rule", ""),
+                    "status": o.get("status"), "reason": o.get("reason", ""), "reason_by": o.get("reason_by", "harness"),
+                    "rule": o.get("rule", ""), "stages": o.get("stages"), "status_on_completed": o.get("status_on_completed"),
+                    "failed_seeds": o.get("failed_seeds"), "data_identity": o.get("data_identity"), "data": o.get("data"),
+                    "resource": o.get("resource"), "stage_times": o.get("stage_times"), "peak_mb": o.get("peak_mb"),
                     "environment": o.get("environment"), "authorization": o.get("authorization", ""),
-                    "commit": o.get("commit", ""), "records": "execution.jsonl" if o.get("runs") else ""})
+                    "commit": o.get("commit", ""), "history": history,
+                    "records": "execution.jsonl" if o.get("runs") else ""})
     return out
 
 
@@ -148,7 +203,7 @@ def _headline(checks: list[dict], claims: list[dict]) -> str:
         return "CENTRAL_SUPPORT_FOUND"
     if "SUPPORT_FOUND" in st:
         return "SOME_CENTRAL_SUPPORT_FOUND"
-    for found in ("PREMISE_NOT_MET", "READING_CHANGED", "NO_VIOLATION_FOUND"):
+    for found in ("PREMISE_NOT_MET", "READING_CHANGED", "NO_VIOLATION_FOUND", "PARTIAL_EVIDENCE"):
         if found in st:
             return f"CENTRAL_{found}"
     return "NO_CENTRAL_FINDING"
@@ -156,7 +211,7 @@ def _headline(checks: list[dict], claims: list[dict]) -> str:
 
 def scientific_status(root: Path) -> str:
     """What the review CHECKED about the central claims — separate from workflow completion."""
-    plan = state.read_json(root / "sealed" / "plan.json")
+    plan = merged(state.read_json(root / "sealed" / "plan.json"), state.read_json(root / "sealed" / "plan__2.json"))
     if plan is None:
         return "NOT_ASSESSED"
     checks = _checks(root, plan)
@@ -166,15 +221,16 @@ def scientific_status(root: Path) -> str:
 def _workflow(checks: list[dict]) -> dict:
     by = lambda *s: [c["id"] for c in checks if c["status"] in s]
     return {"checks_planned": len(checks), "finished": len([c for c in checks if c["status"] != "PENDING"]),
-            "reached_a_scientific_status": by(*_TESTED), "blocked": by("BLOCKED"),
+            "reached_a_scientific_status": by(*_TESTED), "blocked": by("BLOCKED"), "partial": by(PARTIAL),
             "inconclusive": by("INCONCLUSIVE"), "not_checkable": by("NOT_CHECKABLE"),
+            "states": {c["id"]: c.get("state") for c in checks},
             "environment_recoveries": {c["id"]: c["environment"]["recovery"] for c in checks
                                        if (c.get("environment") or {}).get("recovery")}}
 
 
 def ledger(x) -> dict:
     """Every report claim joined to its machine artifact; written to ledger.json."""
-    plan = x.sealed("plan") or {"checks": [], "central_claims": [], "dropped": []}
+    plan = x.plan() or {"checks": [], "central_claims": [], "dropped": []}
     checks = _checks(x.root, plan)
     conf = conflicts(checks)
     central = _central(plan, checks, conf)
@@ -198,16 +254,21 @@ def _cell(s, n: int = 90) -> str:
 
 
 def _check_rows(checks: list[dict], led: dict) -> list[str]:
-    rows = ["| Check | Kind (evidence) | Bears on | Printed target | Result | Status | Deviations | Rule or blocker |",
+    rows = ["| Check | Kind (evidence) | Bears on | Printed target | Result | Status (state) | Deviations | Rule or blocker |",
             "|---|---|---|---|---|---|---|---|"]
     for c in checks:
         t = c.get("target") or {}
         target = t.get("relation") or c["printed"] or _cell(c["step"] or c["statement"], 60)
         got = "" if not c.get("values") else (("margin " if t.get("relation") else "")
                                               + f"{sum(c['values']) / len(c['values']):.6g} (n={len(c['values'])})")
+        if c.get("stages"):
+            got = "; ".join(f"{s}: " + (f"{p.get('margin', p.get('reproduced', ''))} n={p['n']}" if p.get("n") else
+                                         p["status"]) for s, p in c["stages"].items())
+        why = _cell(c["rule"] if c["status"] in SUPPORT + FAILURE else c["reason"] or c["rule"], 160)
+        # Harness-written rules and reasons state facts; only model-written text is screened.
         rows.append(f"| {c['id']} | {c['kind']} ({c['evidence']}) | {_cell(c['claim'], 70)} | {_cell(target, 40)} | "
-                    f"{got} | **{c['status']}** | {len(c['deviations']) or ''} | "
-                    f"{_said(_cell(c['rule'] or c['reason'], 160), led)} |")
+                    f"{_cell(got, 80)} | **{c['status']}** ({c.get('state', '')}) | {len(c['deviations']) or ''} | "
+                    f"{_said(why, led) if c.get('reason_by') == 'model' else why} |")
     return rows
 
 
@@ -230,7 +291,8 @@ def table(led: dict) -> str:
     w = led["workflow"]
     rows += ["", f"Workflow completion: {w['finished']} of {w['checks_planned']} planned checks finished; "
                  f"{len(w['reached_a_scientific_status'])} reached a scientific status "
-                 f"({', '.join(w['reached_a_scientific_status']) or 'none'}); blocked: {', '.join(w['blocked']) or 'none'}; "
+                 f"({', '.join(w['reached_a_scientific_status']) or 'none'}); partial: {', '.join(w['partial']) or 'none'}; "
+                 f"blocked: {', '.join(w['blocked']) or 'none'}; "
                  f"inconclusive: {', '.join(w['inconclusive']) or 'none'}; not checkable: "
                  f"{', '.join(w['not_checkable']) or 'none'}."]
     return "\n".join(rows)
@@ -275,8 +337,10 @@ def _said(s: str, led: dict) -> str:
 def render(x, led: dict, rep: dict | None) -> str:
     p, s = led["paper"], led["source"]
     summary = (rep or {}).get("summary_md", "")
+    # A quote copied with the paper's line break escaped ("incompara-\nble") is the same quote.
     bad = unearned(summary, led) + [f"quote not in the paper: {q[:80]!r}"
-                                    for q in re.findall(r'"([^"\n]{20,})"', summary) if x.paper.find(q)[0] is None]
+                                    for q in re.findall(r'"([^"\n]{20,})"', summary)
+                                    if x.paper.find(q.replace("\\n", "\n"))[0] is None]
     fails = [c for c in led["checks"] if c["status"] in FAILURE]
     lines = [f"# Review: {p['title']}", "",
              f"PDF sha256 `{p['sha256'][:16]}`" + (f", arXiv {p['arxiv_id']}{p['arxiv_version']}" if p["arxiv_id"] else "")
@@ -306,6 +370,40 @@ def render(x, led: dict, rep: dict | None) -> str:
             + (f"printed \"{_cell(d['printed'], 120)}\" (p{d['page']})" if d["printed"] else "the paper is silent")
             + f" -> used: {_cell(d['used'], 200)}. Why: {_cell(d['why'], 200)}" for cid, d in devs] + [
             f"- {cid} environment: {r['action']}" for cid, rs in recs.items() for r in rs] + [""]
+    staged = [c for c in led["checks"] if c.get("stages") or c.get("failed_seeds")]
+    if staged:
+        lines += ["## Stages and partial results (completed measurements are kept when a later stage fails)", ""]
+        for c in staged:
+            lines.append(f"- **{c['id']}** {c['status']} ({c.get('state')})"
+                         + (f"; on what completed: {c['status_on_completed']}" if c.get("status_on_completed") else ""))
+            lines += [f"  - stage {st}: {pr['status']}" + (f", n={pr['n']}" if pr.get("n") else "")
+                      + (f", margin {pr['margin']}, t*SE {pr['band']}" if "margin" in pr and "band" in pr else "")
+                      + (f", mean {pr['reproduced']}" if "reproduced" in pr else "") + f" — {_cell(pr['reason'], 200)}"
+                      for st, pr in (c.get("stages") or {}).items()]
+            lines += [f"  - seed {k} failed: {_cell(v, 220)}" for k, v in sorted((c.get("failed_seeds") or {}).items())]
+        lines.append("")
+    got = [c for c in led["checks"] if c.get("acquire") or c.get("data_identity")]
+    if got:
+        lines += ["## Data acquired and data identity (provenance, as recorded)", ""]
+        for c in got:
+            d = state.read_json(x.root / "checks" / c["id"] / "data.json") or {}
+            for src in d.get("sources") or c.get("acquire") or []:
+                lines.append(f"- **{c['id']}** source `{src.get('source')}`"
+                             + (f" (HTTP {src['http_status']})" if src.get("http_status") else "")
+                             + (f" revision `{src['revision'][:12]}`" if src.get("revision") else "")
+                             + (f" — ERROR: {_cell(src['error'], 200)}" if src.get("error") else "")
+                             + "".join(f"; followed {f.get('url')}" + (f" ERROR {_cell(f['error'], 80)}" if f.get("error")
+                                                                        else "") for f in (src.get("followed") or [])[:5]))
+            if d.get("n_files") is not None:
+                lines.append(f"  - {d.get('n_files')} files, {d.get('bytes')} bytes, each with sha256 in "
+                             f"`checks/{c['id']}/data.json` (fetched {d.get('fetched_at', '?')})")
+            for name, ident in (c.get("data_identity") or {}).items():
+                lines.append(f"  - dataset {name}: {_cell(json.dumps(ident, ensure_ascii=False), 300)}")
+        lines.append("")
+    hist = [(c["id"], h) for c in led["checks"] for h in c.get("history") or []]
+    if hist:
+        lines += ["## Superseded results (withdrawn by a later run of the same check)", ""] + [
+            f"- {cid} `{h['file']}`: {h['status']} — {_cell(h['reason'], 200)}" for cid, h in hist] + [""]
     prot = [(c["id"], c["protocol"]) for c in led["checks"] if c.get("protocol")]
     if prot:
         lines += ["## Protocol choices (what the paper stated, what REFEREE supplied)", ""]
@@ -319,19 +417,29 @@ def render(x, led: dict, rep: dict | None) -> str:
     lines += ["## Summary (model-written from the ledger)", "",
               summary if summary and not bad else
               f"_Withheld: the summary used status language no check earns: {bad[:2]}_" if bad else "_No summary._", ""]
+    args = [c for c in led["checks"] if c.get("premise_argument")]
+    if args:
+        lines += ["## Arguments the script author gave (verifier-approved reasoning, not an executed result)", ""] + [
+            f"- **{c['id']}**: {_said(_cell(c['premise_argument'], 600), led)}" for c in args] + [""]
     lines += ["## Concerns (after the critic)", ""]
     for c in [c for c in led["concerns"] if not c.get("withdrawn")][:15]:   # ponytail: 15 shown, all in the ledger
         q = "; ".join(f"\"{_cell(e['quote'], 160)}\" (p{e['page']})" for e in c["evidence"][:2])
+        linked = ", ".join(f"{k['id']} {k['status']}" for k in led["checks"] if c["id"] in k["concerns"])
         lines.append(f"- **{c['id']} {c['severity']}/{c['confidence']}** {_said(c['title'], led)} — "
                      f"{_said(_cell(c['statement'], 300), led)} Evidence: {q}"
-                     + (f" _Page-image check: {_cell(c['image_check'], 240)}._" if c.get("image_check") else ""))
+                     + (f" _Page-image check: {_cell(c['image_check'], 240)}._" if c.get("image_check") else "")
+                     + (f" _Checked by: {linked} (a concern stands only as far as its check established it)._"
+                        if linked else ""))
     withdrawn = [c for c in led["concerns"] if c.get("withdrawn")]
     if withdrawn:
         lines += ["", f"_{len(withdrawn)} concern(s) withdrawn by the critic, with reasons, are in `ledger.json`._"]
     dropped = led["dropped"]
-    lines += ["", "## Not checked", ""] + [
-        f"- {_cell(cc['quote'], 140)}: {_said(cc['why_unchecked'], led) or 'no check reached a conclusion'}"
-        for cc in led["central_claims"] if cc["claim_status"] in ("NOT_CHECKED", "NOTHING_DECIDED", "PENDING")] + [
+    lines += ["", "## Not checked or not decided", ""] + [
+        f"- {_cell(cc['quote'], 140)} — {cc['claim_status']}: {_said(cc['why_unchecked'], led) or 'no check reached a conclusion'}"
+        for cc in led["central_claims"] if cc["claim_status"] in ("NOT_CHECKED", "NOTHING_DECIDED", "PENDING",
+                                                                  "PARTIAL_EVIDENCE")] + [
+        f"- {_cell(cc['quote'], 80)}: scope item **{o['item']}** omitted — {_said(_cell(o['why'], 200), led)}"
+        for cc in led["central_claims"] for o in cc.get("omitted") or []] + [
         f"- planned check {d['check']} dropped: {_cell(d['why'], 200)}" for d in dropped["checks"]] + [
         f"- {len(dropped['concerns_unresolved_quotes'])} concern(s) dropped because a quote did not resolve (ledger)."]
     text = "\n".join(lines) + "\n"

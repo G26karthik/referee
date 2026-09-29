@@ -121,8 +121,8 @@ def run(argv: list[str], *, mounts: list[tuple[Path, str, bool]], workdir: str, 
     """One process in a fresh container. Never raises: every ending is data."""
     name = f"referee-{uuid.uuid4().hex[:12]}"
     launch = ["docker", "run", "--rm", "--name", name, "-w", workdir]
-    for host, inside, ro in mounts:
-        launch += ["-v", f"{Path(host).resolve()}:{inside}{':ro' if ro else ''}"]
+    for host, inside, ro in mounts:   # a named volume stays a name (resolving it made an empty host dir)
+        launch += ["-v", f"{_src(host)}:{inside}{':ro' if ro else ''}"]
     launch += (["--network", "none"] if not network else []) + (["--gpus", "all"] if gpus else [])
     for k, v in sorted((env or {}).items()):
         launch += ["-e", f"{k}={v}"]
@@ -259,10 +259,12 @@ def classify(rec: dict) -> dict:
     infra = next((s for s in _INFRA if s in low), "") or (
         f"killed by the OS (exit {rec['returncode']})" if rec.get("returncode") in _SIGNALS else "")
     setup = next((s for s in _SETUP if s in low), "")
-    out_lines = len((rec.get("stdout") or "").splitlines())
-    # The burden is on showing it started: an unproven start accuses nobody.
-    reached = (not setup and not rec.get("timed_out") and not rec.get("error")
-               and ("REFEREE_RESULT" in (rec.get("stdout") or "") or (rec.get("seconds", 0) >= 30 and out_lines >= 5)))
+    both = (rec.get("stdout") or "") + "\n" + err
+    # The burden is on showing it started: a result or progress line in either stream shows it;
+    # otherwise only a long, talkative, clean run does. An unproven start accuses nobody.
+    marked = any(t in both for t in ("REFEREE_RESULT ", "REFEREE_PROGRESS ", "REFEREE_DATA "))
+    reached = marked or (not setup and not rec.get("timed_out") and not rec.get("error")
+                         and rec.get("seconds", 0) >= 30 and len(both.splitlines()) >= 5)
     frames = re.findall(r'File "([^"]+)", line \d+', err.rsplit("Traceback (most recent call last)", 1)[-1])
     own = frames[-1] if frames and frames[-1].startswith(f"{MOUNT}/repo/") and "site-packages" not in frames[-1] else ""
     return {"infra_error": infra, "setup_error": setup, "reached": reached, "own_code_crash": own,
@@ -270,18 +272,28 @@ def classify(rec: dict) -> dict:
 
 
 # --- metric parsing: a value bound by name, never by position (invariant 16) ------------
-def _results(stdout: str) -> list[dict]:
-    """The numeric fields of each `REFEREE_RESULT {json}` line (the script contract)."""
+def json_lines(text: str, tag: str) -> list[dict]:
+    """The `<tag> {json}` lines of a stream: REFEREE_RESULT (the compared outputs, stdout only),
+    REFEREE_DATA (a dataset's identity) and REFEREE_PROGRESS (a stage starting), either stream."""
     out = []
-    for line in (stdout or "").splitlines():
-        if line.startswith("REFEREE_RESULT "):
+    for line in (text or "").splitlines():
+        if line.startswith(tag + " "):
             try:
-                d = json.loads(line[len("REFEREE_RESULT "):])
+                d = json.loads(line[len(tag) + 1:])
             except ValueError:
                 continue
             if isinstance(d, dict):
-                out.append({k: float(v) for k, v in d.items() if isinstance(v, (int, float)) and not isinstance(v, bool)})
+                out.append(d)
     return out
+
+
+def _num(d: dict) -> dict:
+    return {k: float(v) for k, v in d.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+
+
+def _results(stdout: str) -> list[dict]:
+    """The numeric fields of each `REFEREE_RESULT {json}` line (the script contract)."""
+    return [_num(d) for d in json_lines(stdout, "REFEREE_RESULT")]
 
 
 def result_values(stdout: str, key: str) -> list[float]:
@@ -289,29 +301,63 @@ def result_values(stdout: str, key: str) -> list[float]:
     return [d[key] for d in _results(stdout) if key in d]
 
 
+def staged_values(stdout: str, rel: str, metric: str) -> list[list]:
+    """[stage, value] per result line: the relation's paired margin (every named output present)
+    or the named metric. `stage` ("" if unnamed) is the unit a result is decided in: a dataset, a
+    setting, a panel — a stage is decided over the seeds, never averaged with another stage."""
+    names = relation(rel)[3] if rel else [metric] if metric else []
+    return [[str(d.get("stage") or "")[:80], margin(rel, _num(d)) if rel else _num(d)[metric]]
+            for d in json_lines(stdout, "REFEREE_RESULT") if names and all(n in _num(d) for n in names)]
+
+
 def cert_rows(stdout: str) -> list[dict]:
     """A certificate's instances: `violated`, `premises` (1/0 when the script evaluated every
-    premise of the exact claim; None when it did not say), `literal` (the text as printed)."""
+    premise of the exact claim; None when it did not say), `literal` (the text as printed),
+    `lhs`/`rhs` (floats) and `exact` (the script also printed both sides as exact strings)."""
     rows = []
-    for line in (stdout or "").splitlines():
-        if not line.startswith("REFEREE_RESULT "):
-            continue
-        try:
-            d = json.loads(line[len("REFEREE_RESULT "):])
-        except ValueError:
-            continue
-        if isinstance(d, dict) and d.get("violated") in (0, 1):
+    for d in json_lines(stdout, "REFEREE_RESULT"):
+        if d.get("violated") in (0, 1):
             rows.append({"violated": int(d["violated"]),
                          "premises": int(d["premises_hold"]) if d.get("premises_hold") in (0, 1) else None,
                          "literal": d.get("literal") if d.get("literal") in ("holds", "fails", "undefined",
-                                                                             "premise_not_met") else None})
+                                                                             "premise_not_met") else None,
+                         **{k: float(d[k]) for k in ("lhs", "rhs") if isinstance(d.get(k), (int, float))
+                            and not isinstance(d.get(k), bool)},
+                         "exact": all(isinstance(d.get(k), str) and d.get(k) for k in ("lhs_exact", "rhs_exact"))})
     return rows
 
 
 def relation_margins(stdout: str, rel: str) -> list[float]:
     """One paired margin per result line that carries every output the relation names."""
-    names = relation(rel)[3]
-    return [margin(rel, d) for d in _results(stdout) if all(n in d for n in names)]
+    return [v for _, v in staged_values(stdout, rel, "")]
+
+
+def failure_text(rec: dict) -> str:
+    """What ended a failed run, in its own last words (progress bars skipped), with its exit
+    code and duration: the fact a reader needs, not a guess about whether it began."""
+    if rec.get("error"):
+        return str(rec["error"])
+    lines = [ln.strip() for ln in (rec.get("stderr") or "").splitlines()
+             if ln.strip() and "it/s]" not in ln and "s/it]" not in ln and "%|" not in ln]
+    tail = " | ".join(lines[-3:])[-400:]
+    return (f"exit {rec.get('returncode')} after {rec.get('seconds', 0):.0f}s: "
+            + (tail or "no error output"))
+
+
+def markers(st: dict, rec: dict) -> set[str]:
+    """Record a run's dataset identities (first report per dataset) and the stages it started;
+    returns those stages."""
+    both = (rec.get("stdout") or "") + "\n" + (rec.get("stderr") or "")
+    ids = st.setdefault("data_identity", {})
+    for d in json_lines(both, "REFEREE_DATA")[:20]:            # ponytail: 20 datasets per run
+        name = str(d.get("dataset") or "")[:120]
+        if name and name not in ids:
+            ids[name] = json.loads(json.dumps({k: d[k] for k in list(d)[:16]}, default=str)[:4000])
+    started = {str(d.get("stage"))[:80] for d in json_lines(both, "REFEREE_PROGRESS") if d.get("stage")}
+    if started and "stage_times" not in st:                   # the pilot's own timing, by stage
+        st["stage_times"] = [{"stage": str(d.get("stage"))[:80], "t": d.get("t")}
+                             for d in json_lines(both, "REFEREE_PROGRESS")[:40]]
+    return started
 
 
 def parse_metric(stdout: str, key: str) -> tuple[float | None, str]:
@@ -502,6 +548,217 @@ def script_env(cfg: state.Config, root: Path, kind: str, attributed: bool) -> tu
     return base, ensure_env(cfg, root, base, DEFAULT_IMAGE, None, SCRIPT_PACKAGES)
 
 
+# --- public artifacts the checkout does not ship: acquired by harness code (never model code)
+# with the network on, from sources the paper or the checkout cites, each file hashed; every
+# later step sees them read-only at /work/data. A cited dataset PAGE may be followed to the
+# same site's files matching `include`.
+DATA_MOUNT = f"{MOUNT}/data"
+_FETCHER = r'''
+import fnmatch, hashlib, html, json, os, re, shutil, subprocess, sys, tarfile, urllib.parse, urllib.request, zipfile
+cap, deny = int(os.environ["REFEREE_CAP"]), [d for d in os.environ.get("REFEREE_DENY", "").lower().split(",") if d]
+cache, total, out = "/root/.cache/referee-urls", 0, []
+TEXT = (".csv", ".tsv", ".txt", ".json", ".jsonl", ".arff", ".md", ".data", ".names")
+def denied(s): return any(d in s.lower() for d in deny)
+def get(url, dest):
+    global total
+    if denied(url): raise RuntimeError("source denied by SH_DENY_SOURCES")
+    key = hashlib.sha256(url.encode()).hexdigest()[:16]
+    name = urllib.parse.unquote(urllib.parse.urlparse(url).path.rstrip("/").split("/")[-1]) or "index.html"
+    cpath, info = f"{cache}/{key}/{name}", {"url": url}
+    if not os.path.exists(cpath):
+        os.makedirs(os.path.dirname(cpath), exist_ok=True)
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "referee"}), timeout=120) as r:
+            info["http_status"], info["content_type"] = r.status, r.headers.get("Content-Type", "")
+            n = int(r.headers.get("Content-Length") or 0)
+            if total + n > cap: raise RuntimeError(f"{n} bytes would pass the storage cap ({cap} bytes, SH_MAX_DATA_GB)")
+            got = 0
+            with open(cpath + ".part", "wb") as f:
+                while (b := r.read(1 << 20)):
+                    got += len(b)
+                    if total + got > cap: raise RuntimeError(f"passed the storage cap ({cap} bytes, SH_MAX_DATA_GB)")
+                    f.write(b)
+            os.replace(cpath + ".part", cpath)
+    else:
+        info["from_cache"] = True
+    total += os.path.getsize(cpath)
+    os.makedirs(dest, exist_ok=True)
+    shutil.copy(cpath, os.path.join(dest, name))
+    return os.path.join(dest, name), info
+def unpack(p, dest):
+    if tarfile.is_tarfile(p):
+        with tarfile.open(p) as t:
+            t.extractall(dest, filter="data")
+        return True
+    if zipfile.is_zipfile(p):
+        with zipfile.ZipFile(p) as z:
+            for m in z.namelist():
+                if m.startswith("/") or ".." in m.split("/"): raise RuntimeError(f"unsafe path in archive: {m}")
+            z.extractall(dest)
+        return True
+    return False
+for i, s in enumerate(json.loads(os.environ["REFEREE_SOURCES"])):
+    dest, rec, src = f"/data/{i}", {"source": s["source"], "dir": str(i)}, s["source"]
+    try:
+        if src.startswith("hf://"):
+            kind, _, repo = src[5:].partition("/")
+            repo, _, rev = repo.partition("@")
+            if denied(repo): raise RuntimeError("source denied by SH_DENY_SOURCES")
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub"], check=True)
+            from huggingface_hub import HfApi, snapshot_download
+            info = HfApi().repo_info(repo, repo_type=kind.rstrip("s"), revision=rev or None, files_metadata=True)
+            pats = s.get("include") or ["*"]
+            files = [x for x in info.siblings if any(fnmatch.fnmatch(x.rfilename, p) for p in pats)]
+            need = sum(x.size or 0 for x in files)
+            if total + need > cap: raise RuntimeError(f"{need} bytes would pass the storage cap ({cap} bytes, SH_MAX_DATA_GB)")
+            snapshot_download(repo, repo_type=kind.rstrip("s"), revision=info.sha, allow_patterns=pats, local_dir=dest)
+            total += need
+            rec.update(revision=info.sha, files_matched=len(files))
+        else:
+            p, info = get(src, dest)
+            rec.update(info)
+            if "html" in info.get("content_type", "") or p.endswith((".php", ".html", ".htm")):
+                base = urllib.parse.urlparse(src)
+                links = sorted({urllib.parse.urljoin(src, html.unescape(h)) for h in
+                                re.findall(r'href=["\']([^"\'#]+)', open(p, encoding="utf-8", errors="replace").read())})
+                links = [u for u in links if urllib.parse.urlparse(u).netloc == base.netloc]
+                rec["links"] = links[:200]
+                want = [u for u in links if s.get("include") and any(
+                    fnmatch.fnmatch(urllib.parse.urlparse(u).path.split("/")[-1], pat) for pat in s["include"])]
+                rec["followed"] = []
+                for u in want[:20]:                     # ponytail: 20 files followed from one cited page
+                    try:
+                        q, inf = get(u, dest)
+                        rec["followed"].append({**inf, "unpacked": unpack(q, dest)})
+                    except Exception as e:
+                        rec["followed"].append({"url": u, "error": f"{type(e).__name__}: {e}"[:300]})
+            else:
+                rec["unpacked"] = unpack(p, dest)
+    except Exception as e:
+        rec["error"] = f"{type(e).__name__}: {e}"[:500]
+    out.append(rec)
+def sha(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""): h.update(b)
+    return h.hexdigest()
+files, heads = [], 0
+for root, _, fs in os.walk("/data"):
+    for f in sorted(fs):
+        p = os.path.join(root, f); row = {"path": os.path.relpath(p, "/data"), "bytes": os.path.getsize(p)}
+        if len(files) < 5000: row["sha256"] = sha(p)
+        if heads < 20 and f.lower().endswith(TEXT) and row["bytes"]:
+            heads += 1
+            with open(p, encoding="utf-8", errors="replace") as fh: row["head"] = fh.read(400)
+        files.append(row)
+print("REFEREE_MANIFEST " + json.dumps({"sources": out, "files": files[:5000], "n_files": len(files),
+                                        "bytes": sum(r["bytes"] for r in files)}))
+'''
+
+
+def data_volume(root: Path, cid: str) -> str:
+    return _cname("data", Path(root).resolve(), cid)
+
+
+def data_mount(root: Path, cid: str) -> list:
+    """The acquired data of a check, read-only at /work/data, once it has any file."""
+    d = state.read_json(Path(root) / "checks" / cid / "data.json") or {}
+    return [(data_volume(root, cid), DATA_MOUNT, True)] if d.get("n_files") else []
+
+
+def fetch(cfg: state.Config, root: Path, cid: str, sources: list[dict]) -> dict | None:
+    """Acquire a check's cited public artifacts once (non-blocking: None while it runs). The
+    manifest (sources, HTTP status, revision, every file's size and sha256) is data.json and an
+    ExecutionRecord (mode=fetch); a failed source is recorded, never silently skipped."""
+    cdir = Path(root) / "checks" / cid
+    f = cdir / "data.json"
+    if (d := state.read_json(f)) and "n_files" in d:
+        return d
+    if not (cfg.allow_network and cfg.allow_install):
+        d = {"sources": [{"source": s["source"], "error": "the network or install gate is shut"} for s in sources],
+             "files": [], "n_files": 0, "bytes": 0, "fetched_at": state.now()}
+        state.write_json(f, d)
+        return d
+    if not docker_status()[0]:
+        return None
+    st = d or {}
+    if st.get("rec"):
+        done = collect(st["rec"], cfg.install_timeout_s)
+        if done is None:
+            return None
+        state.append_jsonl(Path(root) / "execution.jsonl", {**done, "stdout": done.get("stdout", "")[-20000:]})
+        man = next(iter(json_lines(done.get("stdout", ""), "REFEREE_MANIFEST")), None)
+        d = man or {"sources": [{"source": s["source"], "error": failure_text(done)} for s in sources],
+                    "files": [], "n_files": 0, "bytes": 0}
+        state.write_json(f, {**d, "volume": data_volume(root, cid), "fetched_at": state.now(),
+                             "seconds": done.get("seconds")})
+        return state.read_json(f)
+    rec = start(_cname("fetch", cdir.resolve(), json.dumps(sources, sort_keys=True)), ["python", "-c", _FETCHER],
+                mounts=[(data_volume(root, cid), "/data", False), (DOWNLOAD_CACHE, "/root/.cache", False)],
+                workdir="/", image=DEFAULT_IMAGE, network=True, mode="fetch", target=cid,
+                env={"REFEREE_SOURCES": json.dumps(sources), "REFEREE_CAP": str(cfg.max_data_gb << 30),
+                     "REFEREE_DENY": ",".join(cfg.deny_sources), "HF_HUB_DISABLE_TELEMETRY": "1"})
+    state.write_json(f, {"rec": rec, "sources": sources})
+    return None
+
+
+def smoke(cfg: state.Config, root: Path, cid: str, r: int, kind: str, attributed: bool) -> dict | None:
+    """The harness's own draft run of a sealed script (seed 0, network off, result lines
+    MASKED, never evidence), so no verifier approves a script nobody has seen run. None while
+    its environment builds or it runs; then the record (it is the verifier's to read)."""
+    cdir = Path(root) / "checks" / cid
+    f = cdir / f"smoke.{r}.json"
+    st = state.read_json(f) or {}
+    if "returncode" in st:
+        return st
+    if st.get("rec"):
+        done = collect(st["rec"], cfg.try_timeout_s)
+        if done is None:
+            return None
+        state.append_jsonl(Path(root) / "execution.jsonl", done)
+        ev = classify(done)
+        res = {"returncode": done.get("returncode"), "timed_out": done.get("timed_out"), "seconds": done.get("seconds"),
+               "reached": ev["reached"], "infra_error": ev["infra_error"],
+               "failed": ev["failed"] and not done.get("timed_out"), "failure": failure_text(done) if ev["failed"] else "",
+               "stdout": mask(done.get("stdout") or "")[-3000:], "stderr": mask(done.get("stderr") or "")[-3000:]}
+        state.write_json(f, res)
+        return res
+    script = (cdir / f"script.{r}.py").read_text(encoding="utf-8")
+    try:
+        env_dir, envinfo = with_packages(cfg, root, *script_env(cfg, root, kind, attributed), script)
+    except ValueError as e:
+        env_dir, envinfo = None, {"ok": False, "detail": str(e)}
+    if envinfo is None:
+        return None
+    if not envinfo["ok"]:
+        res = {"returncode": None, "failed": True, "failure": f"the environment did not build: {envinfo['detail'][-600:]}",
+               "reached": False, "stdout": "", "stderr": ""}
+        state.write_json(f, res)
+        return res
+    sdir = cdir / f"smoke{r}"
+    sdir.mkdir(parents=True, exist_ok=True)
+    (sdir / "script.py").write_bytes(script.encode("utf-8"))
+    has_repo = (Path(root) / "repo" / ".git").is_dir()
+    mounts = [(sdir, f"{MOUNT}/check", True), (volume(env_dir), "/env", True)] + (
+        [(Path(root) / "repo", f"{MOUNT}/repo", True)] if has_repo else []) + data_mount(root, cid)
+    rec = start(_cname(cdir.resolve(), "smoke", r, state.sha256(script)),
+                ["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", "0"], mounts=mounts,
+                workdir=f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check", image=envinfo.get("image", DEFAULT_IMAGE),
+                network=False, gpus=kind == "RECONSTRUCTION" and gpu(cfg), mode="try", target=cid,
+                meta={"script_sha256": state.sha256(script), "smoke": r})
+    state.write_json(f, {"rec": rec})
+    return None
+
+
+def host_facts(cfg: state.Config) -> str:
+    """What this host offers a check, measured (not assumed), for planners and script authors."""
+    rc, out = _docker(["docker", "info", "--format", "{{.NCPU}} {{.MemTotal}}"], 30)
+    cpus, mem = (out.split() + ["?", "?"])[:2] if rc == 0 else ("?", "?")
+    return (f"one Docker host: {cpus} CPUs, {int(mem) // 2 ** 20 if mem.isdigit() else '?'} MB RAM for containers, "
+            f"GPU inside containers: {'YES (CUDA; use it where the method trains a network)' if gpu(cfg) else 'no'}; "
+            f"{cfg.parallel} runs at a time; one run at most {cfg.run_timeout_s // 60} min; all runs of one check at "
+            f"most {cfg.check_budget_s / 3600:g} h (configured); acquired data at most {cfg.max_data_gb} GB per check")
+
+
 def poll(cfg: state.Config, pid: str, cid: str) -> bool:
     """Advance one started check by at most one container step; True while it still runs.
     State lives in checks/<id>/exec.json, so any caller may poll and none needs to survive."""
@@ -524,12 +781,17 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
                                           (cdir / "script.py").read_text(encoding="utf-8")))
         if envinfo is None:
             return True
-        st.update(env=envinfo, env_dir=str(env_dir), why=why, seed=0, values=[], cert=[], rec=None,
-                  stage="prepare" if check.get("prepare") else "run", done_seeds=[])
-        for row in _checkpoints(cdir, check):          # completed seeds of this exact script/command are kept
+        st.update(env=envinfo, env_dir=str(env_dir), why=why, seed=0, values=[], cert=[], staged=[], rec=None,
+                  stage="prepare" if check.get("prepare") else "run", done_seeds=[], failed_seeds={})
+        for row in _checkpoints(cdir, check):          # ended seeds of this exact script/command are kept
             st["values"] += row["values"]
             st["cert"] += row.get("cert") or []
+            st["staged"] += row.get("staged") or []
             st["done_seeds"].append(row["seed"])
+            if row.get("error"):
+                st["failed_seeds"][str(row["seed"])] = row["error"]
+            for s, e in (row.get("stage_errors") or {}).items():
+                st.setdefault("stage_errors", {}).setdefault(s, e)
             st.setdefault("pilot_s", row.get("seconds") or 0)
         st["seed"], st["reused"] = len(st["done_seeds"]), len(st["done_seeds"])
         log = root / "execution.jsonl"          # this exact script was killed for memory before: one seed at a time
@@ -554,7 +816,7 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         env = {"PATH": "/env/bin:/usr/local/bin:/usr/bin:/bin", "VIRTUAL_ENV": "/env", **(UV_RUN if st["env"].get("uv") else {})}
     else:
         mounts = [(cdir / "run", f"{MOUNT}/check", True), (volume(env_dir), "/env", True)] + (
-            [(checkout, f"{MOUNT}/repo", True)] if has_repo else [])
+            [(checkout, f"{MOUNT}/repo", True)] if has_repo else []) + data_mount(root, cid)
         workdir, env = (f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check"), {}
     # Steps in flight, by seed ("-1" is the prepare step). Independent seeds of a script run
     # SH_PARALLEL at a time (private /tmp, read-only mounts); author code one at a time (it
@@ -593,27 +855,40 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             continue
         st["records"] = st.get("records", 0) + 1
         ev = classify(done)
+        started = markers(st, done)
         rel = (check.get("target") or {}).get("relation", "")
+        rows, staged = [], []
         if kind == "AUTHOR_CODE":
             v, note = parse_metric(done["stdout"], check.get("metric", ""))
             vs = [v] if v is not None and not (ev["failed"] and "text" in note) else []
         elif kind == "CERTIFICATE":
             rows = cert_rows(done["stdout"])
             vs = [r["violated"] for r in rows]
-            st.setdefault("cert", []).extend(rows)
-        else:   # bound by name: the relation's outputs or the generator's compared output
-            vs = (relation_margins(done["stdout"], rel) if rel else result_values(done["stdout"], check.get("metric", "")))
+        else:   # bound by name: the relation's outputs or the generator's compared output, per stage
+            staged = staged_values(done["stdout"], rel, check.get("metric", ""))
+            vs = [v for _, v in staged]
+        failed_stages = {}
         if ev["failed"]:
-            return _finish(cfg, root, check, {**_cancel(root, st), "ev": ev, "failure": (
-                done.get("error") or (done.get("stderr") or "")[-400:] or f"exit {done.get('returncode')}").strip()})
-        if not vs:                # a clean exit with no bound metric establishes nothing
+            err = failure_text(done)
+            if kind == "AUTHOR_CODE" or not (vs or st.get("done_seeds")):
+                return _finish(cfg, root, check, {**_cancel(root, st), "ev": ev, "failure": err})
+            # A later stage (or a later seed) failed: what the run measured before it failed is kept
+            # and the remaining seeds still run, so completed stages accumulate their replicates.
+            st.setdefault("failed_seeds", {})[key] = err
+            failed_stages = {s: err for s in started - {t for t, _ in staged}}
+            for s, e in failed_stages.items():
+                st.setdefault("stage_errors", {}).setdefault(s, e)
+        elif not vs:              # a clean exit with no bound metric establishes nothing
             return _finish(cfg, root, check, {**_cancel(root, st), "values": []})
         st["values"] += vs
+        st.setdefault("cert", []).extend(rows)
+        st.setdefault("staged", []).extend(staged)
         st["seed"] += 1
         st.setdefault("done_seeds", []).append(int(key))
         state.append_jsonl(cdir / "seeds.jsonl", {"key": _ckpt_key(check), "seed": int(key), "values": vs,
-                                                   "cert": rows if kind == "CERTIFICATE" else [],
-                                                   "seconds": done.get("seconds")})
+                                                   "cert": rows, "staged": staged, "seconds": done.get("seconds"),
+                                                   "error": st.get("failed_seeds", {}).get(key, ""),
+                                                   "stage_errors": failed_stages})
         if "pilot_s" not in st:                           # the first completed run is the pilot
             st["pilot_s"] = done.get("seconds") or 0
             if (why := _over_budget(cfg, check, st, runs)):
@@ -674,17 +949,29 @@ def resource_action(done: dict, st: dict, key: str, timeout: int) -> tuple[str, 
     would repeat (killed out of memory alone, or past the per-run limit); ("", "") otherwise."""
     if done.get("mode") != "evidence":
         return "", ""
+    err = (done.get("stderr") or "").lower()
+    if "no space left on device" in err or "disk quota exceeded" in err:
+        return "blocker", ("storage", "a run ran out of disk space on this host (a measured limit); the protocol "
+                           "is not shortened, so it is not repeated.")
+    if "cuda out of memory" in err or "outofmemoryerror" in err:
+        if not st.get("vram_retry"):
+            st.update(width=1, vram_retry=True)          # another run may have shared the GPU: once, alone
+            return "retry", ""
+        return "blocker", ("vram", f"a single run exhausted the GPU's memory even when running alone "
+                           f"(this host's GPU memory: {_gpu_mb()} MB, a measured hardware limit); it is not "
+                           "repeated and never downscaled.")
     if done.get("error") == "out of memory":
         if not st.get("oom_retry"):
             st.update(width=1, oom_retry=True)
             return "retry", ""
-        return "blocker", (f"a single run was killed out of memory after {done.get('seconds', 0):.0f}s even when "
-                           f"running alone (peak observed {st.get('peak_mb', {}).get(key, '?')} MB; this host's "
-                           f"Docker VM has {_vm_mb()} MB). The same run fails the same way, so it is not repeated; "
-                           "it needs a host with more memory.")
+        return "blocker", ("memory", f"a single run was killed out of memory after {done.get('seconds', 0):.0f}s even "
+                           f"when running alone (peak observed {st.get('peak_mb', {}).get(key, '?')} MB; this host's "
+                           f"Docker VM has {_vm_mb()} MB, a measured hardware limit). The same run fails the same way, "
+                           "so it is not repeated; it needs a host with more memory.")
     if done.get("timed_out"):
-        return "blocker", (f"a single run exceeded this host's per-run limit of {timeout}s (SH_RUN_TIMEOUT_S); the "
-                           "protocol is not shortened, so it is not repeated.")
+        return "blocker", ("per_run_timeout", f"a single run exceeded the configured per-run limit of {timeout}s "
+                           "(SH_RUN_TIMEOUT_S, a setting of this run); the protocol is not shortened, so it is not "
+                           "repeated.")
     return "", ""
 
 
@@ -695,9 +982,21 @@ def _over_budget(cfg: state.Config, check: dict, st: dict, runs: int) -> str:
     if need <= cfg.check_budget_s:
         return ""
     fmt = lambda sec: f"{sec / 3600:.1f} h" if sec >= 3600 else f"{sec / 60:.0f} min" if sec >= 60 else f"{sec:.0f} s"
-    return (f"the {runs} runs need about {fmt(need)} more at the pilot's {fmt(st['pilot_s'])} per run ({w} at a "
-            f"time); this host's per-check budget is {fmt(cfg.check_budget_s)} (SH_CHECK_BUDGET_S). The run count "
-            "is not reduced: the completed run(s) are recorded as a pilot and decide nothing.")
+    peak = max((st.get("peak_mb") or {}).values(), default=None)
+    has_gpu = check["kind"] in ("AUTHOR_CODE", "RECONSTRUCTION") and gpu(cfg)
+    return ("time_budget", f"the {runs} runs need about {fmt(need)} more at the pilot's measured {fmt(st['pilot_s'])} "
+            f"per run ({w} at a time; peak memory {peak or '?'} MB of {_vm_mb()} MB; GPU available to the container: "
+            f"{'yes' if has_gpu else 'no'}); the configured per-check time budget is {fmt(cfg.check_budget_s)} "
+            "(SH_CHECK_BUDGET_S, a setting of this run, not a hardware limit). The run count is not reduced: the "
+            "completed run(s) are recorded as a pilot and decide nothing.")
+
+
+def _stage_summary(staged: list) -> dict:
+    """Per stage: how many results and their mean (a pilot's measurements, deciding nothing)."""
+    out: dict = {}
+    for s, v in staged:
+        out.setdefault(s or "(all)", []).append(v)
+    return {s: {"n": len(vs), "mean": round(sum(vs) / len(vs), 6)} for s, vs in out.items()}
 
 
 def _ckpt_key(check: dict) -> str:
@@ -718,6 +1017,12 @@ def ckpt_volume(cdir: Path, seed: int) -> str:
     """A per-seed scratch volume mounted at /work/ckpt: a long run may save progress there and
     resume from it after an infrastructure restart (it never holds evidence)."""
     return _cname("ckpt", Path(cdir).resolve(), seed)
+
+
+def _gpu_mb() -> str:
+    rc, out = _docker(["docker", "run", "--rm", "--gpus", "all", DEFAULT_IMAGE, "sh", "-c",
+                       "nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits"], 120)
+    return out.strip().splitlines()[0] if rc == 0 and out.strip() else "?"
 
 
 def _vm_mb() -> str:
@@ -794,8 +1099,10 @@ def _finish(cfg: state.Config, root: Path, check: dict, st: dict) -> bool:
     outcome = {"check": check["id"], "kind": kind, "evidence": EVIDENCE.get(kind, "NONE"), "authorized": authorized,
                "authorization": why, "commit": src.get("commit", "") if (root / "repo" / ".git").is_dir() else ""}
     if st.get("blocker"):         # a documented final blocker of this host: nothing about the paper is established
-        outcome.update(status="BLOCKED", reason=f"RESOURCE BLOCKER: {st['blocker']}", rule="bounded pilot and resources",
-                       values=[], pilot_values=st.get("values", []), runs=st.get("records", 0),
+        kind_of, text = st["blocker"] if isinstance(st["blocker"], (list, tuple)) else ("time_budget", st["blocker"])
+        outcome.update(status="BLOCKED", reason=f"RESOURCE BLOCKER: {text}", rule="bounded pilot and resources",
+                       resource=kind_of, values=[], pilot_values=st.get("values", []),
+                       pilot_stages=_stage_summary(st.get("staged") or []), runs=st.get("records", 0),
                        records="execution.jsonl", finished_at=state.now())
     else:
         outcome.update(reconcile(kind, check.get("printed", ""), st.get("values", []), st.get("failure", ""),
@@ -803,10 +1110,16 @@ def _finish(cfg: state.Config, root: Path, check: dict, st: dict) -> bool:
                                  authorized, why, (check.get("target") or {}).get("relation", ""),
                                  cert=st.get("cert") if kind == "CERTIFICATE" and st.get("cert") else None,
                                  changed=any(d.get("changes_claim") for d in check.get("deviations") or []),
-                                 step=bool(check.get("step"))),
+                                 step=bool(check.get("step")), staged=st.get("staged"),
+                                 failed=st.get("failed_seeds"), stage_errors=st.get("stage_errors")),
                        values=st.get("values", []), runs=st.get("records", 0), records="execution.jsonl",
                        finished_at=state.now())
     outcome["protocol"] = protocol(check, st, outcome.get("rule", ""))
+    for k in ("data_identity", "stage_times", "peak_mb"):
+        if st.get(k):
+            outcome[k] = st[k]
+    if (d := state.read_json(root / "checks" / check["id"] / "data.json")):
+        outcome["data"] = {k: d.get(k) for k in ("sources", "n_files", "bytes", "volume")}
     if st.get("env"):
         outcome["environment"] = {k: st["env"].get(k) for k in ("detail", "image", "builder", "recovery")}
     if (st.get("ev") or {}).get("setup_error") and kind != "AUTHOR_CODE":   # the script never started: revisable
@@ -823,7 +1136,7 @@ def seeded_command(command: str, flag: str, seed: int) -> tuple[str, bool]:
     return (pat.sub(lambda m: f"{m.group(1)}{seed}", command, count=1), True) if pat.search(command) else (command, False)
 
 
-def try_script(cfg: state.Config, pid: str, cid: str, script: str) -> dict:
+def try_script(cfg: state.Config, pid: str, cid: str, script: str, c: dict) -> dict:
     """A draft run for a generator: same sandbox, network none, result lines MASKED so a
     script cannot be tuned toward the printed number, recorded as mode='try' (never evidence)."""
     if not cfg.allow_script_exec:
@@ -835,7 +1148,6 @@ def try_script(cfg: state.Config, pid: str, cid: str, script: str) -> dict:
     ok, why = docker_status()
     if not ok:
         return {"error": why}
-    c = next((k for k in (state.read_json(root / "sealed" / "plan.json") or {}).get("checks", []) if k["id"] == cid), {})
     try:
         env_dir, envinfo = with_packages(cfg, root, *script_env(cfg, root, c.get("kind", ""),
                                                               bool(c.get("repo_attributed"))), script)
@@ -848,11 +1160,11 @@ def try_script(cfg: state.Config, pid: str, cid: str, script: str) -> dict:
         return {"error": envinfo["detail"]}
     has_repo = (root / "repo" / ".git").is_dir()
     mounts = [(tdir, f"{MOUNT}/check", False), (volume(env_dir), "/env", True)] + (
-        [(root / "repo", f"{MOUNT}/repo", True)] if has_repo else [])
+        [(root / "repo", f"{MOUNT}/repo", True)] if has_repo else []) + data_mount(root, cid)
     rec = run(["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", "0"], mounts=mounts,
               workdir=f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check", image=envinfo.get("image", DEFAULT_IMAGE),
               network=False, timeout=cfg.try_timeout_s, mode="try", target=cid,
-              meta={"script_sha256": state.sha256(script)})
+              gpus=c.get("kind") == "RECONSTRUCTION" and gpu(cfg), meta={"script_sha256": state.sha256(script)})
     state.append_jsonl(root / "execution.jsonl", rec)
     return {"environment": envinfo["detail"], "returncode": rec.get("returncode"), "timed_out": rec.get("timed_out"),
             "error": rec.get("error", ""), "stdout": mask(rec.get("stdout") or "")[-4000:],

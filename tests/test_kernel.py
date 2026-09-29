@@ -185,7 +185,7 @@ def test_identity_needs_two_agreeing_keys_verbatim_in_the_checkout():
         cmd = "python train.py --data cifar --epochs 2000 --seed 0"
         plan = {"checks": [{"id": "C1", "kind": "AUTHOR_CODE", "command_quote": cmd, "metric": "test_acc",
                             "prepare_quote": ""}]}
-        x = type("X", (), {"checkout": co, "paper": Paper(PAGES, ROWS), "cfg": cfg, "sealed": lambda self, t: plan,
+        x = type("X", (), {"checkout": co, "paper": Paper(PAGES, ROWS), "cfg": cfg, "sealed": lambda self, t: plan, "plan": lambda self: plan,
                            "tracked": lambda self: {"README.md", "train.py"}})()
         good = {"command_quote": cmd, "command_file": "README.md", "metric_key": "test_acc", "metric_file": "train.py",
                 "seed_flag": "--seed", "runs": 5, "runs_quote": "mean over 5 random seeds"}
@@ -266,7 +266,8 @@ def test_the_compared_output_is_bound_by_name_by_the_script_author():
         plan = {"checks": [{"id": "C1", "kind": "RELEASED_DATA", "metric": "",
                             "target": {"quote": "reaches 61.4 accuracy", "value": "17"}}]}
         state.write_json(td / "released.json", [{"path": "results/a.csv"}])
-        x = type("X", (), {"root": td, "paper": Paper(PAGES, ROWS), "cfg": cfg, "sealed": lambda self, tid: plan})()
+        x = type("X", (), {"root": td, "paper": Paper(PAGES, ROWS), "cfg": cfg, "sealed": lambda self, tid: plan,
+                           "plan": lambda self: plan})()
         script = 'rows = open("results/a.csv").read().split()\nn = len(rows)\nprint("REFEREE_RESULT", n)\n'
         binds = [{"kind": k, "impl_quote": q, "paper_quote": "reaches 61.4 accuracy"} for k, q in
                  (("dataset", 'open("results/a.csv")'), ("metric", "n = len(rows)"), ("comparison_target", "print("))]
@@ -374,11 +375,12 @@ def test_a_counterexample_satisfies_every_premise_of_the_exact_claim():
     assert certificate([row(1, None)], False, False)["status"] == "INCONCLUSIVE"               # premises unsaid
     assert certificate([row(0, 0), row(0, 1)], False, False)["admissible"] == 1
     rows = execute.cert_rows('REFEREE_RESULT {"violated": 1, "premises_hold": 0}\nREFEREE_RESULT {"violated": 0}')
-    assert rows == [row(1, 0), row(0, None)]
+    assert rows == [{**row(1, 0), "exact": False}, {**row(0, None), "exact": False}]
     with tempfile.TemporaryDirectory() as t:                  # the seal demands premises and honest deviations
         cfg = state.Config()
         plan = {"checks": [{"id": "C1", "kind": "CERTIFICATE", "metric": "", "statement": "Lemma 1", "step": ""}]}
-        x = type("X", (), {"root": Path(t), "paper": Paper(PAGES, ROWS), "cfg": cfg, "sealed": lambda self, tid: plan})()
+        x = type("X", (), {"root": Path(t), "paper": Paper(PAGES, ROWS), "cfg": cfg, "sealed": lambda self, tid: plan,
+                           "plan": lambda self: plan})()
         script = "n = 1\nassert n\nok = n > 0\nprint('REFEREE_RESULT', {'violated': 0})\n"
         b = [{"kind": k, "impl_quote": q, "paper_quote": "reaches 61.4 accuracy"} for k, q in
              (("hypotheses", "assert n"), ("claimed_bound", "ok = n > 0"), ("instance", "n = 1"))]
@@ -440,7 +442,7 @@ def test_resource_limits_end_in_one_documented_blocker():
     oom = {"mode": "evidence", "error": "out of memory", "seconds": 40}
     assert execute.resource_action(oom, st, "0", 3600)[0] == "retry" and st["width"] == 1   # alone, once
     act, why = execute.resource_action(oom, st, "0", 3600)
-    assert act == "blocker" and "not repeated" in why                                      # never a third time
+    assert act == "blocker" and why[0] == "memory" and "not repeated" in why[1]            # never a third time
     assert execute.resource_action({"mode": "evidence", "timed_out": True}, {}, "0", 60)[0] == "blocker"
     assert execute.resource_action({"mode": "evidence", "returncode": 255}, {}, "0", 60) == ("", "")
     with tempfile.TemporaryDirectory() as t:                  # completed seeds of the same script are reused
@@ -494,6 +496,226 @@ def test_detached_steps_outlive_their_poller():
             time.sleep(2)
         assert env and env["ok"] and env["volume"] == execute.volume(env_dir) and "freeze sha256" in env["detail"]
         assert execute._docker(["docker", "volume", "rm", "-f", env["volume"]], 60)[0] == 0
+
+
+def test_measurements_survive_a_later_stage_failure():
+    """Sep-29 label ranking C2: political's five folds were measured (in stderr), then the movies
+    stage exited 1 at 29 s; the check read 'no sign the experiment itself began' and kept nothing."""
+    from harness.reconcile import PARTIAL
+    run = {"returncode": 1, "seconds": 29, "stdout": "",
+           "stderr": 'REFEREE_PROGRESS {"stage": "movies"}\nFit:  14%|█▍        | 7/50 [00:05<00:31,  1.37it/s]\n'
+                     "parsed data for movies does not match the paper Table 4: got (260, 15, 256)"}
+    assert execute.classify(run)["reached"]                                  # a progress line in stderr counts
+    assert execute.failure_text(run).startswith("exit 1 after 29s: REFEREE_PROGRESS") and "260, 15, 256" in \
+        execute.failure_text(run) and "it/s]" not in execute.failure_text(run)
+    rel = "ece * 10 > 1"
+    out = 'REFEREE_RESULT {"stage": "political", "ece": 0.17}\nREFEREE_RESULT {"stage": "movies", "x": 1}'
+    got = execute.staged_values(out, rel, "")                               # a line lacking a name is not a result
+    assert len(got) == 1 and got[0][0] == "political" and abs(got[0][1] - 0.7) < 1e-9
+    st = lambda staged, errs, failed: reconcile("RECONSTRUCTION", "", [v for _, v in staged], "", {}, True, True, "",
+                                                rel, staged=staged, failed=failed, stage_errors=errs)
+    pol = [["political", m] for m in (0.70, 0.72, 0.69)]
+    part = st(pol, {"movies": "exit 1: data mismatch"}, {"0": "exit 1", "1": "exit 1", "2": "exit 1"})
+    assert part["status"] == PARTIAL and part["status_on_completed"] == "RELATION_HOLDS"
+    assert part["stages"]["political"]["n"] == 3 and part["stages"]["movies"]["status"] == "NOT_COMPLETED"
+    bad = st([["political", -m] for m in (0.70, 0.72, 0.69)], {"movies": "exit 1"}, {"0": "exit 1"})
+    assert bad["status"] == "RELATION_VIOLATED"                              # a failure found in a completed stage stands
+    assert st(pol + [["movies", m] for m in (0.3, 0.31, 0.32)], {}, {})["status"] == "RELATION_HOLDS"
+    mixed = st(pol + [["movies", m] for m in (0.3, -0.31, 0.02)], {}, {})
+    assert mixed["status"] == "INCONCLUSIVE"                                 # every stage must hold
+    single = reconcile("RECONSTRUCTION", "", [0.7, 0.72], "", {}, True, True, "", rel,
+                       staged=[["", 0.7], ["", 0.72]], failed={"2": "exit 1"})
+    assert single["status"] == PARTIAL and single["status_on_completed"] == "RELATION_HOLDS"
+    c = {"id": "C1", "kind": "RECONSTRUCTION", "evidence": "PAPER_DERIVED_IMPLEMENTATION", "deviations": [],
+         "status": PARTIAL}
+    assert report._claim_status([c]) == "PARTIAL_EVIDENCE"
+    assert report._headline([c], [{"claim_status": "PARTIAL_EVIDENCE"}]) == "CENTRAL_PARTIAL_EVIDENCE"
+    assert report._state(Path("."), "C1", {"status": PARTIAL}) == "PARTIALLY_COMPLETED"
+    assert report._state(Path("."), "C1", {"status": "BLOCKED", "reason": "RESOURCE BLOCKER: x"}) == "RESOURCE_LIMITED"
+
+
+def test_a_proof_candidate_that_violates_a_premise_or_precision_is_not_a_counterexample():
+    """Sep-29: GRACE Thm 5.1's '8 violations' were float round-off (|lhs-rhs| ~ 4e-16) in a script
+    that claimed exact arithmetic; label ranking's 6 literal failures were reported with 'admissible:
+    12' under a reading that had moved the step's own assertion into its premises."""
+    from harness.reconcile import certificate
+    fuzzy = {"violated": 1, "premises": 1, "literal": None, "lhs": -19.731718235877057, "rhs": -19.73171823587706,
+             "exact": False}
+    res = certificate([fuzzy] * 8 + [{"violated": 0, "premises": 1, "lhs": 1.0, "rhs": 1.0, "exact": False}] * 2,
+                      False, False)
+    assert res["status"] == "INCONCLUSIVE" and res["below_precision"] == 8
+    assert certificate([{**fuzzy, "exact": True}], False, False)["status"] == "COUNTEREXAMPLE_FOUND"
+    assert certificate([{**fuzzy, "lhs": 1.0, "rhs": 2.0}], False, False)["status"] == "COUNTEREXAMPLE_FOUND"
+    rows = [{"violated": 0, "premises": 1, "literal": "holds"}] * 12 + [
+        {"violated": 0, "premises": 0, "literal": "fails"}] * 6 + [{"violated": 0, "premises": 0, "literal": "undefined"}] * 6
+    lit = certificate(rows, True, True)
+    assert lit["status"] == "COUNTEREXAMPLE_FOUND" and lit["admissible"] == 12 and lit["violated_admissible"] == 0
+    assert "exactly as printed" in lit["reason"] and "0 of 12 admissible" in lit["reason"]
+    step = {"id": "C1", "kind": "CERTIFICATE", "evidence": "PROOF_AUDIT", "status": "COUNTEREXAMPLE_FOUND",
+            "deviations": [{"changes_claim": True}]}
+    assert report._claim_status([step]) == "PROOF_GAP_FOUND"            # the printed step fails as printed
+    assert certificate([{"violated": 1, "premises": 0, "literal": "premise_not_met"}] * 3, True, True)["status"] \
+        == "PREMISE_NOT_MET"
+    crashed = certificate([{"violated": 0, "premises": 1}], False, False, crashed=2)
+    assert crashed["status"] == "NO_VIOLATION_FOUND" and crashed["crashed"] == 2 and "crashed" in crashed["reason"]
+    assert execute.cert_rows('REFEREE_RESULT {"violated": 1, "premises_hold": 1, "lhs": 1, "rhs": 2, '
+                             '"lhs_exact": "1", "rhs_exact": "2"}')[0]["exact"]
+
+
+def test_support_is_limited_by_the_recorded_changes():
+    """Sep-29 GRACE C1: no tuning, a rebuilt baseline, different training splits and a changed
+    aggregation were declared as claim changes, yet a relation holding would have read SUPPORT_FOUND."""
+    c = {"id": "C1", "kind": "RECONSTRUCTION", "evidence": "PAPER_DERIVED_IMPLEMENTATION",
+         "status": "RELATION_HOLDS", "deviations": [{"printed": "tuned", "used": "untuned", "changes_claim": True}]}
+    assert report._claim_status([c]) == "READING_CHANGED"
+    assert report._claim_status([{**c, "status": "RELATION_VIOLATED"}]) == "READING_CHANGED"
+    assert report._claim_status([{**c, "deviations": [{"changes_claim": False}]}]) == "SUPPORT_FOUND"
+    led = {"checks": [{"id": "C1", "status": "COUNTEREXAMPLE_FOUND"}], "concerns": []}
+    rows = report._check_rows([{"id": "C1", "kind": "CERTIFICATE", "evidence": "INSTANCE_CHECK", "claim": "x",
+                                "target": None, "printed": "", "step": "", "statement": "s", "values": [1],
+                                "status": "PREMISE_NOT_MET", "deviations": [], "state": "COMPLETED",
+                                "reason": "no admissible instance; a counterexample must satisfy every premise",
+                                "rule": "", "reason_by": "harness"}], led)
+    assert "withheld" not in rows[-1]                                     # the harness's own words are facts
+    rows = report._check_rows([{"id": "C1", "kind": "RECONSTRUCTION", "evidence": "x", "claim": "x", "target": None,
+                                "printed": "", "step": "", "statement": "", "values": [], "status": "NOT_CHECKABLE",
+                                "deviations": [], "reason": "the author refused: this refutes the paper", "rule": "",
+                                "reason_by": "model"}], led)
+    assert "withheld" in rows[-1]                                         # a model's status word is screened
+
+
+def test_a_cited_public_artifact_outside_the_checkout_is_acquirable_with_provenance():
+    """Sep-29 changepoint WISDM: the checkout's README names the public download, yet the check
+    ended 'dataset absent from checkout'; label ranking's RewardBench scores are an HF dataset the
+    authors' code names. Only sources the paper or a tracked checkout file cites are fetched."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid = _project(td)
+        co = td / pid / "repo"
+        co.mkdir(parents=True)
+        (co / "README.md").write_text("Download the data from https://www.example.org/lab/dataset.php first.\n", "utf-8")
+        (co / "analyze.py").write_text('hf_hub_download("allenai/some-results", repo_type="dataset")\n', "utf-8")
+        git = lambda *a: subprocess.run(["git", *a], cwd=co, capture_output=True, text=True)
+        git("init", "-q"), git("add", "."), git("-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "c")
+        x = tasks._Ctx(cfg, pid)
+        ok = lambda src, cited: tasks._acquire(x, {"acquire": [{"source": src, "cited_in": cited, "include": ["*.gz"]}]},
+                                               errs := [], "C1") and not errs
+        assert ok("https://www.example.org/lab/dataset.php", "README.md")
+        assert ok("http://www.example.org/lab/dataset.php", "README.md")        # the scheme is not the citation
+        assert ok("hf://datasets/allenai/some-results", "analyze.py")
+        assert not ok("https://www.example.org/other.tar.gz", "README.md")     # not cited
+        assert not ok("https://www.example.org/lab/dataset.php", "../outside.md")   # not a tracked file
+        assert not ok("hf://datasets/ICML-2026-agent-repro/verdicts", "analyze.py")  # denied, cited or not
+        assert not ok("file:///etc/passwd", "paper")
+        assert execute.data_mount(td / pid, "C1") == []                       # nothing acquired, nothing mounted
+        state.write_json(td / pid / "checks" / "C1" / "data.json", {"n_files": 2, "files": []})
+        assert execute.data_mount(td / pid, "C1")[0][1:] == (execute.DATA_MOUNT, True)   # read-only
+
+
+def test_every_claim_scope_item_is_covered_or_omitted_with_a_reason_and_undecided_claims_get_a_follow_up():
+    """Sep-29 label ranking: the calibration claim compares five models; the check tested two and
+    RPC's omission was recorded nowhere. GRACE's layer-replacement claim was never listed."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid = _project(td)
+        state.write_json(td / ".gpu.json", False)
+        for lens in tasks.LENSES:
+            _seal(cfg, pid, f"lens:{lens}", {"concerns": []}, td)
+        _seal(cfg, pid, "critic", {"reviews": []}, td)
+        x = tasks._Ctx(cfg, pid)
+        chk = {"id": "B", "kind": "CERTIFICATE", "claim_quote": "We report the mean over 5 random seeds",
+               "statement_quote": "The final loss is -0.52", "covers": ["PL", "MM"]}
+        claim = {"quote": "We report the mean over 5 random seeds", "checks": ["B"], "scope": ["PL", "MM", "RPC"]}
+        assert "RPC" in _refused(lambda: tasks._seal_plan(x, "plan", {"checks": [chk], "central_claims": [claim]},
+                                                          final=False))
+        claim["omitted"] = [{"item": "RPC", "why": "its pairwise ECE needs the vendored Cython build, which failed"}]
+        _seal(cfg, pid, "plan", {"checks": [chk], "central_claims": [claim]}, td)
+        state.write_json(td / pid / "checks" / "C1" / "outcome.json", {"status": "NOT_CHECKABLE", "reason": "refused"})
+        phase, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
+        assert phase == "plan" and [o["id"] for o in owed] == ["plan:2"]   # an undecided central claim: a follow-up
+        assert "FOLLOW-UP" in Path(owed[0]["prompt"]).read_text(encoding="utf-8")
+        _seal(cfg, pid, "plan:2", {"checks": [{**chk, "id": "F1", "covers": []}],
+                                   "central_claims": [{"quote": claim["quote"], "checks": ["F1"]}]}, td)
+        plan = tasks._Ctx(cfg, pid).plan()
+        assert [c["id"] for c in plan["checks"]] == ["C1", "C2"] and plan["central_claims"][0]["checks"] == ["C1", "C2"]
+        led = report.ledger(tasks._Ctx(cfg, pid))
+        assert led["central_claims"][0]["omitted"][0]["item"] == "RPC"
+        assert report.scientific_status(td / pid) == "CHECKS_PENDING"      # the follow-up check is still owed
+        state.write_json(td / pid / "checks" / "C2" / "outcome.json", {"status": "NOT_CHECKABLE", "reason": "x"})
+        phase, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
+        assert phase == "report"                                             # one follow-up round, not a loop
+
+
+def test_no_verifier_sees_a_script_the_harness_has_not_run():
+    """Sep-29: every draft of every check failed (a named-volume env was bind-mounted as an empty
+    host dir) or never ran ('environment still building'), so each script was approved unexecuted."""
+    assert execute._src("referee-874db90acf9f1b5d") == "referee-874db90acf9f1b5d"   # a volume name stays a name
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid = _project(td)
+        state.write_json(td / ".gpu.json", False)
+        for lens in tasks.LENSES:
+            _seal(cfg, pid, f"lens:{lens}", {"concerns": []}, td)
+        _seal(cfg, pid, "critic", {"reviews": []}, td)
+        chk = {"id": "B", "kind": "CERTIFICATE", "claim_quote": "We report the mean over 5 random seeds",
+               "statement_quote": "The final loss is -0.52"}
+        _seal(cfg, pid, "plan", {"checks": [chk], "central_claims": [{"quote": chk["claim_quote"], "checks": ["B"]}]}, td)
+        script = "n = 1\nassert n\nok = n > 0\nprint('REFEREE_RESULT', {'violated': 0, 'premises_hold': 1})\n"
+        b = [{"kind": k, "impl_quote": q, "paper_quote": "reaches 61.4 accuracy"} for k, q in
+             (("hypotheses", "assert n"), ("claimed_bound", "ok = n > 0"), ("instance", "n = 1"))]
+        _seal(cfg, pid, "gen:C1.1", {"script": script, "runs": 1, "outputs": ["violated"], "bindings": b}, td)
+        state.write_json(td / pid / "checks" / "C1" / "smoke.1.json",
+                         {"returncode": 1, "failed": True, "failure": "exit 1 after 0s: NameError: name 'q' is not defined",
+                          "stderr": "Traceback ... NameError", "stdout": "", "reached": False})
+        _, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
+        assert [o["id"] for o in owed] == ["gen:C1.2"]                       # back to the author, not to a verifier
+        assert "NameError" in Path(owed[0]["prompt"]).read_text(encoding="utf-8")
+
+
+def test_a_run_that_measures_then_fails_keeps_its_measurements_live():
+    """Live (Docker): a script measures stage `a`, then fails in stage `b`, on every seed. The check
+    runs all its seeds, keeps stage a's three results, and ends PARTIAL — never 'did not begin'."""
+    if not execute.docker_status()[0]:
+        return
+    import time
+    saved = execute.SCRIPT_PACKAGES
+    execute.SCRIPT_PACKAGES = ()                               # a bare venv: quick to build
+    try:
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            cfg = state.Config()
+            cfg.projects, cfg.allow_install, cfg.allow_network, cfg.allow_script_exec = td, True, True, True
+            state.write_json(td / ".gpu.json", False)
+            cdir = td / "p" / "checks" / "C1"
+            cdir.mkdir(parents=True)
+            state.write_json(td / "p" / "source.json", {})
+            script = ("import argparse, json, sys\np = argparse.ArgumentParser(); p.add_argument('--seed', type=int)\n"
+                      "s = p.parse_args().seed\nprint('REFEREE_PROGRESS ' + json.dumps({'stage': 'a'}), flush=True)\n"
+                      "print('REFEREE_RESULT ' + json.dumps({'stage': 'a', 'gap': 0.5 + s / 100}), flush=True)\n"
+                      "print('REFEREE_PROGRESS ' + json.dumps({'stage': 'b'}), file=sys.stderr, flush=True)\n"
+                      "sys.exit('stage b: the parsed data do not match the paper')\n")
+            (cdir / "script.py").write_bytes(script.encode("utf-8"))
+            sha = state.sha256(script)
+            state.write_json(cdir / "check.json", {"id": "C1", "kind": "RECONSTRUCTION", "runs": 3, "script_sha256": sha,
+                                                   "target": {"relation": "gap > 0"}, "repo_attributed": False,
+                                                   "approval": {"approved": True, "script_sha256": sha}})
+            state.write_json(cdir / "exec.json", {"token": state.now()})
+            t0 = time.time()
+            while execute.poll(cfg, "p", "C1") and time.time() - t0 < 600:
+                time.sleep(2)
+            o = state.read_json(cdir / "outcome.json")
+            assert o["status"] == "PARTIAL" and o["status_on_completed"] == "RELATION_HOLDS", o
+            assert o["stages"]["a"]["n"] == 3 and o["stages"]["b"]["status"] == "NOT_COMPLETED"
+            assert "do not match the paper" in o["stages"]["b"]["reason"] and len(o["failed_seeds"]) == 3
+            env_dir = td / ".script-env"                     # a draft mounts the env's named volume by name
+            rec = execute.run(["/env/bin/python", "-c", "print('ok')"], mounts=[(execute.volume(env_dir), "/env", True)],
+                              workdir="/", image=execute.DEFAULT_IMAGE, network=False, timeout=120, mode="try", target="t")
+            assert rec["returncode"] == 0 and "ok" in rec["stdout"], rec
+            execute._docker(["docker", "volume", "rm", "-f", execute.volume(env_dir)], 60)
+            for k in range(3):
+                execute._docker(["docker", "volume", "rm", "-f", execute.ckpt_volume(cdir, k)], 60)
+    finally:
+        execute.SCRIPT_PACKAGES = saved
 
 
 def test_verify_commit_fails_closed():

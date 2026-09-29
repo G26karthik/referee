@@ -82,8 +82,34 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
 19. **Resources end in a documented blocker, never a loop.** The first run is a timed pilot;
     a projection past SH_CHECK_BUDGET_S, an out-of-memory kill of a lone run, or a run past
     SH_RUN_TIMEOUT_S is a BLOCKED "RESOURCE BLOCKER" with the measurement, not repeated and
-    never downscaled. Completed seeds are checkpointed (seeds.jsonl) and reused; each seed has
-    a scratch volume at /work/ckpt.
+    never downscaled. The blocker names its kind (`resource`: time_budget — a configured
+    setting —, memory — measured —, per_run_timeout, storage). Completed seeds are checkpointed
+    (seeds.jsonl) and reused; each seed has a scratch volume at /work/ckpt. Planners and script
+    authors are told the measured host (CPUs, container RAM, GPU yes/no).
+20. **Completed measurements survive later failures.** A script prints one result line per
+    `stage` (dataset, setting) as it finishes. A seed that fails after measuring keeps what it
+    measured and the other seeds still run; each stage is decided over its own seeds (a relation
+    must hold in every stage); a stage that started without a result, or a failed seed, makes
+    the check PARTIAL (`status_on_completed` kept, claim status PARTIAL_EVIDENCE). Only a run
+    that measured nothing ends the check. A check's state (NOT_STARTED, RUNNING,
+    PARTIALLY_COMPLETED, COMPLETED, FAILED, RESOURCE_LIMITED, NOT_RUN) is reported.
+21. **No verifier approves a script nobody ran.** The harness runs every sealed script once
+    (seed 0, results masked, never evidence) before its verifier; a script failing there goes
+    back to its author with the error. A certificate's violation within 1e-9 (relative) without
+    exact values printed is round-off, never a counterexample.
+22. **Cited public artifacts are acquired, not assumed absent.** A check may `acquire` sources
+    the paper or a tracked checkout file cites verbatim (a URL, a dataset page followed to its
+    files by `include` patterns, an hf:// dataset), never a denied source (SH_DENY_SOURCES);
+    harness code downloads them with the network on (cap SH_MAX_DATA_GB), records every file's
+    sha256 (`checks/<id>/data.json`) and mounts them read-only at /work/data. Scripts print a
+    REFEREE_DATA identity line per dataset against the paper's own description; a mismatch is a
+    finding, not an abort.
+23. **Results are limited by what changed.** Support or failure obtained under a claim-changing
+    deviation (data, split, tuning, rebuilt baseline, aggregation, premise, index) is
+    READING_CHANGED, never support or failure of the printed claim. Every scope item a central
+    claim names (methods, datasets) is covered by a check or omitted with a reason; a central
+    claim still undecided after all checks gets one follow-up plan (plan:2, SH_MAX_FOLLOWUP_CHECKS).
+    Superseded outcomes stay visible in the report.
 
 ## Dependency recovery (documented, isolated, recorded)
 
@@ -115,8 +141,10 @@ python tests/test_kernel.py
 ```
 
 Gates: `SH_ALLOW_REPO_EXEC`, `SH_ALLOW_SCRIPT_EXEC`, `SH_ALLOW_INSTALL`, `SH_ALLOW_NETWORK`
-(default on, for cloning), `SH_ALLOW_SOURCE_SEARCH`. Caps: `SH_MAX_CHECKS` (3),
-`SH_MAX_REVISIONS` (1), `SH_MAX_TRIES` (3). Docker is the only execution backend.
+(default on, for cloning and cited-data downloads), `SH_ALLOW_SOURCE_SEARCH`. Caps:
+`SH_MAX_CHECKS` (6), `SH_MAX_FOLLOWUP_CHECKS` (3), `SH_MAX_REVISIONS` (3), `SH_MAX_TRIES` (3),
+`SH_MAX_DATA_GB` (20), `SH_CHECK_BUDGET_S` (7200), `SH_RUN_TIMEOUT_S` (3600). Docker is the only
+execution backend.
 
 Delegation has exactly one channel: the workflow's isolated subagents read a task's files,
 write JSON to `out`, and run `run.py seal`. The harness never spawns a model. Launch an

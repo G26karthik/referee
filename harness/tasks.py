@@ -86,9 +86,14 @@ class _Ctx:
         self.src = state.read_json(self.root / "source.json", {})
         self.checkout = self.root / "repo"
         self.pages_dir = (self.root / "paper" / "pages").as_posix()
+        self.waiting: set[str] = set()      # checks waiting on the harness (data, environment, smoke run)
 
     def sealed(self, tid: str) -> dict | None:
         return _sealed(self.root, tid)
+
+    def plan(self) -> dict | None:
+        """The plan with its follow-up round merged in (checks C1..Cn, then the follow-up's)."""
+        return report.merged(self.sealed("plan"), self.sealed("plan:2"))
 
     def tracked(self) -> set[str]:
         if not hasattr(self, "_tracked"):
@@ -202,16 +207,13 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
     if x.sealed("critic") is None:
         return "critic", [x.task("critic", "critic", _template(
             "critic", title=title, pages_dir=x.pages_dir, concerns=_concern_lines(x.concerns())))], []
-    plan = x.sealed("plan")
+    plan = x.plan()
     rows = (x.root / "paper" / "rows.md",)
     if plan is None:
-        repo_line, lst = _repo_text(x)
-        return "plan", [x.task("plan", "plan", _template(
-            "plan", title=title, pages_dir=x.pages_dir, repo=repo_line, checkout=x.checkout.as_posix(),
-            gpu="unknown until first use", concerns=_concern_lines(x.concerns()), listing=lst,
-            max_checks=x.cfg.max_checks), rows)] + _concern_vision(x), []
+        return "plan", [_plan_task(x, "plan", "")] + _concern_vision(x), []
     tasks = _concern_vision(x)
-    # Environments start as soon as an unfinished check needs them; each advance moves them one step.
+    # Environments and cited data start as soon as an unfinished check needs them; each advance
+    # moves them one step.
     open_ = [c for c in plan["checks"] if not (x.root / "checks" / c["id"] / "outcome.json").exists()]
     if (x.checkout / ".git").is_dir() and plan["repo_is_authors"] and any(
             c["kind"] in ("AUTHOR_CODE", "RECONSTRUCTION") for c in open_):
@@ -219,12 +221,21 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
     if any(c["kind"] in SCRIPT_KINDS for c in open_):
         execute.ensure_env(x.cfg, x.root, x.cfg.projects / ".script-env", execute.DEFAULT_IMAGE, None,
                            execute.SCRIPT_PACKAGES)
+    for c in open_:
+        if c.get("acquire") and execute.fetch(x.cfg, x.root, c["id"], c["acquire"]) is None:
+            x.waiting.add(c["id"])
     for c in plan["checks"]:
         tasks += _step(x, c)
-    running = [c["id"] for c in plan["checks"] if execute.poll(x.cfg, x.pid, c["id"])]
+    running = [c["id"] for c in plan["checks"] if execute.poll(x.cfg, x.pid, c["id"])] + sorted(x.waiting)
     if tasks or running:
         return "verify", tasks, running
     ledger = report.ledger(x)
+    # Coverage: a central claim still undecided after every check ended gets one follow-up plan,
+    # which sees what each check found and why, and may add checks (or say why none can decide it).
+    undecided = [cc for cc in ledger["central_claims"]
+                 if cc["claim_status"] in ("NOT_CHECKED", "NOTHING_DECIDED", "PARTIAL_EVIDENCE")]
+    if undecided and x.cfg.max_followup_checks > 0 and x.sealed("plan:2") is None:
+        return "plan", [_plan_task(x, "plan:2", _followup_text(ledger, undecided))], []
     if x.sealed("report") is None:
         return "report", [x.task("report", "report", _template(
             "report", title=title, table=report.table(ledger), concerns=_concern_lines(ledger["concerns"]),
@@ -233,6 +244,43 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
             paper=False)], []   # the writer works from the ledger; its quotes are already in it
     report.render(x, ledger, x.sealed("report"))
     return "done", [], []
+
+
+def _plan_task(x: _Ctx, tid: str, followup: str) -> dict:
+    repo_line, lst = _repo_text(x)
+    return x.task(tid, "plan", _template(
+        "plan", title=x.meta["title"], pages_dir=x.pages_dir, repo=repo_line, checkout=x.checkout.as_posix(),
+        host=execute.host_facts(x.cfg), concerns=_concern_lines(x.concerns()), listing=lst,
+        max_checks=x.cfg.max_followup_checks if followup else x.cfg.max_checks, followup=followup),
+        (x.root / "paper" / "rows.md",))
+
+
+def _followup_text(ledger: dict, undecided: list[dict]) -> str:
+    done = [{k: c.get(k) for k in ("id", "kind", "claim", "status", "reason", "stages", "data_identity")}
+            for c in ledger["checks"]]
+    return ("\n=== FOLLOW-UP ROUND: these central claims are still undecided after every planned check ended ===\n"
+            + "\n".join(f"- {cc['quote']!r}: {cc['claim_status']} (checks {', '.join(cc['checks']) or 'none'}; "
+                        f"why unchecked: {cc.get('why_unchecked') or '-'})" for cc in undecided)
+            + "\n=== WHAT EACH CHECK FOUND (harness statuses and reasons) ===\n"
+            + json.dumps(done, ensure_ascii=False, indent=1)[:20_000]
+            + "\nPropose NEW checks only (ids F1, F2, ...) for these claims, where a different route, a cited public "
+              "artifact to acquire, or a narrower but still paper-faithful test can decide what the first round could "
+              "not; repeat nothing that already ran. `central_claims` lists ONLY the undecided claims above (same "
+              "quotes) with the new check ids, or a concrete `why_unchecked` naming the blocker the outcomes show.\n")
+
+
+def _data_text(x: _Ctx, cid: str) -> str:
+    """What the harness acquired for a check (read-only at /work/data), as the manifest records it."""
+    d = state.read_json(x.root / "checks" / cid / "data.json")
+    if not d:
+        return ""
+    files = "\n".join(f"  {f['path']} ({f['bytes']} bytes)" + (f" head: {f['head'][:300]!r}" if f.get("head") else "")
+                      for f in d.get("files", [])[:150])
+    return (f"\n=== ACQUIRED DATA (read-only under {execute.DATA_MOUNT}/<n>/, one dir per source; sha256 in the "
+            f"manifest) ===\n" + json.dumps([{k: s.get(k) for k in ("source", "dir", "error", "http_status", "revision",
+                                                                   "followed", "links") if s.get(k)}
+                                             for s in d.get("sources", [])], ensure_ascii=False)[:6000]
+            + f"\n{d.get('n_files', 0)} files, {d.get('bytes', 0)} bytes:\n{files}\n")
 
 
 def _step(x: _Ctx, c: dict) -> list[dict]:
@@ -289,17 +337,26 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
         state.write_json(cdir / "outcome.json", {"check": cid, "kind": kind, "evidence": "PAPER_ARITHMETIC",
                                                  "authorized": True, **out})
         return []
+    if c.get("acquire") and not (state.read_json(cdir / "data.json") or {}).get("fetched_at"):
+        x.waiting.add(cid)                     # the cited data is being acquired: the author writes against it
+        return []
+    if x.sealed(f"gen:{cid}.1") is None and execute.script_env(x.cfg, x.root, kind, c["repo_attributed"])[1] is None:
+        x.waiting.add(cid)                     # its environment is still building: drafts could not run yet
+        return []
+    last = ""
     for r in range(1, rounds + 1):
         g = x.sealed(f"gen:{cid}.{r}")
         if g is None:
             prev = x.sealed(f"verify:{cid}.{r - 1}") if r > 1 else None
             setup = cdir / f"setup.{r - 1}.txt"
-            revision = "" if not prev else (
-                f"\n=== REVISION {r}: the approved script FAILED TO START in the sandbox ===\nFix only what "
+            revision = (
+                f"\n=== REVISION {r}: the previous script FAILED in the harness's run of it ===\nFix what "
                 f"stopped it (a module missing from the environment: declare it on a `# REFEREE_PACKAGES:` line; "
-                f"a path or argument error). The error:\n{setup.read_text(encoding='utf-8')[-1500:]}\n"
+                f"a path, argument or code error; a data file named differently than you assumed — look at the "
+                f"acquired-data manifest). Never fix it by weakening the claim. The error (result lines masked):\n"
+                f"{setup.read_text(encoding='utf-8')[-2500:]}\n"
                 f"--- the script ---\n{(cdir / f'script.{r - 1}.py').read_text(encoding='utf-8')}\n"
-                if setup.exists() else
+                if r > 1 and setup.exists() else "" if not prev else
                 f"\n=== REVISION {r}: an independent verifier rejected the previous attempt ===\nFix exactly "
                 f"this, from the paper's own words (never by weakening the claim or inventing a detail):\n"
                 f"{prev['required_changes'] or prev['notes']}\n--- the rejected script ---\n"
@@ -316,21 +373,41 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
             env = ("the authors' environment (their lockfile/requirements, built from the checkout; if it fails to "
                    "build, the baseline below)" if kind == "RECONSTRUCTION" and c["repo_attributed"] else
                    "the baseline: Python 3.11, standard library plus numpy, scipy, pandas, scikit-learn, sympy")
+            env_now = execute.script_env(x.cfg, x.root, kind, c["repo_attributed"])[1] or {}
             return [x.task(f"gen:{cid}.{r}", "gen", _template(
                 "gen", title=x.meta["title"], pages_dir=x.pages_dir, check_id=cid, kind=kind, claim=c["claim"],
-                spec=spec + extra, contract=_section("contracts", f"gen {kind}"), metric=metric, environment=env,
+                spec=spec + extra + _data_text(x, cid), contract=_section("contracts", f"gen {kind}"), metric=metric,
+                environment=f"{env} (built: {env_now.get('detail', 'pending')[:300]})", host=execute.host_facts(x.cfg),
                 required=", ".join(REQUIRED[kind]), max_tries=x.cfg.max_tries, try_cmd=try_cmd, revision=revision))]
         if g.get("refused"):
-            return _terminal(cdir, c, "NOT_CHECKABLE", f"the script author refused: {g['notes'][:400]}")
+            return _terminal(cdir, c, "NOT_CHECKABLE", f"the script author refused: {g['notes'][:400]}",
+                             by_model=True)
+        if (cdir / f"setup.{r}.txt").exists():
+            last = (cdir / f"setup.{r}.txt").read_text(encoding="utf-8")[-400:]
+            continue                                             # it could not run: the next round revises it
         v = x.sealed(f"verify:{cid}.{r}")
         if v is None:
+            # No verifier sees a script nobody has run: the harness runs it once (seed 0, results
+            # masked). A script that fails there goes back to its author with the error.
+            sm = execute.smoke(x.cfg, x.root, cid, r, kind, c["repo_attributed"])
+            if sm is None:
+                x.waiting.add(cid)
+                return []
+            if sm.get("failed") and not sm.get("infra_error"):
+                (cdir / f"setup.{r}.txt").write_text(f"{sm['failure']}\n--- stderr (tail) ---\n{sm['stderr'][-1500:]}",
+                                                     encoding="utf-8")
+                last = sm["failure"][-400:]
+                continue
             tries = (cdir / "tries.jsonl").read_text(encoding="utf-8")[-6000:] if (cdir / "tries.jsonl").exists() else "(none)"
             proposal = json.dumps({"script": (cdir / f"script.{r}.py").read_text(encoding="utf-8"), **{
                 k: g.get(k) for k in ("runs", "runs_quote", "metric", "outputs", "bindings", "deviations",
-                                      "checked_statement")}}, ensure_ascii=False, indent=1)
-            return [_verify_task(x, c, r, spec, proposal, tries)]
-        if v["verdict"] == "APPROVE" and (cdir / f"setup.{r}.txt").exists():
-            continue                                             # it could not start: the next round revises it
+                                      "checked_statement", "premise_argument")}}, ensure_ascii=False, indent=1)
+            smoke = (f"returncode {sm.get('returncode')}, {sm.get('seconds')}s"
+                     + (" (stopped at the draft time limit: it was still running)" if sm.get("timed_out") else "")
+                     + (f", infrastructure: {sm['infra_error']}" if sm.get("infra_error") else "")
+                     + f"\n--- stdout (result lines masked) ---\n{sm.get('stdout', '')[-2000:]}\n--- stderr ---\n"
+                     f"{sm.get('stderr', '')[-1500:]}")
+            return [_verify_task(x, c, r, spec + _data_text(x, cid), proposal, tries, smoke)]
         if v["verdict"] == "APPROVE":
             # An experiment is decided over independent seeded replicates: never fewer than the
             # paper states, and at least enough for a noise band (more is never a downscale).
@@ -338,19 +415,25 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
             source = "paper" if g.get("runs_quote") else ("referee_floor" if runs > g["runs"] else "referee")
             check = {**c, "runs": runs, "runs_quote": g.get("runs_quote", ""), "runs_source": source,
                      "script_sha256": g["script_sha256"], "metric": g.get("metric", c["metric"]),
-                     "deviations": g.get("deviations", []),
-                     "approval": {"approved": True, "script_sha256": v["script_sha256"]}}
+                     "deviations": g.get("deviations", []), "premise_argument": g.get("premise_argument", ""),
+                     "approval": {"approved": True, "script_sha256": v["script_sha256"],
+                                  "notes": v.get("notes", "")[:1000]}}
             shutil.copyfile(cdir / f"script.{r}.py", cdir / "script.py")
             return _start(x, check)
         if v["verdict"] == "UNCHECKABLE" or r == rounds:
             why = "unCheckable" if v["verdict"] == "UNCHECKABLE" else f"{rounds} rounds rejected"
-            return _terminal(cdir, c, "NOT_CHECKABLE", f"verifier: {why}: {(v['required_changes'] or v['notes'])[:400]}")
+            return _terminal(cdir, c, "NOT_CHECKABLE", f"verifier: {why}: {(v['required_changes'] or v['notes'])[:400]}",
+                             by_model=True)
+    if all(x.sealed(f"gen:{cid}.{r}") is not None for r in range(1, rounds + 1)):
+        return _terminal(cdir, c, "INCONCLUSIVE", f"the script failed in the harness's run in each of {rounds} rounds; "
+                         f"last error: {last}")
     return []
 
 
-def _terminal(cdir: Path, c: dict, status: str, reason: str) -> list:
+def _terminal(cdir: Path, c: dict, status: str, reason: str, by_model: bool = False) -> list:
     state.write_json(cdir / "outcome.json", {"check": c["id"], "kind": c["kind"], "status": status,
-                                             "authorized": False, "reason": reason})
+                                             "authorized": False, "reason": reason,
+                                             **({"reason_by": "model"} if by_model else {})})
     return []
 
 
@@ -365,10 +448,11 @@ def _start(x: _Ctx, check: dict) -> list:
     return []
 
 
-def _verify_task(x: _Ctx, c: dict, r: int, spec: str, proposal: str, tries: str) -> dict:
+def _verify_task(x: _Ctx, c: dict, r: int, spec: str, proposal: str, tries: str, smoke: str = "") -> dict:
     return x.task(f"verify:{c['id']}.{r}", "verify", _template(
         "verify", title=x.meta["title"], pages_dir=x.pages_dir, check_id=c["id"], kind=c["kind"], claim=c["claim"],
-        spec=spec, rules=_section("contracts", f"verify {c['kind']}"), proposal=proposal, tries=tries))
+        spec=spec, rules=_section("contracts", f"verify {c['kind']}"), proposal=proposal, tries=tries,
+        smoke=smoke or "(not applicable)", decide=_section("contracts", f"decide {c['kind']}") or "(see above)"))
 
 
 def _spec_text(c: dict) -> str:
@@ -524,18 +608,49 @@ def _target(x: _Ctx, t: dict, errors: list[str], cid: str) -> dict | None:
     return hit and {"quote": hit["quote"], "value": value, "page": hit["page"]}
 
 
+_SOURCE = re.compile(r"https?://[^\s\"'<>]+|hf://(?:datasets|models)/[\w.-]+/[\w.-]+(?:@[\w.-]+)?")
+
+
+def _acquire(x: _Ctx, c: dict, errs: list[str], cid: str) -> list[dict]:
+    """Public artifacts a check needs that the checkout does not ship: each source must be cited
+    verbatim by the paper or by a tracked checkout file (a cited dataset page may be followed to
+    its files by `include` patterns), and none may be a denied source."""
+    out = []
+    for s in [s for s in c.get("acquire") or [] if isinstance(s, dict)][:5]:    # ponytail: 5 sources per check
+        src, cited = str(s.get("source") or "").strip(), str(s.get("cited_in") or "").strip()
+        inc = [str(p)[:200] for p in s.get("include") or [] if str(p).strip()][:20]
+        if not _SOURCE.fullmatch(src):
+            errs.append(f"{cid}: acquire source {src[:120]!r} is neither an http(s) URL nor hf://datasets|models/owner/name")
+            continue
+        if any(d in src.lower() for d in x.cfg.deny_sources):
+            errs.append(f"{cid}: acquire source {src[:120]!r} is a denied source")
+            continue
+        needle = src[5:].split("/", 1)[1] if src.startswith("hf://") else src.split("://", 1)[1]
+        needle = needle.split("@")[0].rstrip("/")
+        text = x.paper.text if cited == "paper" else (
+            f.read_text(encoding="utf-8", errors="replace") if (f := _repo_file(x, cited)) and f.is_file() else "")
+        if not text or flat(needle) not in flat(text):
+            errs.append(f"{cid}: acquire source {src[:120]!r} is not cited verbatim in {cited or '(nothing)'!r} (give "
+                        "cited_in: 'paper' or a tracked checkout path whose text contains it)")
+            continue
+        out.append({"source": src, "include": inc, "cited_in": cited, "why": str(s.get("why") or "")[:400]})
+    return out
+
+
 def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     errors, checks, dropped = [], [], []
     concern_ids = {c["id"] for c in x.concerns()}
-    attributed = (x.checkout / ".git").is_dir() and obj.get("repo_is_authors") is True
+    base = x.sealed("plan") if tid == "plan:2" else None      # a follow-up round adds to the first plan
+    attributed = base["repo_is_authors"] if base else (x.checkout / ".git").is_dir() and obj.get("repo_is_authors") is True
+    cap, n0 = (x.cfg.max_followup_checks, len(base["checks"])) if base else (x.cfg.max_checks, 0)
     proposed = [c for c in obj.get("checks") or [] if isinstance(c, dict)]
     # Central claims get the budget first: a check no central claim cites is incidental, is
     # cut before any central one, and must say why no central claim could use its slot.
     central_ids = {k for cc in obj.get("central_claims") or [] if isinstance(cc, dict) for k in cc.get("checks") or []}
     proposed.sort(key=lambda c: c.get("id") not in central_ids)
-    for c in proposed[x.cfg.max_checks:]:
-        dropped.append({"check": c.get("id"), "why": f"over the budget of {x.cfg.max_checks} checks"})
-    for i, c in enumerate(proposed[:x.cfg.max_checks], 1):
+    for c in proposed[cap:]:
+        dropped.append({"check": c.get("id"), "why": f"over the budget of {cap} checks"})
+    for i, c in enumerate(proposed[:cap], n0 + 1):
         cid, kind, errs = f"C{i}", c.get("kind"), []
         if kind not in KINDS:
             errs.append(f"{cid}: unknown kind {kind!r}")
@@ -544,7 +659,9 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
                                                                                if k in concern_ids],
                "claim": claim["quote"] if claim else "", "why": str(c.get("why") or "")[:1000],
                "metric": str(c.get("metric") or "").strip(), "repo_attributed": attributed,
-               "central": c.get("id") in central_ids, "incidental_why": str(c.get("incidental_why") or "")[:600]}
+               "central": c.get("id") in central_ids, "incidental_why": str(c.get("incidental_why") or "")[:600],
+               "covers": [str(s)[:120] for s in c.get("covers") or []][:12],
+               "acquire": _acquire(x, c, errs, cid) if kind in SCRIPT_KINDS else []}
         if not rec["central"] and not rec["incidental_why"]:
             errs.append(f"{cid}: no central claim lists this check: link it from `central_claims[].checks`, or give "
                         "`incidental_why` (why no central claim could use this check slot)")
@@ -590,14 +707,24 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         else:
             checks.append(rec)
     central = []
-    for cc in [cc for cc in obj.get("central_claims") or [] if isinstance(cc, dict)]:
+    covered = {c["proposed_id"]: set(map(flat, c["covers"])) for c in checks}
+    for cc in [cc for cc in obj.get("central_claims") or [] if isinstance(cc, dict)][:8]:   # ponytail: 8 central claims
         h = _find(x, str(cc.get("quote") or ""), errors, "central claim")
         if not h:
             dropped.append({"check": "central claim", "why": f"quote not found: {str(cc.get('quote'))[:120]!r}"})
-        else:
-            central.append({"quote": h["quote"], "page": h["page"],
-                            "checks": [k for k in cc.get("checks") or [] if k in {c.get("id") for c in proposed}],
-                            "why_unchecked": str(cc.get("why_unchecked") or "")[:600]})
+            continue
+        # Scope: every method, dataset or setting the claim names is covered by one of its checks or
+        # omitted with a reason — a narrower test never silently stands for the whole claim.
+        scope = [str(s)[:120] for s in cc.get("scope") or [] if str(s).strip()][:16]
+        omitted = [{"item": str(o.get("item") or "")[:120], "why": str(o.get("why") or "")[:400]}
+                   for o in cc.get("omitted") or [] if isinstance(o, dict)]
+        links = [k for k in cc.get("checks") or [] if k in {c.get("id") for c in proposed}]
+        have = set().union(*(covered.get(k, set()) for k in links)) | {flat(o["item"]) for o in omitted if o["why"]}
+        if links and (miss := [s for s in scope if flat(s) not in have]):
+            errors.append(f"central claim {h['quote'][:60]!r}: scope item(s) {miss} are neither in a linked check's "
+                          "`covers` nor in `omitted` with a reason")
+        central.append({"quote": h["quote"], "page": h["page"], "checks": links, "scope": scope, "omitted": omitted,
+                        "why_unchecked": str(cc.get("why_unchecked") or "")[:600]})
     _fail_or_drop(errors, final)
     # The planner's own ids map onto the harness's C1..Cn.
     ids = {c["proposed_id"]: c["id"] for c in checks}
@@ -633,7 +760,7 @@ def _seal_bind(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     commit: the command as a full line or code span of a tracked doc, the key as a whole word
     of a tracked code file."""
     cid = tid.split(":")[1]
-    c = next(k for k in x.sealed("plan")["checks"] if k["id"] == cid)
+    c = next(k for k in x.plan()["checks"] if k["id"] == cid)
     cmd, why, errors = command(str(obj.get("command_quote") or "")), [], []
     if cmd and not documented(_repo_file(x, obj.get("command_file")), cmd):
         errors.append(f"command_quote is not a whole documented command in tracked file {obj.get('command_file')!r}")
@@ -665,7 +792,7 @@ def _seal_bind(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
 
 def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     cid, r = tid.split(":")[1].rsplit(".", 1)
-    c = next(k for k in x.sealed("plan")["checks"] if k["id"] == cid)
+    c = next(k for k in x.plan()["checks"] if k["id"] == cid)
     script = str(obj.get("script") or "")
     need = REQUIRED[c["kind"]]
     # Any number of bindings per kind (a method with two ingredients binds both); each kind needs one.
@@ -673,7 +800,9 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     if not script.strip() or any(not any(b.get("kind") == k and b.get("impl_quote") for b in given) for k in need):
         return {"refused": True, "notes": str(obj.get("notes") or "the script or a required binding is missing")[:2000]}
     errors, out = [], []
-    rel = [f["path"] for f in state.read_json(x.root / "released.json", [])]
+    rel = [f["path"] for f in state.read_json(x.root / "released.json", [])] + [   # released, or acquired for it
+        f"{execute.DATA_MOUNT}/{f['path']}" for f in (state.read_json(x.root / "checks" / cid / "data.json") or {}).get(
+            "files", [])]
     for b in given:
         k = b["kind"]
         if flat(str(b.get("impl_quote") or "")) not in flat(script):
@@ -736,6 +865,9 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     return {"script_sha256": state.sha256(script), "runs": runs, "runs_quote": str(obj.get("runs_quote") or "")[:500],
             "metric": metric, "outputs": outputs, "deviations": deviations, "bindings": out,
             "checked_statement": "proof_step" if c.get("step") else str(obj.get("checked_statement") or "conclusion"),
+            # A general argument (e.g. that a printed premise can never hold) is the author's reasoning:
+            # shown to the verifier and the reader as such, never counted as an executed result.
+            "premise_argument": str(obj.get("premise_argument") or "")[:2000] if c["kind"] == "CERTIFICATE" else "",
             "notes": str(obj.get("notes") or "")[:2000]}
 
 
@@ -787,6 +919,7 @@ def try_(cfg: state.Config, pid: str, tid: str, script_path: str) -> dict:
     if n >= cfg.max_tries * (1 + cfg.max_revisions):
         return {"error": f"the draft budget ({cfg.max_tries} per round) is spent"}
     script = Path(script_path).read_text(encoding="utf-8")
-    res = execute.try_script(cfg, pid, cid, script)
+    plan = report.merged(_sealed(root, "plan"), _sealed(root, "plan:2")) or {"checks": []}
+    res = execute.try_script(cfg, pid, cid, script, next((k for k in plan["checks"] if k["id"] == cid), {}))
     state.append_jsonl(cdir / "tries.jsonl", {"task": tid, "script_sha256": state.sha256(script), **res})
     return res

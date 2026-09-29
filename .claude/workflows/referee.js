@@ -22,6 +22,9 @@ const ENV = A.env || 'PYTHONUTF8=1'
 // Rounds: lenses -> critic -> plan -> per-check bind/gen/verify (+1 revision) -> report,
 // plus polls while experiments run in the background (each poll waits up to 9 minutes).
 const MAX_ROUNDS = A.maxRounds || 30
+// Waiting on running experiments (each wait is one controller call of up to ~9.5 min) is not a
+// work round; it has its own ceiling so a long experiment never exhausts the work rounds.
+const MAX_WAITS = A.maxWaits || 150
 const WORKER_MODEL = A.workerModel || 'claude-sonnet-5-5'
 const CONTROLLER_MODEL = A.controllerModel || 'haiku'
 const sh = cmd => `cd "${REPO}" && ${ENV} ${PY} ${cmd}`
@@ -84,13 +87,15 @@ function worker(pid, t, prior) {
 async function review(source) {
   const rounds = [], fails = {}, why = {}
   let st = await controller(source, `tasks:${source}`)
+  let waits = 0
   for (let round = 0; st && round < MAX_ROUNDS; round++) {
     const pid = st.paper_id
     const ready = st.tasks.filter(t => (fails[t.id] || 0) < 2)
     if (!ready.length) {
-      if (!String(st.blocked_reason || '').startsWith('executions running')) break
-      log(`${pid}: ${st.blocked_reason}; waiting`)
-      st = await controller(pid, `wait:${pid}`)
+      if (!String(st.blocked_reason || '').startsWith('executions running') || waits >= MAX_WAITS) break
+      log(`${pid}: ${st.blocked_reason}; waiting (${++waits}/${MAX_WAITS})`)
+      st = await controller(pid, `wait:${pid}:${waits}`)
+      round--
       continue
     }
     log(`${pid}: round ${round + 1}, phase ${st.phase}, ${ready.length} task(s)`)
@@ -108,7 +113,7 @@ async function review(source) {
   return { source, models: { worker: WORKER_MODEL, controller: CONTROLLER_MODEL }, final: st && { paper_id: st.paper_id, phase: st.phase, workflow_status: st.status,
            blocked_reason: st.blocked_reason, scientific_status: st.scientific_status || 'NOT_ASSESSED',
            left: (st.tasks || []).map(t => t.id) },
-           rounds, gave_up: Object.keys(fails).filter(k => fails[k] >= 2) }
+           rounds, waits, gave_up: Object.keys(fails).filter(k => fails[k] >= 2) }
 }
 
 phase('Review')

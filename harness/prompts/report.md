@@ -29,8 +29,13 @@ anything past 8000 characters):
      (say "incidental": no central claim rests on them). Per check id: what was run, against
      which printed number or stated relation, its status in plain words, and any recorded
      deviation or conflicting reading. A BLOCKED or INCONCLUSIVE check established nothing
-     either way; say what blocked it. Keep what the workflow completed apart from what it
-     established.
+     either way; say what blocked it (the recorded reason: data, configured time budget,
+     measured memory, a script error). A PARTIAL check measured some stages and not others:
+     report the completed stages' results as limited to those stages, and what stopped the rest.
+     A result under claim-changing deviations (READING_CHANGED) is about the changed claim, not
+     the printed one. A data-identity mismatch (the data used differ from the paper's own
+     description) is a finding to state plainly. Keep what the workflow completed apart from
+     what it established; a concern stands only as far as its linked check established it.
   4. **Open questions for the authors** — concrete questions that would settle what remains.
 RULES (enforced): no accept/reject recommendation, score or verdict on the paper. The words
 verified, reproduced, confirmed, validated, replicated, refuted, disproved, counterexample,

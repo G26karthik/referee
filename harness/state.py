@@ -40,8 +40,17 @@ class Config:
     allow_install: bool = field(default_factory=lambda: _flag("SH_ALLOW_INSTALL"))
     allow_network: bool = field(default_factory=lambda: _flag("SH_ALLOW_NETWORK", "1"))
     allow_source_search: bool = field(default_factory=lambda: _flag("SH_ALLOW_SOURCE_SEARCH"))
-    # ponytail: token caps sized for a few papers per run; raise per invocation via env.
-    max_checks: int = field(default_factory=lambda: _int("SH_MAX_CHECKS", 3))
+    # ponytail: token caps sized for a few papers per run; raise per invocation via env. 6 checks
+    # cover a paper's headline experiments and theorems; one follow-up plan may add 3 more where a
+    # central claim is still undecided.
+    max_checks: int = field(default_factory=lambda: _int("SH_MAX_CHECKS", 6))
+    max_followup_checks: int = field(default_factory=lambda: _int("SH_MAX_FOLLOWUP_CHECKS", 3))
+    # ponytail: 20 GB of acquired public data per check fits one host's disk; a larger artifact is
+    # a documented storage blocker, never a silent subset.
+    max_data_gb: int = field(default_factory=lambda: _int("SH_MAX_DATA_GB", 20))
+    # Sources a review must never read (evaluation records about the papers themselves).
+    deny_sources: tuple = field(default_factory=lambda: tuple(
+        s.strip().lower() for s in os.environ.get("SH_DENY_SOURCES", "ICML-2026-agent-repro").split(",") if s.strip()))
     max_revisions: int = field(default_factory=lambda: _int("SH_MAX_REVISIONS", 3))
     max_tries: int = field(default_factory=lambda: _int("SH_MAX_TRIES", 3))
     # ponytail: a paper stating more runs than this is refused, never downscaled.
