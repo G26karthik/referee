@@ -544,6 +544,8 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         if (_vanished(done) or (done["mode"] == "evidence" and classify(done)["infra_error"])) and st.get("restarts", 0) < 3:
             st["restarts"] = st.get("restarts", 0) + 1   # ponytail: 3 restarts; a vanished or OS-killed step is
             st.setdefault("redo", []).append(int(key))   # infrastructure, never a result: run that seed again
+            if done.get("returncode") == 137 or "memory" in (done.get("error") or "").lower():
+                st["width"] = 1                          # killed for memory: its seeds then run one at a time
             continue
         if st["stage"] == "prepare":
             if done.get("returncode") != 0:
@@ -579,7 +581,7 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
     free = cfg.parallel - (len(out.split()) - len(builds.split())) if rc == rc2 == 0 else 0
     # ...and shared fairly: with several checks running, each holds at most an equal share of the slots.
     active = [e for e in cfg.projects.glob("*/checks/*/exec.json") if not (e.parent / "outcome.json").exists()]
-    width = min(width, max(1, cfg.parallel // max(1, len(active))))
+    width = min(width, max(1, cfg.parallel // max(1, len(active))), st.get("width", width))
     while st["stage"] == "run" and len(fly) + len(todo) < width and len(todo) < free and (
             st.get("redo") or st["next"] < runs):
         if st.get("redo"):
