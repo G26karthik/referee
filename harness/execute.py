@@ -541,9 +541,9 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             continue
         state.append_jsonl(root / "execution.jsonl", done)
         del fly[key]
-        if _vanished(done) and st.get("restarts", 0) < 2:          # ponytail: two restarts of a vanished step
-            st["restarts"] = st.get("restarts", 0) + 1                # infrastructure, never a result: run it again
-            st.setdefault("redo", []).append(int(key))
+        if (_vanished(done) or (done["mode"] == "evidence" and classify(done)["infra_error"])) and st.get("restarts", 0) < 3:
+            st["restarts"] = st.get("restarts", 0) + 1   # ponytail: 3 restarts; a vanished or OS-killed step is
+            st.setdefault("redo", []).append(int(key))   # infrastructure, never a result: run that seed again
             continue
         if st["stage"] == "prepare":
             if done.get("returncode") != 0:
