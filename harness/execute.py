@@ -18,6 +18,7 @@ from pathlib import Path
 
 from . import repo as repo_mod
 from . import state
+from .evidence import margin, relation
 
 MOUNT = "/work"
 DEFAULT_IMAGE = "python:3.11-slim"
@@ -68,9 +69,50 @@ def image_for(checkout: Path | None) -> str:
             text = (checkout / name).read_text(encoding="utf-8", errors="replace") if checkout else ""
         except OSError:
             continue
-        if (m := re.search(r"python(?:_requires)?\W{0,6}(?:>=|==|~=|=)?\s*3\.(9|1[0-3])\b", text, re.I)):
+        pat = r"^\s*3\.(9|1[0-3])\b" if name == ".python-version" else \
+            r"python(?:_requires)?\W{0,6}(?:>=|==|~=|=)?\s*3\.(9|1[0-3])\b"
+        if (m := re.search(pat, text, re.I | re.M)):
             return f"python:3.{m.group(1)}-slim"
     return DEFAULT_IMAGE
+
+
+# --- dependency recovery (CLAUDE.md "Dependency recovery"): documented, isolated, recorded -
+_CC = r"'?[\w./+-]*(?:gcc|cc|g\+\+|c\+\+|clang)'?"
+_COMPILER = re.compile(rf"unable to execute {_CC}|command {_CC} failed|No such file or directory: {_CC}|"
+                       rf"{_CC}:? (?:command )?not found|[Cc]\+?\+? compiler", re.I)
+MAX_RECOVERIES = 2   # ponytail: two rebuilds per environment, each from scratch
+
+
+def _declared(checkout: Path | None) -> str:
+    for name in ("pyproject.toml", "setup.cfg", "setup.py"):
+        try:
+            text = (checkout / name).read_text(encoding="utf-8", errors="replace") if checkout else ""
+        except OSError:
+            continue
+        if (m := re.search(r"(?:requires-python|python_requires)\s*=\s*[\"']([^\"']+)", text)):
+            return m.group(1)
+    return ""
+
+
+def recover(stderr: str, image: str, checkout: Path | None) -> tuple[str, str] | None:
+    """The next documented rebuild for an environment that failed, or None (then BLOCKED):
+    a build that needed a compiler -> the full image of the same Python; every available
+    release of a dependency needing a newer Python -> that Python, if the project's declared
+    range admits it. Nothing else changes: no requirement is edited, added or dropped."""
+    minor = int(m.group(1)) if (m := re.search(r"python:3\.(\d+)", image)) else 11
+    if image.endswith("-slim") and _COMPILER.search(stderr or ""):
+        full = image.removesuffix("-slim")
+        return full, f"a build step needed a C/C++ compiler, which {image} lacks: rebuilt on {full} (same Python)"
+    need = sorted({int(n) for n in re.findall(r"Requires-Python\s*>=\s*3\.(\d+)", stderr or "")} - set(range(minor + 1)))
+    spec = _declared(checkout)
+    for n in need[:1]:
+        caps = re.findall(r"(<=?|==)\s*3\.(\d+)", spec)
+        if n <= 13 and not any((op == "<" and int(v) <= n) or (op == "<=" and int(v) < n) or (op == "==" and int(v) != n)
+                               for op, v in caps):
+            new = image.replace(f"3.{minor}", f"3.{n}", 1)
+            return new, (f"no release of a dependency supports Python 3.{minor} (it needs >=3.{n}): rebuilt on {new}, "
+                         f"within the project's declared range {spec or '(none declared)'}")
+    return None
 
 
 def run(argv: list[str], *, mounts: list[tuple[Path, str, bool]], workdir: str, image: str,
@@ -143,18 +185,29 @@ def classify(rec: dict) -> dict:
 
 
 # --- metric parsing: a value bound by name, never by position (invariant 16) ------------
-def result_values(stdout: str, key: str) -> list[float]:
-    """Values of `key` from `REFEREE_RESULT {json}` lines (the script contract)."""
+def _results(stdout: str) -> list[dict]:
+    """The numeric fields of each `REFEREE_RESULT {json}` line (the script contract)."""
     out = []
     for line in (stdout or "").splitlines():
         if line.startswith("REFEREE_RESULT "):
             try:
-                v = json.loads(line[len("REFEREE_RESULT "):]).get(key)
-            except (ValueError, AttributeError):
+                d = json.loads(line[len("REFEREE_RESULT "):])
+            except ValueError:
                 continue
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
-                out.append(float(v))
+            if isinstance(d, dict):
+                out.append({k: float(v) for k, v in d.items() if isinstance(v, (int, float)) and not isinstance(v, bool)})
     return out
+
+
+def result_values(stdout: str, key: str) -> list[float]:
+    """Values of `key`, by name, from the result lines."""
+    return [d[key] for d in _results(stdout) if key in d]
+
+
+def relation_margins(stdout: str, rel: str) -> list[float]:
+    """One paired margin per result line that carries every output the relation names."""
+    names = relation(rel)[3]
+    return [margin(rel, d) for d in _results(stdout) if all(n in d for n in names)]
 
 
 def parse_metric(stdout: str, key: str) -> tuple[float | None, str]:
@@ -215,39 +268,79 @@ def authorize(cfg: state.Config, check: dict, commit_ok: tuple[bool, str] = (Fal
     return True, "an independent verifier approved this exact script"
 
 
+UV_RUN = {"UV_PROJECT_ENVIRONMENT": "/env", "UV_NO_SYNC": "1", "UV_FROZEN": "1", "UV_OFFLINE": "1",
+          "UV_PYTHON_DOWNLOADS": "never", "UV_CACHE_DIR": "/tmp/uv-cache"}   # `uv run` uses /env, never syncs
+
+
 def build_env(cfg: state.Config, root: Path, env_dir: Path, image: str, checkout: Path | None,
-              packages: tuple[str, ...] = ()) -> tuple[bool, str]:
-    """A venv built inside the container (network on), once. Records what was installed."""
+              packages: tuple[str, ...] = ()) -> dict:
+    """A venv built inside the container (network on), once, from what the checkout declares:
+    its uv lockfile (path sources included), else requirements*.txt, else its package. A
+    failed build is rebuilt from scratch only along `recover`; every attempt is an
+    ExecutionRecord. Returns the marker: ok, detail, image, builder, uv, recovery."""
     marker = env_dir / "referee-env.json"
     if not (cfg.allow_install and cfg.allow_network) and not (state.read_json(marker) or {}).get("ok"):
-        return False, "the install or network gate is shut, so no environment was built"
+        return {"ok": False, "detail": "the install or network gate is shut, so no environment was built", "image": image}
     with state.lock(env_dir.parent / f".{env_dir.name}.lock"):      # parallel checks build it once
-        return _build_env(cfg, root, env_dir, image, checkout, packages, marker)
+        if (m := state.read_json(marker)) and "ok" in m:            # ponytail: a failed build is not retried per check
+            return m
+        uv = bool(checkout and not packages and (checkout / "uv.lock").is_file())
+        reqs = sorted(p.name for p in checkout.glob("requirements*.txt")) if checkout else []
+        if packages:
+            builder, add = "baseline packages", ["/env/bin/python -m pip install --quiet " + " ".join(packages)]
+        elif uv:
+            builder = "uv sync --frozen (the authors' lockfile)"
+            add = ["/env/bin/python -m pip install --quiet uv", "cp -r /repo /tmp/src && cd /tmp/src && "
+                   "UV_PROJECT_ENVIRONMENT=/env UV_PYTHON=/env/bin/python UV_PYTHON_DOWNLOADS=never "
+                   "/env/bin/uv sync --frozen --inexact --no-editable"]
+        elif reqs:
+            builder, add = f"pip -r {reqs[0]}", [f"/env/bin/python -m pip install -r /repo/{reqs[0]}"]
+        elif checkout and ((checkout / "pyproject.toml").exists() or (checkout / "setup.py").exists()):
+            builder, add = "pip install of the package", ["cp -r /repo /tmp/src && /env/bin/python -m pip install /tmp/src"]
+        else:
+            builder, add = "no declared dependencies", []
+        steps = ["python -m venv /env", "/env/bin/python -m pip install --quiet --upgrade pip", *add,
+                 "/env/bin/python -m pip freeze > /env/freeze.txt"]
+        recovery: list[dict] = []
+        rec: dict = {}
+        for _ in range(1 + MAX_RECOVERIES):
+            shutil.rmtree(env_dir, ignore_errors=True)               # isolated: every attempt starts empty
+            env_dir.mkdir(parents=True, exist_ok=True)
+            mounts = [(env_dir, "/env", False)] + ([(checkout, "/repo", True)] if checkout else [])
+            rec = run(["sh", "-c", " && ".join(steps)], mounts=mounts, workdir="/", image=image, network=True,
+                      timeout=cfg.install_timeout_s, mode="install", target=str(env_dir.name),
+                      meta={"builder": builder, "recovery": list(recovery)})
+            state.append_jsonl(root / "execution.jsonl", rec)
+            if rec.get("returncode") == 0 or not (fix := recover(rec.get("stderr", ""), image, checkout)):
+                break
+            recovery.append({"failure": (rec.get("stderr") or "")[-300:], "action": fix[1], "image": fix[0]})
+            image = fix[0]
+        ok = rec.get("returncode") == 0
+        detail = (f"built {image} venv by {builder}; freeze sha256 {state.sha256((env_dir / 'freeze.txt').read_bytes())[:12]}"
+                  if ok else f"environment build failed: {(rec.get('stderr') or rec.get('error') or '')[-300:]}")
+        m = {"ok": ok, "detail": detail, "image": image, "builder": builder, "uv": uv, "recovery": recovery}
+        state.write_json(marker, m)
+        return m
 
 
-def _build_env(cfg, root, env_dir, image, checkout, packages, marker) -> tuple[bool, str]:
-    if (m := state.read_json(marker)) and m.get("ok"):
-        return True, m["detail"]
-    env_dir.mkdir(parents=True, exist_ok=True)
-    mounts = [(env_dir, "/env", False)] + ([(checkout, "/repo", True)] if checkout else [])
-    steps = ["python -m venv /env", "/env/bin/python -m pip install --quiet --upgrade pip"]
-    if packages:
-        steps.append("/env/bin/python -m pip install --quiet " + " ".join(packages))
-    elif checkout:
-        reqs = sorted(p.name for p in checkout.glob("requirements*.txt"))
-        if reqs:
-            steps += [f"/env/bin/python -m pip install -r /repo/{r}" for r in reqs[:1]]
-        elif (checkout / "pyproject.toml").exists() or (checkout / "setup.py").exists():
-            steps.append("cp -r /repo /tmp/src && /env/bin/python -m pip install /tmp/src")
-    steps.append("/env/bin/python -m pip freeze > /env/freeze.txt")
-    rec = run(["sh", "-c", " && ".join(steps)], mounts=mounts, workdir="/", image=image, network=True,
-              timeout=cfg.install_timeout_s, mode="install", target=str(env_dir.name))
-    state.append_jsonl(root / "execution.jsonl", rec)
-    ok = rec.get("returncode") == 0
-    detail = (f"built {image} venv; freeze sha256 {state.sha256((env_dir / 'freeze.txt').read_bytes())[:12]}"
-              if ok else f"environment build failed: {(rec.get('stderr') or rec.get('error') or '')[-300:]}")
-    state.write_json(marker, {"ok": ok, "detail": detail, "image": image})
-    return ok, detail
+def author_env(cfg: state.Config, pid: str) -> dict:
+    """The authors' environment (root/env): used by AUTHOR_CODE and by reconstructions that
+    drive the authors' code; built in the background as soon as a plan needs it."""
+    root = state.pdir(cfg, pid)
+    return build_env(cfg, root, root / "env", image_for(root / "repo"), root / "repo")
+
+
+def script_env(cfg: state.Config, root: Path, kind: str, attributed: bool) -> tuple[Path, dict]:
+    """A RECONSTRUCTION runs where the authors' code runs (their environment) when that
+    builds; every other script, or a failed build, runs on the fixed baseline."""
+    base = cfg.projects / ".script-env"
+    if kind == "RECONSTRUCTION" and attributed and (root / "repo" / ".git").is_dir():
+        env = author_env(cfg, root.name)
+        if env.get("ok"):
+            return root / "env", env
+        b = build_env(cfg, root, base, DEFAULT_IMAGE, None, SCRIPT_PACKAGES)
+        return base, {**b, "detail": f"{b['detail']} (the authors' environment did not build: {env['detail'][-200:]})"}
+    return base, build_env(cfg, root, base, DEFAULT_IMAGE, None, SCRIPT_PACKAGES)
 
 
 def execute(cfg: state.Config, pid: str, check: dict) -> dict:
@@ -263,25 +356,29 @@ def execute(cfg: state.Config, pid: str, check: dict) -> dict:
     ok, why = authorize(cfg, check, commit_ok)
     outcome = {"check": check["id"], "kind": kind, "evidence": EVIDENCE.get(kind, "NONE"), "authorized": ok,
                "authorization": why, "commit": src.get("commit", "") if has_repo else ""}
-    failure, ev, seeded = "", {}, False
+    failure, ev, seeded, literal, envinfo = "", {}, False, [], {}
+    rel = (check.get("target") or {}).get("relation", "")
     if ok:
-        image = image_for(checkout) if kind == "AUTHOR_CODE" else DEFAULT_IMAGE
         if kind == "AUTHOR_CODE":
-            ok, why = build_env(cfg, root, root / "env", image, checkout)
+            envinfo = author_env(cfg, pid)
+            ok, why, image, gpus = envinfo["ok"], envinfo["detail"], envinfo["image"], gpu(cfg)
             # The authors' code writes into its own copy of the checkout (no .git), never into
             # the pinned checkout that released-data hashes and host `git` read.
             work = cdir / "work"
             shutil.rmtree(work, ignore_errors=True)
             shutil.copytree(checkout, work, ignore=shutil.ignore_patterns(".git"))
             mounts, workdir = [(work, f"{MOUNT}/repo", False), (root / "env", "/env", False)], f"{MOUNT}/repo"
-            env = {"PATH": "/env/bin:/usr/local/bin:/usr/bin:/bin", "VIRTUAL_ENV": "/env"}
+            env = {"PATH": "/env/bin:/usr/local/bin:/usr/bin:/bin", "VIRTUAL_ENV": "/env",
+                   **(UV_RUN if envinfo.get("uv") else {})}
             if ok and check.get("prepare"):
                 rec = run(["sh", "-c", check["prepare"]], mounts=mounts, workdir=workdir, image=image, network=True,
                           timeout=cfg.install_timeout_s, env=env, mode="prepare", target=check["id"])
                 recs.append(rec)
                 ok, why = rec.get("returncode") == 0, "prepare step: " + (rec.get("stderr") or rec.get("error") or "")[-300:]
         else:
-            ok, why = build_env(cfg, root, cfg.projects / ".script-env", DEFAULT_IMAGE, None, SCRIPT_PACKAGES)
+            env_dir, envinfo = script_env(cfg, root, kind, bool(check.get("repo_attributed")))
+            ok, why, image = envinfo["ok"], envinfo["detail"], envinfo.get("image", DEFAULT_IMAGE)
+            gpus = env_dir == root / "env" and gpu(cfg)
             # The script sees only its own approved copy, read-only (a run cannot rewrite what
             # later seeds execute); scratch space is the container's own /tmp.
             rundir = cdir / "run"
@@ -289,7 +386,7 @@ def execute(cfg: state.Config, pid: str, check: dict) -> dict:
             shutil.copyfile(cdir / "script.py", rundir / "script.py")
             if state.sha256((rundir / "script.py").read_bytes()) != check.get("script_sha256"):
                 ok, why = False, "the script on disk is not the approved script"
-            mounts = [(rundir, f"{MOUNT}/check", True), (cfg.projects / ".script-env", "/env", True)] + (
+            mounts = [(rundir, f"{MOUNT}/check", True), (env_dir, "/env", True)] + (
                 [(checkout, f"{MOUNT}/repo", True)] if has_repo else [])
             workdir, env = (f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check"), {}
         if not ok:
@@ -301,15 +398,17 @@ def execute(cfg: state.Config, pid: str, check: dict) -> dict:
             else:
                 argv = ["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", str(seed)]
             rec = run(argv, mounts=mounts, workdir=workdir, image=image, network=False, timeout=cfg.run_timeout_s,
-                      env=env, gpus=kind == "AUTHOR_CODE" and gpu(cfg), mode="evidence", target=check["id"],
+                      env=env, gpus=gpus, mode="evidence", target=check["id"],
                       meta={"commit": outcome["commit"], "seed": seed, "script_sha256": check.get("script_sha256", "")})
             recs.append(rec)
             ev = classify(rec)
             if kind == "AUTHOR_CODE":
                 v, note = parse_metric(rec["stdout"], check.get("metric", ""))
                 vs = [v] if v is not None and not (ev["failed"] and "text" in note) else []
-            else:
-                vs = result_values(rec["stdout"], "violated" if kind == "CERTIFICATE" else check.get("metric", ""))
+            else:   # bound by name: the relation's outputs, the generator's compared output, or `violated`
+                vs = (relation_margins(rec["stdout"], rel) if rel else
+                      result_values(rec["stdout"], "violated" if kind == "CERTIFICATE" else check.get("metric", "")))
+                literal += result_values(rec["stdout"], "literal_violated") if kind == "CERTIFICATE" else []
             if ev["failed"]:
                 failure = (rec.get("error") or (rec.get("stderr") or "")[-400:] or f"exit {rec.get('returncode')}").strip()
                 break
@@ -320,9 +419,13 @@ def execute(cfg: state.Config, pid: str, check: dict) -> dict:
     for rec in recs:
         state.append_jsonl(root / "execution.jsonl", rec)
     outcome.update(reconcile(kind, check.get("printed", ""), values, failure, ev, seeded,
-                             ok and outcome["authorized"], outcome["authorization"]),
+                             ok and outcome["authorized"], outcome["authorization"], rel),
                    values=values, runs=len([r for r in recs if r["mode"] == "evidence"]),
                    records="execution.jsonl", finished_at=state.now())
+    if envinfo:
+        outcome["environment"] = {k: envinfo.get(k) for k in ("detail", "image", "builder", "recovery")}
+    if literal:           # the printed text evaluated exactly as printed, beside the recorded deviations
+        outcome["literal"] = {"n": len(literal), "violated": sum(1 for v in literal if v == 1)}
     state.write_json(cdir / "outcome.json", outcome)
     return outcome
 
@@ -347,18 +450,24 @@ def try_script(cfg: state.Config, pid: str, cid: str, script: str) -> dict:
     ok, why = docker_status()
     if not ok:
         return {"error": why}
-    ok, why = build_env(cfg, root, cfg.projects / ".script-env", DEFAULT_IMAGE, None, SCRIPT_PACKAGES)
-    if not ok:
-        return {"error": why}
+    c = next((k for k in (state.read_json(root / "sealed" / "plan.json") or {}).get("checks", []) if k["id"] == cid), {})
+    if c.get("kind") == "RECONSTRUCTION" and c.get("repo_attributed") and not (root / "env" / "referee-env.json").exists():
+        return {"error": "the authors' environment is still being built in the background: retry the draft in a "
+                         "few minutes, or finish without one"}
+    env_dir, envinfo = script_env(cfg, root, c.get("kind", ""), bool(c.get("repo_attributed")))
+    if not envinfo["ok"]:
+        return {"error": envinfo["detail"]}
     has_repo = (root / "repo" / ".git").is_dir()
-    mounts = [(tdir, f"{MOUNT}/check", False), (cfg.projects / ".script-env", "/env", True)] + (
+    mounts = [(tdir, f"{MOUNT}/check", False), (env_dir, "/env", True)] + (
         [(root / "repo", f"{MOUNT}/repo", True)] if has_repo else [])
     rec = run(["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", "0"], mounts=mounts,
-              workdir=f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check", image=DEFAULT_IMAGE, network=False,
-              timeout=cfg.try_timeout_s, mode="try", target=cid, meta={"script_sha256": state.sha256(script)})
+              workdir=f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check", image=envinfo.get("image", DEFAULT_IMAGE),
+              network=False, timeout=cfg.try_timeout_s, mode="try", target=cid,
+              meta={"script_sha256": state.sha256(script)})
     state.append_jsonl(root / "execution.jsonl", rec)
-    return {"returncode": rec.get("returncode"), "timed_out": rec.get("timed_out"), "error": rec.get("error", ""),
-            "stdout": mask(rec.get("stdout"))[-4000:], "stderr": mask(rec.get("stderr"))[-4000:]}
+    return {"environment": envinfo["detail"], "returncode": rec.get("returncode"), "timed_out": rec.get("timed_out"),
+            "error": rec.get("error", ""), "stdout": mask(rec.get("stdout") or "")[-4000:],
+            "stderr": mask(rec.get("stderr") or "")[-4000:]}
 
 
 def mask(s: str) -> str:

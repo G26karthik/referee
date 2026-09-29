@@ -57,6 +57,29 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
 11. **No paper-specific logic**, names, thresholds or special cases.
 12. **Report != trace; no acceptance layer.** The status table is deterministic; model prose
     is published only if every status word it uses is earned by a cited check.
+13. **Central claims first.** The paper-level status is computed over central claims only.
+    A check no central claim cites is incidental: cut first from the budget, it must say why
+    (`incidental_why`), and is reported apart; workflow completion is reported apart again.
+14. **Compared values are bound by name, once.** AUTHOR_CODE: the planner's metric key (two
+    keys). Scripts: the author's named `metric`, a stated `relation` over named outputs, or
+    `violated` for a certificate — never a flag computed against the printed number.
+15. **Deviations are recorded; readings are never chosen.** Every departure from the printed
+    text (indexing, a hypothesis, a substitution, a filled gap) is declared, re-found and
+    shown with the result. Readings of one printed object that disagree (a certificate's own
+    as-printed reading, or two checks) are recorded as a conflict: claim status CONFLICTING.
+
+## Dependency recovery (documented, isolated, recorded)
+
+An environment is built from what the checkout declares: `uv.lock` -> `uv sync --frozen`
+(path sources included; `uv run` then runs offline against `/env`), else `requirements*.txt`,
+else the package. On failure `execute.recover` allows at most two rebuilds, each from an
+empty env dir, network only during install: a build that needed a compiler -> the full image
+of the same Python; every release of a dependency needing a newer Python -> that Python, only
+if the project's declared range admits it. No requirement is edited, added or dropped. Every
+attempt is an ExecutionRecord (`mode=install`, `recovery`); the outcome carries
+`environment.recovery`; anything else stays BLOCKED with the pip/uv error. A RECONSTRUCTION
+runs in the authors' environment when it builds (started in the background once a plan needs
+it), else on the fixed baseline.
 
 ## Commands (repo venv; on Windows set PYTHONUTF8=1)
 
@@ -64,6 +87,7 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
 python run.py tasks <paper.pdf|paper-id> --json [--wait 540]
 python run.py seal <paper-id> <task-id> <answer.json>
 python run.py try <paper-id> <gen-task-id> <script.py>      # draft run, masked, never evidence
+python run.py env <paper-id>                               # authors' env (the harness starts it)
 python run.py status [<paper-id>]
 python run.py pack <out.zip> [<paper-id> ...] --clean      # zip artifacts, then delete clones/venvs
 python tests/test_kernel.py

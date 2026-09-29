@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 
 from . import execute, paper, reconcile, report, state
-from .evidence import command, documented, flat, has_word, interval, value_in
+from .evidence import command, documented, flat, has_word, interval, relation, value_in
 from .repo import listing, released
 
 LENSES = ("overclaim", "protocol", "confound", "contradiction")
@@ -161,6 +161,10 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
             gpu="unknown until first use", concerns=_concern_lines(x.concerns()), listing=lst,
             max_checks=x.cfg.max_checks), rows)], []
     tasks, spawn = [], []
+    if (x.checkout / ".git").is_dir() and plan["repo_is_authors"] and not (x.root / "env.started").exists() and any(
+            c["kind"] in ("AUTHOR_CODE", "RECONSTRUCTION") for c in plan["checks"]):
+        (x.root / "env.started").write_text(state.now(), encoding="utf-8")   # the authors' env builds once, early
+        _spawn(x.cfg, x.pid, "env")
     for c in plan["checks"]:
         t, s = _step(x, c)
         tasks += t
@@ -250,10 +254,18 @@ def _step(x: _Ctx, c: dict) -> tuple[list[dict], list[dict]]:
             try_cmd = (f'cd "{state.ROOT.as_posix()}" && PYTHONUTF8=1 SH_PROJECTS_DIR="{x.cfg.projects.as_posix()}" '
                        f'SH_ALLOW_INSTALL={int(x.cfg.allow_install)} SH_ALLOW_SCRIPT_EXEC={int(x.cfg.allow_script_exec)} '
                        f'"{Path(x.cfg.python).as_posix()}" run.py try {x.pid} gen:{cid}.{r}')
-            extra = "" if kind != "RELEASED_DATA" else "\n\n=== RELEASED FILES (checkout) ===\n" + _repo_text(x)[1]
+            extra = "" if kind not in ("RELEASED_DATA", "RECONSTRUCTION") else (
+                "\n\n=== CHECKOUT (read-only; your working directory) ===\n" + _repo_text(x)[1])
+            rel = (c.get("target") or {}).get("relation")
+            metric = ("`violated`" if kind == "CERTIFICATE" else f"every output the relation `{rel}` names" if rel
+                      else f"`{c['metric']}`" if c["metric"] else "the ONE output compared with the printed target; "
+                      "name it in `metric`")
+            env = ("the authors' environment (their lockfile/requirements, built from the checkout; if it fails to "
+                   "build, the baseline below)" if kind == "RECONSTRUCTION" and c["repo_attributed"] else
+                   "the baseline: Python 3.11, standard library plus numpy, scipy, pandas, scikit-learn, sympy")
             return [x.task(f"gen:{cid}.{r}", "gen", _template(
                 "gen", title=x.meta["title"], pages_dir=x.pages_dir, check_id=cid, kind=kind, claim=c["claim"],
-                spec=spec + extra, contract=_section("contracts", f"gen {kind}"), metric=c["metric"] or "violated",
+                spec=spec + extra, contract=_section("contracts", f"gen {kind}"), metric=metric, environment=env,
                 required=", ".join(REQUIRED[kind]), max_tries=x.cfg.max_tries, try_cmd=try_cmd, revision=revision))], []
         if g.get("refused"):
             return _terminal(cdir, c, "NOT_CHECKABLE", f"the script author refused: {g['notes'][:400]}")
@@ -261,11 +273,12 @@ def _step(x: _Ctx, c: dict) -> tuple[list[dict], list[dict]]:
         if v is None:
             tries = (cdir / "tries.jsonl").read_text(encoding="utf-8")[-6000:] if (cdir / "tries.jsonl").exists() else "(none)"
             proposal = json.dumps({"script": (cdir / f"script.{r}.py").read_text(encoding="utf-8"), **{
-                k: g[k] for k in ("runs", "runs_quote", "outputs", "bindings", "checked_statement")}},
-                ensure_ascii=False, indent=1)
+                k: g.get(k) for k in ("runs", "runs_quote", "metric", "outputs", "bindings", "deviations",
+                                      "checked_statement")}}, ensure_ascii=False, indent=1)
             return [_verify_task(x, c, r, spec, proposal, tries)], []
         if v["verdict"] == "APPROVE":
-            check = {**c, "runs": g["runs"], "script_sha256": g["script_sha256"],
+            check = {**c, "runs": g["runs"], "script_sha256": g["script_sha256"], "metric": g.get("metric", c["metric"]),
+                     "deviations": g.get("deviations", []),
                      "approval": {"approved": True, "script_sha256": v["script_sha256"]}}
             shutil.copyfile(cdir / f"script.{r}.py", cdir / "script.py")
             return _start(x, check)
@@ -339,13 +352,17 @@ def advance(cfg: state.Config, source: str, wait: int = 0) -> dict:
 
 
 def _spawn(cfg: state.Config, pid: str, cid: str) -> None:
-    cdir = state.pdir(cfg, pid) / "checks" / cid
-    log = (cdir / "exec.log").open("ab")
+    """A detached `run.py exec <pid> <cid>`, or `run.py env <pid>` for cid == "env"."""
+    cdir = state.pdir(cfg, pid) / ("." if cid == "env" else f"checks/{cid}")
+    cdir.mkdir(parents=True, exist_ok=True)
+    log = (cdir / ("env.log" if cid == "env" else "exec.log")).open("ab")
     flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if sys.platform == "win32" else 0
-    p = subprocess.Popen([cfg.python, str(state.ROOT / "run.py"), "exec", pid, cid], cwd=state.ROOT,
+    argv = ["env", pid] if cid == "env" else ["exec", pid, cid]
+    p = subprocess.Popen([cfg.python, str(state.ROOT / "run.py"), *argv], cwd=state.ROOT,
                          stdout=log, stderr=log, stdin=subprocess.DEVNULL, creationflags=flags,
                          start_new_session=sys.platform != "win32")
-    state.write_json(cdir / "running.json", {"os_pid": p.pid, "started_at": state.now()})
+    if cid != "env":
+        state.write_json(cdir / "running.json", {"os_pid": p.pid, "started_at": state.now()})
 
 
 # --- sealing ----------------------------------------------------------------------------
@@ -439,6 +456,14 @@ def _seal_critic(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
 
 
 def _target(x: _Ctx, t: dict, errors: list[str], cid: str) -> dict | None:
+    if (t or {}).get("relation"):      # a stated comparison: the sentence re-found, the relation parsed
+        try:
+            names = relation(str(t["relation"]))[3]
+        except ValueError as e:
+            errors.append(f"{cid}: relation: {e}")
+            return None
+        hit = _find(x, t.get("quote", ""), errors, f"{cid} relation quote")
+        return hit and {"quote": hit["quote"], "relation": str(t["relation"]), "names": names, "page": hit["page"]}
     value = str((t or {}).get("value") or "").strip()
     if not value:
         errors.append(f"{cid}: the target has no printed value")
@@ -462,6 +487,10 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     concern_ids = {c["id"] for c in x.concerns()}
     attributed = (x.checkout / ".git").is_dir() and obj.get("repo_is_authors") is True
     proposed = [c for c in obj.get("checks") or [] if isinstance(c, dict)]
+    # Central claims get the budget first: a check no central claim cites is incidental, is
+    # cut before any central one, and must say why no central claim could use its slot.
+    central_ids = {k for cc in obj.get("central_claims") or [] if isinstance(cc, dict) for k in cc.get("checks") or []}
+    proposed.sort(key=lambda c: c.get("id") not in central_ids)
     for c in proposed[x.cfg.max_checks:]:
         dropped.append({"check": c.get("id"), "why": f"over the budget of {x.cfg.max_checks} checks"})
     for i, c in enumerate(proposed[:x.cfg.max_checks], 1):
@@ -472,11 +501,17 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         rec = {"id": cid, "proposed_id": c.get("id"), "kind": kind, "concerns": [k for k in c.get("concerns") or []
                                                                                if k in concern_ids],
                "claim": claim["quote"] if claim else "", "why": str(c.get("why") or "")[:1000],
-               "metric": str(c.get("metric") or "").strip(), "repo_attributed": attributed}
+               "metric": str(c.get("metric") or "").strip(), "repo_attributed": attributed,
+               "central": c.get("id") in central_ids, "incidental_why": str(c.get("incidental_why") or "")[:600]}
+        if not rec["central"] and not rec["incidental_why"]:
+            errs.append(f"{cid}: no central claim lists this check: link it from `central_claims[].checks`, or give "
+                        "`incidental_why` (why no central claim could use this check slot)")
         if kind != "CERTIFICATE":
             rec["target"] = _target(x, c.get("target") or {}, errs, cid)
-            rec["printed"] = rec["target"]["value"] if rec["target"] else ""
-        if kind in ("AUTHOR_CODE", "RELEASED_DATA", "RECONSTRUCTION") and not rec["metric"]:
+            rec["printed"] = (rec["target"] or {}).get("value", "")
+            if (rec["target"] or {}).get("relation") and kind not in ("RELEASED_DATA", "RECONSTRUCTION"):
+                errs.append(f"{cid}: a relation target is checked by RELEASED_DATA or RECONSTRUCTION only")
+        if kind == "AUTHOR_CODE" and not rec["metric"]:   # a script's compared output is named by its author
             errs.append(f"{cid}: `metric` must name the program output compared with the printed target")
         if kind == "AUTHOR_CODE":
             if not attributed:
@@ -614,8 +649,23 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     if runs > 1 and c["kind"] == "RECONSTRUCTION" and not (
             (h := x.paper.find(str(obj.get("runs_quote") or ""))[0]) and value_in(h["quote"], str(runs))):
         errors.append("runs > 1 needs runs_quote: the paper's sentence printing that number, verbatim")
-    if c["metric"] and c["metric"] not in (obj.get("outputs") or []) and c["kind"] != "CERTIFICATE":
-        errors.append(f"outputs must include the check's metric {c['metric']!r}")
+    # The value compared is bound by NAME here, once: the relation's outputs, else the one
+    # compared output (the planner's, or else the script author's), never a flag.
+    outputs = [str(o) for o in obj.get("outputs") or []]
+    rel = (c.get("target") or {}).get("relation")
+    metric = "violated" if c["kind"] == "CERTIFICATE" else "" if rel else (c["metric"] or str(obj.get("metric") or "").strip())
+    if rel and (miss := [n for n in c["target"]["names"] if n not in outputs]):
+        errors.append(f"outputs must include every output the relation {rel!r} names; missing {miss}")
+    elif c["kind"] != "CERTIFICATE" and not rel and (metric in ("", "violated") or metric not in outputs):
+        errors.append("`metric` must name the ONE computed output compared with the printed target, and `outputs` "
+                      "must include it (a flag computed against the printed number settles nothing)")
+    deviations = []
+    for d in [d for d in obj.get("deviations") or [] if isinstance(d, dict)][:8]:   # ponytail: 8 per script
+        h = _find(x, str(d["printed"]), errors, "deviation `printed`") if d.get("printed") else None
+        if not str(d.get("used") or "").strip():
+            errors.append("each deviation needs `used`: what the script does instead of the printed text")
+        deviations.append({"printed": h["quote"] if h else "", "page": h["page"] if h else None,
+                           "used": str(d.get("used") or "")[:600], "why": str(d.get("why") or "")[:600]})
     if errors and final:
         return {"refused": True, "notes": "; ".join(errors)[:2000]}
     _fail_or_drop(errors, final)
@@ -623,7 +673,7 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     cdir.mkdir(parents=True, exist_ok=True)
     (cdir / f"script.{r}.py").write_bytes(script.encode("utf-8"))   # bytes: the sha is of exactly these
     return {"script_sha256": state.sha256(script), "runs": runs, "runs_quote": str(obj.get("runs_quote") or "")[:500],
-            "outputs": obj.get("outputs") or [], "bindings": out,
+            "metric": metric, "outputs": outputs, "deviations": deviations, "bindings": out,
             "checked_statement": "proof_step" if c.get("step") else str(obj.get("checked_statement") or "conclusion"),
             "notes": str(obj.get("notes") or "")[:2000]}
 

@@ -198,3 +198,33 @@ def evaluate(expression: str, names: dict[str, Fraction]) -> Fraction:
         return ev(ast.parse(expression, mode="eval"))
     except (SyntaxError, ZeroDivisionError) as e:
         raise ValueError(str(e)) from e
+
+
+_CMP = {ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">="}
+
+
+def relation(expr: str) -> tuple[str, str, str, list[str]]:
+    """`lhs OP rhs` (one of < <= > >=) over named outputs -> (lhs, op, rhs, names): how a
+    comparison the paper states in prose, or shows only in a figure, is checked."""
+    try:
+        node = ast.parse(expr or "", mode="eval").body
+    except SyntaxError as e:
+        raise ValueError(str(e)) from e
+    if not (isinstance(node, ast.Compare) and len(node.ops) == 1 and type(node.ops[0]) in _CMP):
+        raise ValueError("a relation is `lhs OP rhs` with exactly one of < <= > >=")
+    names = sorted({n.id for n in ast.walk(node) if isinstance(n, ast.Name)})
+    lhs, rhs = ast.unparse(node.left), ast.unparse(node.comparators[0])
+    probe = {n: Fraction(2 * i + 3, 7) for i, n in enumerate(names)}
+    for side in (lhs, rhs):                               # the same grammar as ARITHMETIC
+        evaluate(side, probe)
+    if not names:
+        raise ValueError("a relation compares named outputs")
+    return lhs, _CMP[type(node.ops[0])], rhs, names
+
+
+def margin(expr: str, values: dict) -> float:
+    """How far one result satisfies the relation: > 0 holds, < 0 the reverse holds."""
+    lhs, op, rhs, names = relation(expr)
+    env = {n: Fraction(values[n]) for n in names}
+    d = evaluate(lhs, env) - evaluate(rhs, env)
+    return float(-d if op in ("<", "<=") else d)

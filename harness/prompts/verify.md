@@ -13,7 +13,12 @@ The claim it bears on: {{claim}}
 CHECK EACH OF:
 {{rules}}
 Also: is every `paper_quote` really the paper's words for that ingredient (not a nearby
-sentence), and does every `impl_quote` realize it in the script?
+sentence), and does every `impl_quote` realize it in the script? Is EVERY departure from the
+printed text (a changed index range or convention, a hypothesis added or dropped, a
+substituted function, a filled gap) listed in `deviations`? An unlisted one is REVISE; a
+listed one is acceptable when it is the only coherent reading, and is then reported next to
+the result. Does the compared output (`metric`, or the relation's names) carry the computed
+quantity the claim is about — never a flag computed against the printed number?
 
 === PROPOSED CHECK ===
 {{proposal}}

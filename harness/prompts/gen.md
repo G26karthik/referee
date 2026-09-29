@@ -12,11 +12,13 @@ The claim it bears on: {{claim}}
 {{contract}}
 
 THE SCRIPT CONTRACT
-  - Python 3.11, standard library plus only: numpy, scipy, pandas, scikit-learn, sympy.
+  - Environment: {{environment}}. Write scratch files only under /tmp.
   - It accepts `--seed <int>`; the harness runs it once per seed 0..runs-1.
-  - Each run prints exactly one line: `REFEREE_RESULT {"<name>": <number>, ...}` (JSON),
-    carrying at least the output named in the check ({{metric}}).
-  - It never reads the paper's printed result to produce its own: it computes.
+  - It prints `REFEREE_RESULT {"<name>": <number>, ...}` (JSON) lines — one per run, or one
+    per replication the paper states when one run performs them all — carrying at least
+    {{metric}}. Values are read by NAME only.
+  - It never reads the paper's printed result to produce its own, and never compares with it:
+    it computes; the harness compares.
   - Keep one run under about 30 minutes.
 
 BINDINGS. For each required kind below, give `paper_quote` (the paper's own words, copied
@@ -27,6 +29,16 @@ If a required ingredient cannot be written without inventing a detail the paper 
 in `notes` and leave its quotes empty: an honest refusal is a correct outcome; a fabricated
 binding is not.
 
+DEVIATIONS. Every departure from the paper's printed text goes in `deviations`, each as
+{"printed": the paper's words verbatim ("" if the paper is silent), "used": what the script
+does instead, "why": ...}: a changed index range or convention (0- vs 1-based), a hypothesis
+added, dropped or strengthened, a substituted function or constant, a detail the paper leaves
+open that you had to fix. An unlisted departure gets the check rejected. For a CERTIFICATE
+whose deviation changes the printed statement or step itself (not merely fills a gap), ALSO
+evaluate the text exactly as printed on the same instance and add `"literal_violated": 1 or 0`
+to the result line (1 if as printed it fails or is undefined, e.g. an index out of range):
+the harness records both readings side by side and never picks one.
+
 REPLICATION. If the paper states how many seeds/runs/instances this used, set `runs` to it and
 copy the sentence into `runs_quote`; never fewer than the paper used.
 
@@ -36,6 +48,8 @@ count as evidence): write the script to a file, then run
 {{revision}}
 Write ONLY this JSON to the output path you were given:
 {"script": "the full Python source as one JSON string", "runs": 1, "runs_quote": "",
- "outputs": ["{{metric}}"],
+ "metric": "the compared output's name (not for CERTIFICATE or a relation target)",
+ "outputs": ["every name the result line carries"],
+ "deviations": [],
  "bindings": [{"kind": "...", "paper_quote": "...", "impl_quote": "..."}],
  "checked_statement": "conclusion|proof_step (CERTIFICATE only)", "notes": ""}

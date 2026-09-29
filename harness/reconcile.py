@@ -4,17 +4,18 @@ The order is the invariant: a refused run reconciles nothing (BLOCKED); an envir
 startup failure is INCONCLUSIVE, never a failed reproduction (invariant 5); a certificate
 whose hypothesis assertion failed tried an inadmissible instance, never a counterexample;
 a 100x ratio is a units mismatch in this harness; a deterministic run can only agree to
-the printed precision, never "fail" without a noise band to fail against.
+the printed precision, never "fail" without a noise band to fail against; a stated
+comparison (a relation) is decided only beyond 2 standard errors of its paired margins.
 """
 from __future__ import annotations
 
 import statistics
 
-from .evidence import half_width, parse_value
+from .evidence import half_width, parse_value, relation
 from .execute import admits
 
-SUPPORT = ("RESOLVED_VERIFIED", "ARITHMETIC_CONSISTENT")
-FAILURE = ("FAILED_REPRODUCTION", "COUNTEREXAMPLE_FOUND", "ARITHMETIC_CONTRADICTION")
+SUPPORT = ("RESOLVED_VERIFIED", "ARITHMETIC_CONSISTENT", "RELATION_HOLDS")
+FAILURE = ("FAILED_REPRODUCTION", "COUNTEREXAMPLE_FOUND", "ARITHMETIC_CONTRADICTION", "RELATION_VIOLATED")
 
 
 def _r(status: str, reason: str, **kw) -> dict:
@@ -22,7 +23,7 @@ def _r(status: str, reason: str, **kw) -> dict:
 
 
 def reconcile(kind: str, printed: str, values: list[float], failure: str, ev: dict,
-              seeded: bool, authorized: bool, why: str) -> dict:
+              seeded: bool, authorized: bool, why: str, rel: str = "") -> dict:
     if not authorized:
         return _r("BLOCKED", f"not run: {why}. A refusal by this harness is not evidence about the paper.")
     if not admits(kind):
@@ -53,6 +54,8 @@ def reconcile(kind: str, printed: str, values: list[float], failure: str, ev: di
                       f"code ({ev['own_code_crash']}): {failure[:200]}", rule="a run that starts and breaks in its own code")
         return _r("INCONCLUSIVE", f"the run failed ({failure[:200]}), but not by a crash inside the authors' own "
                   "code, so nothing is established about the paper")
+    if rel:
+        return _relation(kind, rel, values)
     claimed = parse_value(printed)
     if not values or claimed is None:
         return _r("INCONCLUSIVE", "no metric was reported" if not values else f"no number in the printed {printed!r}")
@@ -82,6 +85,27 @@ def reconcile(kind: str, printed: str, values: list[float], failure: str, ev: di
             if eff <= band else
             _r("FAILED_REPRODUCTION", f"produced {mean:g} vs printed {printed}: |delta| {out['delta']:g} exceeds "
                f"2 sigma{note}", rule=rule, band=band, **out))
+
+
+def _relation(kind: str, rel: str, margins: list[float]) -> dict:
+    """A comparison the paper states, over paired results (one per REFEREE_RESULT line):
+    decided on the mean margin beyond 2 standard errors. One line decides only when it is an
+    exact recomputation from released data; one run of an experiment has no noise band."""
+    n, strict = len(margins), relation(rel)[1] in ("<", ">")
+    if not n:
+        return _r("INCONCLUSIVE", f"no result carried every output the relation {rel!r} names")
+    if n == 1 and kind != "RELEASED_DATA":
+        return _r("INCONCLUSIVE", "one result of an experiment has no noise band to decide a relation on",
+                  relation=rel, margin=margins[0], n=1)
+    m = statistics.fmean(margins)
+    band = 2 * statistics.stdev(margins) / n ** 0.5 if n > 1 else 0.0
+    out = {"relation": rel, "margin": round(m, 6), "band": round(band, 6), "n": n,
+           "rule": "mean paired margin beyond 2 standard errors" if n > 1 else "exact recomputation from released data"}
+    if m > band or (not strict and band == 0 and m >= 0):
+        return _r("RELATION_HOLDS", f"{rel}: mean margin {m:.4g} over {n} result(s)", **out)
+    if m < -band or (strict and band == 0 and m == 0):
+        return _r("RELATION_VIOLATED", f"{rel} does not hold: mean margin {m:.4g} over {n} result(s)", **out)
+    return _r("INCONCLUSIVE", f"{rel}: mean margin {m:.4g} is within 2 standard errors ({band:.4g}) of equality", **out)
 
 
 def arithmetic(lo: float, hi: float, printed: str) -> dict:

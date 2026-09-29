@@ -4,6 +4,7 @@ workers writing a check script use `try`; `exec` is started by the harness itsel
   python run.py tasks <paper.pdf|paper-id> [--json] [--wait SECONDS]
   python run.py seal <paper-id> <task-id> <answer.json>
   python run.py try <paper-id> <gen-task-id> <script.py>
+  python run.py env <paper-id>          # build the authors' environment (started by the harness)
   python run.py status [<paper-id>]
   python run.py pack <out.zip> [<paper-id> ...] [--clean]
 """
@@ -36,6 +37,7 @@ def main(argv: list[str]) -> int:
     tr.add_argument("pid"), tr.add_argument("task"), tr.add_argument("script")
     e = sub.add_parser("exec")
     e.add_argument("pid"), e.add_argument("check")
+    sub.add_parser("env").add_argument("pid")
     st = sub.add_parser("status")
     st.add_argument("pid", nargs="?")
     p = sub.add_parser("pack")
@@ -57,6 +59,8 @@ def main(argv: list[str]) -> int:
     elif a.cmd == "exec":
         check = state.read_json(state.pdir(cfg, a.pid) / "checks" / a.check / "check.json")
         print(json.dumps({k: v for k, v in execute.execute(cfg, a.pid, check).items() if k != "values"}))
+    elif a.cmd == "env":
+        print(json.dumps(execute.author_env(cfg, a.pid)))
     elif a.cmd == "status":
         for d in sorted(cfg.projects.glob(f"{a.pid or '*'}/ledger.json")) or []:
             led = state.read_json(d)

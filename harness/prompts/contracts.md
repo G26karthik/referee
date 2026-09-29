@@ -25,11 +25,14 @@ Apply only the selection, filtering, averaging and metric the paper itself state
 regenerate, edit, resample or fabricate data. Nothing is trained. Usually `runs` = 1.
 
 ## gen RECONSTRUCTION
-WHAT YOU ARE DOING: an INDEPENDENT RECONSTRUCTION of one small experiment the paper specifies
-completely. It is not the authors' code and will never be reported as theirs. THE RULE THAT
-MATTERS MOST: invent nothing — no default hyperparameter, dataset size, or preprocessing the
-paper does not state; a number from gaps you filled is a statement about your choices. Never
-shrink the experiment (fewer runs, samples, iterations or a smaller model) to make it faster.
+WHAT YOU ARE DOING: a PAPER-DERIVED EVALUATION of one experiment the paper specifies, where no
+documented command runs it. Where the authors' checkout implements the method, DRIVE THEIR
+CODE (import it from the working directory; never copy or edit it) with the paper's stated
+data, configuration and metric; otherwise reimplement what the paper states. It will never be
+reported as an author reproduction. THE RULE THAT MATTERS MOST: every detail neither the paper
+nor the authors' code fixes (a hyperparameter, dataset size, preprocessing, a baseline's
+setting) is a DEVIATION you declare; a number from undeclared choices is rejected. Never shrink
+the experiment (fewer runs, samples, iterations or a smaller model) to make it faster.
 
 ## verify CERTIFICATE
   1. Does `hypotheses` carry EVERY hypothesis the statement (or, for a proof step, the proof at
@@ -45,14 +48,18 @@ shrink the experiment (fewer runs, samples, iterations or a smaller model) to ma
   1. Does the script open the right released file(s) for THIS printed number, by literal path?
   2. Does it compute the paper's stated quantity (same metric, subset, averaging, units),
      applying only selection the paper states — no editing, resampling or regeneration?
-  3. Is the output it prints the number to compare against the printed target?
+  3. Is the compared output the number the printed target (or the stated relation) is about,
+     computed from the files — never a flag computed against the printed number?
 
 ## verify RECONSTRUCTION
   1. Is every required ingredient (method, training, dataset, metric, comparison target)
      realized exactly as the paper states it, each backed by a verbatim paper quote?
-  2. Did the script invent any detail the paper omits, or shrink the experiment (fewer runs,
-     samples, iterations, a smaller model)? Either is a rejection.
-  3. Does `runs` match the paper's stated replication?
+  2. Did the script fill a detail the paper and the authors' code omit WITHOUT declaring it in
+     `deviations`, or shrink the experiment (fewer runs, samples, iterations, a smaller
+     model)? Either is a rejection. Where the checkout implements the method, does the script
+     call that code rather than a rewrite of it?
+  3. Does `runs` (or the number of result lines one run prints) match the paper's stated
+     replication?
 
 ## verify ARITHMETIC
   1. Is each operand's `value` exactly the number printed in its `quote`, and is it the

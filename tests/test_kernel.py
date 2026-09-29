@@ -161,15 +161,6 @@ def test_seals_keep_only_harness_derived_fields_and_detect_tampering():
         _seal(cfg, pid, "critic", {"reviews": [{"id": "overclaim-01", "severity": "FATAL"}]}, td)
         x = tasks._Ctx(cfg, pid)
         assert x.concerns()[0]["severity"] == "MINOR"                  # a critic never raises severity
-        chk = {"kind": "RELEASED_DATA", "claim_quote": "reaches 61.4 accuracy",
-               "target": {"quote": "reaches 61.4 accuracy", "value": "61.4"}}
-        for metric, refused in (("", True), ("acc", False)):   # an unnamed output can never be compared
-            try:
-                tasks._seal_plan(x, "plan", {"checks": [{**chk, "metric": metric}], "central_claims": []}, final=False)
-                err = ""
-            except tasks.SealError as e:
-                err = str(e)
-            assert ("`metric`" in err) == refused, err
         p = td / pid / "sealed" / "lens__overclaim.json"
         p.write_text(p.read_text(encoding="utf-8").replace("MINOR", "FATAL"), encoding="utf-8")
         assert tasks._sealed(td / pid, "lens:overclaim") is None       # tampered: not a seal
@@ -222,6 +213,142 @@ def test_report_status_words_must_be_earned():
     assert report.unearned("contradiction-02: the table contradicts the abstract.", led)
     assert not report.unearned("Was the schedule validated? How is the validation set carved out?", led)
     assert report.unearned("The schedule was validated on the validation set.", led)
+
+
+def _refused(fn) -> str:
+    try:
+        fn()
+    except (tasks.SealError, ValueError) as e:
+        return str(e)
+    raise AssertionError("accepted")
+
+
+def test_plan_spends_the_budget_on_central_claims_first():
+    with tempfile.TemporaryDirectory() as t:
+        cfg, pid = _project(Path(t))
+        x = tasks._Ctx(cfg, pid)
+        arith = {"id": "A", "kind": "ARITHMETIC", "claim_quote": "The baseline reaches 59.3",
+                 "target": {"quote": "reaches 61.4 accuracy", "value": "61.4"},
+                 "operands": [{"name": "a", "quote": "reaches 61.4 accuracy", "value": "61.4"}], "expression": "a"}
+        cert = {"id": "B", "kind": "CERTIFICATE", "claim_quote": "We report the mean over 5 random seeds",
+                "statement_quote": "The final loss is -0.52"}
+        central = [{"quote": "We report the mean over 5 random seeds", "checks": ["B"]}]
+        cfg.max_checks = 1        # the incidental check came first; the central one still gets the slot
+        rec = tasks._seal_plan(x, "plan", {"checks": [arith, cert], "central_claims": central}, final=False)
+        assert [c["kind"] for c in rec["checks"]] == ["CERTIFICATE"] and rec["checks"][0]["central"]
+        assert rec["central_claims"][0]["checks"] == ["C1"] and rec["dropped"][0]["check"] == "A"
+        cfg.max_checks = 3
+        assert "incidental_why" in _refused(lambda: tasks._seal_plan(x, "plan", {"checks": [arith]}, final=False))
+        rec = tasks._seal_plan(x, "plan", {"checks": [{**arith, "incidental_why": "no central claim computes"}]}, final=False)
+        assert rec["checks"][0]["central"] is False
+        code = {"id": "B", "kind": "AUTHOR_CODE", "claim_quote": "We report the mean over 5 random seeds",
+                "target": {"quote": "reaches 61.4 accuracy", "value": "61.4"}}
+        assert "`metric`" in _refused(lambda: tasks._seal_plan(x, "plan", {"checks": [code], "central_claims": central},
+                                                              final=False))   # AUTHOR_CODE: the planner's key
+        rel = {"id": "B", "kind": "RECONSTRUCTION", "claim_quote": "We report the mean over 5 random seeds",
+               "target": {"quote": "Our method reaches 61.4", "relation": "acc_ours > acc_base"}}
+        rec = tasks._seal_plan(x, "plan", {"checks": [rel], "central_claims": central}, final=False)
+        assert rec["checks"][0]["target"]["names"] == ["acc_base", "acc_ours"] and rec["checks"][0]["printed"] == ""
+        for bad in ("acc_ours", "acc_ours > 0.5 * acc_base", "a < b < c", "acc_ours == acc_base"):
+            assert "relation" in _refused(lambda: tasks._seal_plan(
+                x, "plan", {"checks": [{**rel, "target": {**rel["target"], "relation": bad}}], "central_claims": central},
+                final=False)), bad
+        assert "relation" in _refused(lambda: tasks._seal_plan(
+            x, "plan", {"checks": [{**rel, "kind": "AUTHOR_CODE", "metric": "acc"}], "central_claims": central}, final=False))
+
+
+def test_the_compared_output_is_bound_by_name_by_the_script_author():
+    """Sep-29 changepoint C3: the planner named no metric, the generator was told `violated`,
+    and a result line printing the target's value was read as 'no metric was reported'."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg = state.Config()
+        plan = {"checks": [{"id": "C1", "kind": "RELEASED_DATA", "metric": "",
+                            "target": {"quote": "reaches 61.4 accuracy", "value": "17"}}]}
+        state.write_json(td / "released.json", [{"path": "results/a.csv"}])
+        x = type("X", (), {"root": td, "paper": Paper(PAGES, ROWS), "cfg": cfg, "sealed": lambda self, tid: plan})()
+        script = 'rows = open("results/a.csv").read().split()\nn = len(rows)\nprint("REFEREE_RESULT", n)\n'
+        binds = [{"kind": k, "impl_quote": q, "paper_quote": "reaches 61.4 accuracy"} for k, q in
+                 (("dataset", 'open("results/a.csv")'), ("metric", "n = len(rows)"), ("comparison_target", "print("))]
+        g = {"script": script, "runs": 1, "outputs": ["n_no_cp", "violated"], "bindings": binds}
+        for metric in ("", "violated", "n_other"):
+            assert "`metric`" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {**g, "metric": metric}, final=False))
+        bad_dev = {"printed": "a sentence the paper never printed", "used": "x"}
+        assert "deviation" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {**g, "metric": "n_no_cp",
+                                                                               "deviations": [bad_dev]}, final=False))
+        dev = {"printed": "We report the mean over 5 random seeds", "used": "one pass over the file", "why": "no seeds"}
+        rec = tasks._seal_gen(x, "gen:C1.1", {**g, "metric": "n_no_cp", "deviations": [dev]}, final=False)
+        assert rec["metric"] == "n_no_cp" and rec["deviations"][0]["page"] == 1
+        out = 'REFEREE_RESULT {"violated": 0, "n_no_cp": 17, "n_all": 83}'
+        assert execute.result_values(out, rec["metric"]) == [17.0] and execute.result_values(out, "") == []
+        assert reconcile("RELEASED_DATA", "17", [17.0], "", {}, False, True, "")["status"] == "RESOLVED_VERIFIED"
+
+
+def test_a_stated_relation_is_decided_beyond_noise_only():
+    rel = "err_ours < err_base"
+    out = "\n".join(f'REFEREE_RESULT {{"err_ours": {a}, "err_base": {b}}}' for a, b in ((1, 3), (2, 2.5)))
+    assert execute.relation_margins(out + '\nREFEREE_RESULT {"err_ours": 1}', rel) == [2.0, 0.5]
+    st = lambda kind, ms: reconcile(kind, "", ms, "", {}, False, True, "", rel)["status"]
+    assert st("RELEASED_DATA", [0.3]) == "RELATION_HOLDS" and st("RELEASED_DATA", [-0.3]) == "RELATION_VIOLATED"
+    assert st("RELEASED_DATA", [0.0]) == "RELATION_VIOLATED"            # strict: a tie is not "<"
+    assert st("RECONSTRUCTION", [0.3]) == "INCONCLUSIVE"                # one run of an experiment: no band
+    assert st("RECONSTRUCTION", [0.3, 0.31, 0.29]) == "RELATION_HOLDS"
+    assert st("RECONSTRUCTION", [0.3, -0.3, 0.1, -0.1]) == "INCONCLUSIVE"
+    assert st("RECONSTRUCTION", [-0.3, -0.31, -0.29]) == "RELATION_VIOLATED"
+    assert st("RECONSTRUCTION", []) == "INCONCLUSIVE"
+    assert reconcile("RECONSTRUCTION", "", [], "x", {"setup_error": "importerror"}, False, True, "", rel)["status"] \
+        == "INCONCLUSIVE"                                                  # environment never convicts
+
+
+def test_dependency_recovery_is_documented_and_bounded():
+    pip = ("ERROR: Ignored the following versions that require a different python version: 1.21.2 Requires-Python "
+           ">=3.7,<3.11; 2.5.0 Requires-Python >=3.12\nERROR: No matching distribution found for scikit-lr")
+    gxx = "error: [Errno 2] No such file or directory: 'g++'"
+    with tempfile.TemporaryDirectory() as t:
+        co = Path(t)
+        (co / "pyproject.toml").write_text('requires-python = ">=3.11"\n', encoding="utf-8")
+        assert execute.recover(pip, "python:3.11-slim", co)[0] == "python:3.12-slim"
+        assert execute.recover(gxx, "python:3.11-slim", co)[0] == "python:3.11"      # same Python, with compilers
+        assert execute.recover(gxx, "python:3.11", co) is None                      # nothing left: BLOCKED
+        assert execute.recover("No matching distribution found for torch==9", "python:3.11-slim", co) is None
+        (co / "pyproject.toml").write_text('requires-python = ">=3.10,<3.12"\n', encoding="utf-8")
+        assert execute.recover(pip, "python:3.11-slim", co) is None                 # the declared range forbids it
+        (co / ".python-version").write_text("3.12\n", encoding="utf-8")
+        assert execute.image_for(co) == "python:3.12-slim"
+
+
+def test_status_is_about_central_claims_and_conflicting_readings_are_recorded():
+    """Sep-29 changepoint: an incidental ARITHMETIC_CONSISTENT made the paper SUPPORTED_BY_CHECK
+    while every central claim was NOT_VERIFIED."""
+    with tempfile.TemporaryDirectory() as t:
+        root = Path(t)
+        plan = {"checks": [{"id": "C1", "kind": "CERTIFICATE", "concerns": [], "claim": "x", "statement": "Theorem 1"},
+                           {"id": "C2", "kind": "ARITHMETIC", "concerns": [], "claim": "y", "printed": "26.7",
+                            "target": {"quote": "q 26.7", "value": "26.7"}}],
+                "central_claims": [{"quote": "a", "page": 1, "checks": ["C1"], "why_unchecked": ""},
+                                   {"quote": "b", "page": 1, "checks": [], "why_unchecked": "figure"}]}
+        state.write_json(root / "sealed" / "plan.json", plan)
+        assert report.scientific_status(root) == "CHECKS_PENDING"
+        state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "NO_VIOLATION_FOUND"})
+        for s in ("ARITHMETIC_CONSISTENT", "ARITHMETIC_CONTRADICTION"):   # incidental: never lifts or sinks it
+            state.write_json(root / "checks" / "C2" / "outcome.json", {"status": s})
+            assert report.scientific_status(root) == "NO_CENTRAL_CLAIM_VERIFIED"
+        assert report._central(plan, report._checks(root, plan), [])[0]["claim_status"] == "TESTED_NO_VIOLATION"
+        dev = {"printed": "for j = 1..J", "used": "j = 0..J-1", "why": "1-based leaves the range", "page": 6}
+        state.write_json(root / "checks" / "C1" / "check.json", {"deviations": [dev]})
+        state.write_json(root / "checks" / "C1" / "outcome.json",
+                         {"status": "NO_VIOLATION_FOUND", "literal": {"n": 36, "violated": 36}})
+        conf = report.conflicts(report._checks(root, plan))
+        assert len(conf) == 1 and conf[0]["explained"] and conf[0]["checks"] == ["C1"]
+        assert {r["reading"]: r["result"] for r in conf[0]["readings"]} == {"with recorded deviations": "holds",
+                                                                              "as printed": "fails"}
+        assert report.scientific_status(root) == "CENTRAL_CLAIM_CONFLICTING"
+        plan["checks"].append({"id": "C3", "kind": "CERTIFICATE", "concerns": [], "claim": "x", "statement": "Theorem 1"})
+        plan["central_claims"][1]["checks"] = ["C3"]
+        state.write_json(root / "checks" / "C1" / "check.json", {})
+        state.write_json(root / "checks" / "C3" / "outcome.json", {"status": "COUNTEREXAMPLE_FOUND"})
+        conf = report.conflicts(report._checks(root, plan))       # same reading, opposite results
+        assert len(conf) == 1 and not conf[0]["explained"] and conf[0]["checks"] == ["C1", "C3"]
 
 
 def test_verify_commit_fails_closed():

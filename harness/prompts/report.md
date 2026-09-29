@@ -25,9 +25,12 @@ anything past 8000 characters):
   2. **Most important concerns** — the few that bear on central claims, each with its id, the
      paper's own words (quote), and why it matters. Severity and confidence are model
      judgments; say so where it matters.
-  3. **What the checks established** — per check id: what was run, against which printed
-     number, and its status in plain words. A BLOCKED or INCONCLUSIVE check established
-     nothing either way; say what blocked it.
+  3. **What the checks established** — central-claim checks first, then incidental ones
+     (say "incidental": no central claim rests on them). Per check id: what was run, against
+     which printed number or stated relation, its status in plain words, and any recorded
+     deviation or conflicting reading. A BLOCKED or INCONCLUSIVE check established nothing
+     either way; say what blocked it. Keep what the workflow completed apart from what it
+     established.
   4. **Open questions for the authors** — concrete questions that would settle what remains.
 RULES (enforced): no accept/reject recommendation, score or verdict on the paper. The words
 verified, reproduced, confirmed, validated, replicated, refuted, disproved, counterexample,
