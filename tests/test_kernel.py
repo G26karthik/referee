@@ -450,6 +450,10 @@ def test_resource_limits_end_in_one_documented_blocker():
     act, why = execute.resource_action(oom, st, "0", 3600)
     assert act == "blocker" and why[0] == "memory" and "not repeated" in why[1]            # never a third time
     assert execute.resource_action({"mode": "evidence", "timed_out": True}, {}, "0", 60)[0] == "blocker"
+    st = {"pilot_s": 84}                      # a replicate of an 84 s script past 3600 s: the host stalled
+    assert execute.resource_action({"mode": "evidence", "timed_out": True}, st, "39", 3600)[0] == "retry"
+    assert execute.resource_action({"mode": "evidence", "timed_out": True}, st, "39", 3600)[0] == "blocker"  # once
+    assert execute.resource_action({"mode": "evidence", "timed_out": True}, {"pilot_s": 1200}, "3", 3600)[0] == "blocker"
     assert execute.resource_action({"mode": "evidence", "returncode": 255}, {}, "0", 60) == ("", "")
     with tempfile.TemporaryDirectory() as t:                  # completed seeds of the same script are reused
         cdir = Path(t)

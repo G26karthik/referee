@@ -1058,7 +1058,8 @@ def _storage_changed(st: dict, env_dir: Path, root: Path, check: dict) -> bool:
 
 def resource_action(done: dict, st: dict, key: str, timeout: int) -> tuple[str, str]:
     """What a run that hit a resource limit leads to: ("retry", "") once alone after an
-    out-of-memory kill that may have shared memory; ("blocker", why) when the same failure
+    out-of-memory kill that may have shared memory, or once for a replicate past the per-run limit
+    whose pilot took under a quarter of it (a stalled host); ("blocker", why) when the same failure
     would repeat (killed out of memory alone, or past the per-run limit); ("", "") otherwise."""
     if done.get("mode") != "evidence":
         return "", ""
@@ -1082,6 +1083,12 @@ def resource_action(done: dict, st: dict, key: str, timeout: int) -> tuple[str, 
                            f"Docker VM has {_vm_mb()} MB, a measured hardware limit). The same run fails the same way, "
                            "so it is not repeated; it needs a host with more memory.")
     if done.get("timed_out"):
+        per = st.setdefault("stalls_by_seed", {})
+        if 0 < st.get("pilot_s", 0) * 4 < timeout and not per.get(key):
+            # The timed pilot of this same script took under a quarter of the limit: this replicate
+            # met a stalled host (a hung daemon, a throttled GPU), not a long protocol. Once more.
+            per[key] = 1
+            return "retry", ""
         return "blocker", ("per_run_timeout", f"a single run exceeded the configured per-run limit of {timeout}s "
                            "(SH_RUN_TIMEOUT_S, a setting of this run); the protocol is not shortened, so it is not "
                            "repeated.")
