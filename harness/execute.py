@@ -163,7 +163,8 @@ def start(name: str, argv: list[str], *, mounts: list[tuple[Path, str, bool]], w
           network: bool, env: dict | None = None, gpus: bool = False, mode: str, target: str,
           meta: dict | None = None) -> dict:
     """Start one step detached; returns its pending record (the caller persists it)."""
-    launch = ["docker", "run", "-d", "--name", name, "--label", "referee=1", "-w", workdir]
+    launch = ["docker", "run", "-d", "--name", name, "--label", "referee=1", "--label", f"referee.mode={mode}",
+              "-w", workdir]
     for host, inside, ro in mounts:
         launch += ["-v", f"{_src(host)}:{inside}{':ro' if ro else ''}"]
     launch += (["--network", "none"] if not network else []) + (["--gpus", "all"] if gpus else [])
@@ -572,7 +573,12 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
     todo = []
     if st["stage"] == "prepare" and not fly:
         todo = [-1]
-    while st["stage"] == "run" and len(fly) + len(todo) < width and (st.get("redo") or st["next"] < runs):
+    # The host is the limit, not the check: at most SH_PARALLEL evidence runs at once across every review.
+    rc, out = _docker(["docker", "ps", "-q", "--filter", "label=referee=1"], 60)
+    rc2, builds = _docker(["docker", "ps", "-q", "--filter", "label=referee.mode=install"], 60)
+    free = cfg.parallel - (len(out.split()) - len(builds.split())) if rc == rc2 == 0 else 0
+    while st["stage"] == "run" and len(fly) + len(todo) < width and len(todo) < free and (
+            st.get("redo") or st["next"] < runs):
         if st.get("redo"):
             todo.append(st["redo"].pop(0))
         else:
