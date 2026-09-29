@@ -70,8 +70,8 @@ function worker(pid, t, prior) {
     `   Read nothing else except files the task itself tells you to open (page images, the ` +
     `authors' checkout).\n` +
     `2. Create every file with the Write tool, never a shell heredoc or echo. Write your JSON answer, ` +
-    `exactly as the task specifies, to ${t.out} (if Write asks you to read it first, Read it, ` +
-    `then Write). Name any script you draft ${t.id.replace(/[^\w.-]+/g, '_')}.py.\n` +
+    `exactly as the task specifies, to ${t.out}. Seal only after that Write succeeded. ` +
+    `Name any script you draft ${t.id.replace(/[^\w.-]+/g, '_')}.py.\n` +
     `3. Use Bash ONLY for the draft-run command the task gives you (if any) and to seal: ` +
     `${sh(`run.py seal ${pid} "${t.id}" "${t.out}"`)}\n` +
     `4. If sealing is refused, fix exactly what it names (copy the paper's parsed text exactly), ` +

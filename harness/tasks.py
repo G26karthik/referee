@@ -323,6 +323,9 @@ def advance(cfg: state.Config, source: str, wait: int = 0) -> dict:
         with state.lock(root / ".lock"):
             x = _Ctx(cfg, pid)
             phase, tasks, spawn = _plan(x)
+            for t in tasks:   # an answer left by an earlier attempt must never be sealed as this one's
+                if (out := Path(t["out"])).exists():
+                    out.replace(out.with_suffix(".stale.json"))
             for check in spawn:
                 _spawn(cfg, pid, check["id"])
         if tasks or phase == "done" or time.time() >= deadline:
