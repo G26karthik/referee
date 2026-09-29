@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+import stat
 import sys
 import zipfile
 from pathlib import Path
@@ -67,6 +69,26 @@ def main(argv: list[str]) -> int:
     return 0
 
 
+def _size(f: Path) -> int:
+    """A regular file's size; 0 for links and for entries Windows cannot stat (a container's
+    Linux symlinks are reparse points that os.stat refuses)."""
+    try:
+        st = f.lstat()
+    except OSError:
+        return 0
+    return st.st_size if stat.S_ISREG(st.st_mode) else 0
+
+
+def _heavy(rel: Path) -> bool:
+    """Clones, venvs, and each author-code run's working copy of the checkout (checks/<id>/work)."""
+    return rel.parts[0] in HEAVY or (rel.parts[:1] == ("checks",) and rel.parts[2:3] == ("work",))
+
+
+def _writable(func, path, _exc) -> None:
+    os.chmod(path, stat.S_IWRITE)   # git's object files are read-only on Windows
+    func(path)
+
+
 def pack(cfg: state.Config, out: Path, pids: list[str], clean: bool) -> int:
     """Zip the review artifacts (never clones/venvs/data), verify the zip, then optionally
     delete the heavy resources. Nothing is deleted unless the zip tested clean."""
@@ -75,22 +97,27 @@ def pack(cfg: state.Config, out: Path, pids: list[str], clean: bool) -> int:
         for root in roots:
             for f in root.rglob("*"):
                 rel = f.relative_to(root)
-                if f.is_file() and rel.parts[0] not in HEAVY and f.name != ".lock":
+                # heavy first: a container venv's symlinks cannot even be stat'ed on Windows
+                if not _heavy(rel) and f.name != ".lock" and f.is_file():
                     z.write(f, Path(root.name) / rel)
     with zipfile.ZipFile(out) as z:
         if z.testzip() is not None:
             print(f"zip failed its integrity test; nothing deleted: {out}")
             return 1
         n = len(z.namelist())
-    freed = 0
+    freed, left = 0, []
     if clean:
-        heavy = [root / h for root in roots for h in HEAVY] + ([cfg.projects / ".script-env"] if not pids else [])
-        for h in heavy:
+        heavy = [root / h for root in roots for h in HEAVY] + [w for root in roots for w in root.glob("checks/*/work")]
+        for h in heavy + ([cfg.projects / ".script-env"] if not pids else []):
             if h.exists():
-                freed += sum(f.stat().st_size for f in h.rglob("*") if f.is_file() and not f.is_symlink())
-                shutil.rmtree(h, ignore_errors=True)
-    print(json.dumps({"zip": str(out), "files": n, "bytes": out.stat().st_size, "freed_bytes": freed}))
-    return 0
+                freed += sum(_size(f) for f in h.rglob("*"))
+                try:
+                    shutil.rmtree(h, onexc=_writable)
+                except OSError:
+                    left.append(str(h))
+    print(json.dumps({"zip": str(out), "files": n, "bytes": out.stat().st_size, "freed_bytes": freed,
+                      "not_deleted": left}))
+    return 1 if left else 0
 
 
 if __name__ == "__main__":
