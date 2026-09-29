@@ -372,6 +372,7 @@ def authorize(cfg: state.Config, check: dict, commit_ok: tuple[bool, str] = (Fal
     return True, "an independent verifier approved this exact script"
 
 
+DOWNLOAD_CACHE = "referee-download-cache"   # pip/uv wheels shared by every build: a rebuild re-downloads nothing
 UV_RUN = {"UV_PROJECT_ENVIRONMENT": "/env", "UV_NO_SYNC": "1", "UV_FROZEN": "1", "UV_OFFLINE": "1",
           "UV_PYTHON_DOWNLOADS": "never", "UV_CACHE_DIR": "/tmp/uv-cache"}   # `uv run` uses /env, never syncs
 
@@ -455,7 +456,8 @@ def ensure_env(cfg: state.Config, root: Path, env_dir: Path, image: str, checkou
             err = (done.get("stderr") or "") + (done.get("error") or "")
             fix = recover(err, b["image"], checkout) if done.get("returncode") != 0 else None
             if not fix and done.get("returncode") != 0 and (
-                    infra := classify(done)["infra_error"] or ("the container vanished" if _vanished(done) else "")):
+                    infra := classify(done)["infra_error"] or ("the container vanished" if _vanished(done) else "")
+                    or (f"no finish within {cfg.install_timeout_s}s (a slow download)" if done.get("timed_out") else "")):
                 fix = (b["image"], f"an infrastructure failure ('{infra}'): rebuilt unchanged")
             if done.get("returncode") == 0 or not fix or b["attempt"] > MAX_RECOVERIES:
                 ok = done.get("returncode") == 0
@@ -473,8 +475,8 @@ def ensure_env(cfg: state.Config, root: Path, env_dir: Path, image: str, checkou
         _docker(["docker", "volume", "rm", "-f", volume(env_dir)], 120)   # isolated: every attempt starts empty
         env_dir.mkdir(parents=True, exist_ok=True)
         b["rec"] = start(_cname(env_dir.resolve(), b["attempt"]), ["sh", "-c", " && ".join(steps)],
-                         mounts=[(volume(env_dir), "/env", False)] + ([(checkout, "/repo", True)] if checkout else [])
-                         + ([(base, "/base", True)] if base else []),
+                         mounts=[(volume(env_dir), "/env", False), (DOWNLOAD_CACHE, "/root/.cache", False)]
+                         + ([(checkout, "/repo", True)] if checkout else []) + ([(base, "/base", True)] if base else []),
                          workdir="/", image=b["image"], network=True, mode="install", target=env_dir.name,
                          meta={"builder": builder, "recovery": list(b["recovery"])})
         state.write_json(build, b)
