@@ -682,6 +682,17 @@ def test_no_verifier_sees_a_script_the_harness_has_not_run():
         assert "NameError" in Path(owed[0]["prompt"]).read_text(encoding="utf-8")
 
 
+def test_extra_packages_are_a_thin_layer_not_a_copy_of_the_environment():
+    """Sep-29 repaired run: each script declaring packages copied the authors' ~6 GB torch venv,
+    filling the host disk. The packages now live in their own volume over the read-only base."""
+    builder, steps, _ = execute._env_steps(None, ("econml==0.15.1",), base="referee-base")
+    assert "cp -a" not in " ".join(steps) and any("--target /env/extra" in s for s in steps)
+    mounts, env = execute.env_mounts(Path("x"), {"layered": True, "base": "referee-base"})
+    assert mounts[0] == ("referee-base", "/env", True) and mounts[1][1:] == ("/extra", True)
+    assert env == {"PYTHONPATH": "/extra/extra"}
+    assert execute.env_mounts(Path("x"), {"ok": True})[0] == [(execute.volume(Path("x")), "/env", True)]
+
+
 def test_a_run_that_measures_then_fails_keeps_its_measurements_live():
     """Live (Docker): a script measures stage `a`, then fails in stage `b`, on every seed. The check
     runs all its seeds, keeps stage a's three results, and ends PARTIAL — never 'did not begin'."""

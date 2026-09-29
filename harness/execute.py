@@ -462,13 +462,22 @@ def with_packages(cfg: state.Config, root: Path, env_dir: Path, envinfo: dict | 
     return d, ensure_env(cfg, root, d, envinfo.get("image", DEFAULT_IMAGE), None, extra, base=volume(env_dir))
 
 
+def env_mounts(env_dir: Path, envinfo: dict) -> tuple[list, dict]:
+    """How a script sees its environment, read-only: the venv at /env, and a layered env's own
+    packages at /extra (first on PYTHONPATH)."""
+    if envinfo.get("layered"):
+        return ([(envinfo["base"], "/env", True), (volume(env_dir), "/extra", True)],
+                {"PYTHONPATH": "/extra/extra"})
+    return [(volume(env_dir), "/env", True)], {}
+
+
 def _env_steps(checkout: Path | None, packages: tuple[str, ...], base: str = "") -> tuple[str, list[str], bool]:
     uv = bool(checkout and not packages and (checkout / "uv.lock").is_file())
     reqs = sorted(p.name for p in checkout.glob("requirements*.txt")) if checkout else []
-    if base:
-        return f"a copy of {base} plus {' '.join(packages)}", [
-            "cp -a /base/. /env/", "/env/bin/python -m pip install --quiet " + " ".join(packages),
-            "echo REFEREE_FREEZE", "/env/bin/python -m pip freeze"], False
+    if base:   # a thin layer over the read-only base (a copy of a torch env is ~6 GB per script)
+        return f"{base} plus {' '.join(packages)} (layered)", [
+            "mkdir -p /env/extra", "/base/bin/python -m pip install --quiet --target /env/extra " + " ".join(packages),
+            "echo REFEREE_FREEZE", "/base/bin/python -m pip freeze --path /env/extra"], False
     if packages:
         builder, add = "baseline packages", ["/env/bin/python -m pip install --quiet " + " ".join(packages)]
     elif uv:
@@ -522,7 +531,7 @@ def ensure_env(cfg: state.Config, root: Path, env_dir: Path, image: str, checkou
                 ok = done.get("returncode") == 0
                 freeze = (done.get("stdout") or "").split("REFEREE_FREEZE", 1)[-1].strip()   # kept in execution.jsonl
                 m = {"ok": ok, "image": b["image"], "builder": builder, "uv": uv, "recovery": b["recovery"],
-                     "volume": volume(env_dir),
+                     "volume": volume(env_dir), **({"base": base, "layered": True} if base else {}),
                      "detail": f"built {b['image']} venv by {builder}; freeze sha256 {state.sha256(freeze)[:12]}"
                      if ok else f"environment build failed: {err[-300:]}"}
                 state.write_json(marker, m)
@@ -780,10 +789,11 @@ def smoke(cfg: state.Config, root: Path, cid: str, r: int, kind: str, attributed
     sdir.mkdir(parents=True, exist_ok=True)
     (sdir / "script.py").write_bytes(script.encode("utf-8"))
     has_repo = (Path(root) / "repo" / ".git").is_dir()
-    mounts = [(sdir, f"{MOUNT}/check", True), (volume(env_dir), "/env", True), (scratch, f"{MOUNT}/ckpt", False)] + (
+    em, env = env_mounts(env_dir, envinfo)
+    mounts = [(sdir, f"{MOUNT}/check", True)] + em + [(scratch, f"{MOUNT}/ckpt", False)] + (
         [(Path(root) / "repo", f"{MOUNT}/repo", True)] if has_repo else []) + data_mount(root, cid)
     rec = start(_cname(cdir.resolve(), "smoke", r, state.sha256(script), st.get("starts", 0)),
-                ["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", "0"], mounts=mounts,
+                ["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", "0"], mounts=mounts, env=env,
                 workdir=f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check", image=envinfo.get("image", DEFAULT_IMAGE),
                 network=False, gpus=kind == "RECONSTRUCTION" and gpu(cfg), mode="try", target=cid,
                 meta={"script_sha256": state.sha256(script), "smoke": r})
@@ -859,9 +869,10 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         mounts, workdir = [(cdir / "work", f"{MOUNT}/repo", False), (volume(env_dir), "/env", False)], f"{MOUNT}/repo"
         env = {"PATH": "/env/bin:/usr/local/bin:/usr/bin:/bin", "VIRTUAL_ENV": "/env", **(UV_RUN if st["env"].get("uv") else {})}
     else:
-        mounts = [(cdir / "run", f"{MOUNT}/check", True), (volume(env_dir), "/env", True)] + (
+        em, env = env_mounts(env_dir, st["env"])
+        mounts = [(cdir / "run", f"{MOUNT}/check", True)] + em + (
             [(checkout, f"{MOUNT}/repo", True)] if has_repo else []) + data_mount(root, cid)
-        workdir, env = (f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check"), {}
+        workdir = f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check"
     # Steps in flight, by seed ("-1" is the prepare step). Independent seeds of a script run
     # SH_PARALLEL at a time (private /tmp, read-only mounts); author code one at a time (it
     # writes into one work copy, and may hold the GPU). Parallel is scheduling, never a downscale.
@@ -1210,9 +1221,10 @@ def try_script(cfg: state.Config, pid: str, cid: str, script: str, c: dict) -> d
         return {"error": envinfo["detail"]}
     has_repo = (root / "repo" / ".git").is_dir()
     scratch = _cname("try-ckpt", tdir.resolve(), time.time())        # a throwaway /work/ckpt for the draft
-    mounts = [(tdir, f"{MOUNT}/check", False), (volume(env_dir), "/env", True), (scratch, f"{MOUNT}/ckpt", False)] + (
+    em, env = env_mounts(env_dir, envinfo)
+    mounts = [(tdir, f"{MOUNT}/check", False)] + em + [(scratch, f"{MOUNT}/ckpt", False)] + (
         [(root / "repo", f"{MOUNT}/repo", True)] if has_repo else []) + data_mount(root, cid)
-    rec = run(["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", "0"], mounts=mounts,
+    rec = run(["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", "0"], mounts=mounts, env=env,
               workdir=f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check", image=envinfo.get("image", DEFAULT_IMAGE),
               network=False, timeout=cfg.try_timeout_s, mode="try", target=cid,
               gpus=c.get("kind") == "RECONSTRUCTION" and gpu(cfg), meta={"script_sha256": state.sha256(script)})
