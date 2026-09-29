@@ -77,6 +77,13 @@ def image_for(checkout: Path | None) -> str:
     return DEFAULT_IMAGE
 
 
+def run_image(image: str, gpus: bool) -> str:
+    """The image a step runs in. A step given the GPU runs on the full image of the same Python:
+    GPU stacks compile kernels at run time (triton, torch.compile) and a slim image has no C
+    compiler, so the GPU would fail or be silently dropped for the CPU. The environment is the same."""
+    return image.removesuffix("-slim") if gpus else image
+
+
 # --- dependency recovery (CLAUDE.md "Dependency recovery"): documented, isolated, recorded -
 _CC = r"'?[\w./+-]*(?:gcc|cc|g\+\+|c\+\+|clang)'?"
 _COMPILER = re.compile(rf"unable to execute {_CC}|command {_CC} failed|No such file or directory: {_CC}|"
@@ -806,11 +813,12 @@ def smoke(cfg: state.Config, root: Path, cid: str, r: int, kind: str, attributed
     em, env = env_mounts(env_dir, envinfo)
     mounts = [(sdir, f"{MOUNT}/check", True)] + em + [(scratch, f"{MOUNT}/ckpt", False)] + (
         [(Path(root) / "repo", f"{MOUNT}/repo", True)] if has_repo else []) + data_mount(root, cid)
+    gpus = kind == "RECONSTRUCTION" and gpu(cfg)
     rec = start(_cname(cdir.resolve(), "smoke", r, state.sha256(script), st.get("starts", 0)),
                 ["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", "0"], mounts=mounts, env=env,
-                workdir=f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check", image=envinfo.get("image", DEFAULT_IMAGE),
-                network=False, gpus=kind == "RECONSTRUCTION" and gpu(cfg), mode="try", target=cid,
-                meta={"script_sha256": state.sha256(script), "smoke": r})
+                workdir=f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check",
+                image=run_image(envinfo.get("image", DEFAULT_IMAGE), gpus), network=False, gpus=gpus, mode="try",
+                target=cid, meta={"script_sha256": state.sha256(script), "smoke": r})
     state.write_json(f, {"rec": rec, "starts": st.get("starts", 0)})
     return None
 
@@ -850,7 +858,9 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         if envinfo is None:
             return True
         st.update(env=envinfo, env_dir=str(env_dir), why=why, seed=0, values=[], cert=[], staged=[], rec=None,
-                  stage="prepare" if check.get("prepare") else "run", done_seeds=[], failed_seeds={})
+                  stage="prepare" if check.get("prepare") else "run", done_seeds=[], failed_seeds={},
+                  image=run_image(envinfo.get("image", DEFAULT_IMAGE),    # one image for every run of the check
+                                  kind in ("AUTHOR_CODE", "RECONSTRUCTION") and gpu(cfg)))
         for row in _checkpoints(cdir, check):          # ended seeds of this exact script/command are kept
             st["values"] += row["values"]
             st["cert"] += row.get("cert") or []
@@ -880,7 +890,7 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             if state.sha256((cdir / "run" / "script.py").read_bytes()) != check.get("script_sha256"):
                 return _finish(cfg, root, check, {**st, "authorized": False, "why": "the script on disk is not the approved script"})
         state.write_json(cdir / "exec.json", st)
-    env_dir, image = Path(st["env_dir"]), st["env"].get("image", DEFAULT_IMAGE)
+    env_dir, image = Path(st["env_dir"]), st.get("image") or st["env"].get("image", DEFAULT_IMAGE)
     if kind == "AUTHOR_CODE":
         mounts, workdir = [(cdir / "work", f"{MOUNT}/repo", False), (volume(env_dir), "/env", False)], f"{MOUNT}/repo"
         env = {"PATH": "/env/bin:/usr/local/bin:/usr/bin:/bin", "VIRTUAL_ENV": "/env", **(UV_RUN if st["env"].get("uv") else {})}
@@ -1225,6 +1235,8 @@ def _finish(cfg: state.Config, root: Path, check: dict, st: dict) -> bool:
         outcome["data"] = {k: d.get(k) for k in ("sources", "n_files", "bytes", "volume")}
     if st.get("env"):
         outcome["environment"] = {k: st["env"].get(k) for k in ("detail", "image", "builder", "recovery")}
+        if st.get("image") and st["image"] != st["env"].get("image"):
+            outcome["environment"]["run_image"] = st["image"]   # given the GPU (run_image)
     if (st.get("ev") or {}).get("setup_error") and kind != "AUTHOR_CODE":   # the script never started: revisable
         outcome.update(setup_error=st["ev"]["setup_error"], setup_log=st.get("failure", "")[-1500:])
     state.write_json(root / "checks" / check["id"] / "outcome.json", outcome)
@@ -1266,10 +1278,11 @@ def try_script(cfg: state.Config, pid: str, cid: str, script: str, c: dict) -> d
     em, env = env_mounts(env_dir, envinfo)
     mounts = [(tdir, f"{MOUNT}/check", False)] + em + [(scratch, f"{MOUNT}/ckpt", False)] + (
         [(root / "repo", f"{MOUNT}/repo", True)] if has_repo else []) + data_mount(root, cid)
+    gpus = c.get("kind") == "RECONSTRUCTION" and gpu(cfg)
     rec = run(["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", "0"], mounts=mounts, env=env,
-              workdir=f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check", image=envinfo.get("image", DEFAULT_IMAGE),
-              network=False, timeout=cfg.try_timeout_s, mode="try", target=cid,
-              gpus=c.get("kind") == "RECONSTRUCTION" and gpu(cfg), meta={"script_sha256": state.sha256(script)})
+              workdir=f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check",
+              image=run_image(envinfo.get("image", DEFAULT_IMAGE), gpus), network=False, timeout=cfg.try_timeout_s,
+              mode="try", target=cid, gpus=gpus, meta={"script_sha256": state.sha256(script)})
     _docker(["docker", "volume", "rm", "-f", scratch], 60)
     state.append_jsonl(root / "execution.jsonl", rec)
     return {"environment": envinfo["detail"], "returncode": rec.get("returncode"), "timed_out": rec.get("timed_out"),
