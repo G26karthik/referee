@@ -476,6 +476,8 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         if kind != "CERTIFICATE":
             rec["target"] = _target(x, c.get("target") or {}, errs, cid)
             rec["printed"] = rec["target"]["value"] if rec["target"] else ""
+        if kind in ("AUTHOR_CODE", "RELEASED_DATA", "RECONSTRUCTION") and not rec["metric"]:
+            errs.append(f"{cid}: `metric` must name the program output compared with the printed target")
         if kind == "AUTHOR_CODE":
             if not attributed:
                 errs.append(f"{cid}: AUTHOR_CODE needs a checkout you judge to be the authors' own")

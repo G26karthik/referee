@@ -161,6 +161,15 @@ def test_seals_keep_only_harness_derived_fields_and_detect_tampering():
         _seal(cfg, pid, "critic", {"reviews": [{"id": "overclaim-01", "severity": "FATAL"}]}, td)
         x = tasks._Ctx(cfg, pid)
         assert x.concerns()[0]["severity"] == "MINOR"                  # a critic never raises severity
+        chk = {"kind": "RELEASED_DATA", "claim_quote": "reaches 61.4 accuracy",
+               "target": {"quote": "reaches 61.4 accuracy", "value": "61.4"}}
+        for metric, refused in (("", True), ("acc", False)):   # an unnamed output can never be compared
+            try:
+                tasks._seal_plan(x, "plan", {"checks": [{**chk, "metric": metric}], "central_claims": []}, final=False)
+                err = ""
+            except tasks.SealError as e:
+                err = str(e)
+            assert ("`metric`" in err) == refused, err
         p = td / pid / "sealed" / "lens__overclaim.json"
         p.write_text(p.read_text(encoding="utf-8").replace("MINOR", "FATAL"), encoding="utf-8")
         assert tasks._sealed(td / pid, "lens:overclaim") is None       # tampered: not a seal

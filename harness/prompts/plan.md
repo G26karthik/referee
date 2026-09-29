@@ -58,7 +58,9 @@ TARGETS. Every kind except CERTIFICATE compares against ONE printed number, the 
     (same digits; no rounding, no units), "page": the page number it is printed on};
   - a number in prose: {"quote": verbatim text containing it, "value": the number as printed}.
 The harness re-finds the row (one visual row must hold both the label and the value) or the
-quote, and compares at the printed precision.
+quote, and compares at the printed precision. AUTHOR_CODE, RELEASED_DATA and RECONSTRUCTION
+also need `metric`: the name of the ONE output compared with the target (for a script, the
+name it will print, e.g. "mean_test_accuracy").
 
 Write ONLY this JSON to the output path you were given:
 {"repo_is_authors": true,
