@@ -1190,7 +1190,7 @@ def _finish(cfg: state.Config, root: Path, check: dict, st: dict) -> bool:
         kind_of, text = st["blocker"] if isinstance(st["blocker"], (list, tuple)) else ("time_budget", st["blocker"])
         outcome.update(status="BLOCKED", reason=f"RESOURCE BLOCKER: {text}", rule="bounded pilot and resources",
                        resource=kind_of, values=[], pilot_values=st.get("values", []),
-                       pilot_stages=_stage_summary(st.get("staged") or []), runs=st.get("records", 0),
+                       pilot_stages=_stage_summary(st.get("staged") or []), runs=st.get("records", 0) + st.get("reused", 0),
                        records="execution.jsonl", finished_at=state.now())
     else:
         outcome.update(reconcile(kind, check.get("printed", ""), st.get("values", []), st.get("failure", ""),
@@ -1200,9 +1200,11 @@ def _finish(cfg: state.Config, root: Path, check: dict, st: dict) -> bool:
                                  changed=any(d.get("changes_claim") for d in check.get("deviations") or []),
                                  step=bool(check.get("step")), staged=st.get("staged"),
                                  failed=st.get("failed_seeds"), stage_errors=st.get("stage_errors")),
-                       values=st.get("values", []), runs=st.get("records", 0), records="execution.jsonl",
+                       values=st.get("values", []), runs=st.get("records", 0) + st.get("reused", 0), records="execution.jsonl",
                        finished_at=state.now())
     outcome["protocol"] = protocol(check, st, outcome.get("rule", ""))
+    if st.get("reused"):          # seeds that ended earlier (seeds.jsonl) count as runs; which ones is said
+        outcome["reused_seeds"] = st["reused"]
     for k in ("data_identity", "stage_times", "peak_mb"):
         if st.get(k):
             outcome[k] = st[k]
