@@ -247,7 +247,7 @@ _INFRA = ("out of memory", "cuda out of memory", "cuda error", "cublas", "cudnn"
           "no cuda gpus", "api_key", "api key", "wandb", "login", "token", "permission denied",
           "do not match the hashes", "hash mismatch", "connection reset", "read timed out",
           "incompleteread", "failed to download", "error sending request")   # a corrupt or cut download
-_SIGNALS = {-9, -11, -6, 137, 139, 134, 136, 132, 135}
+_SIGNALS = {-9, -11, -6, 137, 139, 134, 136, 132, 135, 255}   # 255: killed by a daemon restart
 
 
 def classify(rec: dict) -> dict:
