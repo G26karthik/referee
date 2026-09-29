@@ -531,7 +531,8 @@ def ensure_env(cfg: state.Config, root: Path, env_dir: Path, image: str, checkou
                 ok = done.get("returncode") == 0
                 freeze = (done.get("stdout") or "").split("REFEREE_FREEZE", 1)[-1].strip()   # kept in execution.jsonl
                 m = {"ok": ok, "image": b["image"], "builder": builder, "uv": uv, "recovery": b["recovery"],
-                     "volume": volume(env_dir), **({"base": base, "layered": True} if base else {}),
+                     "volume": volume(env_dir),   # layered only if the step that ran was (a copy started earlier is a full env)
+                     **({"base": base, "layered": True} if "--target /env/extra" in " ".join(done.get("argv") or []) else {}),
                      "detail": f"built {b['image']} venv by {builder}; freeze sha256 {state.sha256(freeze)[:12]}"
                      if ok else f"environment build failed: {err[-300:]}"}
                 state.write_json(marker, m)
