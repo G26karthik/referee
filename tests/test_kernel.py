@@ -375,6 +375,17 @@ def test_detached_steps_outlive_their_poller():
             break
         time.sleep(1)
     assert done and done["timed_out"] and done["returncode"] is None
+    with tempfile.TemporaryDirectory() as t:        # an env is a named volume, built by polls, never blocking
+        cfg = state.Config()
+        cfg.allow_install = cfg.allow_network = True
+        env_dir = Path(t) / "env"
+        env = None
+        for _ in range(120):
+            if (env := execute.ensure_env(cfg, Path(t), env_dir, execute.DEFAULT_IMAGE, None)):
+                break
+            time.sleep(2)
+        assert env and env["ok"] and env["volume"] == execute.volume(env_dir) and "freeze sha256" in env["detail"]
+        assert execute._docker(["docker", "volume", "rm", "-f", env["volume"]], 60)[0] == 0
 
 
 def test_verify_commit_fails_closed():

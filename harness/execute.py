@@ -165,7 +165,7 @@ def start(name: str, argv: list[str], *, mounts: list[tuple[Path, str, bool]], w
     """Start one step detached; returns its pending record (the caller persists it)."""
     launch = ["docker", "run", "-d", "--name", name, "--label", "referee=1", "-w", workdir]
     for host, inside, ro in mounts:
-        launch += ["-v", f"{Path(host).resolve()}:{inside}{':ro' if ro else ''}"]
+        launch += ["-v", f"{_src(host)}:{inside}{':ro' if ro else ''}"]
     launch += (["--network", "none"] if not network else []) + (["--gpus", "all"] if gpus else [])
     for k, v in sorted((env or {}).items()):
         launch += ["-e", f"{k}={v}"]
@@ -213,6 +213,16 @@ def collect(rec: dict, timeout: int) -> dict | None:
 
 def _cname(*parts) -> str:
     return "referee-" + state.sha256("|".join(str(x) for x in parts))[:16]
+
+
+def volume(env_dir: Path) -> str:
+    """The Docker named volume holding the venv whose markers live in `env_dir`: a venv is
+    thousands of small files, which a host bind mount (worse, a synced folder) writes slowly."""
+    return _cname("env", Path(env_dir).resolve())
+
+
+def _src(host) -> str:
+    return host if isinstance(host, str) and not re.search(r"[\\/:]", host) else str(Path(host).resolve())
 
 
 # --- environment failure is not scientific failure (invariant 5) ------------------------
@@ -356,7 +366,7 @@ def _env_steps(checkout: Path | None, packages: tuple[str, ...]) -> tuple[str, l
     else:
         builder, add = "no declared dependencies", []
     return builder, ["python -m venv /env", "/env/bin/python -m pip install --quiet --upgrade pip", *add,
-                     "/env/bin/python -m pip freeze > /env/freeze.txt"], uv
+                     "echo REFEREE_FREEZE", "/env/bin/python -m pip freeze"], uv
 
 
 def ensure_env(cfg: state.Config, root: Path, env_dir: Path, image: str, checkout: Path | None,
@@ -391,21 +401,21 @@ def ensure_env(cfg: state.Config, root: Path, env_dir: Path, image: str, checkou
                 fix = (b["image"], f"an infrastructure failure ('{infra}'): rebuilt unchanged")
             if done.get("returncode") == 0 or not fix or b["attempt"] > MAX_RECOVERIES:
                 ok = done.get("returncode") == 0
-                freeze = env_dir / "freeze.txt"
+                freeze = (done.get("stdout") or "").split("REFEREE_FREEZE", 1)[-1].strip()   # kept in execution.jsonl
                 m = {"ok": ok, "image": b["image"], "builder": builder, "uv": uv, "recovery": b["recovery"],
-                     "detail": f"built {b['image']} venv by {builder}; freeze sha256 "
-                               f"{state.sha256(freeze.read_bytes())[:12] if freeze.exists() else '?'}" if ok else
-                               f"environment build failed: {err[-300:]}"}
+                     "volume": volume(env_dir),
+                     "detail": f"built {b['image']} venv by {builder}; freeze sha256 {state.sha256(freeze)[:12]}"
+                     if ok else f"environment build failed: {err[-300:]}"}
                 state.write_json(marker, m)
                 build.unlink(missing_ok=True)
                 return m
             b["recovery"].append({"failure": err[-300:], "action": fix[1], "image": fix[0]})
             b["image"] = fix[0]
         b["attempt"] += 1
-        shutil.rmtree(env_dir, ignore_errors=True)                 # isolated: every attempt starts empty
+        _docker(["docker", "volume", "rm", "-f", volume(env_dir)], 120)   # isolated: every attempt starts empty
         env_dir.mkdir(parents=True, exist_ok=True)
         b["rec"] = start(_cname(env_dir.resolve(), b["attempt"]), ["sh", "-c", " && ".join(steps)],
-                         mounts=[(env_dir, "/env", False)] + ([(checkout, "/repo", True)] if checkout else []),
+                         mounts=[(volume(env_dir), "/env", False)] + ([(checkout, "/repo", True)] if checkout else []),
                          workdir="/", image=b["image"], network=True, mode="install", target=env_dir.name,
                          meta={"builder": builder, "recovery": list(b["recovery"])})
         state.write_json(build, b)
@@ -467,10 +477,10 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         state.write_json(cdir / "exec.json", st)
     env_dir, image = Path(st["env_dir"]), st["env"].get("image", DEFAULT_IMAGE)
     if kind == "AUTHOR_CODE":
-        mounts, workdir = [(cdir / "work", f"{MOUNT}/repo", False), (env_dir, "/env", False)], f"{MOUNT}/repo"
+        mounts, workdir = [(cdir / "work", f"{MOUNT}/repo", False), (volume(env_dir), "/env", False)], f"{MOUNT}/repo"
         env = {"PATH": "/env/bin:/usr/local/bin:/usr/bin:/bin", "VIRTUAL_ENV": "/env", **(UV_RUN if st["env"].get("uv") else {})}
     else:
-        mounts = [(cdir / "run", f"{MOUNT}/check", True), (env_dir, "/env", True)] + (
+        mounts = [(cdir / "run", f"{MOUNT}/check", True), (volume(env_dir), "/env", True)] + (
             [(checkout, f"{MOUNT}/repo", True)] if has_repo else [])
         workdir, env = (f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check"), {}
     if st["rec"]:
@@ -568,7 +578,7 @@ def try_script(cfg: state.Config, pid: str, cid: str, script: str) -> dict:
     if not envinfo["ok"]:
         return {"error": envinfo["detail"]}
     has_repo = (root / "repo" / ".git").is_dir()
-    mounts = [(tdir, f"{MOUNT}/check", False), (env_dir, "/env", True)] + (
+    mounts = [(tdir, f"{MOUNT}/check", False), (volume(env_dir), "/env", True)] + (
         [(root / "repo", f"{MOUNT}/repo", True)] if has_repo else [])
     rec = run(["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", "0"], mounts=mounts,
               workdir=f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check", image=envinfo.get("image", DEFAULT_IMAGE),
