@@ -5,6 +5,7 @@ workers writing a check script use `try`; `exec` and `env` poll to completion by
   python run.py seal <paper-id> <task-id> <answer.json>
   python run.py try <paper-id> <gen-task-id> <script.py>
   python run.py env <paper-id>          # build the authors' environment (started by the harness)
+  python run.py stop <paper-id> <check> <why>   # the operator ends a running check
   python run.py status [<paper-id>]
   python run.py pack <out.zip> [<paper-id> ...] [--clean]
 """
@@ -39,6 +40,8 @@ def main(argv: list[str]) -> int:
     e = sub.add_parser("exec")
     e.add_argument("pid"), e.add_argument("check")
     sub.add_parser("env").add_argument("pid")
+    so = sub.add_parser("stop")
+    so.add_argument("pid"), so.add_argument("check"), so.add_argument("why")
     st = sub.add_parser("status")
     st.add_argument("pid", nargs="?")
     p = sub.add_parser("pack")
@@ -61,6 +64,8 @@ def main(argv: list[str]) -> int:
         while execute.poll(cfg, a.pid, a.check):
             time.sleep(10)
         print(json.dumps(state.read_json(state.pdir(cfg, a.pid) / "checks" / a.check / "outcome.json")))
+    elif a.cmd == "stop":             # the operator ends a running check (recorded, never a finding)
+        print(json.dumps({k: v for k, v in execute.stop(cfg, a.pid, a.check, a.why).items() if k != "values"}))
     elif a.cmd == "env":
         while (env := execute.author_env(cfg, state.pdir(cfg, a.pid))) is None:
             time.sleep(10)

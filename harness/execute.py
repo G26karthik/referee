@@ -605,6 +605,21 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
     return True
 
 
+def stop(cfg: state.Config, pid: str, cid: str, why: str) -> dict:
+    """The operator ends a running check: in-flight runs are cancelled (each recorded) and the
+    check is INCONCLUSIVE for a stated reason about this host, never a finding about the paper."""
+    root = state.pdir(cfg, pid)
+    with state.lock(root / ".lock"):
+        cdir = root / "checks" / cid
+        st = state.read_json(cdir / "exec.json") or {}
+        if (cdir / "outcome.json").exists() or not st:
+            return {"error": f"{cid} is not running"}
+        _finish(cfg, root, state.read_json(cdir / "check.json"), {
+            **_cancel(root, st), "ev": {"infra_error": "stopped by the operator"},
+            "failure": f"stopped by the operator after {st.get('seed', 0)} completed run(s): {why}"})
+        return state.read_json(cdir / "outcome.json")
+
+
 def _cancel(root: Path, st: dict) -> dict:
     """End the seeds still in flight once one seed decided the check; each leaves a record."""
     for rec in st.get("fly", {}).values():
