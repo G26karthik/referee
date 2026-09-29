@@ -577,6 +577,9 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
     rc, out = _docker(["docker", "ps", "-q", "--filter", "label=referee=1"], 60)
     rc2, builds = _docker(["docker", "ps", "-q", "--filter", "label=referee.mode=install"], 60)
     free = cfg.parallel - (len(out.split()) - len(builds.split())) if rc == rc2 == 0 else 0
+    # ...and shared fairly: with several checks running, each holds at most an equal share of the slots.
+    active = [e for e in cfg.projects.glob("*/checks/*/exec.json") if not (e.parent / "outcome.json").exists()]
+    width = min(width, max(1, cfg.parallel // max(1, len(active))))
     while st["stage"] == "run" and len(fly) + len(todo) < width and len(todo) < free and (
             st.get("redo") or st["next"] < runs):
         if st.get("redo"):
