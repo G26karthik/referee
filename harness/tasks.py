@@ -389,6 +389,8 @@ def advance(cfg: state.Config, source: str, wait: int = 0) -> dict:
         with state.lock(cfg.projects / ".ingest.lock"):
             pid = paper.ingest(cfg, Path(source))
     root = state.pdir(cfg, pid)
+    from .repo import restore
+    restore(cfg, root)                     # a packed run resumes on its recorded commit
     deadline = time.time() + wait
     while True:
         with state.lock(root / ".lock"):

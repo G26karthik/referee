@@ -165,6 +165,16 @@ def acquire(cfg: state.Config, pid: str, meta: dict) -> dict:
     return src
 
 
+def restore(cfg: state.Config, root: Path) -> None:
+    """A packed project's checkout (pack --clean deletes clones), re-cloned at its RECORDED
+    commit, detached; verify_commit still gates every run."""
+    src, dest = state.read_json(root / "source.json", {}) or {}, root / "repo"
+    if not (src.get("url") and src.get("commit")) or (dest / ".git").is_dir() or not cfg.allow_network:
+        return
+    if git(["clone", "--no-checkout", src["url"], str(dest)])[0] == 0:
+        git(["checkout", "--detach", "-q", src["commit"]], dest)
+
+
 def verify_commit(path: Path, expected: str) -> tuple[bool, str]:
     """Is the checkout about to run exactly the pinned commit, with nothing modified or
     hidden? Fails closed: an uninspectable tree is not a clean tree."""
