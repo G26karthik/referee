@@ -243,7 +243,9 @@ _INFRA = ("out of memory", "cuda out of memory", "cuda error", "cublas", "cudnn"
           "temporary failure in name resolution", "name or service not known",
           "max retries exceeded", "network is unreachable", "connectionerror", "sslerror",
           "couldn't connect", "could not connect", "found no nvidia driver", "not compiled with cuda",
-          "no cuda gpus", "api_key", "api key", "wandb", "login", "token", "permission denied")
+          "no cuda gpus", "api_key", "api key", "wandb", "login", "token", "permission denied",
+          "do not match the hashes", "hash mismatch", "connection reset", "read timed out",
+          "incompleteread", "failed to download", "error sending request")   # a corrupt or cut download
 _SIGNALS = {-9, -11, -6, 137, 139, 134, 136, 132, 135}
 
 

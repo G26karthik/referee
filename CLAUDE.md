@@ -85,7 +85,7 @@ the fixed baseline; a script may declare extra packages (`# REFEREE_PACKAGES:`, 
 runs in a copy of its environment with them. Every long step is a detached, named container that
 each `tasks` call polls (no host process must survive); venvs live in Docker named volumes.
 A reconstruction runs at least SH_REPLICATES (3) seeds; a script that cannot start goes back to
-its author with the error (within SH_MAX_REVISIONS = 2).
+its author with the error (within SH_MAX_REVISIONS = 3).
 
 ## Commands (repo venv; on Windows set PYTHONUTF8=1)
 

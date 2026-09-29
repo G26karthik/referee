@@ -33,6 +33,9 @@ reported as an author reproduction. THE RULE THAT MATTERS MOST: every detail nei
 nor the authors' code fixes (a hyperparameter, dataset size, preprocessing, a baseline's
 setting) is a DEVIATION you declare; a number from undeclared choices is rejected. Never shrink
 the experiment (fewer runs, samples, iterations or a smaller model) to make it faster.
+Where the paper and the authors' code DISAGREE (a split, a subsample, a hyperparameter), the paper
+is what is being checked: follow the paper, and state the code's difference in `notes` (it is a
+finding for the referee).
 
 ## verify CERTIFICATE
   1. Does `hypotheses` carry EVERY hypothesis the statement (or, for a proof step, the proof at
@@ -57,7 +60,8 @@ the experiment (fewer runs, samples, iterations or a smaller model) to make it f
   2. Did the script fill a detail the paper and the authors' code omit WITHOUT declaring it in
      `deviations`, or shrink the experiment (fewer runs, samples, iterations, a smaller
      model)? Either is a rejection. Where the checkout implements the method, does the script
-     call that code rather than a rewrite of it?
+     call that code rather than a rewrite of it? Where paper and code disagree, does it follow the paper (and say so
+     in `notes`)? Following the code there is REVISE; following the paper there is correct.
   3. Does `runs` (or the number of result lines one run prints) match the paper's stated
      replication?
 
