@@ -412,6 +412,9 @@ def test_arithmetic_errors_from_extracted_text_need_the_page_image():
     from harness.evidence import mask, printed_form
     assert mask("about 103(= 51326/83) times", "103") == "about [?](= 51326/83) times"
     assert printed_form("10³") == printed_form("10^3") != printed_form("103")
+    p = Paper(["Total frames 1,369,349 over all users; mean length is 26.7."])   # a bare-number quote
+    ctx = p.masked_context(p.find("1,369,349")[0], "1369349")                    # still gets its words
+    assert ctx == "Total frames [?] over all users; mean length is 26.7."
     with tempfile.TemporaryDirectory() as t:
         td = Path(t)
         cfg, pid = _project(td)

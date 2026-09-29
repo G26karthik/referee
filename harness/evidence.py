@@ -79,8 +79,17 @@ class Paper:
                 return None, "the quote occurs more than once, so it addresses no single place"
             if hits:
                 lo, hi = hits[0]
-                return {"quote": self.text[lo:hi], "page": self.page_of(lo)}, ""
+                return {"quote": self.text[lo:hi], "page": self.page_of(lo), "span": [lo, hi]}, ""
         return None, "the quote does not occur (as whole words) in the parsed paper"
+
+    def masked_context(self, hit: dict, value: str, width: int = 80) -> str | None:
+        """The printed words around a re-found quote with `value` masked inside the quote only:
+        enough context for a transcriber to find the spot on the page image."""
+        lo, hi = hit["span"]
+        inner = mask(self.text[lo:hi], value)
+        if inner is None:
+            return None
+        return " ".join((self.text[max(0, lo - width):lo] + inner + self.text[hi:hi + width]).split())
 
     def cell(self, row_quote: str, value: str, column_quote: str, page: int = 0) -> tuple[dict | None, str]:
         """({"page", "row"}, '') when exactly one printed row holds both the row label and the

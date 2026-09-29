@@ -140,7 +140,7 @@ def _calc_items(x: "_Ctx", prefix: str, calc: dict) -> list[dict]:
         parts.append(("result", calc["target"]))
     for name, o in parts:
         hit = x.paper.find(str(o.get("quote") or ""))[0]
-        ctx = mask(hit["quote"], str(o.get("value") or "")) if hit else None
+        ctx = x.paper.masked_context(hit, str(o.get("value") or "")) if hit else None
         items.append({"id": f"{prefix}:{name}", "page": hit and hit["page"], "context": ctx,
                       "extracted": str(o.get("value") or "")})
     return items
