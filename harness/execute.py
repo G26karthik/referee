@@ -186,8 +186,8 @@ def collect(rec: dict, timeout: int) -> dict | None:
         return rec
     name = rec["container"]
     rc, out = _docker(["docker", "inspect", "-f", "{{json .State}}", name], 60)
-    if rc != 0:
-        if not docker_status()[0]:
+    if rc != 0:                           # only "no such container" is a vanished step; any other
+        if "no such" not in out.lower():  # error (daemon away, a 500 under load) is asked again later
             return None
         return {**rec, "returncode": None, "timed_out": False, "stdout": "", "stderr": "", "ended_at": state.now(),
                 "seconds": 0, "error": "the container disappeared before it was collected"}
@@ -590,7 +590,7 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
                 "script_sha256": check.get("script_sha256", "")} if mode == "evidence" else {}
         fly[str(seed)] = start(_cname(cdir.resolve(), st.get("token", ""), f"{mode}{seed}"), argv, mounts=mounts,
                                workdir=workdir, image=image, network=network, env=env,
-                               gpus=(kind == "AUTHOR_CODE" or env_dir == root / "env") and gpu(cfg),
+                               gpus=kind in ("AUTHOR_CODE", "RECONSTRUCTION") and gpu(cfg),   # an experiment may use it
                                mode=mode, target=cid, meta=meta)
     state.write_json(cdir / "exec.json", st)
     return True
