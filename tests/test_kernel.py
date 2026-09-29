@@ -208,6 +208,9 @@ def test_report_status_words_must_be_earned():
     assert not report.unearned("C1 was not verified: the run was blocked.", led)
     assert report.unearned("The gain is veri**fied** here.", led) and report.unearned("This confirms it.", led)
     assert not report.unearned("C1 is BLOCKED; RESOLVED_VERIFIED would need a run. The verifier refused.", led)
+    led["concerns"] = [{"id": "contradiction-02"}]
+    assert not report.unearned("- contradiction-02 (MAJOR, model judgment).", led)   # an id is a name
+    assert report.unearned("contradiction-02: the table contradicts the abstract.", led)
 
 
 def test_verify_commit_fails_closed():

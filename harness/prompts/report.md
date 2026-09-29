@@ -32,6 +32,7 @@ anything past 8000 characters):
 RULES (enforced): no accept/reject recommendation, score or verdict on the paper. The words
 verified, reproduced, confirmed, validated, replicated, refuted, disproved, counterexample,
 contradicted may appear only in a sentence that names the check id (C1, C2, ...) whose status
-earns them; a report that breaks this is replaced by the table alone.
+earns them; a report that breaks this is replaced by the table alone. Write a concern's class
+exactly as given (CONFIRMED_FINDING), never as words ("confirmed finding").
 
 Write ONLY this JSON to the output path you were given: {"summary_md": "..."}

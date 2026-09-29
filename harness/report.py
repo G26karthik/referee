@@ -103,8 +103,12 @@ def unearned(text: str, led: dict) -> list[str]:
     characters) that no check cited in the same sentence earns. Negated use ("was not
     reproduced", "unverified") is fine."""
     status = {c["id"]: c["status"] for c in led["checks"]}
-    # Harness vocabulary (RESOLVED_VERIFIED, AUTHOR_CODE_REPRODUCTION...) names a status; it is not a claim.
-    norm = re.sub(r"[*_`~]", "", re.sub(r"\b[A-Z]+(?:_[A-Z]+)+\b", " ", flat_text(text)))
+    # Harness vocabulary (RESOLVED_VERIFIED, AUTHOR_CODE_REPRODUCTION...) and the ledger's own
+    # concern ids (contradiction-02) name things; they are not claims.
+    text = flat_text(text)
+    for cid in sorted((c["id"] for c in led.get("concerns", [])), key=len, reverse=True):
+        text = text.replace(cid, " ")
+    norm = re.sub(r"[*_`~]", "", re.sub(r"\b[A-Z]+(?:_[A-Z]+)+\b", " ", text))
     bad = []
     for sentence in re.split(r"(?<=[.!?])\s+|\n+", norm):
         low, ids = sentence.lower(), set(re.findall(r"\bC\d+\b", sentence))
