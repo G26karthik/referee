@@ -844,9 +844,12 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     except ValueError as e:
         errors.append(str(e))
     runs = obj.get("runs") if isinstance(obj.get("runs"), int) and not isinstance(obj.get("runs"), bool) else 1
-    cap = 200 if c["kind"] == "CERTIFICATE" else x.cfg.max_runs     # ponytail: instances are cheap
+    cap = 200 if c["kind"] == "CERTIFICATE" else x.cfg.max_runs     # ponytail: 200 sandboxed runs per check
     if not 1 <= runs <= cap:
-        return {"refused": True, "notes": f"{runs} runs is outside 1..{cap}: refused rather than downscaled"}
+        if final or c["kind"] != "CERTIFICATE":         # a stated run count past the cap: refused, never shrunk
+            return {"refused": True, "notes": f"{runs} runs is outside 1..{cap}: refused rather than downscaled"}
+        errors.append(f"`runs` is at most {cap}: each run is one sandboxed process. A certificate may check several "
+                      "instances per run by printing one REFEREE_RESULT line per instance")
     if runs > 1 and c["kind"] == "RECONSTRUCTION" and not (
             (h := x.paper.find(str(obj.get("runs_quote") or ""))[0]) and value_in(h["quote"], str(runs))):
         errors.append("runs > 1 needs runs_quote: the paper's sentence printing that number, verbatim")
