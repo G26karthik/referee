@@ -463,9 +463,11 @@ def test_resource_limits_end_in_one_documented_blocker():
     pr = execute.protocol({"kind": "RECONSTRUCTION", "runs": 3, "runs_source": "referee_floor",
                            "target": {"relation": "a < b"}, "deviations": [
                                {"printed": "", "used": "thresholds 50..700", "changes_claim": False},
-                               {"printed": "x", "used": "0-based j", "changes_claim": True}]}, {"pilot_s": 8}, "t-test")
-    assert "REFEREE" in pr["runs_from"] and pr["supplied_by_referee"] == ["thresholds 50..700"]
-    assert pr["claim_changes"] == ["0-based j"] and "planner" in pr["relation"] and pr["pilot_seconds"] == 8
+                               {"printed": "x", "used": "0-based j", "changes_claim": True},
+                               {"printed": "", "used": "two baselines only", "changes_claim": True}]}, {"pilot_s": 8}, "t-test")
+    assert "REFEREE" in pr["runs_from"] and pr["supplied_by_referee"] == ["thresholds 50..700"]   # each choice listed once
+    assert pr["claim_changes"] == ["0-based j", "two baselines only"]
+    assert "planner" in pr["relation"] and pr["pilot_seconds"] == 8
 
 
 def test_detached_steps_outlive_their_poller():
@@ -539,6 +541,7 @@ def test_measurements_survive_a_later_stage_failure():
     assert st(pol + [["movies", m] for m in (0.3, 0.31, 0.32)], {}, {})["status"] == "RELATION_HOLDS"
     mixed = st(pol + [["movies", m] for m in (0.3, -0.31, 0.02)], {}, {})
     assert mixed["status"] == "INCONCLUSIVE"                                 # every stage must hold
+    assert mixed["rule"].startswith("mean paired margin")                    # ...and the rule it was decided by is said
     single = reconcile("RECONSTRUCTION", "", [0.7, 0.72], "", {}, True, True, "", rel,
                        staged=[["", 0.7], ["", 0.72]], failed={"2": "exit 1"})
     assert single["status"] == PARTIAL and single["status_on_completed"] == "RELATION_HOLDS"
@@ -548,6 +551,21 @@ def test_measurements_survive_a_later_stage_failure():
     assert report._headline([c], [{"claim_status": "PARTIAL_EVIDENCE"}]) == "CENTRAL_PARTIAL_EVIDENCE"
     assert report._state(Path("."), "C1", {"status": PARTIAL}) == "PARTIALLY_COMPLETED"
     assert report._state(Path("."), "C1", {"status": "BLOCKED", "reason": "RESOURCE BLOCKER: x"}) == "RESOURCE_LIMITED"
+    with tempfile.TemporaryDirectory() as t:        # an operator stop keeps what completed, per stage, deciding nothing
+        cfg = state.Config()
+        cfg.projects = Path(t)
+        (Path(t) / "p" / "checks" / "C1").mkdir(parents=True)
+        state.write_json(Path(t) / "p" / "checks" / "C1" / "check.json",
+                         {"id": "C1", "kind": "RECONSTRUCTION", "runs": 100, "target": {"relation": "a < b"}})
+        state.write_json(Path(t) / "p" / "checks" / "C1" / "exec.json", {
+            "stage": "run", "seed": 2, "records": 2, "fly": {}, "values": [0.1, 0.3, 0.2, 0.4],
+            "staged": [["k5", 0.1], ["k20", 0.3], ["k5", 0.2], ["k20", 0.4]]})
+        o = execute.stop(cfg, "p", "C1", "the host")
+        assert o["status"] == "INCONCLUSIVE" and not o.get("stages")
+        assert o["completed_stages"] == {"k5": {"n": 2, "mean": 0.15}, "k20": {"n": 2, "mean": 0.35}}
+    stopped = {"status": "INCONCLUSIVE", "values": [0.1] * 42, "runs": 14, "protocol": {"runs": 100}}
+    assert report._state(Path("."), "C1", stopped) == "PARTIALLY_COMPLETED"     # 14 of 100 runs is not COMPLETED
+    assert report._state(Path("."), "C1", {**stopped, "runs": 100}) == "COMPLETED"
 
 
 def test_a_proof_candidate_that_violates_a_premise_or_precision_is_not_a_counterexample():

@@ -170,7 +170,8 @@ def _staged(kind, printed, rel, seeded, staged, stages, failed, stage_errors) ->
                   stages=per)
     if all(x in SUPPORT for x in sts):
         return _r(sts[0], f"every stage holds [{brief}]", rule=next(iter(per.values())).get("rule", ""), stages=per)
-    return _r("INCONCLUSIVE", f"not every stage is decided [{brief}]", stages=per)
+    return _r("INCONCLUSIVE", f"not every stage is decided [{brief}]", stages=per,
+              rule=next((p["rule"] for p in per.values() if p.get("rule")), ""))
 
 
 def _point(kind: str, printed: str, values: list[float], seeded: bool) -> dict:

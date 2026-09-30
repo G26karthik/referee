@@ -1179,7 +1179,7 @@ def protocol(check: dict, st: dict, rule: str) -> dict:
                   if check.get("seed_flag") else "none (one documented run)"),
             "decision_rule": rule,
             **({"relation": f"{rel} (written by REFEREE's planner for the quoted sentence)"} if rel else {}),
-            "supplied_by_referee": [d["used"] for d in devs if not d.get("printed")],
+            "supplied_by_referee": [d["used"] for d in devs if not d.get("printed") and not d.get("changes_claim")],
             "claim_changes": [d["used"] for d in devs if d.get("changes_claim")],
             **({"pilot_seconds": st["pilot_s"]} if st.get("pilot_s") else {}),
             **({"admitted_under_check_budget_s": st["budget_s"]} if st.get("budget_s") else {}),
@@ -1236,6 +1236,10 @@ def _finish(cfg: state.Config, root: Path, check: dict, st: dict) -> bool:
                        values=st.get("values", []), runs=st.get("records", 0) + st.get("reused", 0), records="execution.jsonl",
                        finished_at=state.now())
     outcome["protocol"] = protocol(check, st, outcome.get("rule", ""))
+    if st.get("staged") and not outcome.get("stages") and outcome["status"] != "BLOCKED":
+        # Ended before its stages were decided (the host, the operator): what completed is kept per
+        # stage, never pooled across stages, and decides nothing.
+        outcome["completed_stages"] = _stage_summary(st["staged"])
     if st.get("reused"):          # seeds that ended earlier (seeds.jsonl) count as runs; which ones is said
         outcome["reused_seeds"] = st["reused"]
     for k in ("data_identity", "stage_times", "peak_mb"):

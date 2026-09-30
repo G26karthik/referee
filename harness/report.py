@@ -96,6 +96,8 @@ def _state(root: Path, cid: str, o: dict) -> str:
         return "NOT_RUN"
     if s == "INCONCLUSIVE" and not o.get("values"):
         return "FAILED"
+    if s == "INCONCLUSIVE" and (o.get("runs") or 0) < ((o.get("protocol") or {}).get("runs") or 0):
+        return "PARTIALLY_COMPLETED"             # ended (by the host, the operator) before its planned runs
     return "COMPLETED"
 
 
@@ -150,7 +152,9 @@ def _checks(root: Path, plan: dict) -> list[dict]:
                     "admissible": o.get("admissible"), "protocol": o.get("protocol"),
                     "image_check": o.get("image_check"), "pilot_values": o.get("pilot_values"),
                     "status": o.get("status"), "reason": o.get("reason", ""), "reason_by": o.get("reason_by", "harness"),
-                    "rule": o.get("rule", ""), "stages": o.get("stages"), "status_on_completed": o.get("status_on_completed"),
+                    "rule": o.get("rule") or next((p["rule"] for p in (o.get("stages") or {}).values() if p.get("rule")), ""),
+                    "stages": o.get("stages"), "status_on_completed": o.get("status_on_completed"),
+                    "completed_stages": o.get("completed_stages"),
                     "failed_seeds": o.get("failed_seeds"), "data_identity": o.get("data_identity"), "data": o.get("data"),
                     "resource": o.get("resource"), "stage_times": o.get("stage_times"), "peak_mb": o.get("peak_mb"),
                     "environment": o.get("environment"), "authorization": o.get("authorization", ""),
@@ -279,6 +283,10 @@ def _check_rows(checks: list[dict], led: dict) -> list[str]:
             got = "; ".join(f"{s}: " + (f"{p.get('margin', p.get('reproduced', ''))} n={p['n']}" if p.get("n") else
                                          p["status"]) for s, p in c["stages"].items()) \
                 if len(c["stages"]) <= 6 else f"{len(c['stages'])} stages: {_counts(c['stages'])}"
+        elif c.get("completed_stages"):              # per stage, never pooled across stages; decides nothing
+            cs = c["completed_stages"]
+            got = ("margin " if t.get("relation") else "") + ("; ".join(
+                f"{s}: {p['mean']:.6g} n={p['n']}" for s, p in cs.items()) if len(cs) <= 6 else f"{len(cs)} stages (see Stages)")
         # A harness rule states a fact and is shown as is; a reason may carry a script's or a model's
         # own words (a stderr tail, a refusal), so it is screened for status words.
         rule = c["status"] in SUPPORT + FAILURE and c["rule"]
@@ -393,7 +401,7 @@ def render(x, led: dict, rep: dict | None) -> str:
             + (f"printed \"{_cell(d['printed'], 120)}\" (p{d['page']})" if d["printed"] else "the paper is silent")
             + f" -> used: {_cell(d['used'], 200)}. Why: {_cell(d['why'], 200)}" for cid, d in devs] + [
             f"- {cid} environment: {r['action']}" for cid, rs in recs.items() for r in rs] + [""]
-    staged = [c for c in led["checks"] if c.get("stages") or c.get("failed_seeds")]
+    staged = [c for c in led["checks"] if c.get("stages") or c.get("failed_seeds") or c.get("completed_stages")]
     if staged:
         lines += ["## Stages and partial results (completed measurements are kept when a later stage fails)", ""]
         for c in staged:
@@ -408,6 +416,8 @@ def render(x, led: dict, rep: dict | None) -> str:
             if len(sts) > _STAGES_SHOWN:
                 lines.append(f"  - … {len(sts) - _STAGES_SHOWN} more stages, each with its status and reason in "
                              f"`ledger.json` (checks[{c['id']}].stages)")
+            lines += [f"  - stage {st}: n={pr['n']}, mean {pr['mean']} — completed before the check ended; decides nothing"
+                      for st, pr in list((c.get("completed_stages") or {}).items())[:_STAGES_SHOWN]]
             lines += [f"  - seed {k} did not complete: {_said(_cell(v, 220), led)}"
                       for k, v in sorted((c.get("failed_seeds") or {}).items())]
         lines.append("")
@@ -437,10 +447,12 @@ def render(x, led: dict, rep: dict | None) -> str:
     if prot:
         lines += ["## Protocol choices (what the paper stated, what REFEREE supplied)", ""]
         for cid, pr in prot:
+            rule = pr["decision_rule"] or next(c["rule"] for c in led["checks"] if c["id"] == cid)
             lines.append(f"- **{cid}**: runs {pr['runs']} ({pr['runs_from']}); seeds {pr['seeds']}; rule: "
-                         f"{_cell(pr['decision_rule'], 220)}" + (f"; relation {pr['relation']}" if pr.get("relation") else "")
+                         f"{_cell(rule, 220)}" + (f"; relation {pr['relation']}" if pr.get("relation") else "")
                          + (f"; pilot {pr['pilot_seconds']:.0f}s" if pr.get("pilot_seconds") else ""))
-            lines += [f"  - REFEREE supplied: {_cell(u, 220)}" for u in pr.get("supplied_by_referee", [])]
+            lines += [f"  - REFEREE supplied: {_cell(u, 220)}" for u in pr.get("supplied_by_referee", [])
+                      if u not in pr.get("claim_changes", [])]      # a claim-changing choice is listed once, below
             lines += [f"  - changes the claim: {_cell(u, 220)}" for u in pr.get("claim_changes", [])]
         lines.append("")
     lines += ["## Summary (model-written from the ledger)", "",
