@@ -35,6 +35,9 @@ THE SCRIPT CONTRACT
     and CONTINUE with the other units — never exit on it (that would discard what completed).
   - It never reads the paper's printed result to produce its own, and never compares with it:
     it computes; the harness compares.
+  - Where the checkout ships the code that computed the printed quantity (an analysis script, a
+    metrics module), compute it that way: import or follow that code and name its path in a
+    binding. Another estimator, probability or pooling is a claim-changing deviation.
   - Keep one run within the host's per-run limit. The harness times the first run as a pilot and
     stops with a documented blocker if the stated run count cannot finish; a long run may save
     progress under /work/ckpt (a per-seed scratch volume) and resume from it after a restart. Use

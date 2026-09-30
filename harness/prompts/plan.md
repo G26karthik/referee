@@ -46,7 +46,9 @@ central claim can use the slot, and say why in `incidental_why`. Kinds:
   RELEASED_DATA  Recompute a printed statistic or a stated comparison from data/result files
                  the authors released (in the checkout, or acquired below), by a short script
                  an independent verifier checks. PREFER this over a reconstruction when released
-                 results or scores are what the printed numbers were computed from.
+                 results or scores are what the printed numbers were computed from. Where the
+                 checkout ships the analysis code that computed the printed statistic, name that
+                 file in the check: the statistic is computed that code's way.
   RECONSTRUCTION Run an experiment the paper specifies when no documented command runs it: the
                  script DRIVES THE AUTHORS' OWN CODE from the checkout where it implements the
                  method (it runs in the authors' environment), else reimplements what the paper
