@@ -23,6 +23,9 @@ the compared output (`metric`, or the relation's names) carry the computed quant
 about — never a flag computed against the printed number? Does a `# REFEREE_PACKAGES:` line
 declare only what the script imports beyond its environment? Does the script print a
 REFEREE_DATA identity line for each dataset it loads, and keep going (not exit) on a mismatch?
+Does it stay the test the spec names (a compatibility test is not a benchmark; an audit of
+released results is not a recomputation)? Where the checkout's code and the paper define the
+compared quantity differently, does it compute every reading on the same data and cohort?
 
 HOW THE HARNESS WILL DECIDE (approve only if you accept that this script's output, read this
 way, tests the claim):

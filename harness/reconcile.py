@@ -10,6 +10,10 @@ paired margin beyond t*SE; a reproduction is RESOLVED only inside the confidence
 the mean and FAILED only outside the prediction interval of one more run. A certificate's
 counterexample is an instance on which every premise of the EXACT claim holds; a violation
 found only after changing the claim's reading, or on no admissible instance, is not one.
+Identical results of several runs are one measurement, never independent replicates. Where the
+paper's text and the authors' code define the compared quantity differently, both readings are
+decided on the same run (same data, same cohort) and neither is chosen. An engineering
+compatibility test is a condition every run must meet, never a statistical comparison.
 """
 from __future__ import annotations
 
@@ -24,6 +28,9 @@ QUALIFIED = ("PREMISE_NOT_MET", "VIOLATION_UNDER_CHANGED_READING")   # neither s
 # Some measurements completed and are kept (`stages`, `status_on_completed`), but the protocol did
 # not: a stage or a seed failed. Never support, never a failure of the paper.
 PARTIAL = "PARTIAL"
+# The paper's definition and the authors' code's definition, run on the same data and cohort, give
+# different results: recorded with both, never resolved by the harness.
+READINGS_DIFFER = "READINGS_DIFFER"
 _TOL = 1e-9   # ponytail: a violation smaller than this (relative) is below double precision
 _T975 = ((1, 12.706), (2, 4.303), (3, 3.182), (4, 2.776), (5, 2.571), (6, 2.447), (7, 2.365), (8, 2.306),
          (9, 2.262), (10, 2.228), (12, 2.179), (15, 2.131), (20, 2.086), (30, 2.042), (60, 2.0), (120, 1.98))
@@ -103,9 +110,14 @@ def _r(status: str, reason: str, **kw) -> dict:
 def reconcile(kind: str, printed: str, values: list[float], failure: str, ev: dict,
               seeded: bool, authorized: bool, why: str, rel: str = "", cert: list[dict] | None = None,
               changed: bool = False, step: bool = False, staged: list | None = None,
-              failed: dict | None = None, stage_errors: dict | None = None) -> dict:
+              failed: dict | None = None, stage_errors: dict | None = None, readings: list | None = None,
+              cohort_mismatch: list | None = None, deterministic: bool = False, test: str = "") -> dict:
     """`failure` ends a check that measured nothing; `failed` (seed -> error) records seeds that
-    failed after the check had measured something, whose completed measurements are kept."""
+    failed after the check had measured something, whose completed measurements are kept.
+    `staged` entries are [stage, value] or [stage, value, reading]; `readings` names the
+    definitions (the paper's, the code's) the script computed side by side; `deterministic`: the
+    computation has no randomness (released files, a declared deterministic pipeline); `test`
+    "compatibility": an engineering condition each run must meet."""
     if not authorized:
         return _r("BLOCKED", f"not run: {why}. A refusal by this harness is not evidence about the paper.")
     if not admits(kind):
@@ -131,11 +143,51 @@ def reconcile(kind: str, printed: str, values: list[float], failure: str, ev: di
                       f"code ({ev['own_code_crash']}): {failure[:400]}", rule="a run that starts and breaks in its own code")
         return _r("INCONCLUSIVE", f"the run failed ({failure[:400]}), but not by a crash inside the authors' own "
                   "code, so nothing is established about the paper")
-    stages = sorted({s for s, _ in staged or []} | set(stage_errors), key=lambda s: (s == "", s))
+    decide = lambda vals: (_condition(rel, vals) if rel and test == "compatibility" else
+                           _relation(kind, rel, vals, deterministic) if rel else
+                           _point(kind, printed, vals, seeded, deterministic))
+    if readings:
+        return _by_reading(readings, staged or [], failed, stage_errors, decide, cohort_mismatch or [], printed)
+    return _decide(values, [e[:2] for e in staged or []], failed, stage_errors, decide)
+
+
+def _decide(values: list[float], staged: list, failed: dict, stage_errors: dict, decide) -> dict:
+    stages = sorted({s for s, _ in staged} | set(stage_errors), key=lambda s: (s == "", s))
     if stages and stages != [""]:
-        return _staged(kind, printed, rel, seeded, staged or [], stages, failed, stage_errors)
-    res = _relation(kind, rel, values) if rel else _point(kind, printed, values, seeded)
+        return _staged(staged, stages, failed, stage_errors, decide)
+    res = decide(values)
     return _partial(res, failed) if failed else res
+
+
+def _by_reading(names: list, staged: list, failed: dict, stage_errors: dict, decide, mismatch: list,
+                printed: str) -> dict:
+    """Each reading decided on its own results of the same runs. The same finding under every
+    reading (same status and, for a printed number, values within its printed precision) stands;
+    otherwise READINGS_DIFFER with both: the harness never picks the reading that matches."""
+    per = {}
+    for r in names:
+        sub = [[e[0], e[1]] for e in staged if len(e) > 2 and e[2] == r]
+        per[r] = _decide([v for _, v in sub], sub, failed, stage_errors, decide)
+    show = lambda p: p["status"] + (f" {p['reproduced']:g}" if isinstance(p.get("reproduced"), (int, float)) else
+                                    f" margin {p['margin']:g}" if isinstance(p.get("margin"), (int, float)) else "")
+    brief = "; ".join(f"{r}: {show(p)}" for r, p in per.items())
+    base = {"readings": per, "rule": "each reading decided on the same runs, data and cohort; none is chosen"}
+    if mismatch:
+        return _r("INCONCLUSIVE", f"the readings were computed on different cohorts in stage(s) {mismatch[:5]}, so "
+                  f"they are not comparable [{brief}]", **base)
+    if any(not any(len(e) > 2 and e[2] == r for e in staged) for r in names):
+        return _r("INCONCLUSIVE", f"not every declared reading printed a result [{brief}]", **base)
+    if any(p["status"] == PARTIAL for p in per.values()):
+        done = next(p["status_on_completed"] for p in per.values() if p["status"] == PARTIAL)
+        return {**_partial(_r(done, brief), failed, extra="; readings: " + brief), **base}
+    vals = [p.get("reproduced") for p in per.values()]
+    prec = half_width(printed) if printed else 0.0
+    same = len({p["status"] for p in per.values()}) == 1 and (
+        not all(isinstance(v, (int, float)) for v in vals) or max(vals) - min(vals) <= prec + 1e-12)
+    if same:
+        return {**next(iter(per.values())), "reason": f"every reading gives the same finding [{brief}]", **base}
+    return _r(READINGS_DIFFER, f"the readings give different results on the same runs, data and cohort [{brief}]; "
+              "which one the paper's number means is for a human to decide", **base)
 
 
 def _partial(res: dict, failed: dict, stages: dict | None = None, extra: str = "") -> dict:
@@ -147,7 +199,7 @@ def _partial(res: dict, failed: dict, stages: dict | None = None, extra: str = "
             "failed_seeds": failed, **({"stages": stages} if stages else {})}
 
 
-def _staged(kind, printed, rel, seeded, staged, stages, failed, stage_errors) -> dict:
+def _staged(staged, stages, failed, stage_errors, decide) -> dict:
     """Each stage (a dataset, a setting) is decided over its own seeds; a stated relation must
     hold in every stage. A stage that started and printed no result is not completed. A failure
     found in a completed stage stands; otherwise any incomplete stage or failed seed is PARTIAL."""
@@ -155,7 +207,7 @@ def _staged(kind, printed, rel, seeded, staged, stages, failed, stage_errors) ->
     for s in stages:
         vals = [v for t, v in staged if t == s]
         per[s or "(unnamed)"] = ({"status": "NOT_COMPLETED", "reason": stage_errors.get(s, "no result line")[:400]}
-                                 if not vals else _relation(kind, rel, vals) if rel else _point(kind, printed, vals, seeded))
+                                 if not vals else decide(vals))
     sts = [p["status"] for p in per.values()]
     brief = "; ".join(f"{s}: {p['status']}" + (f" (n={p['n']})" if p.get("n") else "") for s, p in per.items())
     fail = next((s for s, p in per.items() if p["status"] in FAILURE), None)
@@ -174,8 +226,9 @@ def _staged(kind, printed, rel, seeded, staged, stages, failed, stage_errors) ->
               rule=next((p["rule"] for p in per.values() if p.get("rule")), ""))
 
 
-def _point(kind: str, printed: str, values: list[float], seeded: bool) -> dict:
-    """A produced value against the printed number."""
+def _point(kind: str, printed: str, values: list[float], seeded: bool, deterministic: bool = False) -> dict:
+    """A produced value against the printed number. Identical values of several runs are one
+    measurement (n_independent 1): they never give a noise band."""
     n = len(values)
     claimed = parse_value(printed)
     if not values or claimed is None:
@@ -194,8 +247,16 @@ def _point(kind: str, printed: str, values: list[float], seeded: bool) -> dict:
         return _r("INCONCLUSIVE", f"printed {claimed:g} vs produced {mean:g}: the produced value is the complement "
                   "(error vs accuracy), a metric-orientation mismatch, not a failed reproduction", **out)
     note = "" if kind == "AUTHOR_CODE" else " (not the authors' code: a finding about the paper's stated method or data)"
+    if deterministic and kind == "RECONSTRUCTION" and n > 1 and std > 0:
+        return _r("INCONCLUSIVE", f"declared deterministic, but its {n} runs differ (std {std:.4g}): the computation is "
+                  "not deterministic as declared, so nothing is decided", rule="a declared deterministic pipeline must "
+                  "repeat exactly", **out)
     if not seeded or n < 2 or std == 0:
         rule = "deterministic run: agreement only within the printed precision; a difference is reported, not scored"
+        if n > 1 and std == 0:
+            out["n_independent"] = 1
+            rule += (f"; the {n} runs gave identical results: one measurement, not {n} replicates"
+                     + ("" if deterministic else " (the seed did not vary the run)"))
         return (_r("RESOLVED_VERIFIED", f"produced {mean:g} vs printed {printed}: within printed precision{note}",
                    rule=rule, **out) if eff <= 1e-12 else
                 _r("INCONCLUSIVE", f"produced {mean:g} vs printed {printed}: |delta| {out['delta']:g} exceeds the "
@@ -214,13 +275,32 @@ def _point(kind: str, printed: str, values: list[float], seeded: bool) -> dict:
               f"interval of {n} seeds — consistent with noise, not pinned down", rule=rule, **out)
 
 
-def _relation(kind: str, rel: str, margins: list[float]) -> dict:
+def _relation(kind: str, rel: str, margins: list[float], deterministic: bool = False) -> dict:
     """A comparison the paper states, over paired results (one per REFEREE_RESULT line):
     decided on the mean margin beyond t(n-1)*SE (a two-sided 95% paired t-test). One line
-    decides only when it is an exact recomputation from released data."""
+    decides only when it is an exact recomputation from released data. Identical margins of
+    several runs are one measurement: it decides only a deterministic computation, and for a
+    seeded experiment it shows the seed did not vary the run (no replicates, no noise band)."""
     n, strict = len(margins), relation(rel)[1] in ("<", ">")
     if not n:
         return _r("INCONCLUSIVE", f"no result carried every output the relation {rel!r} names")
+    if deterministic and kind == "RECONSTRUCTION" and n > 1 and len(set(margins)) > 1:
+        return _r("INCONCLUSIVE", f"declared deterministic, but its {n} runs differ: the computation is not deterministic "
+                  "as declared, so its runs are neither one measurement nor replicates", relation=rel, n=n,
+                  rule="a declared deterministic pipeline must repeat exactly")
+    if n > 1 and len(set(margins)) == 1:
+        if not deterministic:
+            return _r("INCONCLUSIVE", f"the {n} seeded runs gave identical results: the seed did not vary the run, so "
+                      f"they are one measurement, not {n} independent replicates, and give no noise band",
+                      relation=rel, margin=round(margins[0], 6), n=n, n_independent=1,
+                      rule="identical results of seeded runs are one measurement, not replicates")
+        m = margins[0]
+        out = {"relation": rel, "margin": round(m, 6), "band": 0.0, "n": n, "n_independent": 1,
+               "rule": f"deterministic computation: identical in all {n} runs, one measurement (not {n} replicates), "
+                       "decided on the sign of its margin"}
+        if m > 0 or (not strict and m == 0):
+            return _r("RELATION_HOLDS", f"{rel}: margin {m:.4g} (one deterministic measurement)", **out)
+        return _r("RELATION_VIOLATED", f"{rel} does not hold: margin {m:.4g} (one deterministic measurement)", **out)
     if n == 1 and kind != "RELEASED_DATA":
         return _r("INCONCLUSIVE", "one result of an experiment has no noise band to decide a relation on",
                   relation=rel, margin=margins[0], n=1)
@@ -236,6 +316,24 @@ def _relation(kind: str, rel: str, margins: list[float]) -> dict:
         return _r("RELATION_VIOLATED", f"{rel} does not hold: mean margin {m:.4g} over {n} result(s)", **out)
     return _r("INCONCLUSIVE", f"{rel}: mean margin {m:.4g} is within t*SE ({band:.4g}) of equality over {n} "
               "result(s): not decided", **out)
+
+
+def _condition(rel: str, margins: list[float]) -> dict:
+    """An engineering compatibility test (a layer swapped in trains, a module runs): a condition
+    each run must meet. No statistics and no performance conclusion: every run meets it, holds;
+    no run meets it, violated; some do, inconclusive (unstable)."""
+    n, strict = len(margins), relation(rel)[1] in ("<", ">")
+    if not n:
+        return _r("INCONCLUSIVE", f"no result carried every output the condition {rel!r} names")
+    ok = sum(1 for m in margins if m > 0 or (not strict and m == 0))
+    out = {"relation": rel, "n": n, "met": ok, "margin": round(min(margins), 6),
+           "rule": "engineering compatibility condition, required in every run; no statistical inference and no "
+                   "performance conclusion"}
+    if ok == n:
+        return _r("RELATION_HOLDS", f"{rel}: met in all {n} run(s) (compatibility only)", **out)
+    if ok == 0:
+        return _r("RELATION_VIOLATED", f"{rel}: met in none of {n} run(s)", **out)
+    return _r("INCONCLUSIVE", f"{rel}: met in {ok} of {n} run(s): not stable, not decided", **out)
 
 
 def arithmetic(lo: float, hi: float, printed: str) -> dict:

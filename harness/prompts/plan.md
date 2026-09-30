@@ -29,6 +29,11 @@ experiment needs 8 A100s for a week", "the data is neither released, cited nor g
 "Only shown in a figure", "the repository has no ready-made command" and "the data is not in the
 checkout" are NOT such blockers: a stated comparison is checked through a RELATION target, an
 experiment without a command through RECONSTRUCTION, and cited public data through `acquire`.
+Give each claim a `claim_type`: "engineering" (a component can be integrated, swapped in, run or
+trained), "performance" (a method beats, matches or improves on others), "value" (a printed
+number) or "theory" (a mathematical statement). A sentence making two claims ("can replace a
+layer AND improves accuracy") is two central claims, each with its own verbatim quote and type:
+a test of one never stands for the other.
 
 STEP 2 — CHECKS, at most {{max_checks}}, spent on the central claims FIRST; distinct claims get
 independent checks. A check no central claim lists is INCIDENTAL: propose one only when no
@@ -46,16 +51,36 @@ central claim can use the slot, and say why in `incidental_why`. Kinds:
   RELEASED_DATA  Recompute a printed statistic or a stated comparison from data/result files
                  the authors released (in the checkout, or acquired below), by a short script
                  an independent verifier checks. PREFER this over a reconstruction when released
-                 results or scores are what the printed numbers were computed from. Where the
-                 checkout ships the analysis code that computed the printed statistic, name that
-                 file in the check: the statistic is computed that code's way.
+                 results or scores are what the printed numbers were computed from. Give `basis`:
+                 "published_results" (an AUDIT: the files hold the authors' own reported results,
+                 and the check re-derives the printed number from them — it shows consistency, it
+                 re-runs nothing) or "predictions" (the files hold per-item predictions or scores,
+                 and the check recomputes the metric from them). Nothing here is trained.
+  PAPER VS CODE  Where the checkout ships code that computes the compared quantity (an analysis
+                 script, a metrics module), READ it and compare its definition with the paper's
+                 text: the estimator, which items, positions or candidates are pooled, the
+                 selection, the aggregation. If they differ, give `readings`: [{"name": "paper",
+                 "source": "paper", "quote": the paper's definition verbatim}, {"name": "code",
+                 "source": the tracked file's path, "quote": the literal code lines}]. The script
+                 then computes EVERY reading in the same run, on the same data and the same cohort
+                 (models, items), and the harness decides each and never chooses one. Neither the
+                 paper nor the code is presumed right; which reading matches the printed number
+                 is not a reason to prefer it.
   RECONSTRUCTION Run an experiment the paper specifies when no documented command runs it: the
                  script DRIVES THE AUTHORS' OWN CODE from the checkout where it implements the
                  method (it runs in the authors' environment), else reimplements what the paper
                  states. It must fit the host above at the paper's stated scale (never shrunk;
                  use the GPU when the method trains networks). Every detail neither paper nor
                  code fixes is declared by the script author as a deviation; a check that needs
-                 many guessed details is not decisive — choose another route.
+                 many guessed details is not decisive — choose another route. Give `test`:
+                 "performance" (a comparison or a printed number, over independent seeded
+                 replicates at the paper's protocol) or "compatibility" (an ENGINEERING claim: the
+                 component is swapped into one stated configuration and must integrate, run and
+                 train; its relation target is a per-run condition such as "loss_first -
+                 loss_last > 0", with every output named in `define`; it runs SH_REPLICATES times
+                 on a 30-minute budget and supports only compatibility). An engineering claim is
+                 never tested by a benchmark: a performance claim about the same component is a
+                 separate claim with its own performance check.
   CERTIFICATE    Check a theorem, lemma, bound or ONE explicit step of its printed proof on
                  concrete instances in exact arithmetic. Give `statement_quote` (the statement
                  verbatim) and, to check a proof step instead, `step_quote` (the step verbatim).
@@ -98,11 +123,16 @@ its mean paired margin beyond Student-t standard errors over the seeds). AUTHOR_
 Write ONLY this JSON to the output path you were given:
 {"repo_is_authors": true,
  "repo_note": "why the repository is (not) the authors' own code for these experiments",
- "central_claims": [{"quote": "verbatim", "scope": ["every method/dataset/setting it names"],
+ "central_claims": [{"quote": "verbatim", "claim_type": "engineering|performance|value|theory",
+                     "scope": ["every method/dataset/setting it names"],
                      "checks": ["C1"], "omitted": [{"item": "a scope item", "why": "concrete reason"}],
                      "why_unchecked": ""}],
  "checks": [
    {"id": "C1", "kind": "AUTHOR_CODE|RELEASED_DATA|RECONSTRUCTION|CERTIFICATE|ARITHMETIC",
+    "basis": "published_results|predictions (RELEASED_DATA only)",
+    "test": "performance|compatibility (RECONSTRUCTION only)",
+    "define": {"<output name>": "what the script computes under that name"},
+    "readings": [],
     "concerns": ["contradiction-02"],
     "claim_quote": "verbatim sentence this check bears on",
     "covers": ["the scope items this check tests"],

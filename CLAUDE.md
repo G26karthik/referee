@@ -69,13 +69,21 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     text is declared, re-found and flagged `changes_claim` (it alters a premise, conclusion,
     index or definition) or not (it fixes a detail the claim leaves open: a protocol choice
     REFEREE supplied, reported as such with runs, seeds and decision rule). Two checks of one
-    printed object that disagree are CHECKS_DISAGREE.
+    printed object that disagree are CHECKS_DISAGREE. Where the paper's text and the checkout's
+    code define the compared quantity differently, both are declared `readings` (each re-found:
+    paper verbatim, code literal in a tracked file) and computed in ONE run on the same data and
+    cohort (`reading`, `cohort` per result line); each is decided, neither is presumed right, and
+    differing results are READINGS_DIFFER (claim READINGS_DISAGREE).
 16. **A counterexample satisfies every premise of the exact claim.** Certificates report
     `premises_hold` per instance; a violation on an inadmissible instance is nothing, one found
     only under a changed reading is VIOLATION_UNDER_CHANGED_READING, no admissible instance is
     PREMISE_NOT_MET (claim status READING_CHANGED / PREMISE_NOT_MET, never a failure).
 17. **Small samples are decided with Student-t** (two-sided 95%): a relation beyond t·SE; a
     reproduction RESOLVED inside the CI of the mean, FAILED outside the prediction interval.
+    Identical results of several runs are one measurement (`n_independent` 1), never replicates:
+    a recomputation from released files runs once, a pipeline its author declares deterministic
+    (`stochastic: false`) runs twice and must repeat exactly; a seeded experiment whose runs are
+    identical decides nothing.
 18. **No arithmetic error from extracted math without the page image.** An independent
     transcriber reads every number of an ARITHMETIC_CONTRADICTION or a CONFIRMED arithmetic
     concern off the page PNG (masked context); disagreement withdraws the assertion.
@@ -92,7 +100,12 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     must hold in every stage); a stage that started without a result, or a failed seed, makes
     the check PARTIAL (`status_on_completed` kept, claim status PARTIAL_EVIDENCE). Only a run
     that measured nothing ends the check. A check's state (NOT_STARTED, RUNNING,
-    PARTIALLY_COMPLETED, COMPLETED, FAILED, RESOURCE_LIMITED, NOT_RUN) is reported.
+    PARTIALLY_COMPLETED, COMPLETED, FAILED, RESOURCE_LIMITED, NOT_RUN) is how its runs went
+    (`execution`: planned, ended, exited cleanly, result-schema defects), recorded apart from
+    what they found. A result-schema defect (a declared unit without its line, an undeclared stage
+    name, a missing reading or cohort) is the script's: the draft run returns it to its author; in
+    evidence it is recorded, and only one completed run that declared one unit and printed it
+    unnamed is read as that unit — several units are never matched by guessing.
 21. **No verifier approves a script nobody ran.** The harness runs every sealed script once
     (seed 0, results masked, never evidence) before its verifier; a script failing there goes
     back to its author with the error. A certificate's violation within 1e-9 (relative) without
@@ -109,7 +122,12 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     READING_CHANGED, never support or failure of the printed claim. Every scope item a central
     claim names (methods, datasets) is covered by a check or omitted with a reason; a central
     claim still undecided after all checks gets one follow-up plan (plan:2, SH_MAX_FOLLOWUP_CHECKS).
-    Superseded outcomes stay visible in the report.
+    Superseded outcomes stay visible in the report. Every check names its basis (an audit of
+    released result files, a recomputation from released predictions, a fresh run) and the
+    report says which. A central claim has a `claim_type`; an engineering claim (a component
+    integrates, trains) is tested by a compatibility test — a per-run condition, SH_REPLICATES
+    runs, SH_COMPAT_BUDGET_S — that supports only compatibility, and a performance claim by its
+    own performance test; the plan seal refuses either standing for the other.
 
 ## Dependency recovery (documented, isolated, recorded)
 
@@ -141,12 +159,13 @@ python run.py env <paper-id>                               # authors' env (the h
 python run.py status [<paper-id>]
 python run.py pack <out.zip> [<paper-id> ...] --clean      # zip artifacts, then delete clones/venvs
 python tests/test_kernel.py
+python tools/replay.py <projects dir> [--out f.json]              # re-decide recorded runs, no model or container
 ```
 
 Gates: `SH_ALLOW_REPO_EXEC`, `SH_ALLOW_SCRIPT_EXEC`, `SH_ALLOW_INSTALL`, `SH_ALLOW_NETWORK`
 (default on, for cloning and cited-data downloads), `SH_ALLOW_SOURCE_SEARCH`. Caps:
 `SH_MAX_CHECKS` (6), `SH_MAX_FOLLOWUP_CHECKS` (3), `SH_MAX_REVISIONS` (3), `SH_MAX_TRIES` (3),
-`SH_MAX_DATA_GB` (20), `SH_CHECK_BUDGET_S` (7200), `SH_RUN_TIMEOUT_S` (3600). Docker is the only
+`SH_MAX_DATA_GB` (20), `SH_CHECK_BUDGET_S` (7200), `SH_COMPAT_BUDGET_S` (1800), `SH_RUN_TIMEOUT_S` (3600). Docker is the only
 execution backend.
 
 Delegation has exactly one channel: the workflow's isolated subagents read a task's files,

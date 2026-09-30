@@ -61,6 +61,9 @@ class Config:
     parallel: int = field(default_factory=lambda: _int("SH_PARALLEL", 2))
     # ponytail: a check projected (from its timed pilot run) past 2 h is a documented blocker, not downscaled.
     check_budget_s: int = field(default_factory=lambda: _int("SH_CHECK_BUDGET_S", 7200))
+    # ponytail: an engineering compatibility test (does the component integrate and train) is a few
+    # runs of one configuration; 30 min is its budget, never a performance benchmark's.
+    compat_budget_s: int = field(default_factory=lambda: _int("SH_COMPAT_BUDGET_S", 1800))
     run_timeout_s: int = field(default_factory=lambda: _int("SH_RUN_TIMEOUT_S", 3600))
     install_timeout_s: int = field(default_factory=lambda: _int("SH_INSTALL_TIMEOUT_S", 3600))
     try_timeout_s: int = field(default_factory=lambda: _int("SH_TRY_TIMEOUT_S", 300))

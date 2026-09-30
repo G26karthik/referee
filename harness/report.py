@@ -17,7 +17,7 @@ from pathlib import Path
 from . import state
 from .evidence import flat
 from .execute import EVIDENCE
-from .reconcile import FAILURE, PARTIAL, SUPPORT
+from .reconcile import FAILURE, PARTIAL, READINGS_DIFFER, SUPPORT
 
 _SUPPORT_WORDS = ("verif(?!ier)", "reproduc", "confirm", "validat(?!ion)", "replicat", "corroborat")  # a validation set is data
 _FAILURE_WORDS = ("refut", "disprov", "counterexampl", "contradict", "falsif", "failed to reproduc",
@@ -26,7 +26,11 @@ _FAILURE_WORDS = ("refut", "disprov", "counterexampl", "contradict", "falsif", "
 _NOUNS = re.compile(r"\b(?:\d+|seeded|independent|per|of)\s+replicates?\b|\breplicates?\s+(?:count|number)s?\b", re.I)
 _STAGES_SHOWN = 40   # ponytail: stages listed per check in review.md; every stage is in ledger.json
 _RANK = {"FATAL": 3, "MAJOR": 2, "MINOR": 1, "NOTE": 0}
-_TESTED = SUPPORT + FAILURE + ("NO_VIOLATION_FOUND",)
+_TESTED = SUPPORT + FAILURE + ("NO_VIOLATION_FOUND", READINGS_DIFFER)
+# What each evidence basis is, in the reader's words: an audit of published results is not a
+# recomputation from predictions, and neither is a fresh run.
+BASIS_WORDS = {"published_results": "audit of released result files", "predictions": "recomputed from released predictions",
+               "fresh_run": "fresh run", "exact_instances": "exact instances", "paper_numbers": "the paper's own numbers"}
 
 
 def merged(plan: dict | None, follow: dict | None) -> dict | None:
@@ -51,14 +55,19 @@ def _changed(c: dict) -> bool:
     return any(d.get("changes_claim") for d in c.get("deviations") or [])
 
 
-def _claim_status(cs: list[dict], conflicted: bool = False) -> str:
+def _claim_status(cs: list[dict], conflicted: bool = False, claim_type: str = "") -> str:
     """What the checks of one central claim FOUND. A failed step of a printed proof is a gap in
     the proof, never a refutation of the statement; a premise no tested instance met, or a
     result obtained only after changing what the claim says (a premise, a definition, the
     method's tuning or training data...), is neither support nor failure of the printed claim;
-    a check whose protocol did not complete is partial evidence, whatever its completed part says."""
+    a check whose protocol did not complete is partial evidence, whatever its completed part says.
+    Readings of one quantity that differ (the paper's definition, the code's) are recorded, not
+    resolved; an engineering compatibility test speaks only for an engineering claim."""
     if not cs:
         return "NOT_CHECKED"
+    cs = [c for c in cs if not (c.get("test") == "compatibility" and claim_type and claim_type != "engineering")]
+    if not cs:
+        return "NOTHING_DECIDED"
     if conflicted:
         return "CHECKS_DISAGREE"
     # A certificate separates its readings itself (COUNTEREXAMPLE_FOUND is always about the text as
@@ -69,6 +78,8 @@ def _claim_status(cs: list[dict], conflicted: bool = False) -> str:
         return "FAILURE_FOUND"
     if fails:
         return "PROOF_GAP_FOUND"
+    if any(c["status"] == READINGS_DIFFER for c in cs):
+        return "READINGS_DISAGREE"
     if any(c["status"] in SUPPORT and not moved(c) for c in cs):
         return "SUPPORT_FOUND"
     if any(c["status"] == "PREMISE_NOT_MET" for c in cs):
@@ -88,6 +99,13 @@ def _state(root: Path, cid: str, o: dict) -> str:
     if not o:
         return "RUNNING" if (root / "checks" / cid / "exec.json").exists() else "NOT_STARTED"
     s = o.get("status")
+    ex = o.get("execution")
+    if ex and s not in ("BLOCKED", "NOT_CHECKABLE"):      # how the runs went, apart from what they found
+        if not ex.get("runs_exited_ok") and not o.get("values"):
+            return "FAILED"
+        if (ex.get("runs_ended") or 0) < (ex.get("runs_planned") or 0) or ex.get("runs_failed"):
+            return "PARTIALLY_COMPLETED"
+        return "COMPLETED"
     if s == PARTIAL:
         return "PARTIALLY_COMPLETED"
     if s == "BLOCKED":
@@ -112,7 +130,10 @@ def _done(c: dict) -> str:
     stages = "".join(f"; {s}: {p['status']}" + (f" n={p['n']}" if p.get("n") else "")
                      for s, p in st.items()) if len(st) <= 6 else f"; {len(st)} stages: {_counts(st)} (see Stages)"
     extra = (f" (on what completed: {c['status_on_completed']})" if c.get("status_on_completed") else "")
-    return (f"{c['id']} {c['kind']}{' proof step' if c['evidence'] == 'PROOF_AUDIT' else ''} on {what}{stages}"
+    extra += "".join(f"; reading {r}: {p['status']}" for r, p in (c.get("readings") or {}).items())
+    label = f" {c['test']} test" if c.get("test") == "compatibility" else ""
+    label += f" ({BASIS_WORDS[c['basis']]})" if c.get("basis") in ("published_results", "predictions") else ""
+    return (f"{c['id']} {c['kind']}{label}{' proof step' if c['evidence'] == 'PROOF_AUDIT' else ''} on {what}{stages}"
             f"{' (claim reading changed)' if _changed(c) else ''}: {c['status']}{extra}")
 
 
@@ -142,6 +163,9 @@ def _checks(root: Path, plan: dict) -> list[dict]:
                     "claim": c["claim"], "target": c.get("target"), "statement": c.get("statement", ""),
                     "step": c.get("step", ""), "printed": c.get("printed", ""), "metric": run.get("metric", c.get("metric", "")),
                     "covers": c.get("covers", []), "acquire": c.get("acquire", []),
+                    "test": c.get("test", ""), "basis": c.get("basis", ""), "define": c.get("define"),
+                    "reading_defs": run.get("readings") or c.get("readings") or [], "readings": o.get("readings"),
+                    "execution": o.get("execution"), "stochastic": run.get("stochastic"),
                     "command": run.get("command", ""), "identity": run.get("identity"),
                     "script_sha256": run.get("script_sha256", ""), "deviations": run.get("deviations", []),
                     "premise_argument": run.get("premise_argument", ""),
@@ -203,7 +227,7 @@ def _central(plan: dict, checks: list[dict], conf: list[dict]) -> list[dict]:
     by_id, conflicted = {c["id"]: c for c in checks}, {k for x in conf for k in x["checks"]}
     return [{**cc, "statuses": {k: by_id[k]["status"] for k in cc["checks"] if k in by_id},
              "claim_status": _claim_status([by_id[k] for k in cc["checks"] if k in by_id],
-                                           bool(conflicted & set(cc["checks"]))),
+                                           bool(conflicted & set(cc["checks"])), cc.get("claim_type", "")),
              "deviations": sum(len(by_id[k]["deviations"]) for k in cc["checks"] if k in by_id)}
             for cc in plan["central_claims"]]
 
@@ -214,7 +238,8 @@ def _headline(checks: list[dict], claims: list[dict]) -> str:
         return "CHECKS_PENDING"
     st = [c["claim_status"] for c in claims]
     for found, head in (("FAILURE_FOUND", "CENTRAL_FAILURE_FOUND"), ("CHECKS_DISAGREE", "CENTRAL_CHECKS_DISAGREE"),
-                        ("PROOF_GAP_FOUND", "CENTRAL_PROOF_GAP_FOUND")):
+                        ("PROOF_GAP_FOUND", "CENTRAL_PROOF_GAP_FOUND"),
+                        ("READINGS_DISAGREE", "CENTRAL_READINGS_DISAGREE")):
         if found in st:
             return head
     if st and all(s == "SUPPORT_FOUND" for s in st):
@@ -241,6 +266,8 @@ def _workflow(checks: list[dict]) -> dict:
     return {"checks_planned": len(checks), "finished": len([c for c in checks if c["status"] != "PENDING"]),
             "reached_a_scientific_status": by(*_TESTED), "blocked": by("BLOCKED"), "partial": by(PARTIAL),
             "inconclusive": by("INCONCLUSIVE"), "not_checkable": by("NOT_CHECKABLE"),
+            "readings_differ": by(READINGS_DIFFER),
+            "result_schema_defects": [c["id"] for c in checks if (c.get("execution") or {}).get("schema_defects")],
             "states": {c["id"]: c.get("state") for c in checks},
             "environment_recoveries": {c["id"]: c["environment"]["recovery"] for c in checks
                                        if (c.get("environment") or {}).get("recovery")}}
@@ -279,7 +306,11 @@ def _check_rows(checks: list[dict], led: dict) -> list[str]:
         target = t.get("relation") or c["printed"] or _cell(c["step"] or c["statement"], 60)
         got = "" if not c.get("values") else (("margin " if t.get("relation") else "")
                                               + f"{sum(c['values']) / len(c['values']):.6g} (n={len(c['values'])})")
-        if c.get("stages"):
+        if c.get("readings"):                        # each definition's own result, side by side
+            got = "; ".join(f"{r}: " + (f"{p['reproduced']:g}" if isinstance(p.get("reproduced"), (int, float)) else
+                                        f"margin {p['margin']:g}" if isinstance(p.get("margin"), (int, float)) else
+                                        p["status"]) for r, p in c["readings"].items())
+        elif c.get("stages"):
             got = "; ".join(f"{s}: " + (f"{p.get('margin', p.get('reproduced', ''))} n={p['n']}" if p.get("n") else
                                          p["status"]) for s, p in c["stages"].items()) \
                 if len(c["stages"]) <= 6 else f"{len(c['stages'])} stages: {_counts(c['stages'])}"
@@ -291,8 +322,11 @@ def _check_rows(checks: list[dict], led: dict) -> list[str]:
         # own words (a stderr tail, a refusal), so it is screened for status words.
         rule = c["status"] in SUPPORT + FAILURE and c["rule"]
         why = _cell(c["rule"] if rule else c["reason"] or c["rule"], 160)
-        rows.append(f"| {c['id']} | {c['kind']} ({c['evidence']}) | {_cell(c['claim'], 70)} | {_cell(target, 40)} | "
-                    f"{_cell(got, 80)} | **{c['status']}** ({c.get('state', '')}) | {len(c['deviations']) or ''} | "
+        ev = c["evidence"] + (f"; {BASIS_WORDS[c['basis']]}" if c.get("basis") in ("published_results", "predictions")
+                              else "") + ("; compatibility test" if c.get("test") == "compatibility" else "")
+        state_ = c.get("state", "") + ("; result-schema defect" if (c.get("execution") or {}).get("schema_defects") else "")
+        rows.append(f"| {c['id']} | {c['kind']} ({ev}) | {_cell(c['claim'], 70)} | {_cell(target, 40)} | "
+                    f"{_cell(got, 80)} | **{c['status']}** ({state_}) | {len(c['deviations']) or ''} | "
                     f"{why if rule else _said(why, led)} |")
     return rows
 
@@ -317,7 +351,8 @@ def table(led: dict) -> str:
     rows += ["", f"Workflow completion: {w['finished']} of {w['checks_planned']} planned checks finished; "
                  f"{len(w['reached_a_scientific_status'])} reached a scientific status "
                  f"({', '.join(w['reached_a_scientific_status']) or 'none'}); partial: {', '.join(w['partial']) or 'none'}; "
-                 f"blocked: {', '.join(w['blocked']) or 'none'}; "
+                 f"blocked: {', '.join(w['blocked']) or 'none'}; readings differ: "
+                 f"{', '.join(w.get('readings_differ') or []) or 'none'}; "
                  f"inconclusive: {', '.join(w['inconclusive']) or 'none'}; not checkable: "
                  f"{', '.join(w['not_checkable']) or 'none'}."]
     return "\n".join(rows)
@@ -392,6 +427,27 @@ def render(x, led: dict, rep: dict | None) -> str:
             lines += [f"  - {r['check']} {r['reading']}: **{r['result']}**" + (f" ({r['instances']})" if r.get("instances") else "")
                       + "".join(f"; printed \"{_cell(d['printed'], 80)}\" -> used: {_cell(d['used'], 120)}"
                                 for d in r["deviations"]) for r in cf["readings"]]
+        lines.append("")
+    two = [c for c in led["checks"] if c.get("reading_defs")]
+    if two:
+        lines += ["## One quantity, several definitions (each computed on the same runs, data and cohort; not resolved)", ""]
+        for c in two:
+            lines.append(f"- **{c['id']}** {c['status']}: " + _said(_cell(c["reason"], 300), led))
+            for r in c["reading_defs"]:
+                got = (c.get("readings") or {}).get(r["name"]) or {}
+                where = f"the paper (p{r.get('page')})" if r["source"] == "paper" else f"`{r['source']}`"
+                lines.append(f"  - reading **{r['name']}**, as defined in {where}: \"{_cell(r['quote'], 160)}\""
+                             + (f" -> {got.get('status')}" + (f", {got['reproduced']:g}" if isinstance(
+                                 got.get("reproduced"), (int, float)) else "") if got else ""))
+        lines.append("")
+    schema = [c for c in led["checks"] if (c.get("execution") or {}).get("schema_defects")]
+    if schema:
+        lines += ["## Execution and result schema (how the runs went, apart from what they found)", ""]
+        for c in schema:
+            ex = c["execution"]
+            lines.append(f"- **{c['id']}** {c.get('state')}: {ex['runs_exited_ok']} of {ex['runs_planned']} planned run(s) "
+                         f"exited cleanly; status {c['status']}. Result-schema defect(s), the script's labeling, not a "
+                         "finding about the paper: " + "; ".join(_cell(d, 200) for d in ex["schema_defects"][:5]))
         lines.append("")
     devs = [(c["id"], d) for c in led["checks"] for d in c["deviations"]]
     recs = led["workflow"]["environment_recoveries"]

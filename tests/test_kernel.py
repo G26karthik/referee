@@ -823,6 +823,239 @@ def test_verify_commit_fails_closed():
         assert not verify_commit(r, sha)[0]                           # an untracked file counts
 
 
+def test_the_result_schema_is_checked_apart_from_what_the_results_say():
+    """Sep-30 label ranking C9: the script declared its metric's name as its one unit and printed
+    an unnamed result line; the run completed, yet the check read PARTIAL ("a declared unit printed
+    no result line"). A labeling defect is the script's, recorded apart; execution is not science."""
+    from harness.reconcile import PARTIAL
+    check = {"kind": "RELEASED_DATA", "metric": "mean_ece_top10", "target": {"quote": "q", "value": "0.22"}}
+    rec = {"returncode": 0, "stdout": 'REFEREE_PROGRESS {"units": ["mean_ece_top10"]}\n'
+                                      'REFEREE_RESULT {"mean_ece_top10": 0.0135}', "stderr": ""}
+    defects = execute.result_schema(rec, check)
+    assert len(defects) == 2 and "printed no result line" in defects[0] and "(no stage)" in defects[1]
+    assert "0.0135" not in " ".join(defects)                                # names only, never a value
+    staged = execute.staged_values(rec["stdout"], "", "mean_ece_top10")
+    errs, labels = execute.split_units({"mean_ece_top10"}, staged, False, "no line")
+    assert errs == {} and "without that `stage` name" in labels[0]
+    # Sep-30 changepoint C7: 22 declared units printed nothing while other stages printed under names
+    # the (then truncated) units list lacked: those 22 were not measured; they are never relabeled.
+    assert execute.split_units({"a", "b"}, [["a", 1.0], ["c", 2.0]], False, "x") == ({"b": "x"}, [])
+    assert len(execute.units({"stdout": "REFEREE_PROGRESS " + json.dumps({"units": [f"u{i}" for i in range(242)]})})) == 242
+    assert execute.split_units({"mean_ece_top10"}, staged, True, "exit 1")[0] == {"mean_ece_top10": "exit 1"}
+    assert execute.split_units({"a", "b"}, [["a", 1.0]], False, "no line")[0] == {"b": "no line"}   # b never measured
+    res = reconcile("RELEASED_DATA", "0.22", [0.0135], "", {}, False, True, "", staged=staged, stage_errors=errs)
+    assert res["status"] == "INCONCLUSIVE" and res["reason"].startswith("produced 0.0135")
+    ok = {"runs_planned": 1, "runs_ended": 1, "runs_exited_ok": 1, "runs_failed": [], "schema_defects": labels}
+    assert report._state(Path("."), "C9", {**res, "values": [0.0135], "execution": ok}) == "COMPLETED"
+    # a unit genuinely not measured is partial evidence, yet the runs themselves completed
+    assert report._state(Path("."), "C9", {"status": PARTIAL, "values": [1.0], "execution": ok}) == "COMPLETED"
+    assert report._state(Path("."), "C9", {"status": "INCONCLUSIVE", "values": [1.0],
+                                           "execution": {**ok, "runs_planned": 100, "runs_ended": 14}}) == "PARTIALLY_COMPLETED"
+    assert report._state(Path("."), "C9", {"status": "INCONCLUSIVE", "values": [],
+                                           "execution": {**ok, "runs_exited_ok": 0}}) == "FAILED"
+    with tempfile.TemporaryDirectory() as t:        # the outcome records execution next to the finding
+        cfg = state.Config()
+        cfg.projects = Path(t)
+        root = Path(t) / "p"
+        (root / "checks" / "C9").mkdir(parents=True)
+        execute._finish(cfg, root, {**check, "id": "C9", "runs": 1, "basis": "predictions", "printed": "0.22"},
+                        {"values": [0.0135], "staged": staged, "records": 1, "ok_runs": 1, "schema_defects": labels})
+        o = state.read_json(root / "checks" / "C9" / "outcome.json")
+        assert o["status"] == "INCONCLUSIVE" and o["reproduced"] == 0.0135 and o["basis"] == "predictions"
+        assert o["execution"] == {"runs_planned": 1, "runs_ended": 1, "runs_exited_ok": 1, "runs_failed": [],
+                                  "schema_defects": labels}
+    with tempfile.TemporaryDirectory() as t:        # a completed draft that breaks the contract goes back to its author
+        td = Path(t)
+        cfg, pid = _project(td)
+        state.write_json(td / ".gpu.json", False)
+        for lens in tasks.LENSES:
+            _seal(cfg, pid, f"lens:{lens}", {"concerns": []}, td)
+        _seal(cfg, pid, "critic", {"reviews": []}, td)
+        chk = {"id": "B", "kind": "CERTIFICATE", "claim_quote": "We report the mean over 5 random seeds",
+               "statement_quote": "The final loss is -0.52"}
+        _seal(cfg, pid, "plan", {"checks": [chk], "central_claims": [{"quote": chk["claim_quote"], "checks": ["B"]}]}, td)
+        script = "n = 1\nassert n\nok = n > 0\nprint('REFEREE_RESULT', {'violated': 0, 'premises_hold': 1})\n"
+        b = [{"kind": k, "impl_quote": q, "paper_quote": "reaches 61.4 accuracy"} for k, q in
+             (("hypotheses", "assert n"), ("claimed_bound", "ok = n > 0"), ("instance", "n = 1"))]
+        _seal(cfg, pid, "gen:C1.1", {"script": script, "runs": 1, "outputs": ["violated"], "bindings": b}, td)
+        assert execute._smoke_check(td / pid, "C1", 1)["metric"] == "violated"
+        state.write_json(td / pid / "checks" / "C1" / "smoke.1.json",
+                         {"returncode": 0, "failed": False, "reached": True, "stdout": "REFEREE_RESULT <masked>",
+                          "stderr": "", "schema": ["no REFEREE_RESULT line carries every compared output ['violated']"]})
+        _, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
+        assert [o["id"] for o in owed] == ["gen:C1.2"]
+        assert "RESULT SCHEMA" in Path(owed[0]["prompt"]).read_text(encoding="utf-8")
+
+
+def _checkout(td: Path, pid: str, files: dict) -> None:
+    co = td / pid / "repo"
+    co.mkdir(parents=True)
+    for name, text in files.items():
+        (co / name).write_text(text, encoding="utf-8")
+    git = lambda *a: subprocess.run(["git", *a], cwd=co, capture_output=True, text=True)
+    git("init", "-q"), git("add", "."), git("-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "c")
+
+
+def test_a_paper_and_code_disagreement_is_computed_both_ways_never_chosen():
+    """Sep-30 label ranking RewardBench2: the paper pools every candidate position, the released
+    analysis script scores the chosen response only. One reading was computed (0.0135 vs 0.22), and
+    the 09-30 fix told scripts to follow the code. Neither is presumed right: both run, same data
+    and cohort, and the harness never picks the one that matches."""
+    from harness.reconcile import READINGS_DIFFER
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid = _project(td)
+        code_line = "ece = abs(p_chosen.mean() - 1.0)  # the chosen response only"
+        _checkout(td, pid, {"analyze.py": f"import numpy\n{code_line}\n"})
+        x = tasks._Ctx(cfg, pid)
+        rd = {"id": "B", "kind": "RELEASED_DATA", "basis": "predictions", "claim_quote": "We report the mean over 5 random seeds",
+              "target": {"quote": "reaches 61.4 accuracy", "value": "61.4"},
+              "readings": [{"name": "paper", "source": "paper", "quote": "We use generation of samples"},
+                           {"name": "code", "source": "analyze.py", "quote": code_line}]}
+        central = [{"quote": "We report the mean over 5 random seeds", "checks": ["B"]}]
+        rec = tasks._seal_plan(x, "plan", {"checks": [rd], "central_claims": central}, final=False)
+        assert [r["name"] for r in rec["checks"][0]["readings"]] == ["paper", "code"]
+        assert rec["checks"][0]["readings"][0]["page"] == 1 and rec["checks"][0]["basis"] == "predictions"
+        bad_code = {**rd, "readings": [rd["readings"][0], {**rd["readings"][1], "quote": "ece = pooled_over_positions()"}]}
+        assert "literal code" in _refused(lambda: tasks._seal_plan(x, "plan", {"checks": [bad_code], "central_claims": central},
+                                                                  final=False))
+        assert "basis" in _refused(lambda: tasks._seal_plan(x, "plan", {"checks": [{**rd, "basis": ""}],
+                                                                        "central_claims": central}, final=False))
+    check = {"kind": "RELEASED_DATA", "metric": "ece", "readings": [{"name": "paper"}, {"name": "code"}]}
+    out = ('REFEREE_RESULT {"ece": 0.0135, "reading": "paper", "cohort": ["m1", "m2"]}\n'
+           'REFEREE_RESULT {"ece": 0.214, "reading": "code", "cohort": ["m2", "m1"]}')
+    staged = execute.staged_values(out, "", "ece")
+    assert staged == [["", 0.0135, "paper"], ["", 0.214, "code"]] and execute.cohort_mismatch(out, check) == []
+    assert execute.result_schema({"stdout": out}, check) == []
+    moved = out.replace('["m2", "m1"]', '["m2", "m3"]')
+    assert execute.cohort_mismatch(moved, check) == ["(no stage)"]
+    assert any("different cohorts" in d for d in execute.result_schema({"stdout": moved}, check))
+    assert any("no `cohort`" in d for d in execute.result_schema({"stdout": out.replace(', "cohort": ["m1", "m2"]', "")}, check))
+    one = out.splitlines()[0]
+    assert any("['code'] printed no result" in d for d in execute.result_schema({"stdout": one}, check))
+    dec = lambda st, **kw: reconcile("RELEASED_DATA", "0.22", [e[1] for e in st], "", {}, False, True, "", staged=st,
+                                     readings=["paper", "code"], deterministic=True, **kw)
+    diff = dec(staged)
+    assert diff["status"] == READINGS_DIFFER and set(diff["readings"]) == {"paper", "code"}
+    assert diff["readings"]["paper"]["reproduced"] == 0.0135 and diff["readings"]["code"]["reproduced"] == 0.214
+    same = dec([["", 0.22, "paper"], ["", 0.221, "code"]])
+    assert same["status"] == "RESOLVED_VERIFIED" and "every reading" in same["reason"]
+    assert dec(staged, cohort_mismatch=["(no stage)"])["status"] == "INCONCLUSIVE"
+    assert dec(staged[:1])["status"] == "INCONCLUSIVE"                    # a reading that printed nothing
+    c = {"id": "C1", "kind": "RELEASED_DATA", "evidence": "RELEASED_DATA_RECOMPUTATION", "deviations": [],
+         "status": READINGS_DIFFER}
+    assert report._claim_status([c]) == "READINGS_DISAGREE"
+    assert report._claim_status([c, {**c, "id": "C2", "status": "RESOLVED_VERIFIED"}]) == "READINGS_DISAGREE"
+    assert report._headline([c], [{"claim_status": "READINGS_DISAGREE"}]) == "CENTRAL_READINGS_DISAGREE"
+    with tempfile.TemporaryDirectory() as t:        # a script owes both keys once readings exist
+        td = Path(t)
+        plan = {"checks": [{"id": "C1", "kind": "RELEASED_DATA", "metric": "ece", "readings": check["readings"],
+                            "target": {"quote": "reaches 61.4 accuracy", "value": "61.4"}}]}
+        state.write_json(td / "released.json", [{"path": "results/a.csv"}])
+        x = type("X", (), {"root": td, "paper": Paper(PAGES, ROWS), "cfg": state.Config(), "sealed": lambda self, tid: plan,
+                           "plan": lambda self: plan})()
+        script = 'rows = open("results/a.csv").read().split()\nece = len(rows)\nprint("REFEREE_RESULT", ece)\n'
+        binds = [{"kind": k, "impl_quote": q, "paper_quote": "reaches 61.4 accuracy"} for k, q in
+                 (("dataset", 'open("results/a.csv")'), ("metric", "ece = len(rows)"), ("comparison_target", "print("))]
+        g = {"script": script, "runs": 1, "metric": "ece", "outputs": ["ece"], "bindings": binds}
+        assert "`reading`" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", g, final=False))
+        ok = {**g, "script": script.replace("ece)", "ece, 'reading', 'cohort')")}
+        assert tasks._seal_gen(x, "gen:C1.1", ok, final=False)["metric"] == "ece"
+
+
+def test_an_engineering_claim_gets_a_compatibility_test_never_a_benchmark():
+    """Sep-30 GRACE C9: 'can serve as a flexible replacement for' FC layers was planned as a cheap
+    swap-in, then generated as a 100-run, 12-setting superiority benchmark against a tuned
+    baseline (22 min a run, 18.4 h projected) and blocked. A compatibility test is its own test,
+    with its own budget, and speaks only for compatibility."""
+    with tempfile.TemporaryDirectory() as t:
+        cfg, pid = _project(Path(t))
+        x = tasks._Ctx(cfg, pid)
+        compat = {"id": "B", "kind": "RECONSTRUCTION", "test": "compatibility",
+                  "claim_quote": "We report the mean over 5 random seeds",
+                  "target": {"quote": "Our method reaches 61.4", "relation": "loss_first - loss_last > 0"},
+                  "define": {"loss_first": "training loss after epoch 1", "loss_last": "training loss after the last epoch"}}
+        eng = [{"quote": "We report the mean over 5 random seeds", "claim_type": "engineering", "checks": ["B"]}]
+        rec = tasks._seal_plan(x, "plan", {"checks": [compat], "central_claims": eng}, final=False)
+        assert rec["checks"][0]["test"] == "compatibility" and rec["central_claims"][0]["claim_type"] == "engineering"
+        assert rec["checks"][0]["define"]["loss_first"].startswith("training loss")
+        bench = {**compat, "test": "performance", "target": {"quote": "Our method reaches 61.4",
+                                                            "relation": "err_base - err_ours > 0"}}
+        assert "compatibility test" in _refused(lambda: tasks._seal_plan(x, "plan", {"checks": [bench],
+                                                                                    "central_claims": eng}, final=False))
+        perf = [{**eng[0], "claim_type": "performance"}]
+        assert "may speak only" in _refused(lambda: tasks._seal_plan(x, "plan", {"checks": [compat], "central_claims": perf},
+                                                                      final=False))
+        assert "condition" in _refused(lambda: tasks._seal_plan(x, "plan", {"checks": [{
+            **compat, "target": {"quote": "reaches 61.4 accuracy", "value": "61.4"}}], "central_claims": eng}, final=False))
+    cfg = state.Config()
+    g = {"runs": 100, "runs_quote": "report averages over 100 simulation runs", "stochastic": True}
+    assert tasks.run_count(cfg, {"kind": "RECONSTRUCTION", "test": "compatibility"}, g) == (cfg.replicates, "compatibility")
+    assert tasks.run_count(cfg, {"kind": "RECONSTRUCTION", "test": "performance"}, g) == (100, "paper")
+    assert execute.budget(cfg, {"test": "compatibility"}) == (cfg.compat_budget_s, "SH_COMPAT_BUDGET_S")
+    with tempfile.TemporaryDirectory() as t:
+        cfg.projects = Path(t)
+        state.write_json(Path(t) / ".gpu.json", False)
+        pilot = {"pilot_s": 1320, "seed": 1, "width": 1}         # a 22-minute pilot, two more runs
+        why = execute._over_budget(cfg, {"kind": "RECONSTRUCTION", "test": "compatibility"}, pilot, 3)
+        assert why and why[0] == "time_budget" and "SH_COMPAT_BUDGET_S" in why[1]
+        assert not execute._over_budget(cfg, {"kind": "RECONSTRUCTION"}, pilot, 3)
+    rel = "loss_first - loss_last > 0"
+    cond = lambda ms: reconcile("RECONSTRUCTION", "", ms, "", {}, True, True, "", rel, test="compatibility")
+    held = cond([0.8, 0.8, 0.8])                                       # a condition: identical runs are fine
+    assert held["status"] == "RELATION_HOLDS" and "no performance conclusion" in held["rule"] and held["met"] == 3
+    assert cond([0.8, -0.1, 0.5])["status"] == "INCONCLUSIVE" and cond([-0.2, -0.1, -0.3])["status"] == "RELATION_VIOLATED"
+    c = {"id": "C1", "kind": "RECONSTRUCTION", "evidence": "PAPER_DERIVED_IMPLEMENTATION", "deviations": [],
+         "status": "RELATION_HOLDS", "test": "compatibility"}
+    assert report._claim_status([c], claim_type="engineering") == "SUPPORT_FOUND"
+    assert report._claim_status([c], claim_type="performance") != "SUPPORT_FOUND"   # compatibility is not performance
+
+
+def test_identical_reruns_are_one_measurement_never_replicates():
+    """Sep-30 changepoint C7: a deterministic statistic of one fixed dataset ran as 3 'replicates';
+    220 stages had zero spread and were decided by a t-test with t*SE = 0. Identical reruns are one
+    measurement; an audit of released files is not a recomputation, nor a fresh run."""
+    rel = "var_lb - var_km > 0"
+    st = lambda ms, det: reconcile("RECONSTRUCTION", "", ms, "", {}, True, True, "", rel, deterministic=det)
+    seeded = st([0.044, 0.044, 0.044], False)
+    assert seeded["status"] == "INCONCLUSIVE" and seeded["n_independent"] == 1 and "not 3 independent" in seeded["reason"]
+    det = st([0.044, 0.044], True)
+    assert det["status"] == "RELATION_HOLDS" and det["n_independent"] == 1 and "one measurement" in det["rule"]
+    assert st([-0.044, -0.044], True)["status"] == "RELATION_VIOLATED"
+    assert st([0.3, 0.31, 0.29], False)["status"] == "RELATION_HOLDS"          # real replicates still decide
+    stages = reconcile("RECONSTRUCTION", "", [], "", {}, True, True, "", rel,
+                       staged=[[s, 0.1] for s in ("ADD", "ARL") for _ in range(3)])
+    assert stages["status"] == "INCONCLUSIVE" and all(p["n_independent"] == 1 for p in stages["stages"].values())
+    pt = reconcile("RECONSTRUCTION", "0.52", [0.5] * 3, "", {}, True, True, "")
+    assert pt["status"] == "INCONCLUSIVE" and pt["n_independent"] == 1 and "identical" in pt["rule"]   # never FAILED
+    cfg = state.Config()
+    assert tasks.run_count(cfg, {"kind": "RELEASED_DATA"}, {"runs": 5}) == (1, "deterministic")
+    assert tasks.run_count(cfg, {"kind": "RECONSTRUCTION"}, {"runs": 1, "stochastic": False}) == (2, "deterministic")
+    assert tasks.run_count(cfg, {"kind": "RECONSTRUCTION"}, {"runs": 1, "stochastic": True}) == (3, "referee_floor")
+    assert st([0.044, 0.05], True)["status"] == "INCONCLUSIVE"                # declared deterministic, yet it varied
+    assert execute.split_units({"a", "b"}, [["a", 1.0]], False, "x") == ({"b": "x"}, [])   # b was never measured
+    assert execute.result_schema({"stdout": 'REFEREE_RESULT {"violated": true, "premises_hold": 1}'},
+                                 {"kind": "CERTIFICATE"}) == []                   # a boolean flag is a flag
+    with tempfile.TemporaryDirectory() as t:        # a reconstruction says whether its seed drives randomness
+        plan = {"checks": [{"id": "C1", "kind": "RECONSTRUCTION", "metric": "", "test": "performance",
+                            "target": {"quote": "reaches 61.4 accuracy", "value": "61.4"}}]}
+        x = type("X", (), {"root": Path(t), "paper": Paper(PAGES, ROWS), "cfg": cfg, "sealed": lambda self, tid: plan,
+                           "plan": lambda self: plan})()
+        script = "acc = 61.0\nfit()\nload()\nprint('REFEREE_RESULT', acc)\n"
+        binds = [{"kind": k, "impl_quote": q, "paper_quote": "reaches 61.4 accuracy"} for k, q in
+                 (("method", "fit()"), ("training", "fit()"), ("dataset", "load()"), ("metric", "acc = 61.0"),
+                  ("comparison_target", "print("))]
+        g = {"script": script, "runs": 1, "metric": "acc", "outputs": ["acc"], "bindings": binds}
+        assert "`stochastic`" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", g, final=False))
+        assert tasks._seal_gen(x, "gen:C1.1", {**g, "stochastic": False}, final=False)["stochastic"] is False
+    led = {"checks": [], "concerns": []}
+    rows = report._check_rows([{"id": "C1", "kind": "RELEASED_DATA", "evidence": "RELEASED_DATA_RECOMPUTATION",
+                                "basis": "published_results", "claim": "x", "target": None, "printed": "1", "step": "",
+                                "statement": "", "values": [1.0], "status": "RESOLVED_VERIFIED", "deviations": [],
+                                "state": "COMPLETED", "reason": "r", "rule": "deterministic run", "reason_by": "harness"}], led)
+    assert "audit of released result files" in rows[-1]
+
+
 if __name__ == "__main__":
     fns = [v for k, v in dict(globals()).items() if k.startswith("test_")]
     for fn in fns:

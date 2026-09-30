@@ -48,12 +48,18 @@ authors released: in their checkout (your working directory; read-only) or acqui
 check under /work/data. Open each file by its full relative path, written literally in the
 script (e.g. "results/eval/a.jsonl", never a glob). Apply only the selection, filtering,
 averaging and metric the paper itself states; never regenerate, edit, resample or fabricate
-data. Nothing is trained. Usually `runs` = 1. Print a REFEREE_DATA line per file set (rows,
-models, items) against what the paper says it used.
+data. Nothing is trained, and the computation is deterministic: the harness runs it once. Know
+which basis the check has: an AUDIT of published result files (the authors' own reported numbers,
+re-derived) or a RECOMPUTATION from released per-item predictions or scores (the metric computed
+afresh); say which in `notes`. Print a REFEREE_DATA line per file set (rows, models, items)
+against what the paper says it used. Where the checkout's code and the paper define the metric
+differently, compute both readings in this run (see PAPER VS CODE).
 
 ## decide RELEASED_DATA
   - A printed number: RESOLVED within its printed precision; a deterministic difference is
     reported, never scored as a failure. A relation: one exact recomputation decides it.
+  - With readings: each reading is decided on its own; the same finding under every reading
+    stands; otherwise READINGS_DIFFER, with both, for a human.
   - Per `stage`: each stage is decided on its own; a relation must hold in every stage; a stage
     that started and printed no result makes the check PARTIAL (its finished stages are kept).
 
@@ -69,15 +75,23 @@ setting) is a DEVIATION you declare; a change to what is compared (untuned metho
 paper tuned, a baseline you had to rebuild, a different split or training subset for one
 method than for another, a different aggregation) is `changes_claim: true`. Never shrink the
 experiment (fewer runs, samples, iterations or a smaller model) to make it faster. Where the
-paper and the authors' code DISAGREE (a split, a subsample, a hyperparameter), follow the paper,
-and state the code's difference in `notes` (it is a finding for the referee). Compare every
-method the claim names; one you cannot run is a stated omission in `notes`, never silent.
+paper and the authors' code DISAGREE (a split, a subsample, a hyperparameter, a metric), run both
+as READINGS in the same script, on the same data and cohort (see PAPER VS CODE), and name both
+in `readings`; neither is presumed right. Compare every method the claim names; one you cannot
+run is a stated omission in `notes`, never silent. A COMPATIBILITY test is not a benchmark:
+swap the component into the one stated configuration, train it, and print the planner's
+condition outputs (e.g. the first and last training loss, whether outputs are finite).
 Load each dataset exactly as the paper and code specify and print its REFEREE_DATA identity
 (instances, features, labels, distinct classes/rankings) against the paper's own description.
 
 ## decide RECONSTRUCTION
   - A stated relation: per stage, the mean paired margin over the seeds must exceed the Student-t
     95% band (t(n-1)·SE; 3 seeds give t=4.30); every stage must hold. One seed decides nothing.
+  - Identical results of all seeds are one measurement, not replicates: for a declared
+    deterministic pipeline it decides on the sign of its margin; for a seeded experiment it shows
+    the seed did not vary the run, and nothing is decided.
+  - A compatibility test: its condition must hold in every run (no statistics); it supports only
+    that the component integrates and trains, never a performance claim.
   - A printed number: RESOLVED inside the 95% CI of the seed mean, FAILED outside the prediction
     interval, else INCONCLUSIVE.
   - A stage that started and printed no result, or a seed that failed after measuring, makes the
@@ -111,6 +125,12 @@ Load each dataset exactly as the paper and code specify and print its REFEREE_DA
      applying only selection the paper states — no editing, resampling or regeneration?
   3. Is the compared output the number the printed target (or the stated relation) is about,
      computed from the files — never a flag computed against the printed number?
+  4. PAPER VS CODE: if the checkout ships code that computes this quantity, does its definition
+     (estimator, pooled items or positions, selection, aggregation) match the paper's text? If
+     they differ and the script does not compute both as readings on the same data and cohort,
+     REVISE. A script that follows only the code, or only the paper, while they differ is REVISE.
+  5. Is the declared basis honest: an audit of released result files, or a recomputation from
+     released predictions or scores?
 
 ## verify RECONSTRUCTION
   1. Is every required ingredient (method, training, dataset, metric, comparison target)
@@ -121,11 +141,15 @@ Load each dataset exactly as the paper and code specify and print its REFEREE_DA
      model)? Either is a rejection. Is `changes_claim` true for every change to data, splits,
      tuning, baselines, metric or aggregation? Where the checkout implements the method, does the
      script call that code rather than a rewrite of it? Where paper and code disagree, does it
-     follow the paper (and say so in `notes`)? Following the code there is REVISE.
+     compute both as readings on the same data and cohort? Following either one alone is REVISE.
   3. Does `runs` (or the number of result lines one run prints) match the paper's stated
      replication? Are several units (datasets, settings) printed as separate `stage` lines rather
      than folded into one worst case?
   4. Does it use the host's GPU where the method trains networks and the authors' code supports it?
+  5. Is `stochastic` honest (true whenever anything is trained, sampled or simulated)?
+  6. A COMPATIBILITY test: does it keep the planner's condition and output definitions, one
+     stated configuration, and nothing more? A baseline comparison, a tuning sweep or a grid of
+     settings turns an engineering claim into a benchmark: REVISE.
 
 ## verify ARITHMETIC
   1. Is each operand's `value` exactly the number printed in its `quote`, and is it the

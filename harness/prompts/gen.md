@@ -35,9 +35,21 @@ THE SCRIPT CONTRACT
     and CONTINUE with the other units — never exit on it (that would discard what completed).
   - It never reads the paper's printed result to produce its own, and never compares with it:
     it computes; the harness compares.
-  - Where the checkout ships the code that computed the printed quantity (an analysis script, a
-    metrics module), compute it that way: import or follow that code and name its path in a
-    binding. Another estimator, probability or pooling is a claim-changing deviation.
+  - PAPER VS CODE. Where the checkout ships code that computes the compared quantity (an
+    analysis script, a metrics module), read it and compare it with the paper's definition (the
+    estimator, which items, positions or candidates are pooled, the selection, the aggregation).
+    If the spec lists READINGS, or you find that they differ, compute EVERY reading in this one
+    script, on the same loaded data and the same cohort (the same models, items, rows), and print
+    one result line per reading (and stage) carrying `"reading": "<name>"` and `"cohort": [the ids
+    of the items it was computed over]`. List a reading you found yourself in `readings`
+    ({"name", "source": "paper" or the tracked file path, "quote": the paper's words verbatim or
+    the literal code lines}). Never choose one; which reading matches the printed number is no
+    reason to prefer it.
+  - RESULT SCHEMA. The harness runs your final script once (seed 0) and returns it to you if a
+    declared unit prints no result line with that exact `stage`, if a result line carries a stage
+    name you did not declare (or none, when you declared units), if a declared reading is missing
+    in a stage, or if the readings' cohorts differ. Declare units only for real units (datasets,
+    settings), never the metric's name.
   - Keep one run within the host's per-run limit. The harness times the first run as a pilot and
     stops with a documented blocker if the stated run count cannot finish; a long run may save
     progress under /work/ckpt (a per-seed scratch volume) and resume from it after a restart. Use
@@ -72,7 +84,14 @@ printed text is not well-defined there): the harness records both readings and n
 
 REPLICATION. If the paper states how many seeds/runs/instances this used, set `runs` to it and
 copy the sentence into `runs_quote`; never fewer than the paper used. A RECONSTRUCTION is run at least 3 times (seeds
-0, 1, 2): each seed must be an independent replicate (all randomness drawn from `--seed`).
+0, 1, 2): each seed must be an independent replicate (all randomness drawn from `--seed`). Set
+`stochastic` honestly: true when `--seed` drives randomness (training, sampling, simulation,
+data splits), false when the computation is deterministic (fixed data through a fixed pipeline):
+the harness then runs it twice and requires identical results, and identical reruns are one
+measurement, never replicates. A recomputation from released files runs once. A COMPATIBILITY
+test keeps the planner's condition and output definitions exactly: one stated configuration,
+the component swapped in, no baselines to beat, no tuning sweep, no grid of settings; the
+harness sets its run count and its 30-minute budget.
 
 TESTING. You may run a draft (at most {{max_tries}} times; result lines are masked; drafts never
 count as evidence): write the script to a file, then run
@@ -82,6 +101,7 @@ any verifier sees it; if that run fails, the script comes back to you with the e
 {{revision}}
 Write ONLY this JSON to the output path you were given:
 {"script": "the full Python source as one JSON string", "runs": 1, "runs_quote": "",
+ "stochastic": true, "readings": [],
  "metric": "the compared output's name (not for CERTIFICATE or a relation target)",
  "outputs": ["every name the result line carries"],
  "deviations": [],

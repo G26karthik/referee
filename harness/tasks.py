@@ -23,6 +23,15 @@ SCRIPT_KINDS = ("RELEASED_DATA", "RECONSTRUCTION", "CERTIFICATE")
 REQUIRED = {"CERTIFICATE": ("hypotheses", "claimed_bound", "instance"),
             "RELEASED_DATA": ("dataset", "metric", "comparison_target"),
             "RECONSTRUCTION": ("method", "training", "dataset", "metric", "comparison_target")}
+# What a check's evidence rests on: an audit of the authors' released result files, a recomputation
+# of the metric from released per-item predictions or scores, a fresh run (training, simulation),
+# exact instances, or the paper's own printed numbers.
+BASIS = {"AUTHOR_CODE": "fresh_run", "RECONSTRUCTION": "fresh_run", "CERTIFICATE": "exact_instances",
+         "ARITHMETIC": "paper_numbers"}
+RELEASED_BASES = ("published_results", "predictions")
+# A central claim's type decides which test may speak for it: an engineering claim (a component
+# integrates, runs, trains) by a compatibility test; a comparison by a performance test.
+CLAIM_TYPES = ("engineering", "performance", "value", "theory")
 SEVERITY = ("NOTE", "MINOR", "MAJOR", "FATAL")
 CLASSES = ("CONFIRMED_FINDING", "PLAUSIBLE_CONCERN", "OPEN_QUESTION", "DISMISSED")
 PROMPTS = Path(__file__).parent / "prompts"
@@ -404,6 +413,14 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
                                                      encoding="utf-8")
                 last = sm["failure"][-400:]
                 continue
+            if sm.get("schema"):          # it ran to completion, but its result lines break the contract
+                (cdir / f"setup.{r}.txt").write_text(
+                    "RESULT SCHEMA: the run completed, but its REFEREE_RESULT lines do not match the contract (values "
+                    "stay masked): " + "; ".join(sm["schema"]) + "\nEvery declared unit prints its own result line "
+                    "with that exact `stage`; with readings, every reading prints `reading` and `cohort` in every "
+                    f"stage.\n--- stdout (tail, results masked) ---\n{sm.get('stdout', '')[-1500:]}", encoding="utf-8")
+                last = "result schema: " + "; ".join(sm["schema"])[:380]
+                continue
             tries = (cdir / "tries.jsonl").read_text(encoding="utf-8")[-6000:] if (cdir / "tries.jsonl").exists() else "(none)"
             proposal = json.dumps({"script": (cdir / f"script.{r}.py").read_text(encoding="utf-8"), **{
                 k: g.get(k) for k in ("runs", "runs_quote", "metric", "outputs", "bindings", "deviations",
@@ -416,11 +433,10 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
                      f"{sm.get('stderr', '')[-1500:]}")
             return [_verify_task(x, c, r, spec + _data_text(x, cid), proposal, tries, smoke)]
         if v["verdict"] == "APPROVE":
-            # An experiment is decided over independent seeded replicates: never fewer than the
-            # paper states, and at least enough for a noise band (more is never a downscale).
-            runs = max(g["runs"], x.cfg.replicates) if kind == "RECONSTRUCTION" else g["runs"]
-            source = "paper" if g.get("runs_quote") else ("referee_floor" if runs > g["runs"] else "referee")
-            check = {**c, "runs": runs, "runs_quote": g.get("runs_quote", ""), "runs_source": source,
+            runs, source = run_count(x.cfg, c, g)
+            check = {**c, "runs": runs, "runs_quote": g.get("runs_quote", "") if source == "paper" else "",
+                     "runs_source": source, "stochastic": g.get("stochastic"),
+                     "readings": _merge_readings(c.get("readings"), g.get("readings")),
                      "script_sha256": g["script_sha256"], "metric": g.get("metric", c["metric"]),
                      "deviations": g.get("deviations", []), "premise_argument": g.get("premise_argument", ""),
                      "approval": {"approved": True, "script_sha256": v["script_sha256"],
@@ -435,6 +451,31 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
         return _terminal(cdir, c, "INCONCLUSIVE", f"the script failed in the harness's run in each of {rounds} rounds; "
                          f"last error: {last}")
     return []
+
+
+def run_count(cfg: state.Config, c: dict, g: dict) -> tuple[int, str]:
+    """(runs, where the count came from). Recomputing from released files is deterministic: one run.
+    An engineering compatibility test is SH_REPLICATES runs of one configuration, each required to
+    meet its condition (the paper's run count belongs to its performance experiments). A pipeline
+    its author declares deterministic runs twice (the second must repeat the first; reruns are never
+    replicates). An experiment is decided over independent seeded replicates: never fewer than the
+    paper states, and at least enough for a noise band (more is never a downscale)."""
+    if c["kind"] == "RELEASED_DATA":
+        return 1, "deterministic"
+    if c["kind"] != "RECONSTRUCTION":
+        return g["runs"], "paper" if g.get("runs_quote") else "referee"
+    if c.get("test") == "compatibility":
+        return cfg.replicates, "compatibility"
+    if g.get("stochastic") is False:
+        return 2, "deterministic"
+    runs = max(g["runs"], cfg.replicates)
+    return runs, "paper" if g.get("runs_quote") else ("referee_floor" if runs > g["runs"] else "referee")
+
+
+def _merge_readings(a, b) -> list:
+    """The planner's readings, then any further reading the script author found (by name)."""
+    out = list(a or [])
+    return out + [r for r in b or [] if r["name"] not in {o["name"] for o in out}]
 
 
 def _terminal(cdir: Path, c: dict, status: str, reason: str, by_model: bool = False) -> list:
@@ -464,8 +505,30 @@ def _verify_task(x: _Ctx, c: dict, r: int, spec: str, proposal: str, tries: str,
 
 def _spec_text(c: dict) -> str:
     parts = []
+    if c.get("test"):
+        parts.append(f"Test: {c['test'].upper()} — " + (
+            "an ENGINEERING COMPATIBILITY test: show the component integrates, runs and trains in one configuration; "
+            "the condition below must hold in every run. It is NOT a performance comparison: no baselines to beat, "
+            "no tuning sweep, no benchmark grid; its result speaks only for compatibility." if c["test"] == "compatibility"
+            else "a PERFORMANCE comparison over independent seeded replicates, at the paper's stated protocol."))
+    if c.get("basis"):
+        parts.append(f"Evidence basis: {c['basis']} (" + {
+            "published_results": "an AUDIT of the authors' released result files: re-derive the printed number from "
+                                 "the results they published; nothing is re-run or re-scored",
+            "predictions": "a RECOMPUTATION of the metric from released per-item predictions or scores",
+            "fresh_run": "a FRESH RUN (training, simulation) in the sandbox",
+            "exact_instances": "exact instances", "paper_numbers": "the paper's own printed numbers"}.get(c["basis"], "")
+            + ")")
     if c.get("target"):
         parts.append(f"Printed target: {json.dumps(c['target'], ensure_ascii=False)}")
+    if c.get("define"):
+        parts.append("The compared outputs, as the planner defined them (compute each exactly so): "
+                     + json.dumps(c["define"], ensure_ascii=False))
+    if c.get("readings"):
+        parts.append("READINGS (the paper's text and the checkout's code define the compared quantity differently; "
+                     "compute EVERY reading in the same run, on the same data and the same cohort, one result line per "
+                     "reading and stage carrying `reading` and `cohort`; never choose one): "
+                     + json.dumps(c["readings"], ensure_ascii=False))
     if c.get("statement"):
         parts.append(f"Statement (verbatim): {c['statement']}")
     if c.get("step"):
@@ -685,6 +748,25 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
                "central": c.get("id") in central_ids, "incidental_why": str(c.get("incidental_why") or "")[:600],
                "covers": [str(s)[:120] for s in c.get("covers") or []][:12],
                "acquire": _acquire(x, c, errs, cid) if kind in SCRIPT_KINDS else []}
+        rec["basis"] = BASIS.get(kind, "")
+        if kind == "RELEASED_DATA":
+            rec["basis"] = str(c.get("basis") or "")
+            if rec["basis"] not in RELEASED_BASES:
+                errs.append(f"{cid}: RELEASED_DATA needs `basis`: 'published_results' (an audit of the released result "
+                            "files the printed numbers were reported from) or 'predictions' (the metric recomputed from "
+                            "released per-item predictions or scores)")
+        if kind == "RECONSTRUCTION":
+            rec["test"] = str(c.get("test") or "performance")
+            if rec["test"] not in ("performance", "compatibility"):
+                errs.append(f"{cid}: `test` is 'performance' (a comparison over replicates) or 'compatibility' (an "
+                            "engineering claim: the component integrates and trains)")
+            if rec["test"] == "compatibility" and not (c.get("target") or {}).get("relation"):
+                errs.append(f"{cid}: a compatibility test states its condition as a relation target (e.g. "
+                            "\"loss_first - loss_last > 0\")")
+        if isinstance(c.get("define"), dict):
+            rec["define"] = {str(k)[:60]: str(v)[:300] for k, v in list(c["define"].items())[:12]}
+        if c.get("readings"):
+            rec["readings"] = _readings(x, c["readings"], errs, cid)
         if not rec["central"] and not rec["incidental_why"]:
             errs.append(f"{cid}: no central claim lists this check: link it from `central_claims[].checks`, or give "
                         "`incidental_why` (why no central claim could use this check slot)")
@@ -746,8 +828,22 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         if links and (miss := [s for s in scope if flat(s) not in have]):
             errors.append(f"central claim {h['quote'][:60]!r}: scope item(s) {miss} are neither in a linked check's "
                           "`covers` nor in `omitted` with a reason")
+        ctype = str(cc.get("claim_type") or "")
+        if ctype and ctype not in CLAIM_TYPES:
+            errors.append(f"central claim {h['quote'][:60]!r}: claim_type is one of {list(CLAIM_TYPES)}")
+        # A test speaks only for its own kind of claim: an engineering claim is tested for compatibility
+        # (never by expanding it into a benchmark); a compatibility test never supports a comparison.
+        by_pid = {k["proposed_id"]: k for k in checks}
+        for k in [by_pid[i] for i in links if i in by_pid and by_pid[i]["kind"] == "RECONSTRUCTION"]:
+            if ctype == "engineering" and k.get("test") != "compatibility":
+                errors.append(f"central claim {h['quote'][:60]!r} is an engineering claim: its RECONSTRUCTION check "
+                              f"{k['proposed_id']} must be a compatibility test (a performance comparison is a separate "
+                              "claim, with its own quote)")
+            if k.get("test") == "compatibility" and ctype != "engineering":
+                errors.append(f"check {k['proposed_id']} is a compatibility test: it may speak only for a claim whose "
+                              "claim_type is 'engineering'")
         central.append({"quote": h["quote"], "page": h["page"], "checks": links, "scope": scope, "omitted": omitted,
-                        "why_unchecked": str(cc.get("why_unchecked") or "")[:600]})
+                        "claim_type": ctype, "why_unchecked": str(cc.get("why_unchecked") or "")[:600]})
     _fail_or_drop(errors, final)
     # The planner's own ids map onto the harness's C1..Cn.
     ids = {c["proposed_id"]: c["id"] for c in checks}
@@ -755,6 +851,31 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         cc["checks"] = [ids[k] for k in cc["checks"] if k in ids]
     return {"checks": checks, "central_claims": central, "dropped": dropped,
             "repo_is_authors": attributed, "repo_note": str(obj.get("repo_note") or "")[:1000]}
+
+
+def _readings(x: _Ctx, items, errs: list[str], cid: str) -> list[dict]:
+    """Two or three definitions of one compared quantity, each re-found where it is stated: in the
+    paper (verbatim) or in a tracked checkout file (the literal code lines)."""
+    out = []
+    for r in [r for r in items or [] if isinstance(r, dict)][:3]:           # ponytail: 3 readings per check
+        name, src, quote = str(r.get("name") or ""), str(r.get("source") or "").strip(), str(r.get("quote") or "")
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,23}", name) or name in {o["name"] for o in out}:
+            errs.append(f"{cid}: reading name {name!r} must be a distinct short lowercase identifier")
+            continue
+        if src == "paper":
+            h = _find(x, quote, errs, f"{cid} reading {name}")
+            if h:
+                out.append({"name": name, "source": "paper", "quote": h["quote"], "page": h["page"]})
+            continue
+        f = _repo_file(x, src)
+        if not (f and f.is_file() and len(flat(quote)) >= 20 and flat(quote) in flat(
+                f.read_text(encoding="utf-8", errors="replace"))):
+            errs.append(f"{cid}: reading {name}: the quote is not literal code (20+ chars) of tracked file {src!r}")
+            continue
+        out.append({"name": name, "source": src, "quote": quote[:1500]})
+    if items and len(out) < 2:
+        errs.append(f"{cid}: `readings` needs at least two definitions that re-find (the paper's and the code's)")
+    return out
 
 
 def _repo_file(x: _Ctx, rel) -> Path | None:
@@ -850,9 +971,17 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
             return {"refused": True, "notes": f"{runs} runs is outside 1..{cap}: refused rather than downscaled"}
         errors.append(f"`runs` is at most {cap}: each run is one sandboxed process. A certificate may check several "
                       "instances per run by printing one REFEREE_RESULT line per instance")
-    if runs > 1 and c["kind"] == "RECONSTRUCTION" and not (
+    stochastic = obj.get("stochastic")
+    if c["kind"] == "RECONSTRUCTION" and c.get("test") != "compatibility" and not isinstance(stochastic, bool):
+        errors.append("`stochastic` must be true (the seed drives randomness: training, sampling, simulation) or false "
+                      "(the computation is deterministic: the harness runs it twice and requires identical results)")
+    if runs > 1 and c["kind"] == "RECONSTRUCTION" and stochastic is True and c.get("test") != "compatibility" and not (
             (h := x.paper.find(str(obj.get("runs_quote") or ""))[0]) and value_in(h["quote"], str(runs))):
         errors.append("runs > 1 needs runs_quote: the paper's sentence printing that number, verbatim")
+    readings = _readings(x, obj.get("readings"), errors, cid) if obj.get("readings") else []
+    if (c.get("readings") or readings) and not all(re.search(rf"""["']{k}["']""", script) for k in ("reading", "cohort")):
+        errors.append("with readings, each result line carries `reading` (its name) and `cohort` (the items it was "
+                      "computed over), every reading in the same run")
     # The value compared is bound by NAME here, once: the relation's outputs, else the one
     # compared output (the planner's, or else the script author's), never a flag.
     outputs = [str(o) for o in obj.get("outputs") or []]
@@ -890,6 +1019,7 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     (cdir / f"script.{r}.py").write_bytes(script.encode("utf-8"))   # bytes: the sha is of exactly these
     return {"script_sha256": state.sha256(script), "runs": runs, "runs_quote": str(obj.get("runs_quote") or "")[:500],
             "metric": metric, "outputs": outputs, "deviations": deviations, "bindings": out,
+            "stochastic": stochastic if isinstance(stochastic, bool) else None, "readings": readings,
             "checked_statement": "proof_step" if c.get("step") else str(obj.get("checked_statement") or "conclusion"),
             # A general argument (e.g. that a printed premise can never hold) is the author's reasoning:
             # shown to the verifier and the reader as such, never counted as an executed result.

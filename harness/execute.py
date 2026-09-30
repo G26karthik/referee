@@ -321,12 +321,93 @@ def result_values(stdout: str, key: str) -> list[float]:
 
 
 def staged_values(stdout: str, rel: str, metric: str) -> list[list]:
-    """[stage, value] per result line: the relation's paired margin (every named output present)
-    or the named metric. `stage` ("" if unnamed) is the unit a result is decided in: a dataset, a
-    setting, a panel — a stage is decided over the seeds, never averaged with another stage."""
+    """[stage, value] per result line (plus the line's `reading`, when it names one): the
+    relation's paired margin (every named output present) or the named metric. `stage` ("" if
+    unnamed) is the unit a result is decided in: a dataset, a setting, a panel — a stage is
+    decided over the seeds, never averaged with another stage. A `reading` names the definition
+    (the paper's, the authors' code's) a value was computed under."""
     names = relation(rel)[3] if rel else [metric] if metric else []
     return [[str(d.get("stage") or "")[:80], margin(rel, _num(d)) if rel else _num(d)[metric]]
+            + ([str(d["reading"])[:40]] if d.get("reading") else [])
             for d in json_lines(stdout, "REFEREE_RESULT") if names and all(n in _num(d) for n in names)]
+
+
+def compared_names(check: dict) -> list[str]:
+    """The outputs a check's result lines must carry: `violated`, the relation's names, or the metric."""
+    rel = (check.get("target") or {}).get("relation", "")
+    return (["violated"] if check.get("kind") == "CERTIFICATE" else relation(rel)[3] if rel else
+            [check["metric"]] if check.get("metric") else [])
+
+
+def _cohort(v) -> str | None:
+    """A reading's cohort (the models, items or rows it was computed over) as one comparable key."""
+    if isinstance(v, list):
+        items = sorted(str(i) for i in v)
+        return f"{len(items)}:{state.sha256(json.dumps(items))[:16]}"
+    return str(v)[:80] if isinstance(v, (str, int)) and not isinstance(v, bool) else None
+
+
+def reading_cohorts(stdout: str, check: dict) -> dict:
+    """{stage: {reading: cohort key}} over the result lines that carry the compared outputs."""
+    names, out = compared_names(check), {}
+    for d in json_lines(stdout, "REFEREE_RESULT"):
+        if names and all(n in _num(d) for n in names):
+            out.setdefault(str(d.get("stage") or "")[:80], {})[str(d.get("reading") or "")[:40]] = _cohort(d.get("cohort"))
+    return out
+
+
+def cohort_mismatch(stdout: str, check: dict) -> list[str]:
+    """Stages whose declared readings were computed on different cohorts (not comparable)."""
+    want = [r["name"] for r in check.get("readings") or []]
+    return sorted(s or "(no stage)" for s, rs in reading_cohorts(stdout, check).items()
+                  if want and len({rs.get(r) for r in want if r in rs}) > 1)
+
+
+def result_schema(rec: dict, check: dict) -> list[str]:
+    """What a completed run's result lines owe the script contract and did not deliver, by name
+    only (a value is never shown): the compared outputs on some line; a result line for every
+    declared unit, and none under a stage name it did not declare; every declared reading in every
+    stage, each with its `cohort`, the same cohort for all. A defect is the script's to fix: it
+    says nothing about the paper."""
+    names, out = compared_names(check), []
+    if check.get("kind") == "CERTIFICATE":
+        return [] if cert_rows(rec.get("stdout") or "") else ["no REFEREE_RESULT line carries `violated` (0 or 1)"]
+    lines = [d for d in json_lines(rec.get("stdout") or "", "REFEREE_RESULT") if all(n in _num(d) for n in names)]
+    if names and not lines:
+        out.append(f"no REFEREE_RESULT line carries every compared output {names}")
+    if check.get("kind") in ("RECONSTRUCTION", "RELEASED_DATA") and lines:
+        declared, printed = units(rec), {str(d.get("stage") or "")[:80] for d in lines}
+        if declared and (miss := sorted(declared - printed)):
+            out.append(f"declared unit(s) {miss[:10]} printed no result line")
+        if declared and (extra := sorted(printed - declared)):
+            out.append(f"result line(s) under stage name(s) {[e or '(no stage)' for e in extra[:10]]} that the "
+                       "REFEREE_PROGRESS units line did not declare")
+        want = [r["name"] for r in check.get("readings") or []]
+        for st, rs in sorted(reading_cohorts(rec.get("stdout") or "", check).items()) if want else []:
+            where = f"stage {st or '(no stage)'}"
+            if (miss := [r for r in want if r not in rs]):
+                out.append(f"{where}: declared reading(s) {miss} printed no result line")
+            if (extra := sorted(set(rs) - set(want))):
+                out.append(f"{where}: result line(s) under reading(s) {[e or '(none)' for e in extra]} not declared")
+            if any(rs.get(r) is None for r in want if r in rs):
+                out.append(f"{where}: a reading's result line carries no `cohort` (the items it was computed over)")
+            elif len({rs[r] for r in want if r in rs}) > 1:
+                out.append(f"{where}: the readings were computed on different cohorts")
+    return out[:20]                                             # ponytail: 20 defects per run
+
+
+def split_units(declared: set, staged: list, run_failed: bool, why: str) -> tuple[dict, list[str]]:
+    """(incomplete stages, schema defects) of one run. A declared unit without a result is not
+    completed, except in the one case where the results are unambiguous: a completed run that
+    declared ONE unit and printed its results without a stage name. That is a labeling defect
+    (recorded; the results are the check's only unit), never a measurement that did not happen.
+    Several declared units are never matched to results by guessing."""
+    printed = {e[0] for e in staged}
+    miss = declared - printed
+    if not run_failed and len(declared) == 1 and miss == declared and printed == {""}:
+        return {}, [f"the run completed and declared one unit {sorted(declared)}, but printed its result line(s) "
+                    "without that `stage` name"]
+    return {s: why for s in miss}, []
 
 
 def cert_rows(stdout: str) -> list[dict]:
@@ -348,7 +429,7 @@ def cert_rows(stdout: str) -> list[dict]:
 
 def relation_margins(stdout: str, rel: str) -> list[float]:
     """One paired margin per result line that carries every output the relation names."""
-    return [v for _, v in staged_values(stdout, rel, "")]
+    return [e[1] for e in staged_values(stdout, rel, "")]
 
 
 def failure_text(rec: dict) -> str:
@@ -367,7 +448,7 @@ def units(rec: dict) -> set[str]:
     """The result units a run declared (`REFEREE_PROGRESS {"units": [...]}`): each must print a result."""
     both = (rec.get("stdout") or "") + "\n" + (rec.get("stderr") or "")
     return {str(u)[:80] for d in json_lines(both, "REFEREE_PROGRESS") if isinstance(d.get("units"), list)
-            for u in d["units"][:50]}                               # ponytail: 50 units per check
+            for u in d["units"][:1000]}          # ponytail: 1000 units per check (a threshold grid x detectors)
 
 
 def markers(st: dict, rec: dict) -> set[str]:
@@ -778,8 +859,11 @@ def smoke(cfg: state.Config, root: Path, cid: str, r: int, kind: str, attributed
             return None
         infra = ev["infra_error"] or ("the container could not start" if done.get("error", "").startswith("could not")
                                       or _vanished(done) else "")
+        # A draft that completed is held to the result contract (names only; values stay masked).
+        check = _smoke_check(root, cid, r)
+        schema = result_schema(done, check) if not ev["failed"] and not done.get("timed_out") else []
         res = {"returncode": done.get("returncode"), "timed_out": done.get("timed_out"), "seconds": done.get("seconds"),
-               "reached": ev["reached"], "infra_error": infra,
+               "reached": ev["reached"], "infra_error": infra, "schema": schema,
                "failed": ev["failed"] and not done.get("timed_out"), "failure": failure_text(done) if ev["failed"] else "",
                "stdout": mask(done.get("stdout") or "")[-3000:], "stderr": mask(done.get("stderr") or "")[-3000:]}
         state.write_json(f, res)
@@ -821,6 +905,18 @@ def smoke(cfg: state.Config, root: Path, cid: str, r: int, kind: str, attributed
                 target=cid, meta={"script_sha256": state.sha256(script), "smoke": r})
     state.write_json(f, {"rec": rec, "starts": st.get("starts", 0)})
     return None
+
+
+def _smoke_check(root: Path, cid: str, r: int) -> dict:
+    """The check as its draft will run: the plan's check with the round's sealed script fields."""
+    from .tasks import _sealed
+    from .report import merged
+    plan = merged(_sealed(Path(root), "plan"), _sealed(Path(root), "plan:2")) or {"checks": []}
+    c = next((k for k in plan["checks"] if k["id"] == cid), {})
+    g = _sealed(Path(root), f"gen:{cid}.{r}") or {}
+    return {**c, "metric": g.get("metric") or c.get("metric", ""),
+            "readings": (c.get("readings") or []) + [x for x in g.get("readings") or []
+                                                     if x["name"] not in {y["name"] for y in c.get("readings") or []}]}
 
 
 def host_facts(cfg: state.Config) -> str:
@@ -868,10 +964,16 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             st["done_seeds"].append(row["seed"])
             if row.get("error"):
                 st["failed_seeds"][str(row["seed"])] = row["error"]
+            st["ok_runs"] = st.get("ok_runs", 0) + (not row.get("error"))
             st["units"] = sorted(set(st.get("units") or []) | set(row.get("units") or []))
-            for s, e in (row.get("stage_errors") or {}).items():    # only a declared unit can be incomplete
-                if s in (row.get("units") or []):
-                    st.setdefault("stage_errors", {}).setdefault(s, e)
+            # A reused seed follows the same rule as a new one: a completed run's unit printed under
+            # another name is a labeling defect, not an incomplete stage.
+            errs, defects = split_units(set(row.get("units") or []), row.get("staged") or [], bool(row.get("error")), "")
+            for s in errs:                                  # only a declared unit can be incomplete
+                if s in (row.get("stage_errors") or {}):
+                    st.setdefault("stage_errors", {}).setdefault(s, row["stage_errors"][s])
+            st["schema_defects"] = sorted(set(st.get("schema_defects") or []) | set(defects) | set(row.get("schema") or []))
+            st["cohort_mismatch"] = sorted(set(st.get("cohort_mismatch") or []) | set(row.get("cohort_mismatch") or []))
             st.setdefault("pilot_s", row.get("seconds") or 0)
         st["seed"], st["reused"] = len(st["done_seeds"]), len(st["done_seeds"])
         log = root / "execution.jsonl"          # this exact script was killed for memory before: one seed at a time
@@ -948,16 +1050,23 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             vs = [r["violated"] for r in rows]
         else:   # bound by name: the relation's outputs or the generator's compared output, per stage
             staged = staged_values(done["stdout"], rel, check.get("metric", ""))
-            vs = [v for _, v in staged]
+            vs = [e[1] for e in staged]
         # A declared result unit that printed no result is not completed, whether or not the run failed.
         declared = units(done) if kind in ("RECONSTRUCTION", "RELEASED_DATA") else set()
         st["units"] = sorted(set(st.get("units") or []) | declared)
         last = next((s for s in reversed([str(d.get("stage")) for d in json_lines(
             (done.get("stdout") or "") + "\n" + (done.get("stderr") or ""), "REFEREE_PROGRESS") if d.get("stage")])), "")
-        failed_stages = {s: (failure_text(done) if ev["failed"] else "a declared unit printed no result line")
-                         for s in declared - {t for t, _ in staged}}
+        failed_stages, defects = split_units(declared, staged, ev["failed"], failure_text(done) if ev["failed"]
+                                             else "a declared unit printed no result line")
         for s, e in failed_stages.items():
             st.setdefault("stage_errors", {}).setdefault(s, e)
+        # Execution and the result contract are recorded apart from what the results say.
+        if kind in ("RECONSTRUCTION", "RELEASED_DATA") and not ev["failed"]:
+            defects = sorted(set(defects) | set(result_schema(done, check)))
+        mism = cohort_mismatch(done["stdout"], check) if check.get("readings") else []
+        st["schema_defects"] = sorted(set(st.get("schema_defects") or []) | set(defects))[:40]   # ponytail: 40 kept
+        st["cohort_mismatch"] = sorted(set(st.get("cohort_mismatch") or []) | set(mism))
+        st["ok_runs"] = st.get("ok_runs", 0) + (not ev["failed"])
         if ev["failed"] or not vs:
             err = (failure_text(done) + (f" (during {last})" if last else "")) if ev["failed"] else \
                 f"exit 0 after {done.get('seconds', 0):.0f}s with no result line"
@@ -975,18 +1084,19 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         state.append_jsonl(cdir / "seeds.jsonl", {"key": _ckpt_key(check), "seed": int(key), "values": vs,
                                                    "cert": rows, "staged": staged, "seconds": done.get("seconds"),
                                                    "error": st.get("failed_seeds", {}).get(key, ""),
-                                                   "stage_errors": failed_stages, "units": sorted(declared)})
+                                                   "stage_errors": failed_stages, "units": sorted(declared),
+                                                   "schema": defects, "cohort_mismatch": mism})
         if "pilot_s" not in st:                           # the first completed run is the pilot
             st["pilot_s"] = done.get("seconds") or 0
             if (why := _over_budget(cfg, check, st, runs)):
                 return _finish(cfg, root, check, {**_cancel(root, st), "blocker": why})
-            st["budget_s"] = cfg.check_budget_s          # the budget the projection was admitted under
+            st["budget_s"] = budget(cfg, check)[0]       # the budget the projection was admitted under
     _sample_memory(st, fly)
     if st.get("reused") and not st.get("budget_checked") and st["seed"] < runs:   # a pilot from a checkpoint
         st["budget_checked"] = True
         if (why := _over_budget(cfg, check, st, runs)):
             return _finish(cfg, root, check, {**_cancel(root, st), "blocker": why})
-        st["budget_s"] = cfg.check_budget_s
+        st["budget_s"] = budget(cfg, check)[0]
     if st["stage"] == "run" and st["seed"] >= runs and not fly:
         return _finish(cfg, root, check, st)
     todo = []
@@ -1095,27 +1205,35 @@ def resource_action(done: dict, st: dict, key: str, timeout: int) -> tuple[str, 
     return "", ""
 
 
+def budget(cfg: state.Config, check: dict) -> tuple[int, str]:
+    """(seconds, setting) a check's runs may take: an engineering compatibility test has its own,
+    smaller budget; every other check the per-check budget."""
+    return ((cfg.compat_budget_s, "SH_COMPAT_BUDGET_S") if check.get("test") == "compatibility" else
+            (cfg.check_budget_s, "SH_CHECK_BUDGET_S"))
+
+
 def _over_budget(cfg: state.Config, check: dict, st: dict, runs: int) -> str:
     """The documented blocker when the timed pilot projects the remaining runs past the budget."""
     w = 1 if check["kind"] == "AUTHOR_CODE" else max(1, min(cfg.parallel, st.get("width", cfg.parallel)))
     need = st.get("pilot_s", 0) * (runs - st["seed"]) / w
-    if need <= cfg.check_budget_s:
+    limit, setting = budget(cfg, check)
+    if need <= limit:
         return ""
     fmt = lambda sec: f"{sec / 3600:.1f} h" if sec >= 3600 else f"{sec / 60:.0f} min" if sec >= 60 else f"{sec:.0f} s"
     peak = max((st.get("peak_mb") or {}).values(), default=None)
     has_gpu = check["kind"] in ("AUTHOR_CODE", "RECONSTRUCTION") and gpu(cfg)
     return ("time_budget", f"the {runs} runs need about {fmt(need)} more at the pilot's measured {fmt(st['pilot_s'])} "
             f"per run ({w} at a time; peak memory {peak or '?'} MB of {_vm_mb()} MB; GPU available to the container: "
-            f"{'yes' if has_gpu else 'no'}); the configured per-check time budget is {fmt(cfg.check_budget_s)} "
-            "(SH_CHECK_BUDGET_S, a setting of this run, not a hardware limit). The run count is not reduced: the "
+            f"{'yes' if has_gpu else 'no'}); the configured time budget for this check is {fmt(limit)} "
+            f"({setting}, a setting of this run, not a hardware limit). The run count is not reduced: the "
             "completed run(s) are recorded as a pilot and decide nothing.")
 
 
 def _stage_summary(staged: list) -> dict:
     """Per stage: how many results and their mean (a pilot's measurements, deciding nothing)."""
     out: dict = {}
-    for s, v in staged:
-        out.setdefault(s or "(all)", []).append(v)
+    for e in staged:          # a reading, where one is named, is kept apart like a stage
+        out.setdefault((e[0] or "(all)") + (f" [{e[2]}]" if len(e) > 2 else ""), []).append(e[1])
     return {s: {"n": len(vs), "mean": round(sum(vs) / len(vs), 6)} for s, vs in out.items()}
 
 
@@ -1173,7 +1291,13 @@ def protocol(check: dict, st: dict, rule: str) -> dict:
     devs = check.get("deviations") or []
     return {"runs": runs, "runs_from": {"paper": f"the paper: {check.get('runs_quote', '')!r}",
                                         "referee_floor": "REFEREE: at least SH_REPLICATES seeded replicates",
-                                        "referee": "REFEREE: the paper states no run count"}.get(src, src),
+                                        "referee": "REFEREE: the paper states no run count",
+                                        "deterministic": "REFEREE: a deterministic computation runs once (released "
+                                                         "files) or twice (a pipeline: the second run must repeat the "
+                                                         "first); reruns are never replicates",
+                                        "compatibility": "REFEREE: an engineering compatibility test, SH_REPLICATES "
+                                                         "runs each required to meet its condition (the paper's run "
+                                                         "count belongs to its performance experiments)"}.get(src, src),
             "seeds": "0..n-1 passed as --seed (REFEREE)" if check["kind"] != "AUTHOR_CODE"
             else (f"the documented {check.get('seed_flag')} flag (REFEREE varies only its value)"
                   if check.get("seed_flag") else "none (one documented run)"),
@@ -1232,10 +1356,25 @@ def _finish(cfg: state.Config, root: Path, check: dict, st: dict) -> bool:
                                  cert=st.get("cert") if kind == "CERTIFICATE" and st.get("cert") else None,
                                  changed=any(d.get("changes_claim") for d in check.get("deviations") or []),
                                  step=bool(check.get("step")), staged=st.get("staged"),
-                                 failed=st.get("failed_seeds"), stage_errors=st.get("stage_errors")),
+                                 failed=st.get("failed_seeds"), stage_errors=st.get("stage_errors"),
+                                 readings=[r["name"] for r in check.get("readings") or []],
+                                 cohort_mismatch=st.get("cohort_mismatch"),
+                                 deterministic=kind == "RELEASED_DATA" or check.get("stochastic") is False,
+                                 test=check.get("test", "")),
                        values=st.get("values", []), runs=st.get("records", 0) + st.get("reused", 0), records="execution.jsonl",
                        finished_at=state.now())
     outcome["protocol"] = protocol(check, st, outcome.get("rule", ""))
+    # How the runs went (execution), apart from what their results say (the status above).
+    outcome["execution"] = {"runs_planned": int(check.get("runs") or 1),
+                            "runs_ended": st.get("records", 0) + st.get("reused", 0),
+                            "runs_exited_ok": st.get("ok_runs", 0), "runs_failed": sorted((st.get("failed_seeds") or {}),
+                                                                                           key=int),
+                            "schema_defects": st.get("schema_defects") or []}
+    for k in ("test", "basis", "stochastic"):
+        if check.get(k) not in (None, ""):
+            outcome[k] = check[k]
+    if check.get("readings"):     # the definitions; `readings` (from reconcile) holds each one's result
+        outcome["reading_defs"] = [{"name": r["name"], "source": r["source"]} for r in check["readings"]]
     if st.get("staged") and not outcome.get("stages") and outcome["status"] != "BLOCKED":
         # Ended before its stages were decided (the host, the operator): what completed is kept per
         # stage, never pooled across stages, and decides nothing.
