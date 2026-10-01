@@ -3096,6 +3096,82 @@ def test_a_follow_up_plan_made_on_a_harness_fault_is_planned_again_never_one_wit
         assert "never withdrawn" in tasks.reopen(cfg, pid, "plan:2", "again")["error"]   # a finding is never re-rolled
 
 
+def test_a_resource_blocker_is_reopened_on_the_same_approved_script():
+    """Oct-01 PPRM C7/C8/C9: two checks' runs shared one 8 GB GPU until both passed the per-run limit. The fault was the
+    host's scheduling, not the script: the reopened check runs the SAME approved script again (gen/verify seals kept,
+    completed seeds kept for reuse, its data not re-acquired), so a measurement is never re-rolled by a rewrite. A
+    crashed script is still written and approved again."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid = _project_pages(td, DATA_PAGES)
+        state.write_json(td / ".gpu.json", False)
+        for lens in tasks.LENSES:
+            _seal(cfg, pid, f"lens:{lens}", {"concerns": []}, td)
+        _seal(cfg, pid, "critic", {"reviews": []}, td)
+        _seal(cfg, pid, "plan", {"checks": [_run("R")], "central_claims": [_claim()]}, td)
+        root, cdir = td / pid, td / pid / "checks" / "C1"
+        script = "import argparse\np = argparse.ArgumentParser(); p.add_argument('--seed', type=int); p.parse_args()\n"
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "script.1.py").write_text(script, encoding="utf-8")
+        sha = state.sha256(script)
+        seals = state.read_json(root / "seals.json", {})
+        for tid, obj in ((f"gen:C1.1", {"script_sha256": sha, "runs": 1, "runs_quote": "", "metric": "", "outputs": ["acc_a", "acc_b"],
+                                        "deviations": [], "bindings": [], "stochastic": True, "seed_flow": "x"}),
+                         (f"verify:C1.1", {"verdict": "APPROVE", "script_sha256": sha, "required_changes": "", "notes": "ok"})):
+            p = root / "sealed" / f"{tasks._safe(tid)}.json"
+            state.write_json(p, obj)
+            seals[tid] = state.sha256(p.read_bytes())
+        state.write_json(root / "seals.json", seals)
+        tasks._plan(tasks._Ctx(cfg, pid))
+        first = state.read_json(cdir / "exec.json")
+        assert first and state.read_json(cdir / "check.json")["script_sha256"] == sha        # approved: started
+        state.append_jsonl(cdir / "seeds.jsonl", {"key": sha, "seed": 0, "values": [0.15], "seconds": 2682})
+        state.write_json(cdir / "outcome.json", {"check": "C1", "status": "BLOCKED", "resource": "per_run_timeout",
+                                                 "authorized": True, "reason": "RESOURCE BLOCKER: a single run exceeded"})
+        state.write_json(cdir / "data.json", {"n_files": 3, "fetched_at": "t", "sources": [{"unmatched_include": ["*.csv"]}]})
+        res = tasks.reopen(cfg, pid, "C1", "two checks shared one GPU")
+        assert res["same_approved_script"] and "gen:C1.1" not in res["seals_withdrawn"], res
+        assert tasks._sealed(root, "gen:C1.1") and tasks._sealed(root, "verify:C1.1")
+        assert (cdir / "seeds.jsonl").exists() and (cdir / "data.json").exists()            # seeds reused, data kept
+        assert not (cdir / "exec.json").exists() and (cdir / "outcome.reopened.1.json").exists()
+        tasks._plan(tasks._Ctx(cfg, pid))                                                  # the same script runs again
+        assert state.read_json(cdir / "exec.json") and state.read_json(cdir / "check.json")["script_sha256"] == sha
+        # A script that crashed is the script's fault: it is written and approved again.
+        state.write_json(cdir / "outcome.json", {"check": "C1", "status": "INCONCLUSIVE", "authorized": True,
+                                                 "reason": "the script crashed: ZeroDivisionError"})
+        res = tasks.reopen(cfg, pid, "C1", "x")
+        assert not res.get("same_approved_script") and {"gen:C1.1", "verify:C1.1"} <= set(res["seals_withdrawn"])
+
+
+def test_a_gpu_holds_one_run_and_the_budget_counts_its_runs_one_at_a_time():
+    """Oct-01 PPRM: C7 and C8 each loaded Qwen2-VL-2B on one 8 GB GPU; both crawled past the per-run limit. A run given the
+    GPU holds it alone, and a check whose runs take the GPU is projected one run at a time against its budget."""
+    def docker(a, timeout):                       # two running containers, the second given the GPU
+        return (0, "aaa\nbbb\n") if a[:2] == ["docker", "ps"] else (0, "null\n[{\"Driver\":\"\",\"Count\":-1}]\n")
+    real = execute._docker, execute.gpu
+    try:
+        execute._docker = docker
+        assert execute.gpu_busy()                                                   # one container holds the GPU
+        execute._docker = lambda a, t: (0, "aaa\n") if a[1] == "ps" else (0, "null\n")
+        assert not execute.gpu_busy()                                               # running, none with a GPU
+        execute._docker = lambda a, t: (0, "") if a[1] == "ps" else (0, "")
+        assert not execute.gpu_busy()                                               # nothing running
+        execute._docker = lambda a, t: (1, "Cannot connect to the Docker daemon")
+        assert execute.gpu_busy()                                                   # unknown is busy
+        cfg = state.Config()
+        cfg.parallel = 2
+        recon = {"kind": "RECONSTRUCTION"}
+        st = {"pilot_s": 2682, "seed": 1}
+        execute.gpu = lambda c: True
+        need, limit, _, w = execute._projected(cfg, recon, st, 3, 2682)
+        assert w == 1 and need == 2682 + 2 * 2682 and need > limit                  # 8046 s > 7200 s: blocked by budget
+        execute.gpu = lambda c: False
+        assert execute._projected(cfg, recon, st, 3, 2682)[3] == 2                  # a CPU host still runs two at a time
+        assert execute.gpu_run(cfg, recon) is False and execute.gpu_run(cfg, {"kind": "CERTIFICATE"}) is False
+    finally:
+        execute._docker, execute.gpu = real
+
+
 def test_a_tls_failure_is_a_fault_of_this_run_never_a_data_blocker():
     """2026-10-01 run, conformal C5: the Porto zip that arrived on 09-30 failed with `TLSV1_ALERT_DECODE_ERROR`; the class
     `protocol` was never retried and ended the check as a DATA BLOCKER."""

@@ -559,7 +559,11 @@ def reopen(cfg: state.Config, pid: str, cid: str, why: str) -> dict:
         n = len(list(cdir.glob("outcome.reopened.*.json"))) + 1
         (cdir / "outcome.json").replace(cdir / f"outcome.reopened.{n}.json")
         seals = state.read_json(root / "seals.json", {}) or {}
-        gone = [t for t in seals if t.split(":", 1)[0] in ("bind", "gen", "verify") and _check_of(t) == cid]
+        # A RESOURCE BLOCKER is a fact about how the host ran an approved script, never about the script: the same
+        # approved script runs again (its gen/verify seals kept, its completed seeds reused from seeds.jsonl), so a
+        # measurement is never re-rolled by rewriting the script. Anything else is written and approved again.
+        keep = bool(o.get("resource")) and o.get("authorized") is not False and (cdir / "script.py").exists()
+        gone = [] if keep else [t for t in seals if t.split(":", 1)[0] in ("bind", "gen", "verify") and _check_of(t) == cid]
         gone += [t for t in ("report",) if t in seals]        # a report written before this check was redone describes another ledger
         for t in gone:
             seals.pop(t)
@@ -567,13 +571,15 @@ def reopen(cfg: state.Config, pid: str, cid: str, why: str) -> dict:
         state.write_json(root / "seals.json", seals)
         tried = state.read_json(root / "attempts.json", {}) or {}       # the redone task starts with its whole budget: the
         state.write_json(root / "attempts.json", {k: v for k, v in tried.items() if k not in gone})   # last attempt seals leniently
-        for f in [*cdir.glob("smoke.*.json"), *cdir.glob("setup.*.txt"), cdir / "exec.json", cdir / "check.json", cdir / "script.py"]:
+        for f in ([cdir / "exec.json"] if keep else
+                  [*cdir.glob("smoke.*.json"), *cdir.glob("setup.*.txt"), cdir / "exec.json", cdir / "check.json", cdir / "script.py"]):
             f.unlink(missing_ok=True)
-        if o.get("data_blocker") or execute.data_gaps(state.read_json(cdir / "data.json") or {}):
+        if not keep and (o.get("data_blocker") or execute.data_gaps(state.read_json(cdir / "data.json") or {})):
             (cdir / "data.json").unlink(missing_ok=True)       # a failed, cut or partial acquisition is tried again
             shutil.rmtree(cdir / "record_src", ignore_errors=True)
-        state.append_jsonl(root / "log.jsonl", {"event": "reopen", "check": cid, "was": o.get("status"), "why": why[:500]})
-        return {"reopened": cid, "was": o.get("status"), "seals_withdrawn": gone}
+        state.append_jsonl(root / "log.jsonl", {"event": "reopen", "check": cid, "was": o.get("status"), "why": why[:500],
+                                                 **({"same_approved_script": True} if keep else {})})
+        return {"reopened": cid, "was": o.get("status"), "seals_withdrawn": gone, **({"same_approved_script": True} if keep else {})}
 
 
 def _replan(cfg: state.Config, pid: str, root: Path, why: str) -> dict:

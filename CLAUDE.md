@@ -108,7 +108,9 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     setting —, memory — measured —, per_run_timeout, storage). A run's time is the host's awake
     time: hours a sleeping host froze its containers are not run time (`host_slept_s` recorded).
     What a run printed before its limit is kept beside the blocker (`pilot_stages`), deciding
-    nothing. Completed seeds are checkpointed
+    nothing. A run given the GPU holds it alone (no second GPU run, draft or evidence, starts beside it) and
+    is projected one at a time against the budget: a limit measured under another run's load measures
+    the sharing, not the protocol. Completed seeds are checkpointed
     (seeds.jsonl) and reused; each seed has a scratch volume at /work/ckpt. Planners and script
     authors are told the measured host (CPUs, container RAM, GPU yes/no).
 20. **Completed measurements survive later failures.** A script prints one result line per
@@ -222,6 +224,7 @@ python run.py try <paper-id> <gen-task-id> <script.py>      # draft run, masked,
 python run.py discover <paper-id> "<dataset name>" [--registry zenodo|datacite|huggingface]   # public data only
 python run.py discover <paper-id> --files <record url>     # the files of a cited repository record (names, sizes, md5)
 python run.py reopen <paper-id> <check> <why>              # redo a check that ended WITHOUT a finding, after a harness fix
+                                                           # (a RESOURCE BLOCKER reruns the same approved script; plan:2 re-plans)
 python run.py env <paper-id>                               # authors' env (the harness starts it)
 python run.py status [<paper-id>]                          # read-only, recomputed: FINISHED only if review.md is newest
 python run.py pack <out.zip> [<paper-id> ...] --clean      # zip artifacts, then delete clones/venvs

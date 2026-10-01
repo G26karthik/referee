@@ -63,6 +63,23 @@ def gpu(cfg: state.Config) -> bool:
     return rc == 0 and "GPU " in out
 
 
+def gpu_run(cfg: state.Config, check: dict) -> bool:
+    """Is this check's run given the host's GPU? An experiment kind on a host that has one."""
+    return check.get("kind") in ("AUTHOR_CODE", "RECONSTRUCTION") and gpu(cfg)
+
+
+def gpu_busy() -> bool:
+    """Does a running REFEREE container hold the GPU (Docker's own record of the device request)? A daemon that cannot
+    answer is busy: never a second run on a GPU nobody can see."""
+    rc, ids = _docker(["docker", "ps", "-q", "--filter", "label=referee=1"], 60)
+    if rc != 0:
+        return True
+    if not ids.split():
+        return False
+    rc, out = _docker(["docker", "inspect", "-f", "{{json .HostConfig.DeviceRequests}}", *ids.split()], 60)
+    return rc != 0 or any(x.strip() not in ("", "null", "[]") for x in out.splitlines())
+
+
 def image_for(checkout: Path | None) -> str:
     """The slim image of the Python the repo declares (3.9–3.13), else the default."""
     for name in (".python-version", "pyproject.toml", "setup.cfg", "setup.py", "environment.yml"):
@@ -1001,6 +1018,8 @@ def smoke(cfg: state.Config, root: Path, cid: str, r: int, kind: str, attributed
     mounts = [(sdir, f"{MOUNT}/check", True)] + em + [(scratch, f"{MOUNT}/ckpt", False)] + (
         [(Path(root) / "repo", f"{MOUNT}/repo", True)] if has_repo else []) + data_mount(root, cid)
     gpus = kind == "RECONSTRUCTION" and gpu(cfg)
+    if gpus and gpu_busy():                    # a draft never shares the GPU with a timed run: it waits its turn
+        return None
     rec = start(_cname(cdir.resolve(), "smoke", r, state.sha256(script), st.get("starts", 0)),
                 ["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", "0"], mounts=mounts, env=env,
                 workdir=f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check",
@@ -1238,6 +1257,13 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
     width = min(width, max(1, cfg.parallel // max(1, len(active))), st.get("width", width))
     if "pilot_s" not in st:
         width = 1                                          # a bounded pilot: one run first, timed, then the rest
+    if gpu_run(cfg, check):
+        # ponytail: one GPU, one run on it. Two runs of different checks on one 8 GB GPU slowed each other until both
+        # passed the per-run limit (Oct-01 PPRM C7/C8: 7446 of 8188 MiB used, no progress for 35 min), a blocker that
+        # measured the sharing, not the protocol. A run given the GPU holds it alone; every reconstruction is given
+        # the GPU on a GPU host, so there they run one at a time (CPU-only scripts too: a throughput cost, stated).
+        width = 1
+        free = 0 if fly or gpu_busy() else min(free, 1)
     done_set = set(st.get("done_seeds", []))
     while st["next"] in done_set:
         st["next"] += 1
@@ -1274,7 +1300,7 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         ckpt = [(ckpt_volume(cdir, seed), f"{MOUNT}/ckpt", False)] if kind != "AUTHOR_CODE" and seed >= 0 else []
         fly[str(seed)] = start(_cname(cdir.resolve(), st.get("token", ""), f"{mode}{seed}"), argv, mounts=mounts + ckpt,
                                workdir=workdir, image=image, network=network, env=env,
-                               gpus=kind in ("AUTHOR_CODE", "RECONSTRUCTION") and gpu(cfg),   # an experiment may use it
+                               gpus=gpu_run(cfg, check),   # an experiment may use it
                                mode=mode, target=cid, meta=meta)
     state.write_json(cdir / "exec.json", st)
     return True
@@ -1342,7 +1368,7 @@ def budget(cfg: state.Config, check: dict) -> tuple[int, str]:
 def _projected(cfg: state.Config, check: dict, st: dict, runs: int, spent: float = 0.0) -> tuple[float, int, str, int]:
     """(seconds needed, budget, its setting, runs at a time): the time already `spent` plus the timed
     pilot's projection of the remaining runs."""
-    w = 1 if check["kind"] == "AUTHOR_CODE" else max(1, min(cfg.parallel, st.get("width", cfg.parallel)))
+    w = 1 if check["kind"] == "AUTHOR_CODE" or gpu_run(cfg, check) else max(1, min(cfg.parallel, st.get("width", cfg.parallel)))
     limit, setting = budget(cfg, check)
     return spent + st.get("pilot_s", 0) * (runs - st["seed"]) / w, limit, setting, w
 
