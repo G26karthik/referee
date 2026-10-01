@@ -547,6 +547,8 @@ def reopen(cfg: state.Config, pid: str, cid: str, why: str) -> dict:
     the check's script-writing seals are withdrawn so its tasks are owed again. A status that says what was found
     (support, a failure, a violation) is never reopened: a result is not re-rolled until it reads differently."""
     root = state.pdir(cfg, pid)
+    if cid == "plan:2":
+        return _replan(cfg, pid, root, why)
     with state.lock(root / ".lock"):
         cdir = root / "checks" / cid
         o = state.read_json(cdir / "outcome.json")
@@ -572,6 +574,45 @@ def reopen(cfg: state.Config, pid: str, cid: str, why: str) -> dict:
             shutil.rmtree(cdir / "record_src", ignore_errors=True)
         state.append_jsonl(root / "log.jsonl", {"event": "reopen", "check": cid, "was": o.get("status"), "why": why[:500]})
         return {"reopened": cid, "was": o.get("status"), "seals_withdrawn": gone}
+
+
+def _replan(cfg: state.Config, pid: str, root: Path, why: str) -> dict:
+    """The operator withdraws a follow-up plan that was made on what the harness wrongly told it (a failed search read
+    as a search, a budget it had not spent), so the follow-up round is planned again once every first-round check has
+    ended. Only while none of the follow-up's checks has found anything: each one's folder is kept aside
+    (checks/<id>.withdrawn.N), never deleted; a check that found something is never re-rolled."""
+    with state.lock(root / ".lock"):
+        follow = _sealed(root, "plan:2")
+        if follow is None:
+            return {"error": "no sealed follow-up plan to withdraw"}
+        found = [c["id"] for c in follow["checks"] if (state.read_json(root / "checks" / c["id"] / "outcome.json") or {}).get(
+            "status") not in (None, "NOT_CHECKABLE", "BLOCKED", "INCONCLUSIVE")]
+        if found:
+            return {"error": f"follow-up check(s) {found} found something: a follow-up plan with a finding is never withdrawn"}
+        if any((root / "checks" / c["id"] / "exec.json").exists() for c in follow["checks"]):
+            return {"error": "a follow-up check is executing: stop it first (run.py stop), then withdraw the plan"}
+        moved = []
+        for c in follow["checks"]:
+            d = root / "checks" / c["id"]
+            if d.exists():
+                n = len(list(d.parent.glob(f"{c['id']}.withdrawn.*"))) + 1
+                d.rename(d.with_name(f"{c['id']}.withdrawn.{n}"))
+                moved.append(c["id"])
+        seals = state.read_json(root / "seals.json", {}) or {}
+        gone = [t for t in seals if t in ("plan:2", "report") or (t.split(":", 1)[0] in ("bind", "gen", "verify")
+                                                                  and _check_of(t) in {c["id"] for c in follow["checks"]})]
+        n = len(list((root / "sealed").glob("plan__2.withdrawn.*.json"))) + 1
+        (root / "sealed" / "plan__2.json").replace(root / "sealed" / f"plan__2.withdrawn.{n}.json")
+        for t in gone:
+            seals.pop(t)
+            if t != "plan:2":
+                (root / "sealed" / f"{_safe(t)}.json").unlink(missing_ok=True)
+        state.write_json(root / "seals.json", seals)
+        tried = state.read_json(root / "attempts.json", {}) or {}
+        state.write_json(root / "attempts.json", {k: v for k, v in tried.items() if k not in gone})
+        state.append_jsonl(root / "log.jsonl", {"event": "replan", "withdrawn": "plan:2", "checks_set_aside": moved,
+                                                 "why": why[:500]})
+        return {"withdrawn": "plan:2", "checks_set_aside": moved, "seals_withdrawn": gone}
 
 
 def _check_of(tid: str) -> str:

@@ -2915,6 +2915,33 @@ def test_an_alternate_reading_never_outranks_the_primary_readings_failure():
         srv.shutdown()
 
 
+def test_a_follow_up_plan_made_on_a_harness_fault_is_planned_again_never_one_with_a_finding():
+    """2026-10-01 run, PPRM: the follow-up round gave the LLM QA claims up because the harness had charged failed searches
+    to its budget ("one search left"). After the fix the operator re-plans the round; never once it found something."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid = _project_pages(td, DATA_PAGES)
+        state.write_json(td / ".gpu.json", False)
+        for lens in tasks.LENSES:
+            _seal(cfg, pid, f"lens:{lens}", {"concerns": []}, td)
+        _seal(cfg, pid, "critic", {"reviews": []}, td)
+        run = lambda cid: {"id": cid, "kind": "RECONSTRUCTION", "claim_quote": CIFAR, "covers": ["CIFAR-10-C"], **RUN,
+                           "target": {"quote": CIFAR, "relation": "acc_a > acc_b"}}
+        _seal(cfg, pid, "plan", {"checks": [run("R")], "central_claims": [_claim()]}, td)
+        root = td / pid
+        state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "INCONCLUSIVE", "reason": "x"})
+        _seal(cfg, pid, "plan:2", {"checks": [run("F1")], "central_claims": [_claim(checks=["F1"])]}, td)
+        state.write_json(root / "checks" / "C7" / "data.json", {"sources": []})
+        out = tasks.reopen(cfg, pid, "plan:2", "the follow-up was planned on failed searches read as searches")
+        assert out["withdrawn"] == "plan:2" and out["checks_set_aside"] == ["C7"]
+        assert (root / "checks" / "C7.withdrawn.1" / "data.json").exists() and (root / "sealed" / "plan__2.withdrawn.1.json").exists()
+        phase, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
+        assert phase == "plan" and [o["id"] for o in owed] == ["plan:2"]        # the round is planned again
+        _seal(cfg, pid, "plan:2", {"checks": [run("F1")], "central_claims": [_claim(checks=["F1"])]}, td)
+        state.write_json(root / "checks" / "C7" / "outcome.json", {"status": "RELATION_HOLDS", "values": [1]})
+        assert "never withdrawn" in tasks.reopen(cfg, pid, "plan:2", "again")["error"]   # a finding is never re-rolled
+
+
 def test_a_tls_failure_is_a_fault_of_this_run_never_a_data_blocker():
     """2026-10-01 run, conformal C5: the Porto zip that arrived on 09-30 failed with `TLSV1_ALERT_DECODE_ERROR`; the class
     `protocol` was never retried and ended the check as a DATA BLOCKER."""
