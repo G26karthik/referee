@@ -31,7 +31,12 @@ THE SCRIPT CONTRACT
     far>}` (either stream): it shows how far a failed run got and times the pilot.
   - DATA IDENTITY: for each dataset you load, print `REFEREE_DATA {"dataset": "<name>", "source":
     "<file path>", "observed": {...counts, shape, distinct labels...}, "expected": {...what the
-    paper prints, with its quote...}, "matches": true|false}`. A mismatch is a finding: report it
+    paper prints, with its quote...}, "matches": true|false}`. `matches` is true when what you loaded
+    is the dataset the paper describes within what the paper itself states: a count inside its own
+    stated tolerance or hedge ("about 300", "occasionally larger or smaller", "~1% discarded") matches;
+    observed and expected are recorded either way. It is false when the data differ from that
+    description (another dataset, split, version or subset, files missing, counts outside what the
+    paper allows): the harness then reports the result as about different data. A mismatch is a finding: report it
     and CONTINUE with the other units — never exit on it (that would discard what completed).
   - It never reads the paper's printed result to produce its own, and never compares with it:
     it computes; the harness compares.

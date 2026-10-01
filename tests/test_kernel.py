@@ -1553,7 +1553,7 @@ def test_an_empirical_claim_keeps_its_requested_experiment():
         assert "rests on a measurement" in _refused(lambda: seal([{**cert, "role": "supporting"}], {
             **cc, "checks": ["T"], "omitted": [omit]}))
         rec = seal([{**cert, "role": "supporting"}], {**cc, "checks": ["T"], "omitted": [
-            {**omit, "paper_quote": "Method A beats method B on CIFAR-10-C with ResNet-32"}]})
+            {**omit, "blocker": "other"}]})
         assert rec["checks"][0]["role"] == "supporting"
         # an omission names what stops it, and 'data' rests on a search the harness ran
         assert "`blocker`" in _refused(lambda: seal([run], {**cc, "checks": ["R"], "scope": ["CIFAR-10-C", "MMLU"],
@@ -2079,8 +2079,8 @@ GPT = "Method C uses GPT-4.1 as its labeler"
 RUN = {"role": "target", "criterion": "stated", "test": "performance"}
 
 
-def _x(td: Path):
-    cfg, pid = _project_pages(td, DATA_PAGES)
+def _x(td: Path, extra: tuple = ()):
+    cfg, pid = _project_pages(td, DATA_PAGES + list(extra))
     return cfg, pid, tasks._Ctx(cfg, pid)
 
 
@@ -2159,7 +2159,7 @@ def test_a_blocker_rests_on_what_the_harness_holds():
     """Sep-30 rerun 2 PPRM: open-weight Qwen models were given up as 'credentials' and as 'compute' against the
     host's RAM with no measurement, and no registry search was run for them or for the QA benchmarks."""
     with tempfile.TemporaryDirectory() as t:
-        cfg, pid, x = _x(Path(t))
+        cfg, pid, x = _x(Path(t), ("The full sweep took 6,000 GPU hours on 64 A100 cards.",))
         cfg.allow_network = cfg.allow_data_search = True
         did = _discovery(cfg, pid, [{"id": "Qwen/Qwen2-VL-2B", "gated": False, "private": False, "size_bytes": 4_400_000_000},
                                     {"id": "Qwen/Qwen2.5-VL-32B", "gated": False, "private": False, "size_bytes": 67_000_000_000},
@@ -2183,7 +2183,9 @@ def test_a_blocker_rests_on_what_the_harness_holds():
                 del execute.host
             else:
                 execute.host = real
-        _plan(x, [_run()], [omit(blocker="compute", paper_quote="Method A beats method B on CIFAR-10-C")])
+        _plan(x, [_run()], [omit(blocker="compute", paper_quote="The full sweep took 6,000 GPU hours on 64 A100 cards")])
+        assert "states none" in _refused(lambda: _plan(x, [_run()], [omit(           # a sentence that states no compute
+            blocker="compute", paper_quote="Method A beats method B on CIFAR-10-C")]))
         state.write_json(x.root / "checks" / "C9" / "outcome.json", {"status": "BLOCKED", "reason": "RESOURCE BLOCKER: pilot 2h"})
         _plan(x, [_run()], [omit(blocker="compute", failed_checks=["C9"])])               # a measured run past the budget
         assert "rests on a measurement" in _refused(lambda: _plan(x, [_run()], [omit(blocker="compute", failed_checks=["C1"])]))

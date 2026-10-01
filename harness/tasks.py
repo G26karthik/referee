@@ -724,7 +724,8 @@ def _fail_or_drop(errors: list[str], final: bool) -> None:
     dropped (and recorded) instead, so one bad quote cannot stall a review."""
     if errors and not final:
         raise SealError("fix these (copy the paper's parsed text exactly; never weaken the claim):\n- "
-                        + "\n- ".join(errors[:12]))
+                        + "\n- ".join(errors[:40]) + (f"\n- ... and {len(errors) - 40} more of the same kinds; fix "
+                                                       "them all" if len(errors) > 40 else ""))
 
 
 def _find(x: _Ctx, quote: str, errors: list[str], what: str) -> dict | None:
@@ -851,6 +852,11 @@ def _acquire(x: _Ctx, c: dict, errs: list[str], cid: str) -> list[dict]:
     return out
 
 
+_COMPUTE = re.compile(r"\d[\d.,]*\s*(?:[kKmMbB]\b|billion|million)?[\s-]*(?:x\s*)?(?:[A-Z]?\d*\s*)?(?:gpus?|tpus?|"
+                      r"a100s?|h100s?|v100s?|gpu[\s-]?hours?|hours?|days?|weeks?|cores?|nodes?|[gt]b\b|gib|tib|"
+                      r"param(?:eter)?s?|flops?)", re.I)
+
+
 def _blocker(x: _Ctx, e: dict, errors: list[str], label: str) -> str:
     """A requested experiment or dataset that is not run names WHAT stops it, and rests on what the harness
     holds wherever it can (returns the error, "" if the blocker stands):
@@ -897,8 +903,11 @@ def _blocker(x: _Ctx, e: dict, errors: list[str], label: str) -> str:
         h = execute.host(x.cfg) if art and art.get("size_bytes") else {}
         known = [m for m in (h.get("ram_mb"), h.get("vram_mb")) if isinstance(m, (int, float))]
         mem = max(known) * 2 ** 20 if known else None        # unmeasured memory is unknown, never zero
-        if measured or (quote and x.paper.find(quote)[0]):
+        if measured or (quote and x.paper.find(quote)[0] and _COMPUTE.search(quote)):
             pass
+        elif quote and x.paper.find(quote)[0]:
+            errors.append(f"{label}: `paper_quote` must be the paper's statement of the compute it used — a number with "
+                          "its unit (GPUs, GPU hours or days, nodes, GB of memory, parameters): this sentence states none")
         elif art and art.get("size_bytes") and mem is None:
             errors.append(f"{label}: this host's memory could not be measured, so {art['source']}'s size decides nothing: "
                           "propose the check — its measured run is the compute evidence")
