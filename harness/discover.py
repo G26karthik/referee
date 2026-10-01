@@ -125,6 +125,13 @@ def _huggingface_models(q: str, get) -> list[dict]:
 _SEARCH = {"zenodo": _zenodo, "datacite": _datacite, "huggingface": _huggingface, "huggingface-models": _huggingface_models}
 
 
+def _spent(done: list[dict]) -> int:
+    """Searches that count against the budget: one where some registry answered (or a listing that came back). A
+    search every registry failed (an HTTP error, a timeout) learned nothing and is never a reason to stop searching."""
+    return sum(1 for r in done if (any(not v.get("error") for v in r["results"].values()) if "results" in r
+                                   else not r.get("error")))
+
+
 def log_path(cfg: state.Config, pid: str) -> Path:
     return state.pdir(cfg, pid) / "discovery.jsonl"
 
@@ -150,7 +157,7 @@ def search(cfg: state.Config, pid: str, query: str, registry: str = "", get=_get
         if old := next((r for r in done if "results" in r and r["query"].casefold() == query.casefold() and sorted(r["results"])
                         == sorted(regs) and not any(v.get("error") for v in r["results"].values())), None):
             return {**old, "reused": True}
-        if len(done) >= cfg.max_discoveries:
+        if _spent(done) >= cfg.max_discoveries:
             return {"error": f"the discovery budget of {cfg.max_discoveries} searches (SH_MAX_DISCOVERIES) is spent; "
                              "narrow the query or record the dataset as not found"}
         results = {}
@@ -184,7 +191,7 @@ def files(cfg: state.Config, pid: str, url: str, get=_get) -> dict:
         done = records(cfg, pid)
         if old := next((r for r in done if r.get("api") == api and r.get("files") and not r.get("error")), None):
             return {**old, "reused": True}                       # the same record's listing: answered from the log
-        if len(done) >= cfg.max_discoveries:
+        if _spent(done) >= cfg.max_discoveries:
             return {"error": f"the discovery budget of {cfg.max_discoveries} searches (SH_MAX_DISCOVERIES) is spent"}
         try:
             listing = fetcher.record_listing(get(api))

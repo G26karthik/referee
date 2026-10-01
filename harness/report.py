@@ -487,10 +487,10 @@ def _failed_searches(root: Path, plan: dict) -> None:
     for cc in plan.get("central_claims") or []:
         for o in [*(cc.get("omitted") or []), cc]:
             ids = [d for d in o.get("discovery") or [] if d in recs]
-            if o.get("blocker") in ("data", "credentials", "compute") and ids and all(
-                    v.get("error") for d in ids for v in recs[d]["results"].values()):
-                o["unverified"] = (o.get("unverified") or f"every search it cites ({', '.join(ids)}) failed: a failed "
-                                   "search shows nothing about the dataset or model")
+            bad = [f"{d} {reg}" for d in ids for reg, v in recs[d]["results"].items() if v.get("error")]
+            if o.get("blocker") in ("data", "credentials", "compute") and bad:
+                o["unverified"] = (o.get("unverified") or f"search(es) it cites failed ({', '.join(bad[:6])}): a registry "
+                                   "that did not answer shows nothing about the dataset or model")
 
 
 def ledger(x) -> dict:

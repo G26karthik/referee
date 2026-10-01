@@ -2959,11 +2959,19 @@ def test_a_search_that_failed_is_no_search():
         omit = _claim(scope=["CIFAR-10-C", "MMLU"], omitted=[{"item": "MMLU", "why": "no record", "blocker": "data",
                                                                "discovery": [bad["id"]]}])
         assert "every search it cites failed" in _refused(lambda: _plan(x, [_run()], [omit]))
+        cfg.max_discoveries = 2
+        for _ in range(3):                                         # failed searches never spend the budget
+            assert "budget" not in str(discover.search(cfg, pid, "MMLU", registry="huggingface", get=lambda u: (
+                _ for _ in ()).throw(OSError("HTTPError: HTTP Error 503"))).get("error", ""))
+        cfg.max_discoveries = 12
         plan = {"central_claims": [{**omit, "page": 1, "omitted": [dict(o) for o in omit["omitted"]]}], "checks": []}
         report._failed_searches(x.root, plan)
         assert "failed" in plan["central_claims"][0]["omitted"][0]["unverified"]       # a plan sealed before: flagged
         ok = discover.search(cfg, pid, "MMLU", registry="zenodo", get=lambda u: {"hits": {"hits": []}})
         _plan(x, [_run()], [{**omit, "omitted": [{**omit["omitted"][0], "discovery": [bad["id"], ok["id"]]}]}])   # one answered
+        half = {"central_claims": [{**omit, "page": 1, "omitted": [{**omit["omitted"][0], "discovery": [bad["id"], ok["id"]]}]}]}
+        report._failed_searches(x.root, half)                     # ...but the hub that hosts such data never did: flagged
+        assert "huggingface" in half["central_claims"][0]["omitted"][0]["unverified"]
 
 
 def test_hub_errors_are_classified_by_their_http_status():
