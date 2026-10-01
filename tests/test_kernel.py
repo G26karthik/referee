@@ -1238,6 +1238,30 @@ def test_download_failures_are_classified_and_only_transient_ones_are_retried():
         assert fetcher.failure_class({"attempts": [{"class": "bug"}, {"class": "missing"}], "followed": [], "rejected": []}) == "bug"
 
 
+def test_a_named_file_that_arrives_packed_is_acquired_and_says_so():
+    """Oct-01 conformal C5: the UCI Porto archive holds `train.csv.zip`; the plan named `train.csv` (the paper's name).
+    Every file arrived, yet `train.csv` read as matching nothing and the check ended a DATA BLOCKER (missing). A named
+    file admitted in its packed form (one .zip/.gz/.bz2/.xz around that name) is acquired, recorded as packed; a name no
+    file carries, packed or not, stays unmatched."""
+    from harness import fetcher
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        porto = _zip({"train.csv.zip": _zip({"train.csv": "TRIP_ID,POLYLINE\n1,[]\n"}), "solution.csv": "x\n1\n"})
+        srv, host = _serve({"/ds": lambda h: (200, {"Content-Type": "text/html"}, b'<a href="/static/porto.zip">zip</a>'),
+                            "/static/porto.zip": lambda h: (200, {"Content-Type": "application/zip"}, porto)})
+        try:
+            rec = _fetch(fetcher, td, [{"source": f"http://{host}/ds", "include": ["*.zip", "train.csv"]}])[0]
+            assert rec["failure_class"] == "" and rec["unmatched_include"] == [], rec
+            assert rec["packed"] == [{"include": "train.csv", "file": "train.csv.zip"}], rec
+            man = fetcher.manifest(str(td / "data"), [rec])
+            assert man["status"] == "ok" and not execute.data_gaps(man)
+            miss = _fetch(fetcher, td / "b", [{"source": f"http://{host}/ds", "include": ["*.zip", "test.csv"]}])[0]
+            assert miss["unmatched_include"] == ["test.csv"] and not miss.get("packed")      # still a gap
+            assert fetcher.manifest(str(td / "b" / "data"), [miss])["status"] == "partial"
+        finally:
+            srv.shutdown()
+
+
 def test_a_cut_download_resumes_from_the_bytes_it_holds():
     """Oct-01 PPRM C1: CIFAR-10-C.tar (2.9 GB) was cut at 285 MB by a link drop at 08:14Z and every retry began again at
     byte 0. A cut transfer continues from what it holds (Range, If-Range on the first response's validator); a server

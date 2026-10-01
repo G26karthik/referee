@@ -345,8 +345,8 @@ def _data_text(x: _Ctx, cid: str) -> str:
                       for f in d.get("files", [])[:150])
     return (f"\n=== ACQUIRED DATA (read-only under {execute.DATA_MOUNT}/<n>/, one dir per source; sha256 in the "
             f"manifest) ===\n" + json.dumps([{k: s.get(k) for k in ("source", "dir", "failure_class", "admitted_files", "rejected",
-                                                                    "missing", "unmatched_include", "recovery", "landing",
-                                                                    "revision", "truncated") if s.get(k)}
+                                                                    "missing", "unmatched_include", "packed", "recovery",
+                                                                    "landing", "revision", "truncated") if s.get(k)}
                                              for s in d.get("sources", [])], ensure_ascii=False)[:6000]
             + f"\n{d.get('n_files', 0)} files, {d.get('bytes', 0)} bytes:\n{files}\n"
             + ("NOT COMPLETE — what the experiment needs and did not get: " + "; ".join(execute.data_gaps(d))[:1500] + "\n"

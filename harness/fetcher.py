@@ -453,6 +453,14 @@ def _archive(name: str) -> bool:
     return name.lower().endswith(ARCHIVES)
 
 
+def _unpacked_name(name: str) -> str:
+    """The name a file packed in ONE single-file wrapper carries inside it (`train.csv.zip` -> `train.csv`; a `.gz`,
+    `.bz2` or `.xz` alike); "" for anything else (a multi-file `.tar.*` is no single named file)."""
+    low = name.lower()
+    return "" if low.endswith((".tar.gz", ".tar.bz2", ".tar.xz")) else next(
+        (name[: -len(x)] for x in (".zip", ".gz", ".bz2", ".xz") if low.endswith(x) and len(name) > len(x)), "")
+
+
 def _dot(name: str) -> bool:
     """A path under a dot-name (`.gitattributes`, a hub's `.cache/`): repository metadata, never data."""
     return any(p.startswith(".") for p in name.replace("\\", "/").split("/") if p)
@@ -756,7 +764,14 @@ def acquire(f: Fetcher, s: dict, dest: str, tmp: str, idx: str) -> dict:
             break
     names = rec.pop("_hit", []) + [m["file"] for m in rec["missing"]] + [
         x for a in rec["admitted"] for x in (a["file"], a.get("from") or "") if x]
-    rec["unmatched_include"] = [q for q in s.get("include") or [] if not any(_named(x, [q]) for x in names)]
+    # A named file kept in its packed form (`train.csv` as `train.csv.zip`: a member archive and a compressed file stay
+    # whole) was acquired; it is recorded as packed, never read as matching nothing (Oct-01 conformal C5).
+    packed = [{"include": q, "file": x} for q in s.get("include") or [] if not any(_named(x, [q]) for x in names)
+              for x in [next((a["file"] for a in rec["admitted"] if _named(_unpacked_name(a["file"]), [q])), "")] if x]
+    if packed:
+        rec["packed"] = packed
+    rec["unmatched_include"] = [q for q in s.get("include") or [] if not any(_named(x, [q]) for x in names)
+                                and q not in {p["include"] for p in packed}]
     rec["failure_class"] = "" if rec["admitted"] else failure_class(rec)
     return rec
 
