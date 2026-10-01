@@ -522,6 +522,49 @@ def test_detached_steps_outlive_their_poller():
         assert execute._docker(["docker", "volume", "rm", "-f", env["volume"]], 60)[0] == 0
 
 
+def test_a_host_that_slept_is_no_run_time():
+    """Oct-01 PPRM C8/C9: the laptop slept on a critical battery from 10:52 to 17:01Z with two evidence runs in flight.
+    The first poll after it read 23043 s of wall time as a run past the 3600 s limit, killed both and blocked them as
+    RESOURCE BLOCKER (per_run_timeout); C8 had just printed its result. A run's time is the host's awake time."""
+    import datetime
+    import time as _t
+    iso = lambda s: datetime.datetime.fromtimestamp(s, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    now, box, calls = _t.time(), {}, []
+
+    def docker(a, timeout):
+        calls.append(a[1])
+        if a[1] == "kill":
+            box.update(Running=False, FinishedAt=iso(_t.time()), ExitCode=137)
+        return (0, json.dumps(box)) if a[1] == "inspect" else (0, "")
+    real = execute._docker, execute.awake
+    execute._docker = docker
+    try:
+        rec = {"container": "referee-kernel-sleep", "awake_offset": (now - 23043) - 1000.0}   # awake clock 1000 at start
+        box.update(Running=True, StartedAt=iso(now - 23043))
+        execute.awake = lambda: 1000.0 + 912 + (_t.time() - now)   # 912 s awake since: the host slept 22131 s
+        assert execute.collect(rec, 3600) is None and "kill" not in calls          # still within its limit: never killed
+        box.update(Running=False, FinishedAt=iso(now - 9), ExitCode=0)              # it ended on its own, after 903 s awake
+        done = execute.collect(rec, 3600)
+        assert done["returncode"] == 0 and not done["timed_out"] and "error" not in done, done
+        assert 850 < done["seconds"] < 950 and 22000 < done["host_slept_s"] < 22200
+        # The same wall time on a host that never slept is past the limit: killed, recorded as timed out (blocked).
+        calls.clear()
+        box.clear()
+        box.update(Running=True, StartedAt=iso(now - 23043))
+        execute.awake = lambda: 1000.0 + 23043 + (_t.time() - now)
+        done = execute.collect(rec, 3600)
+        assert "kill" in calls and done and done["timed_out"] and done["returncode"] is None, done
+        assert execute.resource_action({**done, "mode": "evidence"}, {}, "0", 3600)[0] == "blocker"
+        assert "host_slept_s" not in done
+        box.update(Running=True, StartedAt=iso(now - 23043))                        # a record from before the clock
+        calls.clear()
+        execute.collect({"container": "referee-kernel-sleep"}, 3600)               # (no awake_offset): wall time, as before
+        assert "kill" in calls
+        assert isinstance(real[1](), float) and real[1]() >= 0                      # the real clock answers on this host
+    finally:
+        execute._docker, execute.awake = real
+
+
 def test_measurements_survive_a_later_stage_failure():
     """Sep-29 label ranking C2: political's five folds were measured (in stderr), then the movies
     stage exited 1 at 29 s; the check read 'no sign the experiment itself began' and kept nothing."""
@@ -813,6 +856,26 @@ def test_a_run_that_measures_then_fails_keeps_its_measurements_live():
             assert o["stages"]["a"]["n"] == 3 and o["stages"]["b"]["status"] == "NOT_COMPLETED"
             assert "do not match the paper" in o["stages"]["b"]["reason"] and len(o["failed_seeds"]) == 3
             assert "setup" not in o["stages"] and "(during b)" in o["failed_seeds"]["0"]   # a step is not a unit
+            # Oct-01 PPRM C8: a run past the per-run limit is a RESOURCE BLOCKER, and what it printed before the
+            # limit is kept beside it (pilot_stages), never discarded; it decides nothing.
+            c2 = td / "p" / "checks" / "C2"
+            c2.mkdir(parents=True)
+            slow = ("import argparse, json, time\np = argparse.ArgumentParser(); p.add_argument('--seed', type=int)\n"
+                    "p.parse_args()\nprint('REFEREE_RESULT ' + json.dumps({'stage': 'a', 'gap': 0.75}), flush=True)\n"
+                    "time.sleep(600)\n")
+            (c2 / "script.py").write_bytes(slow.encode("utf-8"))
+            sha2 = state.sha256(slow)
+            state.write_json(c2 / "check.json", {"id": "C2", "kind": "RECONSTRUCTION", "runs": 3, "script_sha256": sha2,
+                                                 "target": {"relation": "gap > 0"}, "repo_attributed": False,
+                                                 "approval": {"approved": True, "script_sha256": sha2}})
+            state.write_json(c2 / "exec.json", {"token": state.now()})
+            cfg.run_timeout_s, t0 = 25, time.time()
+            while execute.poll(cfg, "p", "C2") and time.time() - t0 < 600:
+                time.sleep(2)
+            o = state.read_json(c2 / "outcome.json")
+            assert o and o["status"] == "BLOCKED" and o["resource"] == "per_run_timeout", o
+            assert o["pilot_stages"] == {"a": {"n": 1, "mean": 0.75}} and o["values"] == [], o
+            execute._docker(["docker", "volume", "rm", "-f", execute.ckpt_volume(c2, 0)], 60)
             env_dir = td / ".script-env"                     # a draft mounts the env's named volume by name
             rec = execute.run(["/env/bin/python", "-c", "print('ok')"], mounts=[(execute.volume(env_dir), "/env", True)],
                               workdir="/", image=execute.DEFAULT_IMAGE, network=False, timeout=120, mode="try", target="t")
@@ -2932,6 +2995,10 @@ def test_a_follow_up_plan_made_on_a_harness_fault_is_planned_again_never_one_wit
         state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "INCONCLUSIVE", "reason": "x"})
         _seal(cfg, pid, "plan:2", {"checks": [run("F1")], "central_claims": [_claim(checks=["F1"])]}, td)
         state.write_json(root / "checks" / "C7" / "data.json", {"sources": []})
+        state.write_json(root / "checks" / "C7" / "exec.json", {"token": "t"})          # still executing: stop it first
+        assert "executing" in tasks.reopen(cfg, pid, "plan:2", "x")["error"]
+        # Oct-01 PPRM: C8/C9 had ended BLOCKED and kept their exec.json; an ended check is not executing.
+        state.write_json(root / "checks" / "C7" / "outcome.json", {"status": "BLOCKED", "reason": "RESOURCE BLOCKER: x"})
         out = tasks.reopen(cfg, pid, "plan:2", "the follow-up was planned on failed searches read as searches")
         assert out["withdrawn"] == "plan:2" and out["checks_set_aside"] == ["C7"]
         assert (root / "checks" / "C7.withdrawn.1" / "data.json").exists() and (root / "sealed" / "plan__2.withdrawn.1.json").exists()

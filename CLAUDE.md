@@ -105,7 +105,10 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     a projection past SH_CHECK_BUDGET_S, an out-of-memory kill of a lone run, or a run past
     SH_RUN_TIMEOUT_S is a BLOCKED "RESOURCE BLOCKER" with the measurement, not repeated and
     never downscaled. The blocker names its kind (`resource`: time_budget — a configured
-    setting —, memory — measured —, per_run_timeout, storage). Completed seeds are checkpointed
+    setting —, memory — measured —, per_run_timeout, storage). A run's time is the host's awake
+    time: hours a sleeping host froze its containers are not run time (`host_slept_s` recorded).
+    What a run printed before its limit is kept beside the blocker (`pilot_stages`), deciding
+    nothing. Completed seeds are checkpointed
     (seeds.jsonl) and reused; each seed has a scratch volume at /work/ckpt. Planners and script
     authors are told the measured host (CPUs, container RAM, GPU yes/no).
 20. **Completed measurements survive later failures.** A script prints one result line per

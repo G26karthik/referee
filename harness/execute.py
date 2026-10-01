@@ -167,6 +167,30 @@ def _secs(ts: str) -> float:
         tzinfo=datetime.timezone.utc).timestamp() if m else 0.0
 
 
+def awake() -> float:
+    """Seconds this host has been awake since it booted: a clock that stops while the host sleeps (a closed lid, a
+    critical battery), so a step's run time is what it ran, never the hours its containers were frozen. Windows:
+    the unbiased interrupt time; macOS: CLOCK_UPTIME_RAW; Linux: CLOCK_MONOTONIC (both stop in suspend)."""
+    import sys
+    if sys.platform == "win32":
+        import ctypes
+        t = ctypes.c_ulonglong(0)
+        if ctypes.windll.kernel32.QueryUnbiasedInterruptTime(ctypes.byref(t)):
+            return t.value / 1e7
+    for clk in ("CLOCK_UPTIME_RAW", "CLOCK_MONOTONIC"):
+        if hasattr(time, clk):
+            return float(time.clock_gettime(getattr(time, clk)))
+    return float(time.monotonic())
+
+
+def _slept(rec: dict, wall: float) -> float:
+    """Seconds the host slept since `rec` started (its wall offset from the awake clock grew by exactly that), at most
+    the `wall` seconds elapsed. A record started before this clock existed has no offset: nothing is subtracted."""
+    off = rec.get("awake_offset")
+    s = min(max(0.0, time.time() - awake() - off), max(0.0, wall)) if isinstance(off, (int, float)) else 0.0
+    return s if s >= 1 else 0.0           # under a second is the two clocks' jitter, not a sleep
+
+
 def start(name: str, argv: list[str], *, mounts: list[tuple[Path, str, bool]], workdir: str, image: str,
           network: bool, env: dict | None = None, gpus: bool = False, mode: str, target: str,
           meta: dict | None = None) -> dict:
@@ -180,7 +204,8 @@ def start(name: str, argv: list[str], *, mounts: list[tuple[Path, str, bool]], w
         launch += ["-e", f"{k}={v}"]
     launch += [image, *argv]
     rec = {"mode": mode, "target": target, "argv": argv, "launch_argv": launch, "cwd": workdir, "image": image,
-           "network": network, **(meta or {}), "container": name, "started_at": state.now()}
+           "network": network, **(meta or {}), "container": name, "started_at": state.now(),
+           "awake_offset": round(time.time() - awake(), 3)}   # wall minus awake: grows only while the host sleeps
     rc, out = _docker(launch, 480)          # ponytail: includes an image pull; 8 min fits one tool call
     if rc != 0 and _docker(["docker", "inspect", name], 60)[0] != 0:
         rec.update(returncode=None, timed_out=False, stdout="", stderr="", ended_at=state.now(), seconds=0,
@@ -190,7 +215,8 @@ def start(name: str, argv: list[str], *, mounts: list[tuple[Path, str, bool]], w
 
 def collect(rec: dict, timeout: int) -> dict | None:
     """The finished record of a started step, or None while it runs (or while the daemon is
-    away). A step past `timeout` is killed and recorded as timed out."""
+    away). A step past `timeout` of the host's awake time is killed and recorded as timed out; the hours a sleeping
+    host froze it are not its run time (Oct-01: a 6 h laptop sleep read as a run past the limit)."""
     if "returncode" in rec:
         return rec
     name = rec["container"]
@@ -200,11 +226,16 @@ def collect(rec: dict, timeout: int) -> dict | None:
             return None
         return {**rec, "returncode": None, "timed_out": False, "stdout": "", "stderr": "", "ended_at": state.now(),
                 "seconds": 0, "error": "the container disappeared before it was collected"}
-    st = json.loads(out)
+    st, killed = json.loads(out), False
     if st.get("Running"):
-        if time.time() - _secs(st.get("StartedAt", "")) > timeout:
-            _docker(["docker", "kill", name], 60)
-        return None
+        wall = time.time() - _secs(st.get("StartedAt", ""))
+        if wall - _slept(rec, wall) <= timeout:
+            return None
+        _docker(["docker", "kill", name], 60)
+        rc, out = _docker(["docker", "inspect", "-f", "{{json .State}}", name], 60)   # collected now, on the same clock
+        if rc != 0 or json.loads(out).get("Running"):
+            return None
+        st, killed = json.loads(out), True
     try:
         p = subprocess.run(["docker", "logs", name], capture_output=True, text=True, encoding="utf-8",
                            errors="replace", timeout=300)
@@ -212,11 +243,13 @@ def collect(rec: dict, timeout: int) -> dict | None:
     except (OSError, subprocess.SubprocessError) as e:
         so, se = "", f"logs unavailable: {e}"
     t0, t1 = _secs(st.get("StartedAt", "")), _secs(st.get("FinishedAt", ""))
-    timed_out = t1 - t0 >= timeout
+    slept = _slept(rec, t1 - t0)
+    ran = max(0.0, t1 - t0 - slept)
+    timed_out = killed or ran >= timeout
     _docker(["docker", "rm", "-f", name], 60)
     return {**rec, "returncode": None if timed_out else st.get("ExitCode"), "timed_out": timed_out,
             "stdout": so[-_OUT_CAP:], "stderr": se[-_OUT_CAP:], "ended_at": st.get("FinishedAt", state.now())[:19] + "Z",
-            "seconds": round(max(0.0, t1 - t0), 2),
+            "seconds": round(ran, 2), **({"host_slept_s": round(slept)} if slept >= 1 else {}),
             **({"error": f"timeout after {timeout}s"} if timed_out else {"error": "out of memory"} if st.get("OOMKilled") else {})}
 
 
@@ -1106,6 +1139,10 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             st.setdefault("redo", []).append(int(key))
             continue
         if act == "blocker":
+            if kind in ("RECONSTRUCTION", "RELEASED_DATA"):      # what it printed before the limit is kept beside the
+                kept = staged_values(done.get("stdout") or "", (check.get("target") or {}).get("relation", ""),
+                                     check.get("metric", ""))   # blocker (pilot_stages), deciding nothing (Oct-01 C8)
+                st["values"], st["staged"] = st.get("values", []) + [e[1] for e in kept], st.get("staged", []) + kept
             return _finish(cfg, root, check, {**_cancel(root, st), "blocker": text})
         per = st.setdefault("restarts_by_seed", {})
         if (_vanished(done) or (done["mode"] == "evidence" and classify(done)["infra_error"])) and per.get(key, 0) < 3:

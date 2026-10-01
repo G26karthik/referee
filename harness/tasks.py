@@ -589,7 +589,8 @@ def _replan(cfg: state.Config, pid: str, root: Path, why: str) -> dict:
             "status") not in (None, "NOT_CHECKABLE", "BLOCKED", "INCONCLUSIVE")]
         if found:
             return {"error": f"follow-up check(s) {found} found something: a follow-up plan with a finding is never withdrawn"}
-        if any((root / "checks" / c["id"] / "exec.json").exists() for c in follow["checks"]):
+        if any((root / "checks" / c["id"] / "exec.json").exists() and not (root / "checks" / c["id"] / "outcome.json").exists()
+               for c in follow["checks"]):                 # an ended check keeps its exec.json: only one without an outcome runs
             return {"error": "a follow-up check is executing: stop it first (run.py stop), then withdraw the plan"}
         moved = []
         for c in follow["checks"]:
