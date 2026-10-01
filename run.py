@@ -4,6 +4,9 @@ workers writing a check script use `try`; `exec` and `env` poll to completion by
   python run.py tasks <paper.pdf|paper-id> [--json] [--wait SECONDS]
   python run.py seal <paper-id> <task-id> <answer.json>
   python run.py try <paper-id> <gen-task-id> <script.py>
+  python run.py discover <paper-id> "<dataset name>" [--registry zenodo|datacite|huggingface|huggingface-models]
+  python run.py discover <paper-id> --files <record url>   # the files of a cited repository record
+  python run.py reopen <paper-id> <check> <why>             # a check that ended without a finding, after a harness fix
   python run.py env <paper-id>          # build the authors' environment (started by the harness)
   python run.py stop <paper-id> <check> <why>   # the operator ends a running check
   python run.py status [<paper-id>]
@@ -21,7 +24,7 @@ import time
 import zipfile
 from pathlib import Path
 
-from harness import execute, state, tasks
+from harness import discover, execute, report, state, tasks
 
 HEAVY = ("repo", "env", "env-extra", "script-env")      # clones, venvs, datasets: rebuilt on demand, never packed
 
@@ -37,6 +40,11 @@ def main(argv: list[str]) -> int:
     s.add_argument("pid"), s.add_argument("task"), s.add_argument("file")
     tr = sub.add_parser("try")
     tr.add_argument("pid"), tr.add_argument("task"), tr.add_argument("script")
+    dv = sub.add_parser("discover")
+    dv.add_argument("pid"), dv.add_argument("query", nargs="?", default=""), dv.add_argument("--registry", default="")
+    dv.add_argument("--files", default="", help="list the files of a cited repository record (names, sizes, checksums)")
+    ro = sub.add_parser("reopen")
+    ro.add_argument("pid"), ro.add_argument("check"), ro.add_argument("why")
     e = sub.add_parser("exec")
     e.add_argument("pid"), e.add_argument("check")
     sub.add_parser("env").add_argument("pid")
@@ -60,6 +68,11 @@ def main(argv: list[str]) -> int:
             return 2
     elif a.cmd == "try":
         print(json.dumps(tasks.try_(cfg, a.pid, a.task, a.script), indent=1))
+    elif a.cmd == "discover":         # public registries only; grants no code, no clone, no execution
+        print(json.dumps(discover.files(cfg, a.pid, a.files) if a.files else discover.search(cfg, a.pid, a.query, a.registry),
+                         indent=1, ensure_ascii=False))
+    elif a.cmd == "reopen":           # a check that ended without a finding, after its cause was fixed
+        print(json.dumps(tasks.reopen(cfg, a.pid, a.check, a.why)))
     elif a.cmd == "exec":             # poll one started check to its end (the harness polls it anyway)
         while execute.poll(cfg, a.pid, a.check):
             time.sleep(10)
@@ -75,8 +88,8 @@ def main(argv: list[str]) -> int:
             led = state.read_json(d)
             print(f"{d.parent.name}: {led['scientific_status']} — "
                   + ", ".join(f"{c['id']} {c['status']}" for c in led["checks"]))
-        if a.pid:
-            print(json.dumps(tasks.advance(cfg, a.pid), indent=1)[:3000])
+            if led.get("completion"):
+                print("  completion: " + report._completion_line(led["completion"]))
     elif a.cmd == "pack":
         return pack(cfg, Path(a.out), a.pids, a.clean)
     return 0

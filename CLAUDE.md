@@ -24,6 +24,9 @@ reconciling numbers, and computing every status.
 | `harness/repo.py` | author-repo attribution, clone, `verify_commit`, listing, released-data hashes |
 | `harness/tasks.py` | the protocol: which task is owed, seal validators (what a model may set) |
 | `harness/execute.py` | `authorize` (the one gate), container runner, env build, failure classes, metric parse |
+| `harness/fetcher.py` | container-side acquisition: final-URL link resolution, failure classes, bounded recovery, content validation |
+| `harness/discover.py` | registry search (Zenodo, DataCite, HF datasets) for datasets a paper names; the log a plan's `acquire` is checked against |
+| `harness/independence.py` | are seeded replicates different runs? (result-line outputs, data fingerprints, the seed's flow into a generator) |
 | `harness/reconcile.py` | executed value vs printed value; statuses |
 | `harness/report.py` | ledger, deterministic status table, earned-language check, `review.md` |
 | `harness/state.py` | config/gates, atomic JSON, project lock |
@@ -80,10 +83,18 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     PREMISE_NOT_MET (claim status READING_CHANGED / PREMISE_NOT_MET, never a failure).
 17. **Small samples are decided with Student-t** (two-sided 95%): a relation beyond t·SE; a
     reproduction RESOLVED inside the CI of the mean, FAILED outside the prediction interval.
-    Identical results of several runs are one measurement (`n_independent` 1), never replicates:
-    a recomputation from released files runs once, a pipeline its author declares deterministic
-    (`stochastic: false`) runs twice and must repeat exactly; a seeded experiment whose runs are
-    identical decides nothing.
+    Runs are ONE measurement (`n_independent` 1) only when they are identical in every output and
+    nothing shows the seed varied them; a recomputation from released files runs once, a pipeline its
+    author declares deterministic (`stochastic: false`) runs twice and must repeat exactly. Equal
+    SUMMARY values are not identical runs: replicates whose other outputs differ, whose
+    `data_fingerprint` differs, or whose `--seed` provably reaches a random generator are independent
+    replicates of a zero-variance sample, decided by the statistic that fits the quantity — a compared
+    proportion of counted trials (`binomial`, zero events included) by its exact Clopper-Pearson interval,
+    anything else by an exact sign test (six replicates reach 95%; a finished check that only more
+    replicates can decide — a repeated value, or a margin within t*SE at fewer than six, t(2) being 4.3 — is
+    extended to six once, inside its time budget, whichever way the result leans) — never by a t-test whose
+    standard error is zero. A stochastic script whose seed reaches no generator is refused at the seal.
+
 18. **No arithmetic error from extracted math without the page image.** An independent
     transcriber reads every number of an ARITHMETIC_CONTRADICTION or a CONFIRMED arithmetic
     concern off the page PNG (masked context); disagreement withdraws the assertion.
@@ -110,13 +121,28 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     (seed 0, results masked, never evidence) before its verifier; a script failing there goes
     back to its author with the error. A certificate's violation within 1e-9 (relative) without
     exact values printed is round-off, never a counterexample.
-22. **Cited public artifacts are acquired, not assumed absent.** A check may `acquire` sources
-    the paper or a tracked checkout file cites verbatim (a URL, a dataset page followed to its
-    files by `include` patterns, an hf:// dataset), never a denied source (SH_DENY_SOURCES);
-    harness code downloads them with the network on (cap SH_MAX_DATA_GB), records every file's
-    sha256 (`checks/<id>/data.json`) and mounts them read-only at /work/data. Scripts print a
-    REFEREE_DATA identity line per dataset against the paper's own description; a mismatch is a
-    finding, not an abort.
+22. **Public artifacts are found and acquired, not assumed absent.** A check may `acquire` (a) a source
+    the paper or a tracked checkout file prints — matched as printed: a scheme the paper omits, a
+    line-break hyphen ("zen-\nodo.org"), and a DOI for its record are one citation, and the span as
+    printed is kept with the other readings it can mean — or (b) a record the harness's own registry
+    search returned for a dataset the paper names (`run.py discover`, logged in `discovery.jsonl`;
+    `SH_ALLOW_DATA_SEARCH`, its own gate: it grants no clone, code or execution, and a run without author
+    code still needs it), never a denied source (SH_DENY_SOURCES). Harness code downloads them with the
+    network on (cap SH_MAX_DATA_GB) inside `fetcher.py`: links resolve against the FINAL url of a
+    response (a DOI redirects to the repository), each failure is classified (transient: retried;
+    missing; inaccessible; no data on the page; content invalid; a bug of this code), recovery uses
+    documented mechanisms only (another printed reading, the repository's records API with its
+    checksums, the DOI registry) and is bounded and recorded, and nothing is admitted unvalidated (an
+    HTML page, an empty or corrupt file, a bad checksum, executable source code). A cap on the files followed
+    is never silent: a landing page follows 20 links, a repository record its own listing (up to 500), and a
+    cut is recorded (`truncated`), shown to planner, script author and report, and never shared as a complete
+    set. Every attempt, redirect
+    and file sha256 is kept (`checks/<id>/data.json`); admitted files mount read-only at /work/data. A
+    check whose required data was not admitted ends as a DATA BLOCKER (or INCONCLUSIVE for a network
+    fault of this run) before any script is written — a simulation in its place would be a different
+    experiment. A script for a check that acquired data must read /work/data. Scripts print a
+    REFEREE_DATA identity line per dataset against the paper's own description; a mismatch is a finding.
+
 23. **Results are limited by what changed.** Support or failure obtained under a claim-changing
     deviation (data, split, tuning, rebuilt baseline, aggregation, premise, index) is
     READING_CHANGED, never support or failure of the printed claim. Every scope item a central
@@ -128,6 +154,15 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     integrates, trains) is tested by a compatibility test — a per-run condition, SH_REPLICATES
     runs, SH_COMPAT_BUDGET_S — that supports only compatibility, and a performance claim by its
     own performance test; the plan seal refuses either standing for the other.
+24. **The requested experiment is not replaced, and completion is four things.** An empirical central
+    claim (performance, value, engineering) is satisfied only by the experiment on what it names; a
+    certificate, a simulation or a stand-in is a `role: supporting` check, reported beside the claim with
+    its own outcome and never counted toward it. What is not run names its `blocker` (data, credentials,
+    compute, protocol, other); `data` rests on a registry search the harness ran (and, if it returned
+    candidates, why none is the dataset) or on a check that failed to acquire it. The ledger's
+    `completion` and the report keep apart: the workflow reached a terminal state (any status), the
+    requested experiment RAN, its protocol matched (no claim-changing deviation, data identity, scope), and
+    what the evidence says. No sentence may imply a paper was reproduced because a report exists.
 
 ## Dependency recovery (documented, isolated, recorded)
 
@@ -155,6 +190,9 @@ its author with the error (within SH_MAX_REVISIONS = 3).
 python run.py tasks <paper.pdf|paper-id> --json [--wait 540]
 python run.py seal <paper-id> <task-id> <answer.json>
 python run.py try <paper-id> <gen-task-id> <script.py>      # draft run, masked, never evidence
+python run.py discover <paper-id> "<dataset name>" [--registry zenodo|datacite|huggingface]   # public data only
+python run.py discover <paper-id> --files <record url>     # the files of a cited repository record (names, sizes, md5)
+python run.py reopen <paper-id> <check> <why>              # redo a check that ended WITHOUT a finding, after a harness fix
 python run.py env <paper-id>                               # authors' env (the harness starts it)
 python run.py status [<paper-id>]
 python run.py pack <out.zip> [<paper-id> ...] --clean      # zip artifacts, then delete clones/venvs
@@ -163,7 +201,10 @@ python tools/replay.py <projects dir> [--out f.json]              # re-decide re
 ```
 
 Gates: `SH_ALLOW_REPO_EXEC`, `SH_ALLOW_SCRIPT_EXEC`, `SH_ALLOW_INSTALL`, `SH_ALLOW_NETWORK`
-(default on, for cloning and cited-data downloads), `SH_ALLOW_SOURCE_SEARCH`. Caps:
+(default on, for cloning and data downloads), `SH_ALLOW_SOURCE_SEARCH` (the authors' repository only),
+`SH_ALLOW_DATA_SEARCH` (default on: registry search for public datasets; separate from every code gate;
+data downloads need the network gate alone, a Hugging Face download also the install gate). Caps:
+`SH_MAX_DISCOVERIES` (12 searches per paper),
 `SH_MAX_CHECKS` (6), `SH_MAX_FOLLOWUP_CHECKS` (3), `SH_MAX_REVISIONS` (3), `SH_MAX_TRIES` (3),
 `SH_MAX_DATA_GB` (20), `SH_CHECK_BUDGET_S` (7200), `SH_COMPAT_BUDGET_S` (1800), `SH_RUN_TIMEOUT_S` (3600). Docker is the only
 execution backend.

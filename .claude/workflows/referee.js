@@ -33,7 +33,7 @@ const STATE = {
   type: 'object',
   properties: {
     paper_id: { type: 'string' }, phase: { type: 'string' }, status: { type: 'string' },
-    blocked_reason: { type: 'string' }, scientific_status: { type: 'string' },
+    blocked_reason: { type: 'string' }, scientific_status: { type: 'string' }, completion: { type: 'string' },
     tasks: { type: 'array', items: { type: 'object', properties: {
       id: { type: 'string' }, role: { type: 'string' }, prompt: { type: 'string' },
       out: { type: 'string' }, effort: { type: 'string' },
@@ -60,7 +60,7 @@ async function run(kind, prompt, opts) {
 function controller(source, label) {
   return run('controller',
     `Run exactly this shell command (Bash, timeout 600000 ms) and return its JSON stdout fields ` +
-    `verbatim (paper_id, phase, status, blocked_reason, scientific_status, tasks). Do nothing else:\n\n` +
+    `verbatim (paper_id, phase, status, blocked_reason, scientific_status, completion, tasks). Do nothing else:\n\n` +
     sh(`run.py tasks "${source}" --json --wait 540`),
     { label, phase: 'Review', model: CONTROLLER_MODEL, effort: 'low', schema: STATE })
 }
@@ -75,7 +75,8 @@ function worker(pid, t, prior) {
     `2. Create every file with the Write tool, never a shell heredoc or echo. Write your JSON answer, ` +
     `exactly as the task specifies, to ${t.out}. Seal only after that Write succeeded. ` +
     `Name any script you draft ${t.id.replace(/[^\w.-]+/g, '_')}.py.\n` +
-    `3. Use Bash ONLY for the draft-run command the task gives you (if any; Bash timeout 600000 ms) and to seal: ` +
+    `3. Use Bash ONLY for the commands the task gives you (the draft-run command, the discover command that searches ` +
+    `public data registries; Bash timeout 600000 ms) and to seal: ` +
     `${sh(`run.py seal ${pid} "${t.id}" "${t.out}"`)}\n` +
     `4. If sealing is refused, fix exactly what it names (copy the paper's parsed text exactly), ` +
     `Write again and re-seal (at most 2 retries). Never invent or weaken evidence to pass.\n` +
@@ -112,6 +113,8 @@ async function review(source) {
   }
   return { source, models: { worker: WORKER_MODEL, controller: CONTROLLER_MODEL }, final: st && { paper_id: st.paper_id, phase: st.phase, workflow_status: st.status,
            blocked_reason: st.blocked_reason, scientific_status: st.scientific_status || 'NOT_ASSESSED',
+           // `workflow_status` says the workflow reached its end; `completion` says which requested experiments ran.
+           completion: st.completion || 'NOT_ASSESSED',
            left: (st.tasks || []).map(t => t.id) },
            rounds, waits, gave_up: Object.keys(fails).filter(k => fails[k] >= 2) }
 }

@@ -427,6 +427,21 @@ def cert_rows(stdout: str) -> list[dict]:
     return rows
 
 
+def result_detail(stdout: str, seed: int) -> list[dict]:
+    """What one run printed, per result line, for judging whether replicates differed: every finite
+    numeric output, the number of counted trials a proportion declares (`binomial`: {output: trials}),
+    and the script's fingerprint of the data it generated (`data_fingerprint`)."""
+    rows = []
+    for d in json_lines(stdout, "REFEREE_RESULT")[:2000]:                    # ponytail: 2000 lines per run
+        out = dict(list(_num(d).items())[:40])                                # ponytail: 40 outputs per line
+        b = d.get("binomial") if isinstance(d.get("binomial"), dict) else {}
+        rows.append({"seed": seed, "stage": str(d.get("stage") or "")[:80], "reading": str(d.get("reading") or "")[:40],
+                     "out": out, "data_fp": str(d.get("data_fingerprint") or "")[:64] or None,
+                     "trials": {k: int(v) for k, v in b.items() if k in out and isinstance(v, (int, float))
+                                and not isinstance(v, bool) and v >= 1}})
+    return rows
+
+
 def relation_margins(stdout: str, rel: str) -> list[float]:
     """One paired margin per result line that carries every output the relation names."""
     return [e[1] for e in staged_values(stdout, rel, "")]
@@ -673,110 +688,24 @@ def script_env(cfg: state.Config, root: Path, kind: str, attributed: bool) -> tu
 # later step sees them read-only at /work/data. A cited dataset PAGE may be followed to the
 # same site's files matching `include`.
 DATA_MOUNT = f"{MOUNT}/data"
-_FETCHER = r'''
-import fnmatch, hashlib, html, json, os, re, shutil, subprocess, sys, tarfile, urllib.parse, urllib.request, zipfile
-cap, deny = int(os.environ["REFEREE_CAP"]), [d for d in os.environ.get("REFEREE_DENY", "").lower().split(",") if d]
-cache, total, out = "/root/.cache/referee-urls", 0, []
-TEXT = (".csv", ".tsv", ".txt", ".json", ".jsonl", ".arff", ".md", ".data", ".names")
-def denied(s): return any(d in s.lower() for d in deny)
-def get(url, dest):
-    global total
-    if denied(url): raise RuntimeError("source denied by SH_DENY_SOURCES")
-    key = hashlib.sha256(url.encode()).hexdigest()[:16]
-    name = os.path.basename(urllib.parse.unquote(urllib.parse.urlparse(url).path.rstrip("/").split("/")[-1]))
-    name = name if name not in ("", ".", "..") else "index.html"      # never a path out of the folder
-    cpath, info = f"{cache}/{key}/{name}", {"url": url}
-    if os.path.exists(cpath + ".ctype"):
-        info["content_type"] = open(cpath + ".ctype").read()
-    if not os.path.exists(cpath):
-        os.makedirs(os.path.dirname(cpath), exist_ok=True)
-        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "referee"}), timeout=120) as r:
-            info["http_status"], info["content_type"] = r.status, r.headers.get("Content-Type", "")
-            open(cpath + ".ctype", "w").write(info["content_type"])
-            n = int(r.headers.get("Content-Length") or 0)
-            if total + n > cap: raise RuntimeError(f"{n} bytes would pass the storage cap ({cap} bytes, SH_MAX_DATA_GB)")
-            got = 0
-            with open(cpath + ".part", "wb") as f:
-                while (b := r.read(1 << 20)):
-                    got += len(b)
-                    if total + got > cap: raise RuntimeError(f"passed the storage cap ({cap} bytes, SH_MAX_DATA_GB)")
-                    f.write(b)
-            os.replace(cpath + ".part", cpath)
-    else:
-        info["from_cache"] = True
-    total += os.path.getsize(cpath)
-    os.makedirs(dest, exist_ok=True)
-    shutil.copy(cpath, os.path.join(dest, name))
-    return os.path.join(dest, name), info
-def unpack(p, dest):
-    if tarfile.is_tarfile(p):
-        with tarfile.open(p) as t:
-            t.extractall(dest, filter="data")
-        return True
-    if zipfile.is_zipfile(p):
-        with zipfile.ZipFile(p) as z:
-            for m in z.namelist():
-                if m.startswith("/") or ".." in m.split("/"): raise RuntimeError(f"unsafe path in archive: {m}")
-            z.extractall(dest)
-        return True
-    return False
-for i, s in enumerate(json.loads(os.environ["REFEREE_SOURCES"])):
-    dest, rec, src = f"/data/{i}", {"source": s["source"], "dir": str(i)}, s["source"]
-    try:
-        if src.startswith("hf://"):
-            kind, _, repo = src[5:].partition("/")
-            repo, _, rev = repo.partition("@")
-            if denied(repo): raise RuntimeError("source denied by SH_DENY_SOURCES")
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub"], check=True)
-            from huggingface_hub import HfApi, snapshot_download
-            info = HfApi().repo_info(repo, repo_type=kind.rstrip("s"), revision=rev or None, files_metadata=True)
-            pats = s.get("include") or ["*"]
-            files = [x for x in info.siblings if any(fnmatch.fnmatch(x.rfilename, p) for p in pats)]
-            need = sum(x.size or 0 for x in files)
-            if total + need > cap: raise RuntimeError(f"{need} bytes would pass the storage cap ({cap} bytes, SH_MAX_DATA_GB)")
-            snapshot_download(repo, repo_type=kind.rstrip("s"), revision=info.sha, allow_patterns=pats, local_dir=dest)
-            total += need
-            rec.update(revision=info.sha, files_matched=len(files))
-        else:
-            p, info = get(src, dest)
-            rec.update(info)
-            if "html" in info.get("content_type", "") or p.endswith((".php", ".html", ".htm")):
-                base = urllib.parse.urlparse(src)
-                links = sorted({urllib.parse.urljoin(src, html.unescape(h)) for h in
-                                re.findall(r'href=["\']([^"\'#]+)', open(p, encoding="utf-8", errors="replace").read())})
-                links = [u for u in links if urllib.parse.urlparse(u).netloc == base.netloc]
-                rec["links"] = links[:200]
-                want = [u for u in links if s.get("include") and any(
-                    fnmatch.fnmatch(urllib.parse.urlparse(u).path.split("/")[-1], pat) for pat in s["include"])]
-                rec["followed"] = []
-                for u in want[:20]:                     # ponytail: 20 files followed from one cited page
-                    try:
-                        q, inf = get(u, dest)
-                        rec["followed"].append({**inf, "unpacked": unpack(q, dest)})
-                    except Exception as e:
-                        rec["followed"].append({"url": u, "error": f"{type(e).__name__}: {e}"[:300]})
-            else:
-                rec["unpacked"] = unpack(p, dest)
-    except Exception as e:
-        rec["error"] = f"{type(e).__name__}: {e}"[:500]
-    out.append(rec)
-def sha(p):
-    h = hashlib.sha256()
-    with open(p, "rb") as f:
-        for b in iter(lambda: f.read(1 << 20), b""): h.update(b)
-    return h.hexdigest()
-files, heads = [], 0
-for root, _, fs in os.walk("/data"):
-    for f in sorted(fs):
-        p = os.path.join(root, f); row = {"path": os.path.relpath(p, "/data"), "bytes": os.path.getsize(p)}
-        if len(files) < 5000: row["sha256"] = sha(p)
-        if heads < 20 and f.lower().endswith(TEXT) and row["bytes"]:
-            heads += 1
-            with open(p, encoding="utf-8", errors="replace") as fh: row["head"] = fh.read(400)
-        files.append(row)
-print("REFEREE_MANIFEST " + json.dumps({"sources": out, "files": files[:2000], "n_files": len(files),
-                                        "bytes": sum(r["bytes"] for r in files)}))   # ponytail: 2000 listed
-'''
+FETCHER = Path(__file__).with_name("fetcher.py")   # mounted read-only into the network-on container that runs it
+
+
+def data_blocker(sources: list[dict], man: dict) -> list[dict]:
+    """The required sources of a check that admitted no file, each with the class of its failure
+    (fetcher.failure_class): what a planner and a reader need to tell a bug from a network fault, a
+    missing file, an inaccessible source or content that failed validation."""
+    got = {str(r.get("dir")): r for r in man.get("sources") or []}
+    out = []
+    for i, s in enumerate(sources):
+        r = got.get(str(i)) or {}
+        if s.get("required", True) and not r.get("admitted_files"):
+            errs = [a.get("error") for a in (r.get("attempts") or []) + (r.get("followed") or []) if a.get("error")]
+            out.append({"source": s["source"], "class": r.get("failure_class") or "bug",
+                        "detail": (errs[-1] if errs else r.get("error") or "the acquisition returned no record")[:300],
+                        "rejected": [f"{x.get('file')}: {x.get('why')}" for x in (r.get("rejected") or [])[:5]],
+                        "recovery": (r.get("recovery") or [])[:5]})
+    return out
 
 
 def data_volume(root: Path, cid: str) -> str:
@@ -787,6 +716,12 @@ def data_mount(root: Path, cid: str) -> list:
     """The acquired data of a check, read-only at /work/data, once it has any file."""
     d = state.read_json(Path(root) / "checks" / cid / "data.json") or {}
     return [(d.get("volume") or data_volume(root, cid), DATA_MOUNT, True)] if d.get("n_files") else []
+
+
+def truncated(man: dict) -> bool:
+    """Did the acquisition follow fewer files than matched (a cap)? Such a set is what its own check was given, never
+    a complete acquisition of the plan: it is not shared with another check, and a reopened check fetches again."""
+    return any(s.get("truncated") for s in man.get("sources") or [])
 
 
 def fetch(cfg: state.Config, root: Path, cid: str, sources: list[dict]) -> dict | None:
@@ -800,38 +735,60 @@ def fetch(cfg: state.Config, root: Path, cid: str, sources: list[dict]) -> dict 
             return d
         f.replace(cdir / "data.vanished.json")    # kept (its hashes); the same sources are acquired again
         d = None
-    if not (cfg.allow_network and cfg.allow_install):
-        d = {"sources": [{"source": s["source"], "error": "the network or install gate is shut"} for s in sources],
-             "files": [], "n_files": 0, "bytes": 0, "fetched_at": state.now()}
+    # Public data needs the network gate alone (code never enters through it); only a hub download
+    # installs a client library, and so also needs the install gate.
+    # Each source meets only the gate it needs: a closed install gate refuses a hub download, never the plain
+    # HTTP source beside it.
+    shut = [("SH_ALLOW_NETWORK is not set" if not cfg.allow_network else
+             "SH_ALLOW_INSTALL is not set (a Hugging Face download installs its client)"
+             if not cfg.allow_install and s["source"].startswith("hf://") else "") for s in sources]
+    if all(shut):
+        d = {"sources": [{"source": s["source"], "dir": str(i), "failure_class": "gate", "admitted_files": 0,
+                          "attempts": [], "error": f"refused: {why}"} for i, (s, why) in enumerate(zip(sources, shut))],
+             "files": [], "n_files": 0, "bytes": 0, "status": "none", "fetched_at": state.now()}
         state.write_json(f, d)
         return d
+    run_sources = [{**s, "refused": why} if why else s for s, why in zip(sources, shut)]
     if not docker_status()[0]:
         return None
     st = d or {}
     if not st.get("rec"):   # the same sources, already acquired for another check of this paper: shared, read-only
         for other in sorted(Path(root).glob("checks/*/data.json")):
             o = state.read_json(other) or {}
-            if other.parent.name != cid and o.get("fetched_at") and o.get("n_files") and not _volume_gone(
+            if other.parent.name != cid and o.get("fetched_at") and o.get("n_files") and not truncated(o) and not _volume_gone(
                     o.get("volume") or data_volume(root, other.parent.name)) and [
-                    {k: s.get(k) for k in ("source", "include")} for s in o.get("sources", [])] == [
+                    {k: s.get(k) for k in ("source", "include")} for s in o.get("plan", [])] == [
                     {k: s.get(k) for k in ("source", "include")} for s in sources]:
                 state.write_json(f, {**o, "shared_with": other.parent.name})
                 return state.read_json(f)
+    plan_key = [{k: s.get(k) for k in ("source", "include")} for s in sources]
+    if not st.get("rec"):                                   # the same plan is already being acquired for another check: wait for it
+        for other in sorted(Path(root).glob("checks/*/data.json")):
+            o = state.read_json(other) or {}
+            if other.parent.name != cid and o.get("rec") and not o.get("fetched_at") and [
+                    {k: s.get(k) for k in ("source", "include")} for s in o.get("sources", [])] == plan_key:
+                return None
     if st.get("rec"):
         done = collect(st["rec"], cfg.install_timeout_s)
         if done is None:
             return None
         state.append_jsonl(Path(root) / "execution.jsonl", {**done, "stdout": done.get("stdout", "")[-20000:]})
         man = next(iter(json_lines(done.get("stdout", ""), "REFEREE_MANIFEST")), None)
-        d = man or {"sources": [{"source": s["source"], "error": failure_text(done)} for s in sources],
-                    "files": [], "n_files": 0, "bytes": 0}
-        state.write_json(f, {**d, "volume": data_volume(root, cid), "fetched_at": state.now(),
+        # No manifest: the container itself failed. That is this host (it could not start, ran out of memory
+        # or time) or this code, never the source's fault.
+        infra = bool(done.get("error")) or done.get("timed_out")
+        d = man or {"sources": [{"source": s["source"], "dir": str(i), "admitted_files": 0, "attempts": [],
+                                 "failure_class": "infrastructure" if infra else "bug", "error": failure_text(done)}
+                                for i, s in enumerate(sources)],
+                    "files": [], "n_files": 0, "bytes": 0, "status": "none"}
+        state.write_json(f, {**d, "plan": sources, "volume": data_volume(root, cid), "fetched_at": state.now(),
                              "seconds": done.get("seconds")})
         return state.read_json(f)
-    rec = start(_cname("fetch", cdir.resolve(), json.dumps(sources, sort_keys=True)), ["python", "-c", _FETCHER],
-                mounts=[(data_volume(root, cid), "/data", False), (DOWNLOAD_CACHE, "/root/.cache", False)],
+    rec = start(_cname("fetch", cdir.resolve(), json.dumps(sources, sort_keys=True)), ["python", "/referee/fetcher.py"],
+                mounts=[(data_volume(root, cid), "/data", False), (DOWNLOAD_CACHE, "/root/.cache", False),
+                        (FETCHER.parent, "/referee", True)],
                 workdir="/", image=DEFAULT_IMAGE, network=True, mode="fetch", target=cid,
-                env={"REFEREE_SOURCES": json.dumps(sources), "REFEREE_CAP": str(cfg.max_data_gb << 30),
+                env={"REFEREE_SOURCES": json.dumps(run_sources), "REFEREE_CAP": str(cfg.max_data_gb << 30),
                      "REFEREE_DENY": ",".join(cfg.deny_sources), "HF_HUB_DISABLE_TELEMETRY": "1"})
     state.write_json(f, {"rec": rec, "sources": sources})
     return None
@@ -961,6 +918,7 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             st["values"] += row["values"]
             st["cert"] += row.get("cert") or []
             st["staged"] += row.get("staged") or []
+            st.setdefault("detail", []).extend(row.get("detail") or [])
             st["done_seeds"].append(row["seed"])
             if row.get("error"):
                 st["failed_seeds"][str(row["seed"])] = row["error"]
@@ -1010,7 +968,7 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         st.setdefault("next", st["seed"] + (st["stage"] == "run"))
     st["rec"] = None
     st.setdefault("next", st.get("seed", 0))
-    runs, width = int(check.get("runs") or 1), 1 if kind == "AUTHOR_CODE" else max(1, cfg.parallel)
+    runs, width = max(int(check.get("runs") or 1), int(st.get("runs_extended") or 0)), 1 if kind == "AUTHOR_CODE" else max(1, cfg.parallel)
     timeout = cfg.install_timeout_s if st["stage"] == "prepare" else cfg.run_timeout_s
     for key, rec in sorted(fly.items(), key=lambda kv: int(kv[0])):
         done = collect(rec, timeout)
@@ -1079,13 +1037,15 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         st["values"] += vs
         st.setdefault("cert", []).extend(rows)
         st.setdefault("staged", []).extend(staged)
+        detail = result_detail(done["stdout"], int(key)) if kind in ("RECONSTRUCTION", "RELEASED_DATA") and not ev["failed"] else []
+        st.setdefault("detail", []).extend(detail)
         st["seed"] += 1
         st.setdefault("done_seeds", []).append(int(key))
         state.append_jsonl(cdir / "seeds.jsonl", {"key": _ckpt_key(check), "seed": int(key), "values": vs,
                                                    "cert": rows, "staged": staged, "seconds": done.get("seconds"),
                                                    "error": st.get("failed_seeds", {}).get(key, ""),
                                                    "stage_errors": failed_stages, "units": sorted(declared),
-                                                   "schema": defects, "cohort_mismatch": mism})
+                                                   "schema": defects, "cohort_mismatch": mism, "detail": detail})
         if "pilot_s" not in st:                           # the first completed run is the pilot
             st["pilot_s"] = done.get("seconds") or 0
             if (why := _over_budget(cfg, check, st, runs)):
@@ -1098,7 +1058,9 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             return _finish(cfg, root, check, {**_cancel(root, st), "blocker": why})
         st["budget_s"] = budget(cfg, check)[0]
     if st["stage"] == "run" and st["seed"] >= runs and not fly:
-        return _finish(cfg, root, check, st)
+        if not (more := _extension(cfg, check, st, runs)):
+            return _finish(cfg, root, check, st)
+        st["runs_extended"], runs = more, more          # independent replicates repeated one value: only more can decide
     todo = []
     if st["stage"] == "prepare" and not fly:
         todo = [-1]
@@ -1229,6 +1191,45 @@ def _over_budget(cfg: state.Config, check: dict, st: dict, runs: int) -> str:
             "completed run(s) are recorded as a pilot and decide nothing.")
 
 
+def _wants(x) -> bool:
+    """Does a reconciled result (or any stage or reading inside it) ask for more replicates?"""
+    if isinstance(x, dict):
+        return bool(x.get("needs_replicates")) or any(_wants(v) for v in x.values() if isinstance(v, (dict, list)))
+    return isinstance(x, list) and any(_wants(v) for v in x)
+
+
+def _extension(cfg: state.Config, check: dict, st: dict, runs: int) -> int:
+    """The replicate count to extend a finished stochastic experiment to, or 0. Independent replicates that
+    repeat one value (a recovery ratio of 1.0, no false alarm) are decided by an exact sign test, which reaches
+    95% only from SIGN_MIN of them; a margin within t*SE at fewer than SIGN_MIN replicates is wide mostly because
+    t(2)=4.3: when only more replicates stand between the check and a decision, and the extra runs fit the
+    check's time budget, the harness runs them (once, never fewer than planned, never a downscale, and whatever
+    direction the result leans). The protocol records the extension and why."""
+    from .reconcile import SIGN_MIN
+    if (check["kind"] != "RECONSTRUCTION" or check.get("test") == "compatibility" or check.get("stochastic") is False
+            or st.get("runs_extended") or runs >= SIGN_MIN or st.get("failed_seeds")):
+        return 0
+    if not _wants(_reconciled(check, st, True, "", failure="")):
+        return 0
+    return SIGN_MIN if not _over_budget(cfg, check, st, SIGN_MIN) else 0
+
+
+def _reconciled(check: dict, st: dict, authorized: bool, why: str, failure: str | None = None) -> dict:
+    from .reconcile import reconcile
+    kind = check["kind"]
+    return reconcile(kind, check.get("printed", ""), st.get("values", []), st.get("failure", "") if failure is None else failure,
+                     st.get("ev", {}), bool(st.get("seeded")) or (kind == "RECONSTRUCTION" and st.get("seed", 0) > 1),
+                     authorized, why, (check.get("target") or {}).get("relation", ""),
+                     cert=st.get("cert") if kind == "CERTIFICATE" and st.get("cert") else None,
+                     changed=any(d.get("changes_claim") for d in check.get("deviations") or []),
+                     step=bool(check.get("step")), staged=st.get("staged"),
+                     failed=st.get("failed_seeds"), stage_errors=st.get("stage_errors"),
+                     readings=[r["name"] for r in check.get("readings") or []],
+                     cohort_mismatch=st.get("cohort_mismatch"),
+                     deterministic=kind == "RELEASED_DATA" or check.get("stochastic") is False,
+                     test=check.get("test", ""), detail=st.get("detail"), rng=check.get("seed_flow"))
+
+
 def _stage_summary(staged: list) -> dict:
     """Per stage: how many results and their mean (a pilot's measurements, deciding nothing)."""
     out: dict = {}
@@ -1245,7 +1246,7 @@ def _checkpoints(cdir: Path, check: dict) -> list[dict]:
     """Seeds of this exact approved script (or documented command) that already completed."""
     f, key, seen, out = cdir / "seeds.jsonl", _ckpt_key(check), set(), []
     for row in map(json.loads, f.read_text(encoding="utf-8").splitlines() if f.exists() else []):
-        if row.get("key") == key and row["seed"] not in seen and row["seed"] < int(check.get("runs") or 1):
+        if row.get("key") == key and row["seed"] not in seen and row["seed"] < max(int(check.get("runs") or 1), 6):   # 6: SIGN_MIN
             seen.add(row["seed"])
             out.append(row)
     return out
@@ -1286,7 +1287,8 @@ def _sample_memory(st: dict, fly: dict) -> None:
 
 def protocol(check: dict, st: dict, rule: str) -> dict:
     """Which protocol choices the paper stated and which REFEREE supplied, per check."""
-    runs, rel = int(check.get("runs") or 1), (check.get("target") or {}).get("relation", "")
+    planned = int(check.get("runs") or 1)
+    runs, rel = max(planned, int(st.get("runs_extended") or 0)), (check.get("target") or {}).get("relation", "")
     src = check.get("runs_source") or ("paper" if check.get("runs_quote") else "referee")
     devs = check.get("deviations") or []
     return {"runs": runs, "runs_from": {"paper": f"the paper: {check.get('runs_quote', '')!r}",
@@ -1305,6 +1307,9 @@ def protocol(check: dict, st: dict, rule: str) -> dict:
             **({"relation": f"{rel} (written by REFEREE's planner for the quoted sentence)"} if rel else {}),
             "supplied_by_referee": [d["used"] for d in devs if not d.get("printed") and not d.get("changes_claim")],
             "claim_changes": [d["used"] for d in devs if d.get("changes_claim")],
+            **({"replicates_extended": f"from {planned} to {runs}: the {planned} independent replicates left the result "
+                f"inside their noise band (a repeated value awaiting the exact sign test, or a margin within t*SE), which "
+                f"only more replicates can narrow; extended once, to the {runs} the sign test needs"} if runs > planned else {}),
             **({"pilot_seconds": st["pilot_s"]} if st.get("pilot_s") else {}),
             **({"admitted_under_check_budget_s": st["budget_s"]} if st.get("budget_s") else {}),
             **({"seeds_reused_from_checkpoints": st["reused"]} if st.get("reused") else {})}
@@ -1337,7 +1342,6 @@ def _cancel(root: Path, st: dict) -> dict:
 
 
 def _finish(cfg: state.Config, root: Path, check: dict, st: dict) -> bool:
-    from .reconcile import reconcile
     kind, src = check["kind"], state.read_json(root / "source.json", {})
     authorized = st.get("authorized", True)
     why = st.get("why", "")
@@ -1350,22 +1354,12 @@ def _finish(cfg: state.Config, root: Path, check: dict, st: dict) -> bool:
                        pilot_stages=_stage_summary(st.get("staged") or []), runs=st.get("records", 0) + st.get("reused", 0),
                        records="execution.jsonl", finished_at=state.now())
     else:
-        outcome.update(reconcile(kind, check.get("printed", ""), st.get("values", []), st.get("failure", ""),
-                                 st.get("ev", {}), bool(st.get("seeded")) or (kind == "RECONSTRUCTION" and st.get("seed", 0) > 1),
-                                 authorized, why, (check.get("target") or {}).get("relation", ""),
-                                 cert=st.get("cert") if kind == "CERTIFICATE" and st.get("cert") else None,
-                                 changed=any(d.get("changes_claim") for d in check.get("deviations") or []),
-                                 step=bool(check.get("step")), staged=st.get("staged"),
-                                 failed=st.get("failed_seeds"), stage_errors=st.get("stage_errors"),
-                                 readings=[r["name"] for r in check.get("readings") or []],
-                                 cohort_mismatch=st.get("cohort_mismatch"),
-                                 deterministic=kind == "RELEASED_DATA" or check.get("stochastic") is False,
-                                 test=check.get("test", "")),
+        outcome.update(_reconciled(check, st, authorized, why),
                        values=st.get("values", []), runs=st.get("records", 0) + st.get("reused", 0), records="execution.jsonl",
                        finished_at=state.now())
     outcome["protocol"] = protocol(check, st, outcome.get("rule", ""))
     # How the runs went (execution), apart from what their results say (the status above).
-    outcome["execution"] = {"runs_planned": int(check.get("runs") or 1),
+    outcome["execution"] = {"runs_planned": max(int(check.get("runs") or 1), int(st.get("runs_extended") or 0)),
                             "runs_ended": st.get("records", 0) + st.get("reused", 0),
                             "runs_exited_ok": st.get("ok_runs", 0), "runs_failed": sorted((st.get("failed_seeds") or {}),
                                                                                            key=int),

@@ -2,7 +2,11 @@
 
 Statuses are computed here from outcome files, never taken from a model (invariant 2).
 The headline is about the paper's CENTRAL claims only; checks no central claim rests on are
-reported apart as incidental, and whether the workflow finished is reported apart again.
+reported apart as incidental, and whether the workflow finished is reported apart again. Four things
+are never one: the workflow reached a terminal state, the requested experiment RAN, its protocol
+matched what the claim names, and the evidence supports or contradicts the claim. A simulation, a
+substituted dataset or a mathematical check beside an empirical claim is supporting evidence with
+its own outcome; it never counts as the experiment the claim names.
 Readings of one printed object that disagree (a changed indexing, an added assumption) are
 recorded as conflicts with their deviations, never resolved here. The model-written summary
 is published only if every status word it uses is earned by a check whose harness status
@@ -24,6 +28,10 @@ _FAILURE_WORDS = ("refut", "disprov", "counterexampl", "contradict", "falsif", "
                   "failed reproduc")
 # Protocol nouns ("replicate count", "3 seeded replicates") name units of a run, not a replication.
 _NOUNS = re.compile(r"\b(?:\d+|seeded|independent|per|of)\s+replicates?\b|\breplicates?\s+(?:count|number)s?\b", re.I)
+# A claim about an experiment (a comparison, a printed number, a component that trains) is satisfied
+# only by that experiment; the checks of any other role stand beside it.
+EMPIRICAL = ("performance", "value", "engineering")
+_EXPERIMENT = ("AUTHOR_CODE", "RECONSTRUCTION", "RELEASED_DATA")
 _STAGES_SHOWN = 40   # ponytail: stages listed per check in review.md; every stage is in ledger.json
 _RANK = {"FATAL": 3, "MAJOR": 2, "MINOR": 1, "NOTE": 0}
 _TESTED = SUPPORT + FAILURE + ("NO_VIOLATION_FOUND", READINGS_DIFFER)
@@ -46,7 +54,12 @@ def merged(plan: dict | None, follow: dict | None) -> dict | None:
             continue
         cc["checks"] = cc["checks"] + [k for k in f["checks"] if k not in cc["checks"]]
         cc["why_unchecked"] = f.get("why_unchecked") or cc.get("why_unchecked", "")
-        cc["omitted"] = (cc.get("omitted") or []) + (f.get("omitted") or [])
+        ran = {flat(s) for k in f["checks"] for c in follow["checks"] if c["id"] == k for s in c.get("covers", [])}
+        cc["omitted"] = [o for o in (cc.get("omitted") or []) if flat(o["item"]) not in ran] + (f.get("omitted") or [])
+        for k in ("blocker", "not_the_dataset"):
+            cc[k] = f.get(k) or cc.get(k, "")
+        for k in ("discovery", "failed_checks"):
+            cc[k] = list(dict.fromkeys((cc.get(k) or []) + (f.get(k) or [])))
     return {**plan, "checks": plan["checks"] + follow["checks"], "central_claims": claims,
             "dropped": plan.get("dropped", []) + follow.get("dropped", [])}
 
@@ -63,6 +76,8 @@ def _claim_status(cs: list[dict], conflicted: bool = False, claim_type: str = ""
     a check whose protocol did not complete is partial evidence, whatever its completed part says.
     Readings of one quantity that differ (the paper's definition, the code's) are recorded, not
     resolved; an engineering compatibility test speaks only for an engineering claim."""
+    if claim_type in EMPIRICAL:
+        cs = [c for c in cs if c.get("role", "target") != "supporting"]   # a simulation or a proof beside it is not the experiment
     if not cs:
         return "NOT_CHECKED"
     cs = [c for c in cs if not (c.get("test") == "compatibility" and claim_type and claim_type != "engineering")]
@@ -98,6 +113,8 @@ def _state(root: Path, cid: str, o: dict) -> str:
     """Where a check is: not started, running, partially completed, completed, failed, resource-limited."""
     if not o:
         return "RUNNING" if (root / "checks" / cid / "exec.json").exists() else "NOT_STARTED"
+    if o.get("data_blocker"):
+        return "DATA_BLOCKED"              # its data was not acquired: no experiment was written or run
     s = o.get("status")
     ex = o.get("execution")
     if ex and s not in ("BLOCKED", "NOT_CHECKABLE"):      # how the runs went, apart from what they found
@@ -162,7 +179,8 @@ def _checks(root: Path, plan: dict) -> list[dict]:
                     "central": c["id"] in central, "incidental_why": c.get("incidental_why", ""),
                     "claim": c["claim"], "target": c.get("target"), "statement": c.get("statement", ""),
                     "step": c.get("step", ""), "printed": c.get("printed", ""), "metric": run.get("metric", c.get("metric", "")),
-                    "covers": c.get("covers", []), "acquire": c.get("acquire", []),
+                    "covers": c.get("covers", []), "acquire": c.get("acquire", []), "role": c.get("role", "target"),
+                    "data_blocker": o.get("data_blocker"),
                     "test": c.get("test", ""), "basis": c.get("basis", ""), "define": c.get("define"),
                     "reading_defs": run.get("readings") or c.get("readings") or [], "readings": o.get("readings"),
                     "execution": o.get("execution"), "stochastic": run.get("stochastic"),
@@ -226,10 +244,102 @@ def conflicts(checks: list[dict]) -> list[dict]:
 def _central(plan: dict, checks: list[dict], conf: list[dict]) -> list[dict]:
     by_id, conflicted = {c["id"]: c for c in checks}, {k for x in conf for k in x["checks"]}
     return [{**cc, "statuses": {k: by_id[k]["status"] for k in cc["checks"] if k in by_id},
+             "supporting": [k for k in cc["checks"] if k in by_id and by_id[k].get("role") == "supporting"
+                            and cc.get("claim_type") in EMPIRICAL],
              "claim_status": _claim_status([by_id[k] for k in cc["checks"] if k in by_id],
                                            bool(conflicted & set(cc["checks"])), cc.get("claim_type", "")),
              "deviations": sum(len(by_id[k]["deviations"]) for k in cc["checks"] if k in by_id)}
             for cc in plan["central_claims"]]
+
+
+def _blockers(cc: dict, cs: list[dict]) -> list[dict]:
+    """What kept a claim's requested experiment from running, each with who says so: the harness (a recorded
+    data blocker, a measured resource limit, a refusal) or the planner (an omission's stated reason)."""
+    out = [{"item": o["item"], "blocker": o.get("blocker") or "unstated", "why": o["why"][:300], "basis": "planner",
+            **({"searched": o["discovery"]} if o.get("discovery") else {})} for o in cc.get("omitted") or [] if o.get("why")]
+    if not cc["checks"] and cc.get("why_unchecked"):
+        out.append({"item": "(the whole claim)", "blocker": cc.get("blocker") or "unstated", "why": cc["why_unchecked"][:300],
+                    "basis": "planner", **({"searched": cc["discovery"]} if cc.get("discovery") else {})})
+    for c in cs:
+        if c.get("data_blocker"):
+            out.append({"item": c["id"], "blocker": "data", "class": ", ".join(sorted({b["class"] for b in c["data_blocker"]})),
+                        "why": c["reason"][:300], "basis": "harness"})
+        elif c["status"] == "BLOCKED":
+            out.append({"item": c["id"], "blocker": "compute" if str(c["reason"]).startswith("RESOURCE BLOCKER") else "refused",
+                        "class": c.get("resource") or "", "why": c["reason"][:300], "basis": "harness"})
+        elif c["status"] == "NOT_CHECKABLE":
+            out.append({"item": c["id"], "blocker": "protocol", "why": c["reason"][:300], "basis": "script author or verifier"})
+        elif c["status"] == "INCONCLUSIVE" and not c.get("values"):
+            out.append({"item": c["id"], "blocker": "failed", "why": c["reason"][:300], "basis": "harness"})
+    return out
+
+
+def _completion(checks: list[dict], claims: list[dict]) -> dict:
+    """Per central claim, four things kept apart: did the requested experiment RUN, did its protocol match
+    what the claim names, what does the evidence say, and what stood beside it as supporting evidence.
+    Deterministic: from check states, deviations and data identity, never from a model."""
+    by_id = {c["id"]: c for c in checks}
+    rows = []
+    for cc in claims:
+        empirical = cc.get("claim_type") in EMPIRICAL
+        cs = [by_id[k] for k in cc["checks"] if k in by_id]
+        target = [c for c in cs if not (empirical and c.get("role") == "supporting")]
+        ran = [c for c in target if c["state"] in ("COMPLETED", "PARTIALLY_COMPLETED") and c["kind"] != ("CERTIFICATE" if empirical else "")
+               and (c.get("values") or c["kind"] == "ARITHMETIC")]
+        changes = [d["used"] for c in ran for d in c["deviations"] if d.get("changes_claim")]
+        mismatch = [n for c in ran for n, i in (c.get("data_identity") or {}).items() if isinstance(i, dict) and i.get("matches") is False]
+        unrun = [o["item"] for o in cc.get("omitted") or [] if o.get("why")]
+        partial = any(c["state"] == "PARTIALLY_COMPLETED" or c["status"] == PARTIAL for c in ran)
+        if not ran:
+            exp, matched = "NOT_RUN", None
+        elif changes or mismatch:
+            exp, matched = "RAN_WITH_CHANGES", False
+        elif partial or unrun:
+            exp, matched = "RAN_PARTIAL", True
+        else:
+            exp, matched = "RAN_AS_SPECIFIED", True
+        rows.append({"claim": cc["quote"], "page": cc["page"], "claim_type": cc.get("claim_type") or "",
+                     "requested": "an experiment" if empirical else "a mathematical statement on exact instances"
+                     if cc.get("claim_type") == "theory" else "unspecified", "experiment": exp, "protocol_matched": matched,
+                     "changes": changes[:5], "data_mismatch": mismatch, "scope_not_run": unrun,
+                     "evidence": cc["claim_status"], "ran": [c["id"] for c in ran],
+                     "supporting": [{"check": c["id"], "kind": c["kind"], "status": c["status"], "state": c["state"]}
+                                    for c in cs if empirical and c.get("role") == "supporting"],
+                     "not_run": _blockers(cc, cs) if exp in ("NOT_RUN", "RAN_PARTIAL") or unrun else []})
+    counts: dict = {}
+    for r in rows:
+        k = ("experiments " if r["claim_type"] in EMPIRICAL else "statements ") + r["experiment"]
+        counts[k] = counts.get(k, 0) + 1
+    return {"claims": rows, "counts": counts,
+            "workflow": {"terminal": len([c for c in checks if c["status"] != "PENDING"]), "planned": len(checks),
+                         "note": "a check in a terminal state was processed by the workflow; that says nothing about whether "
+                                 "its experiment ran"}}
+
+
+def _completion_line(comp: dict) -> str:
+    emp = [r for r in comp["claims"] if r["claim_type"] in EMPIRICAL]
+    word = {"RAN_AS_SPECIFIED": "ran as specified", "RAN_PARTIAL": "ran in part", "RAN_WITH_CHANGES": "ran with claim-changing "
+            "changes (about the changed claim)", "NOT_RUN": "not run"}
+    parts = [f"{sum(1 for r in emp if r['experiment'] == k)} {v}" for k, v in word.items() if any(r["experiment"] == k for r in emp)]
+    blocked: dict = {}
+    for r in emp:
+        for b in r["not_run"]:
+            blocked[b["blocker"]] = blocked.get(b["blocker"], 0) + 1
+    th = [r for r in comp["claims"] if r["claim_type"] not in EMPIRICAL]
+    ran_th = sum(1 for r in th if r["experiment"] != "NOT_RUN")
+    w = comp["workflow"]
+    return (f"requested experiments (central empirical claims): {len(emp)}" + (f" — {', '.join(parts)}" if parts else "")
+            + (f" [not run or in part, by blocker: {', '.join(f'{k} {v}' for k, v in sorted(blocked.items()))}]" if blocked else "")
+            + f"; mathematical claims: {ran_th} of {len(th)} checked on exact instances; workflow: {w['terminal']} of "
+              f"{w['planned']} planned checks reached a terminal state (not a measure of what was reproduced)")
+
+
+def completion_line(root: Path) -> str:
+    plan = merged(state.read_json(root / "sealed" / "plan.json"), state.read_json(root / "sealed" / "plan__2.json"))
+    if plan is None:
+        return "NOT_ASSESSED"
+    checks = _checks(root, plan)
+    return _completion_line(_completion(checks, _central(plan, checks, conflicts(checks))))
 
 
 def _headline(checks: list[dict], claims: list[dict]) -> str:
@@ -264,6 +374,7 @@ def scientific_status(root: Path) -> str:
 def _workflow(checks: list[dict]) -> dict:
     by = lambda *s: [c["id"] for c in checks if c["status"] in s]
     return {"checks_planned": len(checks), "finished": len([c for c in checks if c["status"] != "PENDING"]),
+            "reached_terminal_state": len([c for c in checks if c["status"] != "PENDING"]),
             "reached_a_scientific_status": by(*_TESTED), "blocked": by("BLOCKED"), "partial": by(PARTIAL),
             "inconclusive": by("INCONCLUSIVE"), "not_checkable": by("NOT_CHECKABLE"),
             "readings_differ": by(READINGS_DIFFER),
@@ -286,6 +397,7 @@ def ledger(x) -> dict:
            "repo_is_authors": plan.get("repo_is_authors"), "repo_note": plan.get("repo_note", ""),
            "concerns": sorted(x.concerns(), key=lambda c: (-_RANK[c["severity"]], c["id"])),
            "checks": checks, "central_claims": central, "incidental_checks": [c["id"] for c in checks if not c["central"]],
+           "completion": _completion(checks, central),
            "conflicts": conf, "workflow": _workflow(checks),
            "dropped": {"concerns_unresolved_quotes": lens_drops, "checks": plan.get("dropped", [])},
            "scientific_status": _headline(checks, central)}
@@ -335,7 +447,19 @@ def table(led: dict) -> str:
     """The deterministic status block: central claims, their checks, incidental checks, and
     workflow completion, each apart."""
     by_id = {c["id"]: c for c in led["checks"]}
-    rows = ["| Central claim | What was done | Found | Deviations | Why unchecked |", "|---|---|---|---|---|"]
+    comp = led.get("completion") or {"claims": [], "workflow": {"terminal": 0, "planned": 0}}
+    head = ["Completion, kept apart from what was found: " + _completion_line(comp), ""] if comp["claims"] else []
+    head += [f"- {_cell(r['claim'], 90)} (p{r['page']}, {r['claim_type'] or 'untyped'}): experiment **{r['experiment']}**, protocol "
+             f"matched: {'yes' if r['protocol_matched'] else 'no' if r['protocol_matched'] is False else 'n/a (not run)'}, "
+             f"evidence {r['evidence']}"
+             + (f"; changes: {_cell('; '.join(r['changes']), 160)}" if r["changes"] else "")
+             + (f"; data identity mismatch: {', '.join(r['data_mismatch'])}" if r["data_mismatch"] else "")
+             + "".join(f"; not run — {b['item']}: {b['blocker']}" + (f" ({b['class']})" if b.get("class") else "")
+                       + f" [{b['basis']}]" for b in r["not_run"][:4])
+             + "".join(f"; supporting only: {x['check']} {x['kind']} {x['status']}" for x in r["supporting"])
+             for r in comp["claims"]]
+    head += [""] if head else []
+    rows = head + ["| Central claim | What was done | Found | Deviations | Why unchecked |", "|---|---|---|---|---|"]
     rows += [f"| {_cell(cc['quote'], 110)} (p{cc['page']}) | "
              f"{'; '.join(_done(by_id[k]) for k in cc['statuses']) or '—'} | **{cc['claim_status']}** | "
              f"{cc.get('deviations') or ''} | {_said(_cell(cc['why_unchecked'], 140), led)} |" for cc in led["central_claims"]]
@@ -348,7 +472,8 @@ def table(led: dict) -> str:
         _check_rows(incidental, led) + [f"- {c['id']}: {_said(_cell(c['incidental_why'], 200), led)}"
                                         for c in incidental if c["incidental_why"]] if incidental else ["_none_"])
     w = led["workflow"]
-    rows += ["", f"Workflow completion: {w['finished']} of {w['checks_planned']} planned checks finished; "
+    rows += ["", f"Workflow completion: {w['finished']} of {w['checks_planned']} planned checks reached a terminal state "
+                 "(a blocked, refused or inconclusive check is terminal; this is not what was reproduced); "
                  f"{len(w['reached_a_scientific_status'])} reached a scientific status "
                  f"({', '.join(w['reached_a_scientific_status']) or 'none'}); partial: {', '.join(w['partial']) or 'none'}; "
                  f"blocked: {', '.join(w['blocked']) or 'none'}; readings differ: "
@@ -483,12 +608,25 @@ def render(x, led: dict, rep: dict | None) -> str:
         for c in got:
             d = state.read_json(x.root / "checks" / c["id"] / "data.json") or {}
             for src in d.get("sources") or c.get("acquire") or []:
+                got = next((a for a in (c.get("acquire") or []) if a.get("source") == src.get("source")), {})
+                last = (src.get("attempts") or [{}])[0]
                 lines.append(f"- **{c['id']}** source `{src.get('source')}`"
-                             + (f" (HTTP {src['http_status']})" if src.get("http_status") else "")
+                             + (f" (cited as \"{_cell(got['cited_as'], 80)}\", {got.get('cited_form')})" if got.get("cited_as") else "")
+                             + (f" (discovered by search {got['discovery']}: {got.get('found', {}).get('title', '')[:60]!r})"
+                                if got.get("discovery") else "")
+                             + (f" -> {last['final_url']}" if last.get("final_url") and last.get("final_url") != src.get("source") else "")
+                             + (f" (HTTP {last['http_status']})" if last.get("http_status") else "")
                              + (f" revision `{src['revision'][:12]}`" if src.get("revision") else "")
+                             + (f"; {src['admitted_files']} file(s) admitted" if "admitted_files" in src else "")
+                             + (f"; TRUNCATED: {src['truncated']['matched']} matched, {src['truncated']['followed']} followed"
+                                if src.get("truncated") else "")
+                             + (f" — NOT ACQUIRED [{src['failure_class']}]" if src.get("failure_class") else "")
                              + (f" — ERROR: {_cell(src['error'], 200)}" if src.get("error") else "")
-                             + "".join(f"; followed {f.get('url')}" + (f" ERROR {_cell(f['error'], 80)}" if f.get("error")
-                                                                        else "") for f in (src.get("followed") or [])[:5]))
+                             + "".join(f"; rejected {r.get('file')} ({r.get('class')}: {_cell(r.get('why'), 80)})"
+                                       for r in (src.get("rejected") or [])[:4])
+                             + "".join(f"; recovery: {_cell(r, 100)}" for r in (src.get("recovery") or [])[:4])
+                             + "".join(f"; followed {f.get('url')}" + (f" ERROR [{f.get('class')}] {_cell(f['error'], 80)}"
+                                                                        if f.get("error") else "") for f in (src.get("followed") or [])[:5]))
             if d.get("n_files") is not None:
                 lines.append(f"  - {d.get('n_files')} files, {d.get('bytes')} bytes, each with sha256 in "
                              f"`checks/{c['id']}/data.json` (fetched {d.get('fetched_at', '?')})")
@@ -506,7 +644,8 @@ def render(x, led: dict, rep: dict | None) -> str:
             rule = pr["decision_rule"] or next(c["rule"] for c in led["checks"] if c["id"] == cid)
             lines.append(f"- **{cid}**: runs {pr['runs']} ({pr['runs_from']}); seeds {pr['seeds']}; rule: "
                          f"{_cell(rule, 220)}" + (f"; relation {pr['relation']}" if pr.get("relation") else "")
-                         + (f"; pilot {pr['pilot_seconds']:.0f}s" if pr.get("pilot_seconds") else ""))
+                         + (f"; pilot {pr['pilot_seconds']:.0f}s" if pr.get("pilot_seconds") else "")
+                         + (f"; replicates extended {pr['replicates_extended']}" if pr.get("replicates_extended") else ""))
             lines += [f"  - REFEREE supplied: {_cell(u, 220)}" for u in pr.get("supplied_by_referee", [])
                       if u not in pr.get("claim_changes", [])]      # a claim-changing choice is listed once, below
             lines += [f"  - changes the claim: {_cell(u, 220)}" for u in pr.get("claim_changes", [])]

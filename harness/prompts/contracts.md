@@ -87,9 +87,13 @@ Load each dataset exactly as the paper and code specify and print its REFEREE_DA
 ## decide RECONSTRUCTION
   - A stated relation: per stage, the mean paired margin over the seeds must exceed the Student-t
     95% band (t(n-1)·SE; 3 seeds give t=4.30); every stage must hold. One seed decides nothing.
-  - Identical results of all seeds are one measurement, not replicates: for a declared
-    deterministic pipeline it decides on the sign of its margin; for a seeded experiment it shows
-    the seed did not vary the run, and nothing is decided.
+  - Equal SUMMARY values are not identical runs. The harness compares the runs' other outputs,
+    the script's data fingerprints and the seed's route into a random generator: replicates that
+    differ but repeat the compared value are a zero-variance sample — a proportion of counted trials
+    (`binomial`) is decided by its exact interval, anything else by an exact sign test that needs 6
+    replicates. Runs that are identical in every output, with nothing showing the seed varied them,
+    are one measurement: for a declared deterministic pipeline it decides on the sign of its margin;
+    for a seeded experiment nothing is decided.
   - A compatibility test: its condition must hold in every run (no statistics); it supports only
     that the component integrates and trains, never a performance claim.
   - A printed number: RESOLVED inside the 95% CI of the seed mean, FAILED outside the prediction
@@ -135,7 +139,10 @@ Load each dataset exactly as the paper and code specify and print its REFEREE_DA
 ## verify RECONSTRUCTION
   1. Is every required ingredient (method, training, dataset, metric, comparison target)
      realized exactly as the paper states it, each backed by a verbatim paper quote? Does it
-     compare every method the claim names (or state each omission in `notes`)?
+     compare every method the claim names (or state each omission in `notes`)? A `training` binding
+     marked `not_applicable` must be true (nothing is trained, fitted or tuned on data in this
+     experiment, a fit of the paper's own formula to data counts as fitting): REVISE if a model
+     or parameters are in fact learned.
   2. Did the script fill a detail the paper and the authors' code omit WITHOUT declaring it in
      `deviations`, or shrink the experiment (fewer runs, samples, iterations, a smaller
      model)? Either is a rejection. Is `changes_claim` true for every change to data, splits,
@@ -150,6 +157,12 @@ Load each dataset exactly as the paper and code specify and print its REFEREE_DA
   6. A COMPATIBILITY test: does it keep the planner's condition and output definitions, one
      stated configuration, and nothing more? A baseline comparison, a tuning sweep or a grid of
      settings turns an engineering claim into a benchmark: REVISE.
+  7. ACQUIRED DATA: if the spec lists acquired files, does the script compute on them (not on a
+     simulation or a stand-in generated in the script)? Does the REFEREE_DATA identity line compare the
+     files' contents (rows, classes, shapes) with the paper's description? A surrogate in place of the
+     named data is REVISE (a separate check with role "supporting" may hold it).
+  8. REPLICATES: is every generator seeded from `--seed`? Does the script print `data_fingerprint`
+     where it generates data, and `binomial` trials for a rate or a coverage it reports?
 
 ## verify ARITHMETIC
   1. Is each operand's `value` exactly the number printed in its `quote`, and is it the

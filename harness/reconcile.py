@@ -10,16 +10,24 @@ paired margin beyond t*SE; a reproduction is RESOLVED only inside the confidence
 the mean and FAILED only outside the prediction interval of one more run. A certificate's
 counterexample is an instance on which every premise of the EXACT claim holds; a violation
 found only after changing the claim's reading, or on no admissible instance, is not one.
-Identical results of several runs are one measurement, never independent replicates. Where the
+Identical results of several runs are one measurement, never independent replicates — but equal
+SUMMARY values are not identical runs: the runs' other outputs, their data fingerprints and the
+seed's route into a random generator say whether they differed (harness/independence.py). Independent
+replicates whose compared value repeats are a zero-variance sample: a proportion of counted trials
+(zero events included) is decided by its exact binomial interval, anything else by an exact sign test
+that needs six replicates to reach 95% — never by a t-test with a standard error of zero. Where the
 paper's text and the authors' code define the compared quantity differently, both readings are
 decided on the same run (same data, same cohort) and neither is chosen. An engineering
 compatibility test is a condition every run must meet, never a statistical comparison.
 """
 from __future__ import annotations
 
+import math
+import re
 import statistics
 
-from .evidence import half_width, parse_value, relation
+from . import independence
+from .evidence import half_width, margin, parse_value, relation
 from .execute import admits
 
 SUPPORT = ("RESOLVED_VERIFIED", "ARITHMETIC_CONSISTENT", "RELATION_HOLDS")
@@ -32,6 +40,8 @@ PARTIAL = "PARTIAL"
 # different results: recorded with both, never resolved by the harness.
 READINGS_DIFFER = "READINGS_DIFFER"
 _TOL = 1e-9   # ponytail: a violation smaller than this (relative) is below double precision
+# An exact two-sided sign test reaches 95% only from six replicates that all fall on one side (p = 2 * 0.5^6).
+SIGN_MIN = 6
 _T975 = ((1, 12.706), (2, 4.303), (3, 3.182), (4, 2.776), (5, 2.571), (6, 2.447), (7, 2.365), (8, 2.306),
          (9, 2.262), (10, 2.228), (12, 2.179), (15, 2.131), (20, 2.086), (30, 2.042), (60, 2.0), (120, 1.98))
 
@@ -111,13 +121,16 @@ def reconcile(kind: str, printed: str, values: list[float], failure: str, ev: di
               seeded: bool, authorized: bool, why: str, rel: str = "", cert: list[dict] | None = None,
               changed: bool = False, step: bool = False, staged: list | None = None,
               failed: dict | None = None, stage_errors: dict | None = None, readings: list | None = None,
-              cohort_mismatch: list | None = None, deterministic: bool = False, test: str = "") -> dict:
+              cohort_mismatch: list | None = None, deterministic: bool = False, test: str = "",
+              detail: list | None = None, rng: bool | None = None) -> dict:
     """`failure` ends a check that measured nothing; `failed` (seed -> error) records seeds that
     failed after the check had measured something, whose completed measurements are kept.
     `staged` entries are [stage, value] or [stage, value, reading]; `readings` names the
     definitions (the paper's, the code's) the script computed side by side; `deterministic`: the
     computation has no randomness (released files, a declared deterministic pipeline); `test`
-    "compatibility": an engineering condition each run must meet."""
+    "compatibility": an engineering condition each run must meet. `detail` (per run and stage: every numeric
+    output, counted trials, a data fingerprint) and `rng` (does --seed reach a generator?) say whether
+    replicates that repeat a value were different runs."""
     if not authorized:
         return _r("BLOCKED", f"not run: {why}. A refusal by this harness is not evidence about the paper.")
     if not admits(kind):
@@ -143,19 +156,24 @@ def reconcile(kind: str, printed: str, values: list[float], failure: str, ev: di
                       f"code ({ev['own_code_crash']}): {failure[:400]}", rule="a run that starts and breaks in its own code")
         return _r("INCONCLUSIVE", f"the run failed ({failure[:400]}), but not by a crash inside the authors' own "
                   "code, so nothing is established about the paper")
-    decide = lambda vals: (_condition(rel, vals) if rel and test == "compatibility" else
-                           _relation(kind, rel, vals, deterministic) if rel else
-                           _point(kind, printed, vals, seeded, deterministic))
+    def decide(vals, stage="", reading=""):
+        ind = independence.assess(detail, stage, reading, rng) if detail is not None else None
+        if rel and test == "compatibility":
+            return _condition(rel, vals)
+        if rel:
+            return _relation(kind, rel, vals, deterministic, ind, [r for r in detail or [] if r["stage"] == stage
+                                                                    and r["reading"] == reading])
+        return _point(kind, printed, vals, seeded, deterministic, ind)
     if readings:
         return _by_reading(readings, staged or [], failed, stage_errors, decide, cohort_mismatch or [], printed)
     return _decide(values, [e[:2] for e in staged or []], failed, stage_errors, decide)
 
 
-def _decide(values: list[float], staged: list, failed: dict, stage_errors: dict, decide) -> dict:
+def _decide(values: list[float], staged: list, failed: dict, stage_errors: dict, decide, reading: str = "") -> dict:
     stages = sorted({s for s, _ in staged} | set(stage_errors), key=lambda s: (s == "", s))
     if stages and stages != [""]:
-        return _staged(staged, stages, failed, stage_errors, decide)
-    res = decide(values)
+        return _staged(staged, stages, failed, stage_errors, lambda vals, s="": decide(vals, s, reading))
+    res = decide(values, "", reading)
     return _partial(res, failed) if failed else res
 
 
@@ -167,7 +185,7 @@ def _by_reading(names: list, staged: list, failed: dict, stage_errors: dict, dec
     per = {}
     for r in names:
         sub = [[e[0], e[1]] for e in staged if len(e) > 2 and e[2] == r]
-        per[r] = _decide([v for _, v in sub], sub, failed, stage_errors, decide)
+        per[r] = _decide([v for _, v in sub], sub, failed, stage_errors, decide, r)
     show = lambda p: p["status"] + (f" {p['reproduced']:g}" if isinstance(p.get("reproduced"), (int, float)) else
                                     f" margin {p['margin']:g}" if isinstance(p.get("margin"), (int, float)) else "")
     brief = "; ".join(f"{r}: {show(p)}" for r, p in per.items())
@@ -207,7 +225,7 @@ def _staged(staged, stages, failed, stage_errors, decide) -> dict:
     for s in stages:
         vals = [v for t, v in staged if t == s]
         per[s or "(unnamed)"] = ({"status": "NOT_COMPLETED", "reason": stage_errors.get(s, "no result line")[:400]}
-                                 if not vals else decide(vals))
+                                 if not vals else decide(vals, s))
     sts = [p["status"] for p in per.values()]
     brief = "; ".join(f"{s}: {p['status']}" + (f" (n={p['n']})" if p.get("n") else "") for s, p in per.items())
     fail = next((s for s, p in per.items() if p["status"] in FAILURE), None)
@@ -220,13 +238,16 @@ def _staged(staged, stages, failed, stage_errors, decide) -> dict:
     if fail:
         return _r(per[fail]["status"], f"stage {fail}: {per[fail]['reason']} [{brief}]", rule=per[fail].get("rule", ""),
                   stages=per)
-    if all(x in SUPPORT for x in sts):
-        return _r(sts[0], f"every stage holds [{brief}]", rule=next(iter(per.values())).get("rule", ""), stages=per)
+    if all(x in SUPPORT + ("NO_VIOLATION_FOUND",) for x in sts):
+        weakest = "NO_VIOLATION_FOUND" if "NO_VIOLATION_FOUND" in sts else sts[0]
+        return _r(weakest, ("no stage was violated (tested replicates only, never a proof) " if weakest == "NO_VIOLATION_FOUND"
+                            else "every stage holds ") + f"[{brief}]", rule=next(iter(per.values())).get("rule", ""), stages=per)
     return _r("INCONCLUSIVE", f"not every stage is decided [{brief}]", stages=per,
               rule=next((p["rule"] for p in per.values() if p.get("rule")), ""))
 
 
-def _point(kind: str, printed: str, values: list[float], seeded: bool, deterministic: bool = False) -> dict:
+def _point(kind: str, printed: str, values: list[float], seeded: bool, deterministic: bool = False,
+           ind: dict | None = None) -> dict:
     """A produced value against the printed number. Identical values of several runs are one
     measurement (n_independent 1): they never give a noise band."""
     n = len(values)
@@ -254,9 +275,12 @@ def _point(kind: str, printed: str, values: list[float], seeded: bool, determini
     if not seeded or n < 2 or std == 0:
         rule = "deterministic run: agreement only within the printed precision; a difference is reported, not scored"
         if n > 1 and std == 0:
-            out["n_independent"] = 1
-            rule += (f"; the {n} runs gave identical results: one measurement, not {n} replicates"
-                     + ("" if deterministic else " (the seed did not vary the run)"))
+            many = bool(ind and ind["independent"]) and not deterministic
+            out["n_independent"] = n if many else 1
+            rule += (f"; the {n} independent runs repeated the value ({ind['basis']}): a zero-variance sample, "
+                     "decided only within the printed precision" if many and ind else
+                     f"; the {n} runs gave identical results: one measurement, not {n} replicates"
+                     + ("" if deterministic else f" ({ind['basis']})" if ind else " (the seed did not vary the run)"))
         return (_r("RESOLVED_VERIFIED", f"produced {mean:g} vs printed {printed}: within printed precision{note}",
                    rule=rule, **out) if eff <= 1e-12 else
                 _r("INCONCLUSIVE", f"produced {mean:g} vs printed {printed}: |delta| {out['delta']:g} exceeds the "
@@ -275,23 +299,36 @@ def _point(kind: str, printed: str, values: list[float], seeded: bool, determini
               f"interval of {n} seeds — consistent with noise, not pinned down", rule=rule, **out)
 
 
-def _relation(kind: str, rel: str, margins: list[float], deterministic: bool = False) -> dict:
+def _relation(kind: str, rel: str, margins: list[float], deterministic: bool = False, ind: dict | None = None,
+              lines: list[dict] | None = None) -> dict:
     """A comparison the paper states, over paired results (one per REFEREE_RESULT line):
     decided on the mean margin beyond t(n-1)*SE (a two-sided 95% paired t-test). One line
-    decides only when it is an exact recomputation from released data. Identical margins of
-    several runs are one measurement: it decides only a deterministic computation, and for a
-    seeded experiment it shows the seed did not vary the run (no replicates, no noise band)."""
+    decides only when it is an exact recomputation from released data. A compared proportion of
+    counted trials is decided by its exact binomial interval. Identical margins of several runs are
+    one measurement — unless the runs are shown to differ (`ind`), when they are a zero-variance
+    sample of independent replicates, decided by an exact sign test and never by a t-test with a
+    standard error of zero. For a deterministic computation identical margins are one measurement
+    decided on their sign; for a seeded experiment whose runs are identical, the seed did not vary
+    the run (no replicates, no noise band)."""
     n, strict = len(margins), relation(rel)[1] in ("<", ">")
     if not n:
         return _r("INCONCLUSIVE", f"no result carried every output the relation {rel!r} names")
-    if deterministic and kind == "RECONSTRUCTION" and n > 1 and len(set(margins)) > 1:
+    same = n > 1 and len(set(margins)) == 1
+    shown = bool(ind and ind["independent"]) and not deterministic
+    if not deterministic and (prop := _proportion(rel, lines or [], shown or not same, strict)):
+        return prop
+    if deterministic and kind == "RECONSTRUCTION" and n > 1 and (len(set(margins)) > 1 or (
+            ind and ind["state"] == "different")):
         return _r("INCONCLUSIVE", f"declared deterministic, but its {n} runs differ: the computation is not deterministic "
                   "as declared, so its runs are neither one measurement nor replicates", relation=rel, n=n,
                   rule="a declared deterministic pipeline must repeat exactly")
-    if n > 1 and len(set(margins)) == 1:
+    if same:
         if not deterministic:
+            if shown:
+                return _zero_variance(rel, margins, ind or {}, strict)
             return _r("INCONCLUSIVE", f"the {n} seeded runs gave identical results: the seed did not vary the run, so "
-                      f"they are one measurement, not {n} independent replicates, and give no noise band",
+                      f"they are one measurement, not {n} independent replicates, and give no noise band"
+                      + (f" ({ind['basis']})" if ind else ""),
                       relation=rel, margin=round(margins[0], 6), n=n, n_independent=1,
                       rule="identical results of seeded runs are one measurement, not replicates")
         m = margins[0]
@@ -314,8 +351,124 @@ def _relation(kind: str, rel: str, margins: list[float], deterministic: bool = F
         return _r("RELATION_HOLDS", f"{rel}: mean margin {m:.4g} over {n} result(s)", **out)
     if m < -band or (strict and band == 0 and m == 0):
         return _r("RELATION_VIOLATED", f"{rel} does not hold: mean margin {m:.4g} over {n} result(s)", **out)
+    # Three replicates (the floor REFEREE itself sets) carry t(2)=4.3: a margin within that band may be decided by
+    # more of them, so a finished check is extended once (execute._extension), never re-run for a direction.
     return _r("INCONCLUSIVE", f"{rel}: mean margin {m:.4g} is within t*SE ({band:.4g}) of equality over {n} "
-              "result(s): not decided", **out)
+              "result(s): not decided", **({"needs_replicates": SIGN_MIN} if not deterministic and n < SIGN_MIN else {}), **out)
+
+
+def _lentz(a: float, b: float, x: float) -> float:
+    """The continued fraction of the incomplete beta function (modified Lentz)."""
+    tiny = 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c, d = 1.0, 1.0 - qab * x / qap
+    d = 1.0 / (d if abs(d) > tiny else tiny)
+    h = d
+    for m in range(1, 400):                         # ponytail: 400 terms converge to 1e-14 for every n this harness sees
+        m2 = 2 * m
+        for aa in (m * (b - m) * x / ((qam + m2) * (a + m2)), -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))):
+            d = 1.0 + aa * d
+            d = 1.0 / (d if abs(d) > tiny else tiny)
+            c = 1.0 + aa / (c if abs(c) > tiny else tiny)
+            h *= d * c
+        if abs(d * c - 1.0) < 1e-14:
+            break
+    return h
+
+
+def _betainc(a: float, b: float, x: float) -> float:
+    """The regularised incomplete beta function I_x(a, b)."""
+    if x <= 0.0 or x >= 1.0:
+        return 0.0 if x <= 0.0 else 1.0
+    front = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log1p(-x))
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _lentz(a, b, x) / a
+    return 1.0 - front * _lentz(b, a, 1.0 - x) / b
+
+
+def _beta_quantile(p: float, a: float, b: float) -> float:
+    lo, hi = 0.0, 1.0
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        if _betainc(a, b, mid) < p:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+def clopper_pearson(k: int, n: int, conf: float = 0.95) -> tuple[float, float]:
+    """The exact two-sided confidence interval of a proportion of k events in n trials; zero (or all)
+    events give the closed forms 1-(a/2)^(1/n) and (a/2)^(1/n)."""
+    a = 1.0 - conf
+    lo = 0.0 if k == 0 else _beta_quantile(a / 2, k, n - k + 1)
+    hi = 1.0 if k == n else _beta_quantile(1 - a / 2, k + 1, n - k)
+    return lo, hi
+
+
+def _proportion(rel: str, lines: list[dict], pooled: bool, strict: bool) -> dict | None:
+    """The relation decided on a compared PROPORTION OF COUNTED TRIALS: the one output that every result
+    line declares with its number of independent trials (`binomial`), appearing once in the relation,
+    the other outputs constant. Events and trials are pooled over the independent replicates (over the
+    first run alone when the replicates are not shown to differ); the exact Clopper-Pearson interval is
+    decided by its worse end. Zero events are decided by the interval, not by a standard error of zero."""
+    left, _, right, names = relation(rel)
+    counted = [n for n in names if lines and all(n in (r.get("trials") or {}) for r in lines)]
+    if len(counted) != 1 or len(re.findall(rf"\b{re.escape(counted[0])}\b", f"{left} {right}")) != 1:
+        return None
+    b = counted[0]
+    used = lines if pooled else [r for r in lines if r["seed"] == lines[0]["seed"]]
+    others = {n: used[0]["out"].get(n) for n in names if n != b}
+    if any(v is None or any(r["out"].get(n) != v for r in used) for n, v in others.items()):
+        return None                                 # the rest of the relation moves between runs: no single interval
+    trials = sum(int(r["trials"][b]) for r in used)
+    events = sum(round(r["out"][b] * r["trials"][b]) for r in used)
+    if trials <= 0 or not 0 <= events <= trials:
+        return None
+    lo, hi = clopper_pearson(events, trials)
+    try:
+        at = [margin(rel, {**others, b: v}) for v in (lo, hi)]
+    except (ZeroDivisionError, ValueError):
+        return None
+    worst, best = min(at), max(at)
+    n_ind = len({r["seed"] for r in used})
+    out = {"relation": rel, "events": events, "trials": trials, "ci": [round(lo, 6), round(hi, 6)],
+           "margin": round(worst, 6), "n": n_ind, "n_independent": n_ind if pooled else 1,
+           "rule": "exact Clopper-Pearson interval (two-sided 95%) of a proportion of counted trials, zero events "
+                   "included, decided by the worse end of the interval"}
+    what = f"{b} = {events}/{trials} pooled over {n_ind} replicate(s); exact 95% interval [{lo:.4g}, {hi:.4g}]"
+    if worst > 0 or (not strict and worst >= 0):
+        return _r("RELATION_HOLDS", f"{rel}: {what}; the relation holds over the whole interval (margin >= {worst:.4g})", **out)
+    if best < 0 or (strict and best <= 0):
+        return _r("RELATION_VIOLATED", f"{rel} does not hold: {what}; it fails over the whole interval (margin <= {best:.4g})",
+                  **out)
+    return _r("INCONCLUSIVE", f"{rel}: {what}; the interval straddles the relation's boundary, so it is not decided", **out)
+
+
+def _zero_variance(rel: str, margins: list[float], ind: dict, strict: bool) -> dict:
+    """Independent replicates that repeat one margin. Each replicate either meets the relation or not,
+    so the sample is binary: an exact two-sided sign test (p = 2 * 0.5^n, significant from six
+    replicates), never a t-test whose standard error is zero. A margin exactly at a non-strict
+    boundary is 'no violation found', with the exact bound on the rate of violations."""
+    n, m = len(margins), margins[0]
+    met = m > 0 or (not strict and m == 0)
+    p = min(1.0, 2 * 0.5 ** n)
+    ub = 1 - 0.05 ** (1 / n)                       # exact one-sided 95% bound on the per-replicate rate of the opposite outcome
+    out = {"relation": rel, "margin": round(m, 6), "n": n, "n_independent": n, "independence": ind.get("basis", ""),
+           "rule": f"{n} independent replicates repeat one margin (zero variance): exact sign test p = {p:.3g}; a t-test "
+                   "would divide by a standard error of zero"}
+    if met and m == 0:
+        return _r("NO_VIOLATION_FOUND", f"{rel}: the margin is exactly 0 (the boundary) in all {n} independent replicates; "
+                  f"0 of {n} violated it (exact one-sided 95% upper bound on the per-replicate violation rate {ub:.3g}). "
+                  "Tested replicates only, never a proof", **out)
+    if n >= SIGN_MIN:
+        return (_r("RELATION_HOLDS", f"{rel}: met with margin {m:.4g} in all {n} independent replicates "
+                   f"(exact sign test p = {p:.3g})", **out) if met else
+                _r("RELATION_VIOLATED", f"{rel} does not hold: margin {m:.4g} in all {n} independent replicates "
+                   f"(exact sign test p = {p:.3g})", **out))
+    return _r("INCONCLUSIVE", f"{rel}: {'met' if met else 'violated'} with margin {m:.4g} in all {n} independent replicates, "
+              f"but an exact two-sided sign test needs {SIGN_MIN} replicates to reach 95% (p = {p:.3g} for {n}); the runs were "
+              f"shown to differ ({ind.get('basis', '')})", needs_replicates=SIGN_MIN, **out)
 
 
 def _condition(rel: str, margins: list[float]) -> dict:

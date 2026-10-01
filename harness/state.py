@@ -39,7 +39,13 @@ class Config:
         "SH_ALLOW_CERTIFICATE_EXEC") or _flag("SH_ALLOW_REIMPLEMENTATION_EXEC"))
     allow_install: bool = field(default_factory=lambda: _flag("SH_ALLOW_INSTALL"))
     allow_network: bool = field(default_factory=lambda: _flag("SH_ALLOW_NETWORK", "1"))
-    allow_source_search: bool = field(default_factory=lambda: _flag("SH_ALLOW_SOURCE_SEARCH"))
+    allow_source_search: bool = field(default_factory=lambda: _flag("SH_ALLOW_SOURCE_SEARCH"))   # the authors' repository
+    # Finding the public datasets a paper names (registry searches that send only the artifact's
+    # name). It is its own gate: it grants no code, no clone and no execution, and a run without
+    # author code still needs it.
+    allow_data_search: bool = field(default_factory=lambda: _flag("SH_ALLOW_DATA_SEARCH", "1"))
+    # ponytail: 12 registry searches per paper cover the datasets a paper names; more is a loop.
+    max_discoveries: int = field(default_factory=lambda: _int("SH_MAX_DISCOVERIES", 12))
     # ponytail: token caps sized for a few papers per run; raise per invocation via env. 6 checks
     # cover a paper's headline experiments and theorems; one follow-up plan may add 3 more where a
     # central claim is still undecided.

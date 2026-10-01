@@ -97,6 +97,30 @@ class Paper:
             return None
         return " ".join((self.text[max(0, lo - width):lo] + inner + self.text[hi:hi + width]).split())
 
+    def cites(self, src: str) -> dict | None:
+        """Where the text cites `src`: a whole URL (its scheme aside), a whole
+        `owner/name` hub id, or an identifier that names the same record (a DOI for its landing page,
+        a Zenodo record for its DOI). A PDF breaks a URL across lines and hyphenates it at a line end
+        ("zen-\\nodo.org"): both readings are searched, the printed one first, and the span is returned
+        as printed with the URL variants that span can mean (`variants`). None if nothing cites it."""
+        for needle, kind in citation_needles(src):
+            n = flat(needle)
+            for hay, idx, form in ((self.flat, None, "as printed"), (self.soft, self.soft_idx, "line-break hyphen dropped")):
+                at = hay.find(n) if n else -1
+                while at >= 0:
+                    a, b = (at, at + len(n) - 1) if idx is None else (idx[at], idx[at + len(n) - 1])
+                    lo, hi = self.offs[a], self.offs[b] + 1
+                    if _cite_bounded(self.text, lo, hi, kind, src):
+                        span = self.text[lo:hi]
+                        hard = re.sub(r"\s+", "", span)
+                        soft = re.sub(r"\s+", "", re.sub(r"-\s+", "", span))
+                        scheme = src.split("://", 1)[0]
+                        alts = [f"{scheme}://{v}" for v in dict.fromkeys((soft, hard))] if kind == "url" else []
+                        return {"span": span, "page": self.page_of(lo), "form": form, "as": kind,
+                                "variants": [v for v in alts if v.lower() != src.lower()]}
+                    at = hay.find(n, at + 1)
+        return None
+
     def cell(self, row_quote: str, value: str, column_quote: str, page: int = 0) -> tuple[dict | None, str]:
         """({"page", "row"}, '') when exactly one printed row holds both the row label and the
         value, on a page that prints the column header (and on `page`, if given, which
@@ -111,6 +135,46 @@ class Paper:
             return None, (f"{len(hits)} printed rows hold both {row_quote!r} and {value!r} on a page "
                           f"printing {column_quote!r}; exactly one must (give its page to disambiguate)")
         return {"page": hits[0][0], "row": hits[0][1]}, ""
+
+
+_ZENODO_DOI = re.compile(r"10\.5281/zenodo\.(\d+)", re.I)
+
+
+def citation_needles(src: str) -> list[tuple[str, str]]:
+    """(needle, kind) for each way a text may cite `src`, the printed URL first: the URL without its
+    scheme, a hub id, and the identifier of the same record (a DOI page <-> its DOI, a Zenodo
+    record <-> its DOI). The equivalences are those of the registries, never of a particular paper."""
+    if src.startswith("hf://"):
+        return [(src[5:].partition("/")[2].split("@")[0], "hf")]
+    host, _, path = src.split("://", 1)[1].rstrip("/").partition("/")
+    host = host.lower()
+    out = [(f"{host}/{path}" if path else host, "url")]
+    if host in ("doi.org", "dx.doi.org") and path.startswith("10."):
+        out.append((path, "id"))
+        if m := _ZENODO_DOI.fullmatch(path):
+            out += [(f"zenodo.org/{p}/{m[1]}", "url") for p in ("records", "record")]
+    elif host == "zenodo.org" and (m := re.match(r"records?/(\d+)", path)):
+        out.append((f"10.5281/zenodo.{m[1]}", "id"))
+    return out
+
+
+def _cite_bounded(text: str, lo: int, hi: int, kind: str, src: str) -> bool:
+    """Is text[lo:hi] a whole URL or id, not the middle of a longer name? A sentence's full stop may follow."""
+    before = text[:lo]
+    if kind == "hf":
+        hub = f"huggingface.co/{src[5:].partition('/')[0]}/"
+        if not before.lower().endswith(hub) and before and (before[-1].isalnum() or before[-1] in "_./-"):
+            return False
+    else:
+        if before and (before[-1].isalnum() or before[-1] in "_.-"):
+            return False
+    if hi < len(text) and text[hi] == "/":
+        hi += 1
+    if hi < len(text):
+        c = text[hi]
+        if c.isalnum() or c in "_%/-" or (c == "." and hi + 1 < len(text) and text[hi + 1].isalnum()):
+            return False
+    return True
 
 
 _NUMBER = re.compile(r"(?<![\w.])[-+−]?\d[\d,]*(?:\.\d+)?(?:[eE][-+]?\d+)?(?!\.?\w)")

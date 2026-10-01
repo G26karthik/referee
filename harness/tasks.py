@@ -13,8 +13,8 @@ import shutil
 import time
 from pathlib import Path
 
-from . import execute, paper, reconcile, report, state
-from .evidence import command, documented, flat, has_word, interval, mask, printed_form, relation, value_in
+from . import discover, execute, independence, paper, reconcile, report, state
+from .evidence import Paper, command, documented, flat, has_word, interval, mask, printed_form, relation, value_in
 from .repo import listing, released
 
 LENSES = ("overclaim", "protocol", "confound", "contradiction")
@@ -28,10 +28,21 @@ REQUIRED = {"CERTIFICATE": ("hypotheses", "claimed_bound", "instance"),
 # exact instances, or the paper's own printed numbers.
 BASIS = {"AUTHOR_CODE": "fresh_run", "RECONSTRUCTION": "fresh_run", "CERTIFICATE": "exact_instances",
          "ARITHMETIC": "paper_numbers"}
+# An ingredient an experiment may genuinely lack: a simulation, a sequential test or an exact computation trains
+# nothing. It is then declared `not_applicable` with its reason (the verifier checks it), never faked with a quote
+# and never a reason to refuse an experiment whose other ingredients are all bound.
+OPTIONAL = {"RECONSTRUCTION": ("training",)}
 RELEASED_BASES = ("published_results", "predictions")
 # A central claim's type decides which test may speak for it: an engineering claim (a component
 # integrates, runs, trains) by a compatibility test; a comparison by a performance test.
 CLAIM_TYPES = ("engineering", "performance", "value", "theory")
+# An empirical claim (a comparison, a printed number, a component that trains) is satisfied only by an
+# experiment on what it names; a mathematical check or a simulation beside it is supporting evidence.
+EMPIRICAL = report.EMPIRICAL
+ROLES = ("target", "supporting")
+# Why a requested experiment or dataset is not run. `data` is checked against the harness's own registry
+# searches (or a check that failed to acquire it); the others are the planner's word, reported as such.
+BLOCKERS = ("data", "credentials", "compute", "protocol", "other")
 SEVERITY = ("NOTE", "MINOR", "MAJOR", "FATAL")
 CLASSES = ("CONFIRMED_FINDING", "PLAUSIBLE_CONCERN", "OPEN_QUESTION", "DISMISSED")
 PROMPTS = Path(__file__).parent / "prompts"
@@ -242,8 +253,12 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
     # Coverage: once every check ended, one follow-up plan sees what each check found and why; it
     # may add checks for central claims still undecided, and for any headline claim the first plan
     # never listed (or say why none can decide them).
+    # ...and an empirical claim whose requested experiment did not run as specified (blocked, partial, or
+    # run only on a substitute) is undecided however its supporting checks came out.
+    ran = {r["claim"]: r["experiment"] for r in ledger["completion"]["claims"]}
     undecided = [cc for cc in ledger["central_claims"]
-                 if cc["claim_status"] in ("NOT_CHECKED", "NOTHING_DECIDED", "PARTIAL_EVIDENCE")]
+                 if cc["claim_status"] in ("NOT_CHECKED", "NOTHING_DECIDED", "PARTIAL_EVIDENCE")
+                 or (cc.get("claim_type") in EMPIRICAL and ran.get(cc["quote"]) not in (None, "RAN_AS_SPECIFIED"))]
     if x.cfg.max_followup_checks > 0 and x.sealed("plan:2") is None:
         return "plan", [_plan_task(x, "plan:2", _followup_text(ledger, undecided))], []
     if x.sealed("report") is None:
@@ -256,25 +271,45 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
     return "done", [], []
 
 
+def _discovery_text(x: _Ctx) -> str:
+    done = discover.records(x.cfg, x.pid)
+    return "\n".join((f"  {r['id']}: {r['query']!r} -> " + ", ".join(
+        f"{k} {len(v['candidates'])}" + (f" (error: {v['error'][:60]})" if v["error"] else "") for k, v in r["results"].items()))
+        if "results" in r else f"  {r['id']}: files of {r['files_of']} -> {len(r['files'])} file(s)" for r in done) or "  (none yet)"
+
+
 def _plan_task(x: _Ctx, tid: str, followup: str) -> dict:
     repo_line, lst = _repo_text(x)
+    find = (f'cd "{state.ROOT.as_posix()}" && PYTHONUTF8=1 SH_PROJECTS_DIR="{x.cfg.projects.as_posix()}" '
+            f'SH_ALLOW_NETWORK={int(x.cfg.allow_network)} SH_ALLOW_DATA_SEARCH={int(x.cfg.allow_data_search)} '
+            f'SH_MAX_DISCOVERIES={x.cfg.max_discoveries} SH_DENY_SOURCES="{",".join(x.cfg.deny_sources)}" '
+            f'"{Path(x.cfg.python).as_posix()}" run.py discover {x.pid}')
     return x.task(tid, "plan", _template(
         "plan", title=x.meta["title"], pages_dir=x.pages_dir, repo=repo_line, checkout=x.checkout.as_posix(),
         host=execute.host_facts(x.cfg), concerns=_concern_lines(x.concerns()), listing=lst,
-        max_checks=x.cfg.max_followup_checks if followup else x.cfg.max_checks, followup=followup),
+        max_checks=x.cfg.max_followup_checks if followup else x.cfg.max_checks, followup=followup,
+        discover_cmd=find, discover_files_cmd=f"{find} --files", discoveries=_discovery_text(x), max_discoveries=x.cfg.max_discoveries,
+        data_search="on" if x.cfg.allow_network and x.cfg.allow_data_search else "OFF (SH_ALLOW_DATA_SEARCH / SH_ALLOW_NETWORK)"),
         (x.root / "paper" / "rows.md",))
 
 
 def _followup_text(ledger: dict, undecided: list[dict]) -> str:
-    done = [{k: c.get(k) for k in ("id", "kind", "claim", "status", "reason", "stages", "data_identity")}
-            for c in ledger["checks"]]
-    listed = "\n".join(f"- {cc['quote']!r}: {cc['claim_status']}" for cc in ledger["central_claims"])
+    done = [{k: c.get(k) for k in ("id", "kind", "claim", "role", "status", "reason", "stages", "data_identity", "data_blocker")
+             if c.get(k) is not None} for c in ledger["checks"]]
+    ran = {r["claim"]: r for r in ledger["completion"]["claims"]}
+    listed = "\n".join(f"- {cc['quote']!r}: {cc['claim_status']}; the requested experiment: "
+                       f"{ran[cc['quote']]['experiment']}" + "".join(
+                           f" [{b['item']}: {b['blocker']}{' ' + b['class'] if b.get('class') else ''}]"
+                           for b in ran[cc["quote"]]["not_run"][:4]) for cc in ledger["central_claims"] if cc["quote"] in ran)
     return ("\n=== FOLLOW-UP ROUND (every planned check has ended) ===\nCentral claims the first plan listed, and what "
             f"was found:\n{listed}\nStill undecided:\n"
             + ("\n".join(f"- {cc['quote']!r}: {cc['claim_status']} (checks {', '.join(cc['checks']) or 'none'}; "
                          f"why unchecked: {cc.get('why_unchecked') or '-'})" for cc in undecided) or "- none")
             + "\n=== WHAT EACH CHECK FOUND (harness statuses and reasons) ===\n"
             + json.dumps(done, ensure_ascii=False, indent=1)[:20_000]
+            + "\nA check with a `data_blocker` could not acquire its data: its class says whether the source is missing, "
+              "inaccessible, empty, failed validation, or a network fault of this run; another registry record, another file "
+              "of the same record, or the same source again (after a transient fault) is a legitimate follow-up.\n"
             + "\nPropose NEW checks only (ids F1, F2, ...), up to the budget, for (a) the undecided claims above, where a "
               "different route, a cited public artifact to acquire, or a narrower but still paper-faithful test can decide "
               "what the first round could not, and (b) any headline claim of the abstract, the contribution list or the "
@@ -292,8 +327,7 @@ def _data_text(x: _Ctx, cid: str) -> str:
     files = "\n".join(f"  {f['path']} ({f['bytes']} bytes)" + (f" head: {f['head'][:300]!r}" if f.get("head") else "")
                       for f in d.get("files", [])[:150])
     return (f"\n=== ACQUIRED DATA (read-only under {execute.DATA_MOUNT}/<n>/, one dir per source; sha256 in the "
-            f"manifest) ===\n" + json.dumps([{k: s.get(k) for k in ("source", "dir", "error", "http_status", "revision",
-                                                                   "followed", "links") if s.get(k)}
+            f"manifest) ===\n" + json.dumps([{k: s.get(k) for k in ("source", "dir", "failure_class", "admitted_files", "rejected", "recovery", "landing", "revision", "truncated") if s.get(k)}
                                              for s in d.get("sources", [])], ensure_ascii=False)[:6000]
             + f"\n{d.get('n_files', 0)} files, {d.get('bytes', 0)} bytes:\n{files}\n")
 
@@ -352,9 +386,13 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
         state.write_json(cdir / "outcome.json", {"check": cid, "kind": kind, "evidence": "PAPER_ARITHMETIC",
                                                  "authorized": True, **out})
         return []
-    if c.get("acquire") and not (state.read_json(cdir / "data.json") or {}).get("fetched_at"):
-        x.waiting.add(cid)                     # the cited data is being acquired: the author writes against it
-        return []
+    if c.get("acquire"):
+        data = state.read_json(cdir / "data.json") or {}
+        if not data.get("fetched_at"):
+            x.waiting.add(cid)                 # the data is being acquired: the author writes against it
+            return []
+        if (blk := execute.data_blocker(c["acquire"], data)):
+            return _data_blocked(cdir, c, blk)
     if x.sealed(f"gen:{cid}.1") is None and execute.script_env(x.cfg, x.root, kind, c["repo_attributed"])[1] is None:
         x.waiting.add(cid)                     # its environment is still building: drafts could not run yet
         return []
@@ -435,7 +473,7 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
         if v["verdict"] == "APPROVE":
             runs, source = run_count(x.cfg, c, g)
             check = {**c, "runs": runs, "runs_quote": g.get("runs_quote", "") if source == "paper" else "",
-                     "runs_source": source, "stochastic": g.get("stochastic"),
+                     "runs_source": source, "stochastic": g.get("stochastic"), "seed_flow": g.get("seed_flow"),
                      "readings": _merge_readings(c.get("readings"), g.get("readings")),
                      "script_sha256": g["script_sha256"], "metric": g.get("metric", c["metric"]),
                      "deviations": g.get("deviations", []), "premise_argument": g.get("premise_argument", ""),
@@ -476,6 +514,60 @@ def _merge_readings(a, b) -> list:
     """The planner's readings, then any further reading the script author found (by name)."""
     out = list(a or [])
     return out + [r for r in b or [] if r["name"] not in {o["name"] for o in out}]
+
+
+def reopen(cfg: state.Config, pid: str, cid: str, why: str) -> dict:
+    """The operator reopens a check that ended WITHOUT a scientific finding (a refusal, a blocker, an inconclusive
+    run) after its cause was fixed in the harness. The old outcome is kept beside it (outcome.reopened.N.json);
+    the check's script-writing seals are withdrawn so its tasks are owed again. A status that says what was found
+    (support, a failure, a violation) is never reopened: a result is not re-rolled until it reads differently."""
+    root = state.pdir(cfg, pid)
+    with state.lock(root / ".lock"):
+        cdir = root / "checks" / cid
+        o = state.read_json(cdir / "outcome.json")
+        if not o:
+            return {"error": f"{cid} has no outcome to reopen"}
+        if o.get("status") not in ("NOT_CHECKABLE", "BLOCKED", "INCONCLUSIVE"):
+            return {"error": f"{cid} is {o.get('status')}: a check that found something is never reopened"}
+        n = len(list(cdir.glob("outcome.reopened.*.json"))) + 1
+        (cdir / "outcome.json").replace(cdir / f"outcome.reopened.{n}.json")
+        seals = state.read_json(root / "seals.json", {}) or {}
+        gone = [t for t in seals if t.split(":", 1)[0] in ("bind", "gen", "verify") and _check_of(t) == cid]
+        gone += [t for t in ("report",) if t in seals]        # a report written before this check was redone describes another ledger
+        for t in gone:
+            seals.pop(t)
+            (root / "sealed" / f"{_safe(t)}.json").unlink(missing_ok=True)
+        state.write_json(root / "seals.json", seals)
+        tried = state.read_json(root / "attempts.json", {}) or {}       # the redone task starts with its whole budget: the
+        state.write_json(root / "attempts.json", {k: v for k, v in tried.items() if k not in gone})   # last attempt seals leniently
+        for f in [*cdir.glob("smoke.*.json"), *cdir.glob("setup.*.txt"), cdir / "exec.json", cdir / "check.json", cdir / "script.py"]:
+            f.unlink(missing_ok=True)
+        if o.get("data_blocker") or execute.truncated(state.read_json(cdir / "data.json") or {}):
+            (cdir / "data.json").unlink(missing_ok=True)       # a failed or cut acquisition is tried again
+        state.append_jsonl(root / "log.jsonl", {"event": "reopen", "check": cid, "was": o.get("status"), "why": why[:500]})
+        return {"reopened": cid, "was": o.get("status"), "seals_withdrawn": gone}
+
+
+def _check_of(tid: str) -> str:
+    """The check id a bind/gen/verify task id belongs to (bind:C1, gen:C1.2, verify:C1.2)."""
+    return tid.split(":", 1)[1].rsplit(".", 1)[0]
+
+
+def _data_blocked(cdir: Path, c: dict, blk: list[dict]) -> list:
+    """A check whose required data was not admitted ends here: no script is written against data that
+    was not acquired (it would substitute a surrogate). A source that is missing, inaccessible, empty or
+    failed validation is a documented DATA BLOCKER (BLOCKED); a network or host failure, or a fault of
+    this harness, is INCONCLUSIVE — a fact about this run, not about the source."""
+    classes = sorted({b["class"] for b in blk})
+    infra = set(classes) <= {"infrastructure", "transient", "bug"}
+    why = "; ".join(f"{b['source']} [{b['class']}]: {b['detail']}" + (f" (rejected: {'; '.join(b['rejected'])})" if b["rejected"] else "")
+                    for b in blk)
+    state.write_json(cdir / "outcome.json", {
+        "check": c["id"], "kind": c["kind"], "status": "INCONCLUSIVE" if infra else "BLOCKED", "authorized": False,
+        "reason": ("DATA ACQUISITION FAILED" if infra else "DATA BLOCKER") + f" ({', '.join(classes)}): {why}. No script was "
+                  "written against data that was not acquired: a simulation would be a different experiment.",
+        "data_blocker": blk, "rule": "acquisition and content validation before any experiment"})
+    return []
 
 
 def _terminal(cdir: Path, c: dict, status: str, reason: str, by_model: bool = False) -> list:
@@ -558,7 +650,8 @@ def advance(cfg: state.Config, source: str, wait: int = 0) -> dict:
         time.sleep(15)
     return {"paper_id": pid, "phase": phase, "status": "complete" if phase == "done" else "waiting",
             "blocked_reason": f"executions running: {', '.join(running)}" if running and not tasks else "",
-            "scientific_status": report.scientific_status(root), "tasks": tasks}
+            "scientific_status": report.scientific_status(root), "completion": report.completion_line(root),
+            "tasks": tasks}
 
 
 # --- sealing ----------------------------------------------------------------------------
@@ -694,9 +787,11 @@ def _cites(text: str, src: str) -> bool:
 
 
 def _acquire(x: _Ctx, c: dict, errs: list[str], cid: str) -> list[dict]:
-    """Public artifacts a check needs that the checkout does not ship: each source must be cited
-    verbatim by the paper or by a tracked checkout file (a cited dataset page may be followed to
-    its files by `include` patterns), and none may be a denied source."""
+    """Public artifacts a check needs that the checkout does not ship. A source is cited by the paper or
+    by a tracked checkout file — matched as printed: a line-break hyphen, a missing scheme or www., and a
+    DOI for its record are the same citation, and the span as printed is kept with the readings it can
+    mean — or it is a record the harness's own registry search returned for a dataset the paper names
+    (`cited_in: "discovery"`). None may be a denied source."""
     out = []
     for s in [s for s in c.get("acquire") or [] if isinstance(s, dict)][:5]:    # ponytail: 5 sources per check
         src, cited = str(s.get("source") or "").strip(), str(s.get("cited_in") or "").strip()
@@ -710,14 +805,58 @@ def _acquire(x: _Ctx, c: dict, errs: list[str], cid: str) -> list[dict]:
         if not src.startswith("hf://") and "@" in src.split("://", 1)[1].split("/", 1)[0]:
             errs.append(f"{cid}: acquire source {src[:120]!r} carries user info before its host; refused")
             continue
-        text = x.paper.text if cited == "paper" else (
-            f.read_text(encoding="utf-8", errors="replace") if (f := _repo_file(x, cited)) and f.is_file() else "")
-        if not _cites(text, src):
-            errs.append(f"{cid}: acquire source {src[:120]!r} is not cited verbatim in {cited or '(nothing)'!r} (give "
-                        "cited_in: 'paper' or a tracked checkout path whose text contains it)")
-            continue
-        out.append({"source": src, "include": inc, "cited_in": cited, "why": str(s.get("why") or "")[:400]})
+        rec = {"source": src, "include": inc, "cited_in": cited, "why": str(s.get("why") or "")[:400],
+               "required": s.get("required") is not False}
+        if cited == "discovery":
+            did, named = str(s.get("discovery") or ""), str(s.get("named_in_paper") or "")
+            hit = discover.returned(x.cfg, x.pid, did, src)
+            if not hit:
+                errs.append(f"{cid}: acquire source {src[:120]!r} is not a record that discovery {did or '(none given)'!r} "
+                            "returned: run the discover command, then copy `source` from one of its candidates")
+                continue
+            if len(flat(named)) < 3 or flat(named) not in x.paper.flat:
+                errs.append(f"{cid}: `named_in_paper` must be the paper's own words naming the dataset (verbatim), "
+                            f"which the record {src[:80]!r} is claimed to be")
+                continue
+            rec.update(discovery=did, named_in_paper=named, found={k: hit[k] for k in (
+                "registry", "title", "creators", "year", "doi", "license") if hit.get(k)})
+        else:
+            f = None if cited == "paper" else _repo_file(x, cited)
+            book = x.paper if cited == "paper" else (Paper([f.read_text(encoding="utf-8", errors="replace")])
+                                                     if f and f.is_file() else None)
+            hit = book.cites(src) if book else None
+            if not hit:
+                errs.append(f"{cid}: acquire source {src[:120]!r} is not cited in {cited or '(nothing)'!r} (give cited_in: "
+                            "'paper' or a tracked checkout path; a line-break hyphen, a missing scheme, and a DOI for "
+                            "its record count as the same citation). A dataset the paper only NAMES is found with the discover "
+                            "command and given as cited_in: 'discovery'")
+                continue
+            rec.update(cited_as=hit["span"][:300], cited_form=hit["form"], alternates=hit["variants"][:2])
+        out.append(rec)
     return out
+
+
+def _blocker(x: _Ctx, e: dict, errors: list[str], label: str) -> None:
+    """A requested experiment or dataset that is not run names WHAT stops it. `data` must rest on the
+    harness's own record: a registry search it ran for the dataset (and, if that search returned
+    candidates, why none is the dataset the paper names), or a check that failed to acquire it."""
+    b = e.get("blocker")
+    if b not in BLOCKERS:
+        errors.append(f"{label}: `blocker` is one of {list(BLOCKERS)} — what stops the requested experiment (data: no public "
+                      "source could be found or read; credentials: a paid or gated service; compute: this host's measured "
+                      "limits; protocol: a detail the paper omits that no script may invent; other)")
+    elif b == "data" and x.cfg.allow_network and x.cfg.allow_data_search:
+        recs = {r["id"]: r for r in discover.records(x.cfg, x.pid)}
+        ids = [d for d in e.get("discovery") or [] if d in recs and "results" in recs[d]]
+        failed = [k for k in e.get("failed_checks") or []
+                  if (state.read_json(x.root / "checks" / str(k) / "outcome.json") or {}).get("data_blocker")]
+        if not ids and not failed:
+            errors.append(f"{label}: a dataset given up as unobtainable needs `discovery` — the ids of the registry searches you "
+                          "ran for it (the discover command) — or `failed_checks`: checks that tried to acquire it")
+        elif ids and not failed and sum(len(r["candidates"]) for d in ids for r in recs[d]["results"].values()) \
+                and not str(e.get("not_the_dataset") or "").strip():
+            errors.append(f"{label}: the searches {ids} returned candidate records: acquire one (cited_in 'discovery'), or say "
+                          "in `not_the_dataset` why none of them is the dataset the paper names")
 
 
 def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
@@ -746,6 +885,8 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
                "claim": claim["quote"] if claim else "", "why": str(c.get("why") or "")[:1000],
                "metric": str(c.get("metric") or "").strip(), "repo_attributed": attributed,
                "central": c.get("id") in central_ids, "incidental_why": str(c.get("incidental_why") or "")[:600],
+               "role": c.get("role") if c.get("role") in ROLES else "target",
+               "criterion": "supplied" if c.get("criterion") == "supplied" else "stated",
                "covers": [str(s)[:120] for s in c.get("covers") or []][:12],
                "acquire": _acquire(x, c, errs, cid) if kind in SCRIPT_KINDS else []}
         rec["basis"] = BASIS.get(kind, "")
@@ -821,7 +962,10 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         # Scope: every method, dataset or setting the claim names is covered by one of its checks or
         # omitted with a reason — a narrower test never silently stands for the whole claim.
         scope = [str(s)[:120] for s in cc.get("scope") or [] if str(s).strip()][:16]
-        omitted = [{"item": str(o.get("item") or "")[:120], "why": str(o.get("why") or "")[:400]}
+        omitted = [{"item": str(o.get("item") or "")[:120], "why": str(o.get("why") or "")[:400],
+                    "blocker": str(o.get("blocker") or "")[:20], "discovery": [str(d)[:12] for d in o.get("discovery") or []][:6],
+                    "failed_checks": [str(d)[:12] for d in o.get("failed_checks") or []][:6],
+                    "not_the_dataset": str(o.get("not_the_dataset") or "")[:600]}
                    for o in cc.get("omitted") or [] if isinstance(o, dict)]
         links = [k for k in cc.get("checks") or [] if k in {c.get("id") for c in proposed}]
         have = set().union(*(covered.get(k, set()) for k in links)) | {flat(o["item"]) for o in omitted if o["why"]}
@@ -831,6 +975,19 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         ctype = str(cc.get("claim_type") or "")
         if ctype and ctype not in CLAIM_TYPES:
             errors.append(f"central claim {h['quote'][:60]!r}: claim_type is one of {list(CLAIM_TYPES)}")
+        # An empirical claim keeps its requested experiment: what is not run says what stops it, and a
+        # mathematical check stands beside the experiment, never in its place.
+        claim_blocker = {k: cc.get(k) for k in ("blocker", "discovery", "failed_checks", "not_the_dataset")}
+        if ctype in EMPIRICAL:
+            for o in [o for o in omitted if o["why"]]:
+                _blocker(x, o, errors, f"central claim {h['quote'][:40]!r} omitted {o['item']!r}")
+            if not links:
+                _blocker(x, claim_blocker, errors, f"central claim {h['quote'][:40]!r} has no check; why_unchecked")
+            for k in [k for k in checks if k["proposed_id"] in links and k["role"] == "target"]:
+                if k["kind"] == "CERTIFICATE" or (k["kind"] == "ARITHMETIC" and ctype != "value"):
+                    errors.append(f"check {k['proposed_id']} is a {k['kind']} (exact instances / the paper's own numbers); it cannot "
+                                  f"stand for the {ctype} claim {h['quote'][:50]!r}, which is about an experiment: give it "
+                                  "role 'supporting', or link the check that runs the experiment")
         # A test speaks only for its own kind of claim: an engineering claim is tested for compatibility
         # (never by expanding it into a benchmark); a compatibility test never supports a comparison.
         by_pid = {k["proposed_id"]: k for k in checks}
@@ -843,7 +1000,11 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
                 errors.append(f"check {k['proposed_id']} is a compatibility test: it may speak only for a claim whose "
                               "claim_type is 'engineering'")
         central.append({"quote": h["quote"], "page": h["page"], "checks": links, "scope": scope, "omitted": omitted,
-                        "claim_type": ctype, "why_unchecked": str(cc.get("why_unchecked") or "")[:600]})
+                        "claim_type": ctype, "why_unchecked": str(cc.get("why_unchecked") or "")[:600],
+                        "blocker": str(claim_blocker["blocker"] or "")[:20],
+                        "discovery": [str(d)[:12] for d in claim_blocker["discovery"] or []][:6],
+                        "failed_checks": [str(d)[:12] for d in claim_blocker["failed_checks"] or []][:6],
+                        "not_the_dataset": str(claim_blocker["not_the_dataset"] or "")[:600]})
     _fail_or_drop(errors, final)
     # The planner's own ids map onto the harness's C1..Cn.
     ids = {c["proposed_id"]: c["id"] for c in checks}
@@ -941,7 +1102,9 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     need = REQUIRED[c["kind"]]
     # Any number of bindings per kind (a method with two ingredients binds both); each kind needs one.
     given = [b for b in obj.get("bindings") or [] if isinstance(b, dict) and b.get("kind") in need][:12]  # ponytail: 12
-    if not script.strip() or any(not any(b.get("kind") == k and b.get("impl_quote") for b in given) for k in need):
+    na = {b["kind"]: str(b["not_applicable"]).strip()[:500] for b in given
+          if b["kind"] in OPTIONAL.get(c["kind"], ()) and len(str(b.get("not_applicable") or "").strip()) >= 20}
+    if not script.strip() or any(not any(b.get("kind") == k and b.get("impl_quote") for b in given) and k not in na for k in need):
         return {"refused": True, "notes": str(obj.get("notes") or "the script or a required binding is missing")[:2000]}
     errors, out = [], []
     rel = [f["path"] for f in state.read_json(x.root / "released.json", [])] + [   # released, or acquired for it
@@ -949,6 +1112,9 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
             "files", [])]
     for b in given:
         k = b["kind"]
+        if k in na and not b.get("impl_quote"):
+            out.append({"kind": k, "impl_quote": "", "paper_quote": "", "page": None, "not_applicable": na[k]})
+            continue
         if flat(str(b.get("impl_quote") or "")) not in flat(script):
             errors.append(f"binding {k}: impl_quote is not in the script")
         h = None if k == "instance" else _find(x, b.get("paper_quote", ""), errors, f"binding {k} paper_quote")
@@ -978,6 +1144,15 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     if runs > 1 and c["kind"] == "RECONSTRUCTION" and stochastic is True and c.get("test") != "compatibility" and not (
             (h := x.paper.find(str(obj.get("runs_quote") or ""))[0]) and value_in(h["quote"], str(runs))):
         errors.append("runs > 1 needs runs_quote: the paper's sentence printing that number, verbatim")
+    flow = independence.seed_flow(script) if c["kind"] == "RECONSTRUCTION" else None
+    if c["kind"] == "RECONSTRUCTION" and c.get("test") != "compatibility" and stochastic is True and flow is False:
+        errors.append("`stochastic` is true, but `--seed` never reaches a random generator in the script (no default_rng, "
+                      "RandomState, seed or manual_seed call, no random_state=, is fed from it): the replicates would be "
+                      "one run repeated. Seed every generator from --seed, or declare `stochastic`: false")
+    if c.get("acquire") and c["kind"] in ("RELEASED_DATA", "RECONSTRUCTION") and execute.DATA_MOUNT not in script:
+        errors.append(f"this check acquired data for the claim (see the manifest), but the script never reads {execute.DATA_MOUNT}: "
+                      "a simulation or surrogate in its place is a different experiment. Read the acquired files; a simulation "
+                      "belongs in a separate check with role 'supporting'")
     readings = _readings(x, obj.get("readings"), errors, cid) if obj.get("readings") else []
     if (c.get("readings") or readings) and not all(re.search(rf"""["']{k}["']""", script) for k in ("reading", "cohort")):
         errors.append("with readings, each result line carries `reading` (its name) and `cohort` (the items it was "
@@ -1004,6 +1179,13 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         deviations.append({"printed": h["quote"] if h else "", "page": h["page"] if h else None,
                            "used": str(d.get("used") or "")[:600], "why": str(d.get("why") or "")[:600],
                            "changes_claim": d.get("changes_claim") is True})
+    if c.get("criterion") == "supplied":   # a qualitative claim tested by a criterion the planner chose: its result is about that criterion
+        deviations.append({"printed": "", "page": None, "changes_claim": True,
+                           "used": "REFEREE's planner supplied the decision criterion "
+                                   f"({(c.get('target') or {}).get('relation') or c.get('metric') or 'the compared output'}) for a claim "
+                                   "whose sentence states no such comparison or number",
+                           "why": "the claim is qualitative; any threshold, rival or baseline is REFEREE's, so a result speaks for that "
+                                  "criterion and never for the claim as the paper states it"})
     if c["kind"] == "CERTIFICATE":   # a counterexample must satisfy every premise of the exact claim
         if "premises_hold" not in script:
             errors.append("each result line reports `premises_hold`: 1 if every premise of the claim being tested holds "
@@ -1019,7 +1201,7 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     (cdir / f"script.{r}.py").write_bytes(script.encode("utf-8"))   # bytes: the sha is of exactly these
     return {"script_sha256": state.sha256(script), "runs": runs, "runs_quote": str(obj.get("runs_quote") or "")[:500],
             "metric": metric, "outputs": outputs, "deviations": deviations, "bindings": out,
-            "stochastic": stochastic if isinstance(stochastic, bool) else None, "readings": readings,
+            "stochastic": stochastic if isinstance(stochastic, bool) else None, "seed_flow": flow, "readings": readings,
             "checked_statement": "proof_step" if c.get("step") else str(obj.get("checked_statement") or "conclusion"),
             # A general argument (e.g. that a printed premise can never hold) is the author's reasoning:
             # shown to the verifier and the reader as such, never counted as an executed result.

@@ -35,6 +35,19 @@ THE SCRIPT CONTRACT
     and CONTINUE with the other units — never exit on it (that would discard what completed).
   - It never reads the paper's printed result to produce its own, and never compares with it:
     it computes; the harness compares.
+  - ACQUIRED DATA IS THE EXPERIMENT'S DATA. If the manifest above lists acquired files, the script reads
+    them from /work/data (the harness refuses a script that never does). A simulation, a smaller stand-in
+    or a different dataset in their place is a different experiment: never write one to make a check
+    "work"; if the files are not what the paper describes, print the REFEREE_DATA mismatch and continue.
+  - REPLICATES ARE DIFFERENT RUNS. Every random generator (sampling, splits, simulation, initialisation)
+    is seeded from `--seed`; the harness refuses a stochastic script whose seed reaches none. Where the
+    script generates data, add `"data_fingerprint": "<sha256 of the generated arrays>"` to each result line.
+    Equal summary numbers (a recovery ratio of 1.0, zero false alarms) are still different runs if the data
+    differ; the harness judges that from the other outputs and this fingerprint.
+  - A PROPORTION OF COUNTED TRIALS (a false-alarm rate over 400 simulated trials, a coverage over 100 test
+    points, an error rate over n items): also print `"binomial": {"<output>": <number of independent trials>}`
+    on the result line, so the harness decides it with an exact binomial interval — zero events included —
+    instead of a standard error that is zero. The trials must be independent draws.
   - PAPER VS CODE. Where the checkout ships code that computes the compared quantity (an
     analysis script, a metrics module), read it and compare it with the paper's definition (the
     estimator, which items, positions or candidates are pooled, the selection, the aggregation).
@@ -63,7 +76,11 @@ of YOUR script that realize it — the harness checks they occur in the script).
 {{required}}.
 If a required ingredient cannot be written without inventing a detail the paper omits, say so
 in `notes` and leave its quotes empty: an honest refusal is a correct outcome; a fabricated
-binding is not.
+binding is not. The one ingredient an experiment may not HAVE is `training`: a simulation, a
+sequential test, an optimisation or an exact computation trains nothing. Then give it as
+{"kind": "training", "not_applicable": "<why nothing is trained or fitted here>"} (at least a sentence; the
+verifier checks it) — do not refuse an experiment whose other ingredients are all bound, and do not
+invent a training quote.
 
 DEVIATIONS. Every departure from the paper's printed text goes in `deviations`, each as
 {"printed": the paper's words verbatim ("" if the paper is silent), "used": what the script
@@ -81,6 +98,14 @@ For a CERTIFICATE with a claim-changing deviation, ALSO evaluate the text exactl
 the same instance and add `"literal": "holds" | "fails" | "undefined" | "premise_not_met"` to the
 result line (fails = its printed premises hold and its printed conclusion fails; undefined = the
 printed text is not well-defined there): the harness records both readings and never picks one.
+
+OPEN DETAILS ARE DECLARED BEFORE THE VERIFIER FINDS THEM. Every choice the paper leaves open ("in some fixed
+order", a radius, a bounding box, a filter, an order of extension, a tie-break) and every place the printed text
+is inconsistent with itself (a cell size that contradicts the grid size; a count that the filter must reproduce)
+is a `deviation` with the paper's words, what you used and `changes_claim`. Run a draft and compare what your
+REFEREE_DATA reports (counts, sizes) with the numbers the paper prints before you submit: a cohort twice the
+printed size is a wrong filter, not a finding. Each round the verifier finds one more undeclared choice costs
+one of your few revisions.
 
 REPLICATION. If the paper states how many seeds/runs/instances this used, set `runs` to it and
 copy the sentence into `runs_quote`; never fewer than the paper used. A RECONSTRUCTION is run at least 3 times (seeds

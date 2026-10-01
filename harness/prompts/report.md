@@ -36,7 +36,13 @@ anything past 8000 characters):
      the printed one. A data-identity mismatch (the data used differ from the paper's own
      description) is a finding to state plainly. Keep what the workflow completed apart from
      what it established; a concern stands only as far as its linked check established it.
-  4. **Open questions for the authors** — concrete questions that would settle what remains.
+  4. **Requested experiments** — from the Completion block of the status table, for each central
+     empirical claim: did the experiment the claim names RUN, did its protocol match (data, models,
+     scope), what does the evidence say, and what stopped it if it did not run (the blocker, and whether
+     the harness or the planner says so). A simulation or a proof beside it is supporting evidence, never
+     the experiment. Do not write or imply that a paper was reproduced because a report exists or the
+     workflow finished.
+  5. **Open questions for the authors** — concrete questions that would settle what remains.
 RULES (enforced): no accept/reject recommendation, score or verdict on the paper. The words
 verified, reproduced, confirmed, validated, replicated, refuted, disproved, counterexample,
 contradicted may appear only in a sentence that names the check id (C1, C2, ...) whose status

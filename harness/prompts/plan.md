@@ -23,12 +23,25 @@ headline experiments, its theorems, and its engineering claims (e.g. "can replac
 existing model" is exercised by swapping it in and training — it is NOT a qualitative claim). For
 each give `scope`: every method, dataset, setting and metric the claim names or compares (e.g.
 ["RPC", "PL", "Mallows", "political", "movies"]). Every scope item is either in the `covers` of a
-check linked to the claim, or listed in the claim's `omitted` with a concrete reason. A claim with
-no check gets a concrete `why_unchecked` naming a blocker NO kind below overcomes ("the only
-experiment needs 8 A100s for a week", "the data is neither released, cited nor generable").
-"Only shown in a figure", "the repository has no ready-made command" and "the data is not in the
-checkout" are NOT such blockers: a stated comparison is checked through a RELATION target, an
-experiment without a command through RECONSTRUCTION, and cited public data through `acquire`.
+check linked to the claim, or listed in the claim's `omitted` with a concrete reason AND a `blocker`
+(data | credentials | compute | protocol | other). A claim with no check gets a concrete
+`why_unchecked` and a `blocker` naming what NO kind below overcomes ("the only experiment needs 8
+A100s for a week": compute; "the model is a paid closed API": credentials; "no public record of the
+dataset exists after searching the registries": data). "Only shown in a figure", "the repository has
+no ready-made command", "the data is not in the checkout" and "the paper names the dataset but does
+not link it" are NOT such blockers: a stated comparison is checked through a RELATION target, an
+experiment without a command through RECONSTRUCTION, and public data — linked or only named — through
+`acquire` (see DATA below).
+
+THE REQUESTED EXPERIMENT IS NOT REPLACED. An empirical claim (`performance`, `value`, `engineering`) is
+about an experiment on the data, models and protocol it names. The check that satisfies it runs THAT
+experiment (RECONSTRUCTION, RELEASED_DATA or AUTHOR_CODE on the named data). A simulation on invented
+data, a smaller stand-in dataset, a different model, or a proof of a related lemma is a different
+experiment: propose it, if it helps, as an extra check with `"role": "supporting"` — it is reported
+beside the claim and never decides it — and it never lets you drop the requested experiment. If the
+requested experiment cannot run, its scope item goes in `omitted` with its `blocker`, and the report
+says which experiments ran and which did not. Never shrink a dataset, a model or a run count to make it
+fit; a `compute` blocker cites the measured host above.
 Give each claim a `claim_type`: "engineering" (a component can be integrated, swapped in, run or
 trained), "performance" (a method beats, matches or improves on others), "value" (a printed
 number) or "theory" (a mathematical statement). A sentence making two claims ("can replace a
@@ -93,16 +106,46 @@ central claim can use the slot, and say why in `incidental_why`. Kinds:
 Prefer a check that is decisive for a central claim over one that is merely cheap. Two
 concerns about the same number share one check.
 
-DATA NOT IN THE CHECKOUT. Missing from the checkout is not unavailable: find where the paper,
-the README, a data readme or the authors' code says the data or scores come from (a download
-link, a dataset page, a Hugging Face dataset id the code downloads). List what a script check
-needs in its `acquire`: [{"source": "https://..." or "hf://datasets/<owner>/<name>",
-"cited_in": "paper" or the tracked checkout path whose text contains that exact URL or id,
-"include": ["filename patterns"] (for a dataset page: which linked files to fetch; for an HF
-dataset: which files), "why": "..."}]. The harness downloads them once (network on only for
-this), records every file's sha256 and mounts them read-only at /work/data/<n>/ for the script;
-a source nobody cites is refused. Name the dataset's documented size or identity (instances,
-items, splits) in `why` so the script can check it.
+DATA NOT IN THE CHECKOUT. Missing from the checkout is not unavailable, and a dataset the paper only
+NAMES is not "uncited": it has to be found. List what a script check needs in its `acquire`:
+[{"source": ..., "cited_in": ..., "include": ["filename patterns"], "why": "...", "required": true}].
+The harness downloads them once (network on only for this), validates every file (an HTML page, an
+empty or corrupt file, a bad checksum and source code are not admitted), records each file's sha256 and
+mounts the rest read-only at /work/data/<n>/. Name the dataset's documented size or identity (instances,
+items, splits) in `why` so the script can check it. `include` selects files (for a landing page or a
+record with several files: a record may hold gigabytes you do not need; fetch only what the claim uses).
+Two ways to a source:
+  (a) The paper or a tracked checkout file PRINTS it (a URL, a DOI, a Zenodo record, an hf:// id):
+      `"source": "https://..."` or `"hf://datasets|models/<owner>/<name>"`, `"cited_in": "paper"` or the
+      tracked path. Copy it as a normal URL; a scheme the paper omits, a line-break hyphen ("zen-\nodo.org")
+      and a DOI written for its record count as the same citation, and the harness keeps the span as printed.
+      For a repository record, LOOK at its files before choosing `include`:
+          {{discover_files_cmd}} "<record url>"
+      (names, sizes, checksums). Name the files the claim needs; a bare suffix pattern such as "*.csv" takes
+      every file of that kind, and a cut (more files matched than are followed) is reported to you, to the
+      script author and in the report.
+  (b) The paper only NAMES the dataset ("CIFAR-10-C", "the Porto taxi trajectories", "MMLU"): search the
+      public registries with the harness's own command, which sends nothing but your query:
+          {{discover_cmd}} "<query>" [--registry zenodo|datacite|huggingface|huggingface-models]
+      Public data search is {{data_search}}; at most {{max_discoveries}} searches per paper. Searches so far:
+{{discoveries}}
+      Query with the dataset's title as its owners write it; a quoted phrase is an exact title
+      (Zenodo: title:"CIFAR-10-C"; DataCite: titles.title:"Taxi Service Trajectory"), and the creators'
+      surnames from the reference the paper cites for the dataset narrow it. Prefer the record made by the
+      dataset's own authors (creators, year, DOI, files) over a re-upload; judge from what the registry
+      returned, never from memory. Then cite a candidate exactly as returned:
+      `{"source": "<a candidate's source>", "cited_in": "discovery", "discovery": "D2",
+        "named_in_paper": "<the paper's own words naming the dataset, verbatim>", "include": [...], ...}`.
+  A dataset is unobtainable only after (b) found nothing it could be: an `omitted` entry with
+  `"blocker": "data"` names the searches (`"discovery": ["D1", "D2"]`) and, if they returned candidates, says
+  in `not_the_dataset` why none is the dataset the paper names. A check whose data could not be acquired ends
+  as a documented DATA BLOCKER with the failure's class (missing, inaccessible, network, content invalid) and
+  no script is written against it; the follow-up round may try another record.
+
+A claim that states no comparison and no number (a qualitative description: "fits well", "is robust") is not
+decided by a comparison you invent: if you test it against a rival, a baseline or a threshold of your own, say
+`"criterion": "supplied"` — the harness then records that as a claim-changing deviation, and the result
+speaks for your criterion, never for the claim as printed.
 
 TARGETS. Every kind except CERTIFICATE compares against ONE `target`:
   - a table cell: {"row_quote": the row label exactly as printed in the rows file,
@@ -125,14 +168,18 @@ Write ONLY this JSON to the output path you were given:
  "repo_note": "why the repository is (not) the authors' own code for these experiments",
  "central_claims": [{"quote": "verbatim", "claim_type": "engineering|performance|value|theory",
                      "scope": ["every method/dataset/setting it names"],
-                     "checks": ["C1"], "omitted": [{"item": "a scope item", "why": "concrete reason"}],
-                     "why_unchecked": ""}],
+                     "checks": ["C1"], "omitted": [{"item": "a scope item", "why": "concrete reason",
+                       "blocker": "data|credentials|compute|protocol|other", "discovery": [],
+                       "not_the_dataset": "", "failed_checks": []}],
+                     "why_unchecked": "", "blocker": "", "discovery": [], "not_the_dataset": "", "failed_checks": []}],
  "checks": [
    {"id": "C1", "kind": "AUTHOR_CODE|RELEASED_DATA|RECONSTRUCTION|CERTIFICATE|ARITHMETIC",
+    "role": "target|supporting (target: it runs the experiment the claim names; supporting: it stands beside it)",
     "basis": "published_results|predictions (RELEASED_DATA only)",
     "test": "performance|compatibility (RECONSTRUCTION only)",
     "define": {"<output name>": "what the script computes under that name"},
     "readings": [],
+    "criterion": "stated|supplied (stated: the claim's own sentence states the comparison or number this target encodes; supplied: it states neither — 'describes well', 'is robust' — and YOU chose the relation, rival, baseline or threshold)",
     "concerns": ["contradiction-02"],
     "claim_quote": "verbatim sentence this check bears on",
     "covers": ["the scope items this check tests"],
