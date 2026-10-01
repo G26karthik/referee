@@ -138,7 +138,8 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     response (a DOI redirects to the repository), each failure is classified (transient: retried;
     missing; inaccessible; no data on the page; content invalid; a bug of this code), recovery uses
     documented mechanisms only (another printed reading, the repository's records API with its
-    checksums, the DOI registry) and is bounded and recorded, and nothing is admitted unvalidated (an
+    checksums, the DOI registry, an HTTP range that continues a cut transfer of the same version — If-Range on
+    its ETag or Last-Modified) and is bounded and recorded, and nothing is admitted unvalidated (an
     HTML page, an empty or corrupt file, a bad checksum, executable source code). A cap on the files followed
     is never silent: a landing page follows 20 links, a repository record its own listing (up to 500), and a
     cut is recorded (`truncated`), shown to planner, script author and report, and never shared as a complete
@@ -234,7 +235,8 @@ Gates: `SH_ALLOW_REPO_EXEC`, `SH_ALLOW_SCRIPT_EXEC`, `SH_ALLOW_INSTALL`, `SH_ALL
 data downloads need the network gate alone, a Hugging Face download also the install gate). Caps:
 `SH_MAX_DISCOVERIES` (12 searches per paper),
 `SH_MAX_CHECKS` (6), `SH_MAX_FOLLOWUP_CHECKS` (3), `SH_MAX_REVISIONS` (3), `SH_MAX_TRIES` (3),
-`SH_MAX_DATA_GB` (20), `SH_CHECK_BUDGET_S` (7200), `SH_COMPAT_BUDGET_S` (1800), `SH_RUN_TIMEOUT_S` (3600). Docker is the only
+`SH_MAX_DATA_GB` (20), `SH_FETCH_TIMEOUT_S` (the data cap at 1 MB/s), `SH_CHECK_BUDGET_S` (7200), `SH_COMPAT_BUDGET_S` (1800),
+`SH_RUN_TIMEOUT_S` (3600; host awake time). Docker is the only
 execution backend.
 
 Delegation has exactly one channel: the workflow's isolated subagents read a task's files,

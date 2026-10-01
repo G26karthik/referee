@@ -911,7 +911,7 @@ def fetch(cfg: state.Config, root: Path, cid: str, sources: list[dict]) -> dict 
                     {k: s.get(k) for k in ("source", "include")} for s in o.get("sources", [])] == plan_key:
                 return None
     if st.get("rec"):
-        done = collect(st["rec"], cfg.install_timeout_s)
+        done = collect(st["rec"], cfg.fetch_timeout_s)
         if done is None:
             return None
         state.append_jsonl(Path(root) / "execution.jsonl", {**done, "stdout": done.get("stdout", "")[-20000:]})

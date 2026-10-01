@@ -113,6 +113,15 @@ def _writable(func, path, _exc) -> None:
     func(path)
 
 
+def _ckpt_mounts(root: Path) -> list[str]:
+    """Every checkpoint volume a run of this review mounted, read from its execution records (a volume is named from
+    its check folder's path, so a folder renamed later would name another)."""
+    log = root / "execution.jsonl"
+    rows = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines() if x.strip()] if log.exists() else []
+    return sorted({a.rsplit(":", 1)[0] for r in rows for a in r.get("launch_argv") or []
+                   if isinstance(a, str) and a.endswith(f":{execute.MOUNT}/ckpt") and a.startswith("referee-")})
+
+
 def pack(cfg: state.Config, out: Path, pids: list[str], clean: bool) -> int:
     """Zip the review artifacts (never clones/venvs/data), verify the zip, then optionally
     delete the heavy resources. Nothing is deleted unless the zip tested clean."""
@@ -138,9 +147,10 @@ def pack(cfg: state.Config, out: Path, pids: list[str], clean: bool) -> int:
             execute._docker(["docker", "volume", "rm", "-f", execute.volume(e)], 120)
         ckpts = [execute.ckpt_volume(c.parent, k) for root in roots for c in root.glob("checks/*/check.json")
                  for k in range(int((state.read_json(c) or {}).get("runs") or 1))] + [
+            v for root in roots for v in _ckpt_mounts(root)] + [     # as mounted: a renamed (withdrawn) folder's too
             (state.read_json(d / "data.json") or {}).get("volume") or execute.data_volume(root, d.name)
             for root in roots for d in root.glob("checks/*") if (d / "data.json").exists()]
-        for v in ckpts + ([execute.DOWNLOAD_CACHE] if not pids else []):
+        for v in sorted(set(ckpts)) + ([execute.DOWNLOAD_CACHE] if not pids else []):
             execute._docker(["docker", "volume", "rm", "-f", v], 120)
         for h in heavy + ([cfg.projects / ".script-env"] if not pids else []):
             if h.exists():

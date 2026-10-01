@@ -54,6 +54,10 @@ class Config:
     # ponytail: 20 GB of acquired public data per check fits one host's disk; a larger artifact is
     # a documented storage blocker, never a silent subset.
     max_data_gb: int = field(default_factory=lambda: _int("SH_MAX_DATA_GB", 20))
+    # ponytail: a fetch may take what SH_MAX_DATA_GB needs at 1 MB/s (20 GB: about 5.7 h); a data download is no pip
+    # build, so it has its own limit. A stalled transfer is caught inside the fetcher by its read timeout; this cap
+    # only ends a fetcher that stopped answering (Oct-01: a 2.9 GB archive at this host's 0.76 MB/s needs over 1 h).
+    fetch_timeout_s: int = field(default_factory=lambda: _int("SH_FETCH_TIMEOUT_S", _int("SH_MAX_DATA_GB", 20) * 1024))
     # Sources a review must never read (evaluation records about the papers themselves).
     deny_sources: tuple = field(default_factory=lambda: tuple(
         s.strip().lower() for s in os.environ.get("SH_DENY_SOURCES", "ICML-2026-agent-repro").split(",") if s.strip()))

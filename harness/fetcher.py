@@ -259,27 +259,37 @@ class Fetcher:
         else:
             os.makedirs(os.path.dirname(cpath), exist_ok=True)
             failed: list[dict] = []
-            for i in range(self.tries):
-                hop = _Redirects()
-                try:
-                    req = urllib.request.Request(url, headers={"User-Agent": "referee"})
-                    with urllib.request.build_opener(hop).open(req, timeout=self.timeout) as r:
-                        final = r.geturl()
-                        if self.denied(final):
-                            raise FetchError("denied", f"redirected to a denied source: {final}")
-                        info.update(final_url=final, redirects=hop.chain, http_status=r.status,
-                                    content_type=r.headers.get("Content-Type", ""),
-                                    content_disposition=r.headers.get("Content-Disposition", ""))
-                        self._save(r, cpath, md5, size)
-                    break
-                except Exception as e:                    # noqa: BLE001 - classified, never swallowed
-                    klass, msg = classify(e)
-                    if isinstance(e, FetchError) and klass not in ("corrupt", "short"):
-                        raise
-                    failed.append({"try": i + 1, "class": klass, "error": msg[:300], "redirects": hop.chain})
-                    if klass not in ("transient", "corrupt", "short") or i == self.tries - 1:
-                        raise FetchError({"corrupt": "content_invalid", "short": "transient"}.get(klass, klass), msg, failed) from e
-                    self.sleep(2 ** i)
+            part: dict = {}       # this fetch's own partial file, and the validator of the response that began it
+            try:
+                for i in range(self.tries):
+                    hop = _Redirects()
+                    held = os.path.getsize(part["tmp"]) if part.get("validator") and os.path.exists(part["tmp"]) else 0
+                    try:
+                        head = {"User-Agent": "referee", **({"Range": f"bytes={held}-", "If-Range": part["validator"]}
+                                                            if held else {})}    # kept across a redirect hop
+                        req = urllib.request.Request(url, headers=head)
+                        with urllib.request.build_opener(hop).open(req, timeout=self.timeout) as r:
+                            final = r.geturl()
+                            if self.denied(final):
+                                raise FetchError("denied", f"redirected to a denied source: {final}")
+                            if r.status != 206:               # a continuation keeps what the response that began it said
+                                info.update(final_url=final, redirects=hop.chain, http_status=r.status,
+                                            content_type=r.headers.get("Content-Type", ""),
+                                            content_disposition=r.headers.get("Content-Disposition", ""))
+                            self._save(r, cpath, md5, size, part, held)
+                        break
+                    except Exception as e:                    # noqa: BLE001 - classified, never swallowed
+                        klass, msg = classify(e)
+                        if isinstance(e, FetchError) and klass not in ("corrupt", "short"):
+                            raise
+                        failed.append({"try": i + 1, "class": klass, "error": msg[:300], "redirects": hop.chain,
+                                       **({"resumed_from": held} if held else {})})
+                        if klass not in ("transient", "corrupt", "short") or i == self.tries - 1:
+                            raise FetchError({"corrupt": "content_invalid", "short": "transient"}.get(klass, klass), msg, failed) from e
+                        self.sleep(2 ** i)
+            finally:
+                if part.get("tmp") and os.path.exists(part["tmp"]):    # no partial file outlives its fetch
+                    os.remove(part["tmp"])
             info.update(retries=failed, bytes=os.path.getsize(cpath))
             tmp = f"{cpath}.meta.json.{uuid.uuid4().hex}"
             with open(tmp, "w") as f:
@@ -296,31 +306,53 @@ class Fetcher:
             shutil.copy(cpath, out)
         return out, info
 
-    def _save(self, r, cpath: str, md5: str = "", size: int | None = None) -> None:
-        """Stream the response to a temp file of its own, check it against what was promised (Content-Length,
-        the published size and md5), and only then rename it into the cache."""
+    def _save(self, r, cpath: str, md5: str = "", size: int | None = None, part: dict | None = None,
+              held: int = 0) -> None:
+        """Stream the response to a temp file of this fetch's own, check it against what was promised (the total
+        length, the published size and md5), and only then rename it into the cache. A 206 that continues exactly the
+        `held` bytes (asked with If-Range on the validator of the response that began them) is appended; a server that
+        ignores the range starts the file over, and a range other than the one asked for is refused and dropped. What
+        arrived before a cut or a network fault is kept in `part` for the next try only where an ETag or Last-Modified
+        ties it to one version of the file (Oct-01: a 2.9 GB archive cut at 285 MB began again at byte 0)."""
+        part = {} if part is None else part
+        rng = re.match(r"bytes (\d+)-\d+/(\d+|\*)", r.headers.get("Content-Range") or "")
         n = int(r.headers.get("Content-Length") or 0)
-        if n > self.room():
-            raise FetchError("storage", f"{n} bytes would pass the storage cap ({self.cap} bytes, SH_MAX_DATA_GB)")
-        tmp, got, h = f"{cpath}.part.{uuid.uuid4().hex}", 0, hashlib.md5()
+        cont = bool(held and r.status == 206 and rng and int(rng.group(1)) == held)
+        if not cont and part.get("tmp") and os.path.exists(part["tmp"]):     # the whole file again, or another range
+            os.remove(part["tmp"])
+        if not cont:
+            part.clear()
+            held = 0
+            if r.status == 206:
+                raise FetchError("short", f"a partial answer ({r.headers.get('Content-Range')}) that continues no bytes held")
+        total = (int(rng.group(2)) if rng.group(2) != "*" else held + n) if cont else n
+        if total > self.room():
+            raise FetchError("storage", f"{total} bytes would pass the storage cap ({self.cap} bytes, SH_MAX_DATA_GB)")
+        if not cont:
+            part.update(tmp=f"{cpath}.part.{uuid.uuid4().hex}", validator=r.headers.get("ETag") or r.headers.get("Last-Modified") or "")
+        tmp, got = part["tmp"], held
         try:
-            with open(tmp, "wb") as f:
+            with open(tmp, "ab" if cont else "wb") as f:
                 while b := r.read(1 << 20):
                     got += len(b)
                     if got > self.room():
                         raise FetchError("storage", f"passed the storage cap ({self.cap} bytes, SH_MAX_DATA_GB)")
-                    h.update(b)
                     f.write(b)
-            if n and got < n:                               # cut short in transit
-                raise FetchError("short", f"the transfer ended after {got} of {n} bytes")
+            if total and got < total:                       # cut short in transit
+                raise FetchError("short", f"the transfer ended after {got} of {total} bytes")
             if size is not None and got != size:            # whole as sent, yet not the published file: corrupt
-                raise FetchError("short" if got < size and not n else "corrupt", f"{got} bytes arrived, the published size is {size}")
-            if md5 and h.hexdigest() != md5.lower():
-                raise FetchError("corrupt", f"md5 {h.hexdigest()} differs from the published {md5}")
+                raise FetchError("short" if got < size and not total else "corrupt", f"{got} bytes arrived, the published size is {size}")
+            if md5 and (h := _md5(tmp)) != md5.lower():
+                raise FetchError("corrupt", f"md5 {h} differs from the published {md5}")
             _put(tmp, cpath)
-        except BaseException:
-            if os.path.exists(tmp):
-                os.remove(tmp)
+            part.clear()
+        except BaseException as e:
+            resumable = part.get("validator") and (e.klass == "short" if isinstance(e, FetchError)
+                                                   else isinstance(e, Exception) and classify(e)[0] == "transient")
+            if not resumable:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+                part.clear()
             raise
 
     def json(self, url: str, tmp: str):

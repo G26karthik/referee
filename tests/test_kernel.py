@@ -1238,6 +1238,60 @@ def test_download_failures_are_classified_and_only_transient_ones_are_retried():
         assert fetcher.failure_class({"attempts": [{"class": "bug"}, {"class": "missing"}], "followed": [], "rejected": []}) == "bug"
 
 
+def test_a_cut_download_resumes_from_the_bytes_it_holds():
+    """Oct-01 PPRM C1: CIFAR-10-C.tar (2.9 GB) was cut at 285 MB by a link drop at 08:14Z and every retry began again at
+    byte 0. A cut transfer continues from what it holds (Range, If-Range on the first response's validator); a server
+    that ignores the range, or answers another one, starts over; a cut that repeats still fails, leaving nothing."""
+    import hashlib as _h
+    from harness import fetcher
+    body = bytes(range(256)) * 1200                                   # 307200 bytes
+    md5 = _h.md5(body).hexdigest()
+    seen: dict = {}
+
+    def range_of(h):
+        r = h.headers.get("Range") or ""
+        return int(r[6:-1]) if r.startswith("bytes=") and r.endswith("-") else None
+
+    def make(mode):
+        def route(h):
+            seen.setdefault(mode, []).append((h.headers.get("Range"), h.headers.get("If-Range")))
+            start, n = range_of(h), len(seen[mode])
+            val = {} if mode == "novalidator" else {"ETag": '"v1"'}
+            if n == 1 or mode == "alwayscut":                         # the first answer (every answer): cut at 100 KB
+                return 200, {"Content-Length": str(len(body)), **val}, iter([body[:102400]])
+            if start is not None and mode in ("resume", "redirect") and h.headers.get("If-Range") == '"v1"':
+                return 206, {"Content-Length": str(len(body) - start), **val,
+                             "Content-Range": f"bytes {start}-{len(body) - 1}/{len(body)}"}, body[start:]
+            if mode == "wrongrange" and n == 2:                       # a range other than the one asked for
+                return 206, {"Content-Length": str(len(body)), **val, "Content-Range": f"bytes 0-{len(body) - 1}/{len(body)}"}, body
+            return 200, {**val}, body                                 # ignores the range: the whole file again
+        return route
+    routes = {f"/{m}.tar": make(m) for m in ("resume", "ignored", "wrongrange", "novalidator", "alwayscut", "redirect")}
+    srv, host = _serve({**routes, "/hop": lambda h: (302, {"Location": f"http://{host}/redirect.tar"}, b"")})
+    try:
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            f = fetcher.Fetcher(str(td / "cache"), 1 << 30, [], sleep=lambda s: None, tries=3, timeout=5)
+            for mode, url in [(m, f"http://{host}/{m}.tar") for m in ("resume", "ignored", "wrongrange", "novalidator")] + [
+                    ("redirect", f"http://{host}/hop")]:
+                p, info = f.get(url, str(td / mode), md5=md5)
+                assert Path(p).read_bytes() == body, (mode, len(Path(p).read_bytes()))
+                assert info["retries"][0]["class"] == "short", (mode, info)
+            assert seen["resume"][1] == ("bytes=102400-", '"v1"') and seen["redirect"][1] == ("bytes=102400-", '"v1"')
+            assert seen["novalidator"][1] == (None, None)              # nothing to tie the bytes to: never resumed
+            try:
+                f.get(f"http://{host}/alwayscut.tar", str(td / "cut"), md5=md5)
+                raise AssertionError("a cut on every try was admitted")
+            except fetcher.FetchError as e:
+                assert e.klass == "transient" and len(e.attempts) == 3, (e.klass, e.attempts)
+            assert len(seen["alwayscut"]) == 3 and seen["alwayscut"][1][0] == "bytes=102400-"
+            assert not list((td / "cache").rglob("*.part.*"))         # no partial file outlives the fetch
+        if "SH_FETCH_TIMEOUT_S" not in os.environ:                     # a download has its own limit: the data cap at 1 MB/s
+            assert state.Config().fetch_timeout_s == state.Config().max_data_gb * 1024
+    finally:
+        srv.shutdown()
+
+
 def test_downloaded_content_is_validated_before_it_reaches_an_experiment():
     from harness import fetcher
     with tempfile.TemporaryDirectory() as t:
@@ -2998,13 +3052,22 @@ def test_a_follow_up_plan_made_on_a_harness_fault_is_planned_again_never_one_wit
         state.write_json(root / "checks" / "C7" / "exec.json", {"token": "t"})          # still executing: stop it first
         assert "executing" in tasks.reopen(cfg, pid, "plan:2", "x")["error"]
         # Oct-01 PPRM: C8/C9 had ended BLOCKED and kept their exec.json; an ended check is not executing.
-        state.write_json(root / "checks" / "C7" / "outcome.json", {"status": "BLOCKED", "reason": "RESOURCE BLOCKER: x"})
+        state.write_json(root / "checks" / "C7" / "outcome.json", {"status": "BLOCKED", "reason": "RESOURCE BLOCKER: x",
+                                                                   "pilot_stages": {"a": {"n": 1, "mean": 0.75}}})
         out = tasks.reopen(cfg, pid, "plan:2", "the follow-up was planned on failed searches read as searches")
         assert out["withdrawn"] == "plan:2" and out["checks_set_aside"] == ["C7"]
         assert (root / "checks" / "C7.withdrawn.1" / "data.json").exists() and (root / "sealed" / "plan__2.withdrawn.1.json").exists()
         phase, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
         assert phase == "plan" and [o["id"] for o in owed] == ["plan:2"]        # the round is planned again
         _seal(cfg, pid, "plan:2", {"checks": [run("F1")], "central_claims": [_claim(checks=["F1"])]}, td)
+        # The new round's C7 is a live check; the withdrawn C7 is never one, and stays visible with what it measured.
+        led = report.ledger(tasks._Ctx(cfg, pid))
+        assert [c["id"] for c in led["checks"]] == ["C1", "C7"] and led["checks"][1]["status"] == "PENDING"
+        w = led["withdrawn_checks"]
+        assert [x["folder"] for x in w] == ["checks/C7.withdrawn.1"] and w[0]["status"] == "BLOCKED"
+        assert "failed searches" in w[0]["withdrawn_because"] and w[0]["pilot_stages"]["a"]["n"] == 1
+        md = report.render(tasks._Ctx(cfg, pid), led, None)
+        assert "checks/C7.withdrawn.1" in md and "measured before the limit, deciding nothing: a n=1 mean 0.75" in md
         state.write_json(root / "checks" / "C7" / "outcome.json", {"status": "RELATION_HOLDS", "values": [1]})
         assert "never withdrawn" in tasks.reopen(cfg, pid, "plan:2", "again")["error"]   # a finding is never re-rolled
 

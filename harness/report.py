@@ -181,10 +181,33 @@ def _done(c: dict) -> str:
                      for s, p in st.items()) if len(st) <= 6 else f"; {len(st)} stages: {_counts(st)} (see Stages)"
     extra = (f" (on what completed: {c['status_on_completed']})" if c.get("status_on_completed") else "")
     extra += "".join(f"; reading {r}: {p['status']}" for r, p in (c.get("readings") or {}).items())
+    extra += _measured_before(c) if c.get("status") == "BLOCKED" else ""
     label = f" {c['test']} test" if c.get("test") == "compatibility" else ""
     label += f" ({BASIS_WORDS[c['basis']]})" if c.get("basis") in ("published_results", "predictions") else ""
     return (f"{c['id']} {c['kind']}{label}{' proof step' if c['evidence'] == 'PROOF_AUDIT' else ''} on {what}{stages}"
             f"{' (claim reading changed)' if _changed(c) else ''}: {c['status']}{extra}")
+
+
+def _measured_before(c: dict) -> str:
+    """What a run printed before a resource limit ended it: kept beside the blocker, deciding nothing."""
+    st = c.get("pilot_stages") or {}
+    return ("; measured before the limit, deciding nothing: " + ", ".join(f"{s} n={p['n']} mean {p['mean']}"
+                                                                         for s, p in st.items())) if st else ""
+
+
+def _withdrawn(root: Path) -> list[dict]:
+    """Checks of a follow-up plan the operator withdrew (checks/<id>.withdrawn.N, see tasks._replan): never a live check,
+    always shown beside the report with the operator's stated reason and what they found or measured."""
+    why = {str(i + 1): e.get("why", "") for i, e in enumerate(
+        e for e in map(json.loads, (root / "log.jsonl").read_text(encoding="utf-8").splitlines() if (root / "log.jsonl").exists() else [])
+        if e.get("event") == "replan")}
+    out = []
+    for d in sorted((root / "checks").glob("*.withdrawn.*")):
+        o, n = state.read_json(d / "outcome.json") or {}, d.name.rsplit(".", 1)[1]
+        out.append({"folder": f"checks/{d.name}", "plan": f"sealed/plan__2.withdrawn.{n}.json", "kind": o.get("kind", ""),
+                    "status": o.get("status") or "NOT_FINISHED", "reason": str(o.get("reason", ""))[:300],
+                    "pilot_stages": o.get("pilot_stages") or {}, "withdrawn_because": why.get(n, "")[:500]})
+    return out
 
 
 def _counts(stages: dict) -> str:
@@ -225,7 +248,7 @@ def _checks(root: Path, plan: dict) -> list[dict]:
                     "runs": o.get("runs") or (o.get("protocol") or {}).get("seeds_reused_from_checkpoints"),
                     "values": o.get("values"), "literal": o.get("literal"),
                     "admissible": o.get("admissible"), "protocol": o.get("protocol"),
-                    "image_check": o.get("image_check"), "pilot_values": o.get("pilot_values"),
+                    "image_check": o.get("image_check"), "pilot_values": o.get("pilot_values"), "pilot_stages": o.get("pilot_stages"),
                     "status": o.get("status"), "reason": o.get("reason", ""), "reason_by": o.get("reason_by", "harness"),
                     "rule": o.get("rule") or next((p["rule"] for p in (o.get("stages") or {}).values() if p.get("rule")), ""),
                     "stages": o.get("stages"), "status_on_completed": o.get("status_on_completed"),
@@ -508,7 +531,7 @@ def ledger(x) -> dict:
            "concerns": sorted(x.concerns(), key=lambda c: (-_RANK[c["severity"]], c["id"])),
            "checks": checks, "central_claims": central, "incidental_checks": [c["id"] for c in checks if not c["central"]],
            "completion": _completion(checks, central), "definition_choices": definition_choices(checks),
-           "conflicts": conf, "workflow": _workflow(checks),
+           "conflicts": conf, "workflow": _workflow(checks), "withdrawn_checks": _withdrawn(x.root),
            "dropped": {"concerns_unresolved_quotes": lens_drops, "checks": plan.get("dropped", [])},
            "scientific_status": _headline(checks, central)}
     state.write_json(x.root / "ledger.json", out)
@@ -771,9 +794,13 @@ def render(x, led: dict, rep: dict | None) -> str:
                 lines.append(f"  - dataset {name}: {_said(_cell(json.dumps(ident, ensure_ascii=False), 300), led)}")
         lines.append("")
     hist = [(c["id"], h) for c in led["checks"] for h in c.get("history") or []]
-    if hist:
+    wd = led.get("withdrawn_checks") or []
+    if hist or wd:
         lines += ["## Superseded results (withdrawn by a later run of the same check)", ""] + [
-            f"- {cid} `{h['file']}`: {h['status']} — {_cell(h['reason'], 200)}" for cid, h in hist] + [""]
+            f"- {cid} `{h['file']}`: {h['status']} — {_cell(h['reason'], 200)}" for cid, h in hist] + [
+            f"- `{w['folder']}` (its follow-up plan `{w['plan']}` was withdrawn by the operator: "
+            f"{_cell(w['withdrawn_because'], 240)}): {w['status']} — {_cell(w['reason'], 200)}{_measured_before(w)}"
+            for w in wd] + [""]
     prot = [(c["id"], c["protocol"]) for c in led["checks"] if c.get("protocol")]
     if prot:
         lines += ["## Protocol choices (what the paper stated, what REFEREE supplied)", ""]
