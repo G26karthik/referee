@@ -96,10 +96,13 @@ def classify(e: BaseException) -> tuple[str, str]:
         return "inaccessible", f"{type(e).__name__}: {e}"
     if names & {"RepositoryNotFoundError", "RevisionNotFoundError", "EntryNotFoundError"}:
         return "missing", f"{type(e).__name__}: {e}"
+    # A TLS failure is a fault of this host's connection to the source (a handshake, a middlebox, a server's bad
+    # moment: the same file arrived on 09-30 and failed with a decode alert on 10-01), never a fact about the data:
+    # retried, and if it persists, a fault of this run (INCONCLUSIVE), not a data blocker.
     if isinstance(e, ssl.SSLError):
-        return "protocol", f"TLS: {e}"
+        return "transient", f"TLS: {e}"
     if isinstance(e, urllib.error.URLError):
-        return ("protocol", f"TLS: {e.reason}") if isinstance(e.reason, ssl.SSLError) else ("transient", f"unreachable: {e.reason}")
+        return "transient", (f"TLS: {e.reason}" if isinstance(e.reason, ssl.SSLError) else f"unreachable: {e.reason}")
     if isinstance(e, (socket.timeout, TimeoutError, ConnectionError, http.client.HTTPException)):
         return "transient", f"{type(e).__name__}: {e}"
     if isinstance(e, OSError):

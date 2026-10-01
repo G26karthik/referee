@@ -2915,6 +2915,21 @@ def test_an_alternate_reading_never_outranks_the_primary_readings_failure():
         srv.shutdown()
 
 
+def test_a_tls_failure_is_a_fault_of_this_run_never_a_data_blocker():
+    """2026-10-01 run, conformal C5: the Porto zip that arrived on 09-30 failed with `TLSV1_ALERT_DECODE_ERROR`; the class
+    `protocol` was never retried and ended the check as a DATA BLOCKER."""
+    import ssl
+    import urllib.error
+    from harness import fetcher
+    assert fetcher.classify(ssl.SSLError(1, "[SSL: TLSV1_ALERT_DECODE_ERROR] tlsv1 alert decode error"))[0] == "transient"
+    assert fetcher.classify(urllib.error.URLError(ssl.SSLError(1, "decode error")))[0] == "transient"
+    with tempfile.TemporaryDirectory() as t:
+        cdir = Path(t)
+        blk = [{"source": "https://x.org/d.zip", "class": "transient", "detail": "TLS: decode error", "rejected": []}]
+        tasks._data_blocked(cdir, {"id": "C1", "kind": "RECONSTRUCTION"}, blk)
+        assert state.read_json(cdir / "outcome.json")["status"] == "INCONCLUSIVE"        # this run's fault, not the source's
+
+
 def test_hub_errors_are_classified_by_their_http_status():
     from harness import fetcher
 
