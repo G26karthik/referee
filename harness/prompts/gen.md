@@ -40,17 +40,21 @@ THE SCRIPT CONTRACT
     or a different dataset in their place is a different experiment: never write one to make a check
     "work"; if the files are not what the paper describes, print the REFEREE_DATA mismatch and continue.
   - REPLICATES ARE DIFFERENT RUNS. Every random generator (sampling, splits, simulation, initialisation)
-    is seeded from `--seed`; the harness refuses a stochastic script whose seed reaches none. Where the
-    script generates data, add `"data_fingerprint": "<sha256 of the generated arrays>"` to each result line.
-    Equal summary numbers (a recovery ratio of 1.0, zero false alarms) are still different runs if the data
-    differ; the harness judges that from the other outputs and this fingerprint.
+    is seeded from `--seed`; the harness refuses a stochastic script whose seed reaches none. A stochastic
+    script adds `"data_fingerprint": "<sha256 of the random draws THIS stage consumed>"` to EVERY result line
+    (the generated data, the sampled indices or split, the initial weights — whatever the seed changed in
+    that stage). Equal summary numbers (a recovery ratio of 1.0, zero false alarms) are still different runs
+    if the draws differ; identical lines with identical fingerprints are one run repeated, never replicates.
   - A PROPORTION OF COUNTED TRIALS (a false-alarm rate over 400 simulated trials, a coverage over 100 test
     points, an error rate over n items): also print `"binomial": {"<output>": <number of independent trials>}`
     on the result line, so the harness decides it with an exact binomial interval — zero events included —
     instead of a standard error that is zero. The trials must be independent draws.
   - PAPER VS CODE. Where the checkout ships code that computes the compared quantity (an
-    analysis script, a metrics module), read it and compare it with the paper's definition (the
-    estimator, which items, positions or candidates are pooled, the selection, the aggregation).
+    analysis script, a metrics module), or the acquired record does (files listed under `record_src` in
+    the manifest: its code, notebooks or README, kept as text you may Read but never run; a precomputed
+    column; rows the paper says it discarded that the files still hold), read it and compare it with the
+    paper's definition (the estimator, which items, positions or candidates are pooled, the selection,
+    the aggregation). A record's file is cited as `"source": "record:<n>/<path>"`.
     If the spec lists READINGS, or you find that they differ, compute EVERY reading in this one
     script, on the same loaded data and the same cohort (the same models, items, rows), and print
     one result line per reading (and stage) carrying `"reading": "<name>"` and `"cohort": [the ids
@@ -82,12 +86,15 @@ sequential test, an optimisation or an exact computation trains nothing. Then gi
 verifier checks it) — do not refuse an experiment whose other ingredients are all bound, and do not
 invent a training quote.
 
-DEVIATIONS. Every departure from the paper's printed text goes in `deviations`, each as
+DEVIATIONS (at most 16; merge choices of one kind into one entry — more is refused, never cut). Every
+departure from the paper's printed text goes in `deviations`, each as
 {"printed": the paper's words verbatim ("" if the paper is silent), "used": what the script
 does instead, "why": ..., "changes_claim": true|false}: a changed index range or convention
 (0- vs 1-based), a hypothesis added, dropped or strengthened, a substituted function or
 constant, a different dataset version, split, training subset, tuning, baseline implementation,
-metric or aggregation, a detail the paper leaves open that you had to fix. `changes_claim` is
+metric or aggregation, a MODEL other than the paper's (another architecture, size, depth or checkpoint
+— a smaller network or LLM in its place changes what is compared: `changes_claim` true), a detail the
+paper leaves open that you had to fix. `changes_claim` is
 true when the deviation changes WHAT IS COMPARED or what the claim says (a premise, the
 conclusion, an index, a definition, the data or split the result is on, untuned methods where the
 paper tuned them, a baseline rebuilt differently, a different aggregation) and false when it only

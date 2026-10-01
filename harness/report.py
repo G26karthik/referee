@@ -54,8 +54,10 @@ def merged(plan: dict | None, follow: dict | None) -> dict | None:
             continue
         cc["checks"] = cc["checks"] + [k for k in f["checks"] if k not in cc["checks"]]
         cc["why_unchecked"] = f.get("why_unchecked") or cc.get("why_unchecked", "")
-        ran = {flat(s) for k in f["checks"] for c in follow["checks"] if c["id"] == k for s in c.get("covers", [])}
-        cc["omitted"] = [o for o in (cc.get("omitted") or []) if flat(o["item"]) not in ran] + (f.get("omitted") or [])
+        # An omission stays on record until a check that covers it RAN (decided in _completion from what ran),
+        # never merely because a follow-up check was planned for it.
+        seen = {flat(o["item"]) for o in cc.get("omitted") or []}
+        cc["omitted"] = (cc.get("omitted") or []) + [o for o in f.get("omitted") or [] if flat(o["item"]) not in seen]
         for k in ("blocker", "not_the_dataset"):
             cc[k] = f.get(k) or cc.get(k, "")
         for k in ("discovery", "failed_checks"):
@@ -68,26 +70,57 @@ def _changed(c: dict) -> bool:
     return any(d.get("changes_claim") for d in c.get("deviations") or [])
 
 
-def _claim_status(cs: list[dict], conflicted: bool = False, claim_type: str = "") -> str:
+def _data_changed(c: dict, root: Path) -> list[str]:
+    """How the data a check ran on differs from what it requested, from the harness's own records: the
+    acquisition's gaps (a cut listing, a named file missing or rejected, an include pattern that matched
+    nothing), a dataset whose identity line did not affirm the paper's description, or — for a check that
+    acquired data — no identity line at all. Empty when nothing says the data changed."""
+    if c["kind"] not in _EXPERIMENT:
+        return []
+    from .execute import data_gaps
+    out = list(data_gaps(state.read_json(root / "checks" / c["id"] / "data.json") or {})) if c.get("acquire") else []
+    ident = c.get("data_identity") or {}
+    out += [f"dataset {n}: identity not affirmed (matches: {i.get('matches') if isinstance(i, dict) else i!r})"
+            for n, i in ident.items() if not (isinstance(i, dict) and i.get("matches") is True)]
+    if c.get("acquire") and not ident and c.get("values"):
+        out.append("no REFEREE_DATA identity line: the data the run read was never compared with the paper's description")
+    return out
+
+
+def _empirical(claim_type: str) -> bool:
+    """A claim is about an experiment unless it is typed a mathematical statement; an untyped claim
+    gets the strictest rules, never none."""
+    return claim_type != "theory"
+
+
+def _claim_status(cs: list[dict], conflicted: bool = False, claim_type: str = "", partial: bool = False) -> str:
     """What the checks of one central claim FOUND. A failed step of a printed proof is a gap in
     the proof, never a refutation of the statement; a premise no tested instance met, or a
     result obtained only after changing what the claim says (a premise, a definition, the
-    method's tuning or training data...), is neither support nor failure of the printed claim;
-    a check whose protocol did not complete is partial evidence, whatever its completed part says.
-    Readings of one quantity that differ (the paper's definition, the code's) are recorded, not
-    resolved; an engineering compatibility test speaks only for an engineering claim."""
-    if claim_type in EMPIRICAL:
-        cs = [c for c in cs if c.get("role", "target") != "supporting"]   # a simulation or a proof beside it is not the experiment
+    method's tuning or training data, the data itself...), is neither support nor failure of the printed
+    claim; a check whose protocol did not complete is partial evidence, whatever its completed part says,
+    and so is support for a claim whose requested scope did not all run (`partial`). Readings of one
+    quantity that differ (the paper's definition, the code's) are recorded, not resolved; an engineering
+    compatibility test speaks only for an engineering claim; a supporting check never speaks for a claim."""
+    cs = [c for c in cs if c.get("role", "target") == "target"]   # a simulation or a proof beside it is not the experiment
+    if _empirical(claim_type):     # nor, for a claim about an experiment, exact instances of a lemma (invariant 24)
+        cs = [c for c in cs if not (c["kind"] == "CERTIFICATE" or (c["kind"] == "ARITHMETIC" and claim_type != "value"))]
     if not cs:
         return "NOT_CHECKED"
-    cs = [c for c in cs if not (c.get("test") == "compatibility" and claim_type and claim_type != "engineering")]
+    cs = [c for c in cs if not (c.get("test") == "compatibility" and claim_type != "engineering")]
     if not cs:
         return "NOTHING_DECIDED"
     if conflicted:
         return "CHECKS_DISAGREE"
     # A certificate separates its readings itself (COUNTEREXAMPLE_FOUND is always about the text as
-    # printed); any other check's result under a claim-changing deviation is about the changed claim.
-    moved = lambda c: _changed(c) and c["kind"] != "CERTIFICATE"
+    # printed); any other check's result under a claim-changing deviation, or on data other than the data
+    # it requested, is about the changed claim.
+    moved = lambda c: (_changed(c) or bool(c.get("data_changed"))) and c["kind"] != "CERTIFICATE"
+    st = _found(cs, moved)
+    return "PARTIAL_EVIDENCE" if partial and st in ("SUPPORT_FOUND", "NO_VIOLATION_FOUND") else st
+
+
+def _found(cs: list[dict], moved) -> str:
     fails = [c for c in cs if c["status"] in FAILURE and not moved(c)]
     if any(c["evidence"] != "PROOF_AUDIT" for c in fails):
         return "FAILURE_FOUND"
@@ -100,7 +133,7 @@ def _claim_status(cs: list[dict], conflicted: bool = False, claim_type: str = ""
     if any(c["status"] == "PREMISE_NOT_MET" for c in cs):
         return "PREMISE_NOT_MET"
     if any(c["status"] == "VIOLATION_UNDER_CHANGED_READING" or (c["status"] in SUPPORT + FAILURE and moved(c))
-           or (c["status"] == "NO_VIOLATION_FOUND" and _changed(c)) for c in cs):
+           or (c["status"] == "NO_VIOLATION_FOUND" and (_changed(c) or moved(c))) for c in cs):
         return "READING_CHANGED"
     if any(c["status"] == "NO_VIOLATION_FOUND" for c in cs):
         return "NO_VIOLATION_FOUND"
@@ -203,6 +236,7 @@ def _checks(root: Path, plan: dict) -> list[dict]:
                     "commit": o.get("commit", ""), "history": history,
                     "records": "execution.jsonl" if o.get("runs") or (o.get("protocol") or {}).get(
                         "seeds_reused_from_checkpoints") else ""})
+        out[-1]["data_changed"] = _data_changed(out[-1], root)
     return out
 
 
@@ -242,25 +276,37 @@ def conflicts(checks: list[dict]) -> list[dict]:
 
 
 def _central(plan: dict, checks: list[dict], conf: list[dict]) -> list[dict]:
+    """Each central claim with what its requested experiment did (completion) and, from both, what it found:
+    support stands only for a claim whose requested scope all ran; on a claim whose experiment did not run,
+    what else was checked is partial evidence at most."""
     by_id, conflicted = {c["id"]: c for c in checks}, {k for x in conf for k in x["checks"]}
-    return [{**cc, "statuses": {k: by_id[k]["status"] for k in cc["checks"] if k in by_id},
-             "supporting": [k for k in cc["checks"] if k in by_id and by_id[k].get("role") == "supporting"
-                            and cc.get("claim_type") in EMPIRICAL],
-             "claim_status": _claim_status([by_id[k] for k in cc["checks"] if k in by_id],
-                                           bool(conflicted & set(cc["checks"])), cc.get("claim_type", "")),
-             "deviations": sum(len(by_id[k]["deviations"]) for k in cc["checks"] if k in by_id)}
-            for cc in plan["central_claims"]]
+    out = []
+    for cc in plan["central_claims"]:
+        row = _completion_row(cc, by_id)
+        partial = row["partial"] or (_empirical(cc.get("claim_type", "")) and row["experiment"] == "NOT_RUN")
+        st = _claim_status([by_id[k] for k in cc["checks"] if k in by_id], bool(conflicted & set(cc["checks"])),
+                           cc.get("claim_type", ""), partial)
+        out.append({**cc, "statuses": {k: by_id[k]["status"] for k in cc["checks"] if k in by_id},
+                    "supporting": [k for k in cc["checks"] if k in by_id and by_id[k].get("role") == "supporting"],
+                    "claim_status": st, "completion": {**row, "evidence": st},
+                    "deviations": sum(len(by_id[k]["deviations"]) for k in cc["checks"] if k in by_id)})
+    return out
 
 
-def _blockers(cc: dict, cs: list[dict]) -> list[dict]:
+def _blockers(cc: dict, cs: list[dict], unrun: list[str] = ()) -> list[dict]:
     """What kept a claim's requested experiment from running, each with who says so: the harness (a recorded
-    data blocker, a measured resource limit, a refusal) or the planner (an omission's stated reason)."""
+    data blocker, a measured resource limit, a refusal, a scope item whose check did not complete) or the planner
+    (an omission's stated reason, with what the seal could not verify of it)."""
     out = [{"item": o["item"], "blocker": o.get("blocker") or "unstated", "why": o["why"][:300], "basis": "planner",
-            **({"searched": o["discovery"]} if o.get("discovery") else {})} for o in cc.get("omitted") or [] if o.get("why")]
+            **({"searched": o["discovery"]} if o.get("discovery") else {}),
+            **({"unverified": o["unverified"]} if o.get("unverified") else {})} for o in cc.get("omitted") or [] if o.get("why")]
     if not cc["checks"] and cc.get("why_unchecked"):
         out.append({"item": "(the whole claim)", "blocker": cc.get("blocker") or "unstated", "why": cc["why_unchecked"][:300],
-                    "basis": "planner", **({"searched": cc["discovery"]} if cc.get("discovery") else {})})
+                    "basis": "planner", **({"searched": cc["discovery"]} if cc.get("discovery") else {}),
+                    **({"unverified": cc["unverified"]} if cc.get("unverified") else {})})
     for c in cs:
+        if c.get("role", "target") != "target":
+            continue
         if c.get("data_blocker"):
             out.append({"item": c["id"], "blocker": "data", "class": ", ".join(sorted({b["class"] for b in c["data_blocker"]})),
                         "why": c["reason"][:300], "basis": "harness"})
@@ -269,46 +315,58 @@ def _blockers(cc: dict, cs: list[dict]) -> list[dict]:
                         "class": c.get("resource") or "", "why": c["reason"][:300], "basis": "harness"})
         elif c["status"] == "NOT_CHECKABLE":
             out.append({"item": c["id"], "blocker": "protocol", "why": c["reason"][:300], "basis": "script author or verifier"})
-        elif c["status"] == "INCONCLUSIVE" and not c.get("values"):
-            out.append({"item": c["id"], "blocker": "failed", "why": c["reason"][:300], "basis": "harness"})
+        elif c["status"] in ("INCONCLUSIVE", "PENDING") and not c.get("values"):
+            out.append({"item": c["id"], "blocker": "failed" if c["status"] == "INCONCLUSIVE" else "pending",
+                        "why": c["reason"][:300], "basis": "harness"})
+    named = {flat(b["item"]) for b in out}
+    out += [{"item": s, "blocker": "not run", "why": "no target check covering it ran to completion", "basis": "harness"}
+            for s in unrun if flat(s) not in named]
     return out
+
+
+def _completion_row(cc: dict, by_id: dict) -> dict:
+    """For one central claim: did the requested experiment RUN, on what it requested, over its whole scope?
+    Derived from harness facts only — check states, the kinds that can run an experiment, recorded deviations,
+    the acquisition's own record and the data identity lines — never from a label alone. A supporting check
+    stands beside the claim and runs nothing of it."""
+    empirical = _empirical(cc.get("claim_type", ""))
+    cs = [by_id[k] for k in cc["checks"] if k in by_id]
+    target = [c for c in cs if c.get("role", "target") == "target"]
+    ran = [c for c in target if c["state"] in ("COMPLETED", "PARTIALLY_COMPLETED")
+           and (c["kind"] in _EXPERIMENT if empirical else True) and (c.get("values") or c["kind"] == "ARITHMETIC")]
+    changes = [d["used"] for c in ran for d in c["deviations"] if d.get("changes_claim")] + [
+        f"{c['id']}: {g}" for c in ran for g in c.get("data_changed") or []]
+    mismatch = [n for c in ran for n, i in (c.get("data_identity") or {}).items()
+                if not (isinstance(i, dict) and i.get("matches") is True)]
+    done = {flat(s) for c in ran if c["state"] == "COMPLETED" for s in c.get("covers") or []}
+    scope = cc.get("scope") or []
+    unrun = [s for s in scope if flat(s) not in done] if scope else [o["item"] for o in cc.get("omitted") or [] if o.get("why")]
+    unran = [c["id"] for c in target if c not in ran]
+    partial = bool(unrun or unran) or any(c["state"] == "PARTIALLY_COMPLETED" or c["status"] == PARTIAL for c in ran)
+    if not ran:
+        exp, matched = "NOT_RUN", None
+    elif changes:
+        exp, matched = "RAN_WITH_CHANGES", False
+    elif partial:
+        exp, matched = "RAN_PARTIAL", False           # protocol matched includes its scope (invariant 24)
+    else:
+        exp, matched = "RAN_AS_SPECIFIED", True
+    return {"claim": cc["quote"], "page": cc["page"], "claim_type": cc.get("claim_type") or "",
+            "requested": "a mathematical statement on exact instances" if not empirical else "an experiment",
+            "experiment": exp, "protocol_matched": matched, "partial": partial, "changes": changes[:6],
+            "data_mismatch": mismatch, "scope_not_run": unrun, "targets_not_run": unran, "ran": [c["id"] for c in ran],
+            "supporting": [{"check": c["id"], "kind": c["kind"], "status": c["status"], "state": c["state"]}
+                           for c in cs if c.get("role") == "supporting" or (empirical and c["kind"] == "CERTIFICATE")],
+            "not_run": _blockers(cc, cs, unrun) if exp != "RAN_AS_SPECIFIED" else []}
 
 
 def _completion(checks: list[dict], claims: list[dict]) -> dict:
     """Per central claim, four things kept apart: did the requested experiment RUN, did its protocol match
-    what the claim names, what does the evidence say, and what stood beside it as supporting evidence.
-    Deterministic: from check states, deviations and data identity, never from a model."""
-    by_id = {c["id"]: c for c in checks}
-    rows = []
-    for cc in claims:
-        empirical = cc.get("claim_type") in EMPIRICAL
-        cs = [by_id[k] for k in cc["checks"] if k in by_id]
-        target = [c for c in cs if not (empirical and c.get("role") == "supporting")]
-        ran = [c for c in target if c["state"] in ("COMPLETED", "PARTIALLY_COMPLETED") and c["kind"] != ("CERTIFICATE" if empirical else "")
-               and (c.get("values") or c["kind"] == "ARITHMETIC")]
-        changes = [d["used"] for c in ran for d in c["deviations"] if d.get("changes_claim")]
-        mismatch = [n for c in ran for n, i in (c.get("data_identity") or {}).items() if isinstance(i, dict) and i.get("matches") is False]
-        unrun = [o["item"] for o in cc.get("omitted") or [] if o.get("why")]
-        partial = any(c["state"] == "PARTIALLY_COMPLETED" or c["status"] == PARTIAL for c in ran)
-        if not ran:
-            exp, matched = "NOT_RUN", None
-        elif changes or mismatch:
-            exp, matched = "RAN_WITH_CHANGES", False
-        elif partial or unrun:
-            exp, matched = "RAN_PARTIAL", True
-        else:
-            exp, matched = "RAN_AS_SPECIFIED", True
-        rows.append({"claim": cc["quote"], "page": cc["page"], "claim_type": cc.get("claim_type") or "",
-                     "requested": "an experiment" if empirical else "a mathematical statement on exact instances"
-                     if cc.get("claim_type") == "theory" else "unspecified", "experiment": exp, "protocol_matched": matched,
-                     "changes": changes[:5], "data_mismatch": mismatch, "scope_not_run": unrun,
-                     "evidence": cc["claim_status"], "ran": [c["id"] for c in ran],
-                     "supporting": [{"check": c["id"], "kind": c["kind"], "status": c["status"], "state": c["state"]}
-                                    for c in cs if empirical and c.get("role") == "supporting"],
-                     "not_run": _blockers(cc, cs) if exp in ("NOT_RUN", "RAN_PARTIAL") or unrun else []})
+    what the claim names, what does the evidence say, and what stood beside it as supporting evidence."""
+    rows = [cc["completion"] for cc in claims]
     counts: dict = {}
     for r in rows:
-        k = ("experiments " if r["claim_type"] in EMPIRICAL else "statements ") + r["experiment"]
+        k = ("experiments " if _empirical(r["claim_type"]) else "statements ") + r["experiment"]
         counts[k] = counts.get(k, 0) + 1
     return {"claims": rows, "counts": counts,
             "workflow": {"terminal": len([c for c in checks if c["status"] != "PENDING"]), "planned": len(checks),
@@ -317,7 +375,7 @@ def _completion(checks: list[dict], claims: list[dict]) -> dict:
 
 
 def _completion_line(comp: dict) -> str:
-    emp = [r for r in comp["claims"] if r["claim_type"] in EMPIRICAL]
+    emp = [r for r in comp["claims"] if _empirical(r["claim_type"])]
     word = {"RAN_AS_SPECIFIED": "ran as specified", "RAN_PARTIAL": "ran in part", "RAN_WITH_CHANGES": "ran with claim-changing "
             "changes (about the changed claim)", "NOT_RUN": "not run"}
     parts = [f"{sum(1 for r in emp if r['experiment'] == k)} {v}" for k, v in word.items() if any(r["experiment"] == k for r in emp)]
@@ -325,10 +383,14 @@ def _completion_line(comp: dict) -> str:
     for r in emp:
         for b in r["not_run"]:
             blocked[b["blocker"]] = blocked.get(b["blocker"], 0) + 1
-    th = [r for r in comp["claims"] if r["claim_type"] not in EMPIRICAL]
+    th = [r for r in comp["claims"] if not _empirical(r["claim_type"])]
     ran_th = sum(1 for r in th if r["experiment"] != "NOT_RUN")
     w = comp["workflow"]
-    return (f"requested experiments (central empirical claims): {len(emp)}" + (f" — {', '.join(parts)}" if parts else "")
+    ev: dict = {}
+    for r in comp["claims"]:
+        ev[r.get("evidence", "")] = ev.get(r.get("evidence", ""), 0) + 1
+    return (f"central claims: {len(comp['claims'])}, evidence " + ", ".join(f"{v} {k}" for k, v in sorted(ev.items()))
+            + f"; requested experiments (central empirical claims): {len(emp)}" + (f" — {', '.join(parts)}" if parts else "")
             + (f" [not run or in part, by blocker: {', '.join(f'{k} {v}' for k, v in sorted(blocked.items()))}]" if blocked else "")
             + f"; mathematical claims: {ran_th} of {len(th)} checked on exact instances; workflow: {w['terminal']} of "
               f"{w['planned']} planned checks reached a terminal state (not a measure of what was reproduced)")
@@ -362,6 +424,19 @@ def _headline(checks: list[dict], claims: list[dict]) -> str:
     return "NO_CENTRAL_FINDING"
 
 
+def progress(root: Path) -> str:
+    """Whether the review of one paper FINISHED: its report is sealed and review.md was written after every
+    outcome and seal — otherwise it is in progress (or was interrupted), whatever an older ledger says."""
+    seals = state.read_json(root / "seals.json", {}) or {}
+    review = root / "review.md"
+    newer = [f for f in [root / "seals.json", *root.glob("checks/*/outcome.json")] if f.exists()]
+    if "report" in seals and review.exists() and all(f.stat().st_mtime <= review.stat().st_mtime + 1 for f in newer):
+        return "FINISHED"
+    why = ("no plan sealed" if "plan" not in seals else "the report is not sealed" if "report" not in seals
+           else "outcomes or seals are newer than review.md")
+    return f"IN PROGRESS ({why}; a ledger or review written earlier is not the current state)"
+
+
 def scientific_status(root: Path) -> str:
     """What the review CHECKED about the central claims — separate from workflow completion."""
     plan = merged(state.read_json(root / "sealed" / "plan.json"), state.read_json(root / "sealed" / "plan__2.json"))
@@ -369,6 +444,25 @@ def scientific_status(root: Path) -> str:
         return "NOT_ASSESSED"
     checks = _checks(root, plan)
     return _headline(checks, _central(plan, checks, conflicts(checks)))
+
+
+def definition_choices(checks: list[dict]) -> list[dict]:
+    """One printed sentence of the paper (a filter, a definition, a convention) that several checks applied
+    differently: each re-found the same words and recorded a different choice. The harness does not pick one;
+    it shows them side by side (a follow-up may compute both as readings in one check). Without author code
+    this is the deterministic trace of a paper-vs-released-artifact disagreement the checks ran into."""
+    by: dict = {}
+    for c in checks:
+        for d in c.get("deviations") or []:
+            if d.get("printed"):
+                g = by.setdefault(flat(d["printed"]), {"printed": d["printed"], "page": d.get("page"), "uses": {}})
+                g["uses"].setdefault((flat(d.get("used", ""))[:200], bool(d.get("changes_claim"))), []).append(c["id"])
+    return [{"printed": g["printed"][:400], "page": g["page"],
+             "choices": [{"checks": sorted(set(ids)), "used": next(d["used"] for c in checks if c["id"] in ids
+                                                                  for d in c["deviations"] if flat(d.get("used", ""))[:200] == u
+                                                                  and flat(d.get("printed", "")) == k)[:300],
+                          "changes_claim": ch} for (u, ch), ids in g["uses"].items()]}
+            for k, g in by.items() if len(g["uses"]) > 1 and len({i for ids in g["uses"].values() for i in ids}) > 1]
 
 
 def _workflow(checks: list[dict]) -> dict:
@@ -397,7 +491,7 @@ def ledger(x) -> dict:
            "repo_is_authors": plan.get("repo_is_authors"), "repo_note": plan.get("repo_note", ""),
            "concerns": sorted(x.concerns(), key=lambda c: (-_RANK[c["severity"]], c["id"])),
            "checks": checks, "central_claims": central, "incidental_checks": [c["id"] for c in checks if not c["central"]],
-           "completion": _completion(checks, central),
+           "completion": _completion(checks, central), "definition_choices": definition_choices(checks),
            "conflicts": conf, "workflow": _workflow(checks),
            "dropped": {"concerns_unresolved_quotes": lens_drops, "checks": plan.get("dropped", [])},
            "scientific_status": _headline(checks, central)}
@@ -455,7 +549,8 @@ def table(led: dict) -> str:
              + (f"; changes: {_cell('; '.join(r['changes']), 160)}" if r["changes"] else "")
              + (f"; data identity mismatch: {', '.join(r['data_mismatch'])}" if r["data_mismatch"] else "")
              + "".join(f"; not run — {b['item']}: {b['blocker']}" + (f" ({b['class']})" if b.get("class") else "")
-                       + f" [{b['basis']}]" for b in r["not_run"][:4])
+                       + f" [{b['basis']}" + (f"; NOT verified: {_cell(b['unverified'], 120)}" if b.get("unverified") else "")
+                       + "]" for b in r["not_run"][:6])
              + "".join(f"; supporting only: {x['check']} {x['kind']} {x['status']}" for x in r["supporting"])
              for r in comp["claims"]]
     head += [""] if head else []
@@ -486,8 +581,24 @@ def table(led: dict) -> str:
 def unearned(text: str, led: dict) -> list[str]:
     """Sentences using a status word (any inflection, through markdown or look-alike
     characters) that no check cited in the same sentence earns. Negated use ("was not
-    reproduced", "unverified") is fine."""
-    status = {c["id"]: c["status"] for c in led["checks"]}
+    reproduced", "unverified", "nothing here shows that any result was reproduced") is fine. A support
+    word is earned only by a check whose own result is about the printed claim (no claim-changing deviation,
+    no change of data) and whose every central claim found support with its requested experiment run as
+    specified; a failure word only by a failure about the printed claim."""
+    by_id = {c["id"]: c for c in led["checks"]}
+    claims_of: dict = {}
+    for cc in led.get("central_claims") or []:
+        for k in cc.get("checks") or []:
+            claims_of.setdefault(k, []).append(cc)
+    moved = lambda c: (_changed(c) or bool(c.get("data_changed"))) and c["kind"] != "CERTIFICATE"
+    def earns(i: str, statuses: tuple) -> bool:
+        c = by_id.get(i)
+        if not c or c["status"] not in statuses or moved(c):
+            return False
+        return statuses is FAILURE or (c.get("role", "target") == "target" and all(
+            cc.get("claim_status") == "SUPPORT_FOUND"
+            and (cc.get("completion") or {}).get("experiment", "RAN_AS_SPECIFIED") == "RAN_AS_SPECIFIED"
+            for cc in claims_of.get(i, [])))
     # Harness vocabulary (RESOLVED_VERIFIED, AUTHOR_CODE_REPRODUCTION...) and the ledger's own
     # concern ids (contradiction-02) name things; they are not claims.
     text = flat_text(text)
@@ -501,9 +612,11 @@ def unearned(text: str, led: dict) -> list[str]:
         low, ids = sentence.lower(), set(re.findall(r"\bC\d+\b", sentence))
         for stems, earned in ((_SUPPORT_WORDS, SUPPORT), (_FAILURE_WORDS, FAILURE)):
             for m in re.finditer(r"\b(?:un)?(?:" + "|".join(stems) + r")\w*", low):
-                negated = m.group().startswith("un") or re.search(
-                    r"\b(?:not|no|never|cannot|without|nothing)\b|n't", low[max(0, m.start() - 30):m.start()])
-                if not negated and not any(status.get(i) in earned for i in ids):
+                start = max([low.rfind(p, 0, m.start()) for p in (";", ":", ",", "—", "–", "(")] + [-1]) + 1
+                neg = r"\b(?:not|no|never|cannot|without|nothing|neither|nor|none)\b|n't"
+                negated = m.group().startswith("un") or re.search(neg, low[start:m.start()]) or re.search(
+                    neg, low[max(0, m.start() - 30):m.start()])          # the clause the word stands in, or just before it
+                if not negated and not any(earns(i, earned) for i in ids):
                     bad.append(sentence.strip()[:200])
                     break
     return bad
@@ -552,6 +665,14 @@ def render(x, led: dict, rep: dict | None) -> str:
             lines += [f"  - {r['check']} {r['reading']}: **{r['result']}**" + (f" ({r['instances']})" if r.get("instances") else "")
                       + "".join(f"; printed \"{_cell(d['printed'], 80)}\" -> used: {_cell(d['used'], 120)}"
                                 for d in r["deviations"]) for r in cf["readings"]]
+        lines.append("")
+    if led.get("definition_choices"):
+        lines += ["## One printed definition, several choices (checks that applied the same sentence differently; "
+                  "not resolved)", ""]
+        for d in led["definition_choices"]:
+            lines.append(f"- \"{_cell(d['printed'], 200)}\" (p{d['page']})")
+            lines += [f"  - {', '.join(u['checks'])}: {_cell(u['used'], 200)}"
+                      + (" **(changes the claim)**" if u["changes_claim"] else "") for u in d["choices"]]
         lines.append("")
     two = [c for c in led["checks"] if c.get("reading_defs")]
     if two:

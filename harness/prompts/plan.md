@@ -25,9 +25,21 @@ each give `scope`: every method, dataset, setting and metric the claim names or 
 ["RPC", "PL", "Mallows", "political", "movies"]). Every scope item is either in the `covers` of a
 check linked to the claim, or listed in the claim's `omitted` with a concrete reason AND a `blocker`
 (data | credentials | compute | protocol | other). A claim with no check gets a concrete
-`why_unchecked` and a `blocker` naming what NO kind below overcomes ("the only experiment needs 8
-A100s for a week": compute; "the model is a paid closed API": credentials; "no public record of the
-dataset exists after searching the registries": data). "Only shown in a figure", "the repository has
+`why_unchecked` and a `blocker` naming what NO kind below overcomes, with what the harness can check
+it against (it refuses a blocker its own records contradict):
+  - data: "no public record of the dataset exists after searching the registries" — `discovery` ids,
+    and `not_the_dataset` if the searches returned candidates;
+  - credentials: a paid closed API (`service`: true), or a gated or private record — `artifact` is a
+    candidate a registry search returned (search --registry huggingface-models for a model) whose record
+    shows it gated; a public, ungated model or dataset is acquired, never given up;
+  - compute: `failed_checks` (a check whose measured run exceeded this host: a RESOURCE BLOCKER), or
+    `artifact` (a registry candidate whose size exceeds the host's measured memory), or `paper_quote` (the
+    paper's own words stating the compute it used: "trained on 64 TPUs for 3 days") — never an estimate
+    nobody measured: when in doubt, propose the check, and the harness's timed pilot measures it;
+  - protocol: name the detail the paper omits and why no declared deviation can supply it (an
+    unspecified hyperparameter or schedule IS a declared deviation, not a blocker);
+  - other.
+Every omitted dataset or model is searched for first (b, below), whatever its blocker. "Only shown in a figure", "the repository has
 no ready-made command", "the data is not in the checkout" and "the paper names the dataset but does
 not link it" are NOT such blockers: a stated comparison is checked through a RELATION target, an
 experiment without a command through RECONSTRUCTION, and public data — linked or only named — through
@@ -38,13 +50,16 @@ about an experiment on the data, models and protocol it names. The check that sa
 experiment (RECONSTRUCTION, RELEASED_DATA or AUTHOR_CODE on the named data). A simulation on invented
 data, a smaller stand-in dataset, a different model, or a proof of a related lemma is a different
 experiment: propose it, if it helps, as an extra check with `"role": "supporting"` — it is reported
-beside the claim and never decides it — and it never lets you drop the requested experiment. If the
+beside the claim, never decides it and covers none of its scope — and it never lets you drop the requested
+experiment. Every check states its `role` and (except a CERTIFICATE) its `criterion`; nothing defaults. If the
 requested experiment cannot run, its scope item goes in `omitted` with its `blocker`, and the report
 says which experiments ran and which did not. Never shrink a dataset, a model or a run count to make it
 fit; a `compute` blocker cites the measured host above.
-Give each claim a `claim_type`: "engineering" (a component can be integrated, swapped in, run or
-trained), "performance" (a method beats, matches or improves on others), "value" (a printed
-number) or "theory" (a mathematical statement). A sentence making two claims ("can replace a
+Give EVERY claim a `claim_type` (required; a follow-up round never retypes a claim): "engineering" (a
+component can be integrated, swapped in, run or trained), "performance" (a method beats, matches or improves
+on others), "value" (a printed number) or "theory" (a mathematical statement). A claim about what happens on
+data or with models (a method outperforms, a detector alarms sooner, a fit describes measured accuracy) is
+empirical even when the paper also proves something about it. A sentence making two claims ("can replace a
 layer AND improves accuracy") is two central claims, each with its own verbatim quote and type:
 a test of one never stands for the other.
 
@@ -70,9 +85,10 @@ central claim can use the slot, and say why in `incidental_why`. Kinds:
                  re-runs nothing) or "predictions" (the files hold per-item predictions or scores,
                  and the check recomputes the metric from them). Nothing here is trained.
   PAPER VS CODE  Where the checkout ships code that computes the compared quantity (an analysis
-                 script, a metrics module), READ it and compare its definition with the paper's
-                 text: the estimator, which items, positions or candidates are pooled, the
-                 selection, the aggregation. If they differ, give `readings`: [{"name": "paper",
+                 script, a metrics module) — or a released record does (its README, notebooks, a
+                 precomputed column, rows the paper says were discarded but the files still hold) —
+                 READ it and compare its definition with the paper's text: the estimator, which items,
+                 positions or candidates are pooled, the selection, the aggregation. If they differ, give `readings`: [{"name": "paper",
                  "source": "paper", "quote": the paper's definition verbatim}, {"name": "code",
                  "source": the tracked file's path, "quote": the literal code lines}]. The script
                  then computes EVERY reading in the same run, on the same data and the same cohort
@@ -85,7 +101,9 @@ central claim can use the slot, and say why in `incidental_why`. Kinds:
                  states. It must fit the host above at the paper's stated scale (never shrunk;
                  use the GPU when the method trains networks). Every detail neither paper nor
                  code fixes is declared by the script author as a deviation; a check that needs
-                 many guessed details is not decisive — choose another route. Give `test`:
+                 many open details is still the requested experiment: its script declares each one as a
+                 protocol choice (a deviation), and a different experiment is never chosen for being
+                 cheaper. Give `test`:
                  "performance" (a comparison or a printed number, over independent seeded
                  replicates at the paper's protocol) or "compatibility" (an ENGINEERING claim: the
                  component is swapped into one stated configuration and must integrate, run and
@@ -170,8 +188,10 @@ Write ONLY this JSON to the output path you were given:
                      "scope": ["every method/dataset/setting it names"],
                      "checks": ["C1"], "omitted": [{"item": "a scope item", "why": "concrete reason",
                        "blocker": "data|credentials|compute|protocol|other", "discovery": [],
-                       "not_the_dataset": "", "failed_checks": []}],
-                     "why_unchecked": "", "blocker": "", "discovery": [], "not_the_dataset": "", "failed_checks": []}],
+                       "not_the_dataset": "", "failed_checks": [], "artifact": "", "service": false,
+                       "paper_quote": ""}],
+                     "why_unchecked": "", "blocker": "", "discovery": [], "not_the_dataset": "", "failed_checks": [],
+                     "artifact": "", "service": false, "paper_quote": ""}],
  "checks": [
    {"id": "C1", "kind": "AUTHOR_CODE|RELEASED_DATA|RECONSTRUCTION|CERTIFICATE|ARITHMETIC",
     "role": "target|supporting (target: it runs the experiment the claim names; supporting: it stands beside it)",

@@ -97,9 +97,10 @@ PROVENANCE — every finding must be checkable by someone holding the paper.
 
 CHECKABILITY — say in `checkable` how a concern could be settled: "author_code" (running the
 authors' released code would reproduce or refute a printed number), "released_data" (a
-statistic recomputed from released files), "math" (a theorem, bound or proof step checkable
-on concrete instances), "arithmetic" (the paper's own printed numbers do not produce its own
-stated result), or "none".
+statistic recomputed from released files), "fresh_run" (the experiment re-run from the paper's
+own description on public data or models it names, linked or only named — no author code is
+needed), "math" (a theorem, bound or proof step checkable on concrete instances), "arithmetic"
+(the paper's own printed numbers do not produce its own stated result), or "none".
 
 BEFORE YOU RETURN, check your own work: every serious finding verified against the text and
 recomputed; an alternative honestly tested; questions separated from findings; confidence

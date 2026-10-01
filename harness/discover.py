@@ -55,7 +55,7 @@ def _zenodo(q: str, get) -> list[dict]:
                     "doi": h.get("doi", ""), "license": (m.get("license") or {}).get("id", ""),
                     "description": re.sub(r"<[^>]+>", " ", m.get("description", ""))[:300].strip(),
                     "files": [{"name": f.get("key"), "bytes": f.get("size")} for f in files][:15],
-                    "total_bytes": sum(f.get("size") or 0 for f in files)})
+                    "total_bytes": sum(f.get("size") or 0 for f in files), "access_right": m.get("access_right", "")})
     return out
 
 
@@ -76,19 +76,42 @@ def _datacite(q: str, get) -> list[dict]:
     return out
 
 
+# What a hub search returns with each repository. With `expand`, the answer holds only the fields named, so the
+# card fields are named too; `safetensors` exists for models only (an unknown name fails the whole search).
+_HF_EXPAND = {"datasets": ("author", "createdAt", "downloads", "tags", "gated", "private", "usedStorage"),
+              "models": ("author", "createdAt", "downloads", "tags", "gated", "private", "usedStorage", "safetensors")}
+_DTYPE_BYTES = {"F64": 8, "I64": 8, "U64": 8, "F32": 4, "I32": 4, "U32": 4, "F16": 2, "BF16": 2, "I16": 2, "U16": 2,
+                "F8_E4M3": 1, "F8_E5M2": 1, "I8": 1, "U8": 1, "BOOL": 1}
+
+
+def _hub(kind: str, registry: str, q: str, get) -> list[dict]:
+    """Hub repositories with what a plan seal needs to judge a blocker: `gated` (False, "auto" or "manual"), `private`,
+    `size_bytes` (weights from the safetensors dtype counts, else the repository's storage; `size_basis` says which)
+    and `params`; None where the hub did not say."""
+    j = get(f"https://huggingface.co/api/{kind}?" + urllib.parse.urlencode(
+        {"search": q, "limit": PER_REGISTRY, "expand": list(_HF_EXPAND[kind])}, doseq=True))
+    out = []
+    for d in [d for d in j if isinstance(d, dict) and d.get("id")][:PER_REGISTRY] if isinstance(j, list) else []:
+        st = d.get("safetensors") if isinstance(d.get("safetensors"), dict) else {}
+        by = st.get("parameters") if isinstance(st.get("parameters"), dict) else {}
+        weights = sum(n * _DTYPE_BYTES[t.upper()] for t, n in by.items()) if by and all(
+            str(t).upper() in _DTYPE_BYTES and isinstance(n, int) for t, n in by.items()) else None
+        size, basis = ((weights, "safetensors") if weights else (d["usedStorage"], "usedStorage")
+                       if isinstance(d.get("usedStorage"), int) else (None, ""))
+        out.append({"source": f"hf://{kind}/{d['id']}", "registry": registry, "title": d["id"], "creators": [d.get("author", "")],
+                    "year": str(d.get("createdAt", ""))[:4], "downloads": d.get("downloads"), "tags": (d.get("tags") or [])[:8],
+                    "gated": d.get("gated"), "private": d.get("private"), "size_bytes": size, "size_basis": basis,
+                    **({"params": st["total"]} if isinstance(st.get("total"), int) else {})})
+    return out
+
+
 def _huggingface(q: str, get) -> list[dict]:
-    j = get("https://huggingface.co/api/datasets?" + urllib.parse.urlencode({"search": q, "limit": PER_REGISTRY}))
-    return [{"source": f"hf://datasets/{d['id']}", "registry": "huggingface", "title": d["id"], "creators": [d.get("author", "")],
-             "year": str(d.get("createdAt", ""))[:4], "downloads": d.get("downloads"), "tags": (d.get("tags") or [])[:8]}
-            for d in j if isinstance(d, dict) and d.get("id")][:PER_REGISTRY]
+    return _hub("datasets", "huggingface", q, get)
 
 
 def _huggingface_models(q: str, get) -> list[dict]:
     """Trained checkpoints (weights and configs; a repository's code is never admitted by the fetcher)."""
-    j = get("https://huggingface.co/api/models?" + urllib.parse.urlencode({"search": q, "limit": PER_REGISTRY}))
-    return [{"source": f"hf://models/{d['id']}", "registry": "huggingface-models", "title": d["id"], "creators": [d.get("author", "")],
-             "year": str(d.get("createdAt", ""))[:4], "downloads": d.get("downloads"), "tags": (d.get("tags") or [])[:8]}
-            for d in j if isinstance(d, dict) and d.get("id")][:PER_REGISTRY]
+    return _hub("models", "huggingface-models", q, get)
 
 
 _SEARCH = {"zenodo": _zenodo, "datacite": _datacite, "huggingface": _huggingface, "huggingface-models": _huggingface_models}
@@ -112,13 +135,18 @@ def search(cfg: state.Config, pid: str, query: str, registry: str = "", get=_get
         return {"error": "a query names the dataset (its title as the paper prints it; a phrase in quotes for an exact title)"}
     if registry and registry not in REGISTRIES:
         return {"error": f"registry is one of {list(REGISTRIES)}"}
+    regs = [registry] if registry else list(REGISTRIES)
     with state.lock(state.pdir(cfg, pid) / ".discovery.lock"):
         done = records(cfg, pid)
+        # The same query to the same registries again is answered from the log (an answer with an error is asked again).
+        if old := next((r for r in done if "results" in r and r["query"].casefold() == query.casefold() and sorted(r["results"])
+                        == sorted(regs) and not any(v.get("error") for v in r["results"].values())), None):
+            return {**old, "reused": True}
         if len(done) >= cfg.max_discoveries:
             return {"error": f"the discovery budget of {cfg.max_discoveries} searches (SH_MAX_DISCOVERIES) is spent; "
                              "narrow the query or record the dataset as not found"}
         results = {}
-        for reg in [registry] if registry else REGISTRIES:
+        for reg in regs:
             try:
                 found = _SEARCH[reg](query, get)
                 dropped = [c for c in found if any(d in json.dumps(c).lower() for d in cfg.deny_sources)]
@@ -146,6 +174,8 @@ def files(cfg: state.Config, pid: str, url: str, get=_get) -> dict:
                          f"({', '.join(fetcher.RECORD_APIS)}); a landing page's files are found when it is fetched"}
     with state.lock(state.pdir(cfg, pid) / ".discovery.lock"):
         done = records(cfg, pid)
+        if old := next((r for r in done if r.get("api") == api and r.get("files") and not r.get("error")), None):
+            return {**old, "reused": True}                       # the same record's listing: answered from the log
         if len(done) >= cfg.max_discoveries:
             return {"error": f"the discovery budget of {cfg.max_discoveries} searches (SH_MAX_DISCOVERIES) is spent"}
         try:

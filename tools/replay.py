@@ -2,13 +2,13 @@
 no container, nothing written into a project. `python tools/replay.py <projects dir> [--out f.json]`.
 
 Per RELEASED_DATA / RECONSTRUCTION check that ended by reconciliation: its checkpointed seeds
-(seeds.jsonl), folded as a new poll would reuse them, and the result schema of every recorded
-evidence run of the approved script (execution.jsonl, raw stdout); also the harness's own draft
-run (smoke) of that script. A blocker, a refusal or an operator stop stays as recorded.
-
-The per-run detail the kernel now judges replicates by (every output of a result line, counted trials, the
-seed's route into a random generator) is rebuilt from the recorded stdout and the approved script, so runs
-made before it existed are decided by the same rule as new ones.
+(seeds.jsonl) are folded by the very function a new poll uses (execute.reuse_checkpoints) and decided
+by the very function a finished check uses (execute._reconciled), so this tool cannot drift from the
+harness. `fresh` re-derives, from each seed's own recorded stdout (execution.jsonl, same script sha and
+seed), what the kernel now judges by: per-run detail, the result schema and the readings' cohorts. A
+seed whose stdout is gone keeps what its row recorded (a row without detail is evidence missing, never
+identical runs). Also the harness's own draft run (smoke) of that script. A blocker, a refusal or an
+operator stop stays as recorded.
 """
 import json
 import sys
@@ -17,7 +17,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from harness import execute, independence, report  # noqa: E402
-from harness.reconcile import reconcile  # noqa: E402
 
 
 def replay(cdir: Path) -> dict | None:
@@ -29,46 +28,31 @@ def replay(cdir: Path) -> dict | None:
             "old_state": report._state(cdir.parent.parent, c["id"], o)}
     if o["status"] in ("BLOCKED", "NOT_CHECKABLE") or str(o.get("reason", "")).startswith("infrastructure failure"):
         return {**base, "replayed": False, "why": "ended by a blocker, a refusal or a stop: kept as recorded"}
-    st = {"values": [], "staged": [], "failed_seeds": {}, "stage_errors": {}, "ok_runs": 0, "schema_defects": set()}
-    rows = execute._checkpoints(cdir, c)
-    for row in rows:
-        st["values"] += row["values"]
-        st["staged"] += row.get("staged") or []
-        if row.get("error"):
-            st["failed_seeds"][str(row["seed"])] = row["error"]
-        st["ok_runs"] += not row.get("error")
-        errs, defects = execute.split_units(set(row.get("units") or []), row.get("staged") or [], bool(row.get("error")), "")
-        st["stage_errors"].update({s: row["stage_errors"][s] for s in errs if s in (row.get("stage_errors") or {})})
-        st["schema_defects"] |= set(defects)
+    st: dict = {}
+    rows = execute.reuse_checkpoints(cdir.parent.parent, cdir, c, st, fresh=True)
     log = cdir.parent.parent / "execution.jsonl"
     recs = [r for r in map(json.loads, log.read_text(encoding="utf-8").splitlines())
-            if r.get("target") == c["id"] and r.get("script_sha256") == c.get("script_sha256")]
-    detail = []
-    for r in [r for r in recs if r.get("mode") == "evidence"]:
-        if not execute.classify(r)["failed"]:
-            st["schema_defects"] |= set(execute.result_schema(r, c))
-            detail += execute.result_detail(r.get("stdout") or "", int(r.get("seed") or 0))
+            if r.get("target") == c["id"] and r.get("script_sha256") == c.get("script_sha256")] if log.exists() else []
     script = cdir / "script.py"
     rng = independence.seed_flow(script.read_text(encoding="utf-8")) if script.exists() else None
     smoke = [execute.result_schema(r, c) for r in recs if r.get("mode") == "try" and r.get("smoke")
              and not execute.classify(r)["failed"]]
     det = c["kind"] == "RELEASED_DATA" or c.get("stochastic") is False
-    args = dict(rel=(c.get("target") or {}).get("relation", ""), staged=st["staged"], failed=st["failed_seeds"],
-                stage_errors=st["stage_errors"], test=c.get("test", ""), detail=detail or None, rng=rng)
-    seeded = c["kind"] == "RECONSTRUCTION" and len(rows) > 1
-    new = reconcile(c["kind"], c.get("printed", ""), st["values"], "", {}, seeded, True, "", deterministic=det, **args)
-    ex = {"runs_planned": int(c.get("runs") or 1), "runs_ended": len(rows), "runs_exited_ok": st["ok_runs"],
-          "runs_failed": sorted(st["failed_seeds"], key=int), "schema_defects": sorted(st["schema_defects"])}
+    new = execute._reconciled(c, st, True, "", failure="")
+    ex = {"runs_planned": int(c.get("runs") or 1), "runs_ended": len(rows), "runs_exited_ok": st.get("ok_runs", 0),
+          "runs_failed": sorted(st.get("failed_seeds") or {}, key=int), "schema_defects": st.get("schema_defects") or []}
+    tables = [new] + list((new.get("readings") or {}).values())     # every reading's own stages, not the first one's
+    ident = sum(1 for t in tables for p in (t.get("stages") or {}).values() if p.get("n_independent") == 1) + sum(
+        1 for t in tables if t.get("n_independent") == 1)
     out = {**base, "replayed": True, "new_status": new["status"], "new_reason": new["reason"][:300],
-           "new_state": report._state(cdir.parent.parent, c["id"], {**new, "values": st["values"], "execution": ex}),
-           "execution": ex, "smoke_schema_defects": smoke,
-           "identical_stages": sum(1 for p in (new.get("stages") or {}).values() if p.get("n_independent") == 1)
-           + (1 if new.get("n_independent") == 1 else 0),
+           "new_state": report._state(cdir.parent.parent, c["id"], {**new, "values": st.get("values", []), "execution": ex}),
+           "execution": ex, "smoke_schema_defects": smoke, "identical_stages": ident,
            "stages": len(new.get("stages") or {}), "seed_reaches_rng": rng,
-           "stage_statuses": _counts(new.get("stages") or {}), "old_stage_statuses": _counts(o.get("stages") or {})}
+           "stage_statuses": _counts(new.get("stages") or {}), "old_stage_statuses": _counts(o.get("stages") or {}),
+           **({"readings_differ_in": new["readings_differ_in"]} if new.get("readings_differ_in") else {})}
     if c["kind"] == "RECONSTRUCTION" and out["identical_stages"] and not det:
         # What the same records would decide had the author declared the pipeline deterministic.
-        alt = reconcile(c["kind"], c.get("printed", ""), st["values"], "", {}, seeded, True, "", deterministic=True, **args)
+        alt = execute._reconciled({**c, "stochastic": False}, st, True, "", failure="")
         out["if_declared_deterministic"] = {"status": alt["status"], "status_on_completed": alt.get("status_on_completed"),
                                             "reason": alt["reason"][:300]}
     return out

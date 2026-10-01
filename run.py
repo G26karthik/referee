@@ -83,13 +83,11 @@ def main(argv: list[str]) -> int:
         while (env := execute.author_env(cfg, state.pdir(cfg, a.pid))) is None:
             time.sleep(10)
         print(json.dumps(env))
-    elif a.cmd == "status":
-        for d in sorted(cfg.projects.glob(f"{a.pid or '*'}/ledger.json")) or []:
-            led = state.read_json(d)
-            print(f"{d.parent.name}: {led['scientific_status']} — "
-                  + ", ".join(f"{c['id']} {c['status']}" for c in led["checks"]))
-            if led.get("completion"):
-                print("  completion: " + report._completion_line(led["completion"]))
+    elif a.cmd == "status":           # read-only: recomputed from the files on disk, never from a stale ledger
+        for d in sorted(p for p in cfg.projects.glob(f"{a.pid or '*'}/paper/doc.json")):
+            root = d.parent.parent
+            print(f"{root.name} [{report.progress(root)}]: {report.scientific_status(root)}")
+            print("  completion: " + report.completion_line(root))
     elif a.cmd == "pack":
         return pack(cfg, Path(a.out), a.pids, a.clean)
     return 0

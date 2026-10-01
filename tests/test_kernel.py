@@ -2,17 +2,23 @@
 Run: python tests/test_kernel.py   (or pytest)."""
 from __future__ import annotations
 
+import hashlib
+import importlib.util
+import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import time
+import types
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from harness import execute, report, state, tasks  # noqa: E402
+from harness import discover, execute, independence, report, state, tasks  # noqa: E402
 from harness.evidence import Paper, evaluate, interval, value_in  # noqa: E402
-from harness.reconcile import arithmetic, reconcile  # noqa: E402
+from harness.reconcile import READINGS_DIFFER, arithmetic, certificate, reconcile  # noqa: E402
 
 PAGES = ["Our method reaches 61.4 accuracy on CIFAR.\nThe baseline reaches 59.3 accuracy on CIFAR.\n"
          "We report the mean over 5 random seeds.\n"
@@ -87,7 +93,10 @@ def test_reconcile_never_convicts_on_environment_or_refusal():
     assert reconcile("RECONSTRUCTION", "61.4", [], "crash", {"reached": True}, True, True, "")["status"] == "INCONCLUSIVE"
     assert reconcile("CERTIFICATE", "", [], "AssertionError", {}, False, True, "")["status"] == "INCONCLUSIVE"
     assert reconcile("CERTIFICATE", "", [0, 1, 0], "", {}, False, True, "")["status"] == "INCONCLUSIVE"  # premises unsaid
-    assert reconcile("CERTIFICATE", "", [0, 0], "", {}, False, True, "")["status"] == "NO_VIOLATION_FOUND"
+    # 2026-10-01 (invariant 16): instances whose premises the script never evaluated are not admissible
+    assert reconcile("CERTIFICATE", "", [0, 0], "", {}, False, True, "")["status"] == "INCONCLUSIVE"
+    assert reconcile("CERTIFICATE", "", [0, 0], "", {}, False, True, "", cert=[{"violated": 0, "premises": 1}] * 2)[
+        "status"] == "NO_VIOLATION_FOUND"
     assert reconcile("TRY", "61.4", [61.4], "", {}, False, True, "")["status"] == "INCONCLUSIVE"   # not admissible
 
 
@@ -233,12 +242,13 @@ def test_plan_spends_the_budget_on_central_claims_first():
     with tempfile.TemporaryDirectory() as t:
         cfg, pid = _project(Path(t))
         x = tasks._Ctx(cfg, pid)
-        arith = {"id": "A", "kind": "ARITHMETIC", "claim_quote": "The baseline reaches 59.3",
+        arith = {"id": "A", "kind": "ARITHMETIC", "claim_quote": "The baseline reaches 59.3", "role": "target", "criterion": "stated",
                  "target": {"quote": "reaches 61.4 accuracy", "value": "61.4"},
                  "operands": [{"name": "a", "quote": "reaches 61.4 accuracy", "value": "61.4"}], "expression": "a"}
         cert = {"id": "B", "kind": "CERTIFICATE", "claim_quote": "We report the mean over 5 random seeds",
-                "statement_quote": "The final loss is -0.52"}
-        central = [{"quote": "We report the mean over 5 random seeds", "checks": ["B"]}]
+                "statement_quote": "The final loss is -0.52", "role": "target", "covers": ["the loss"]}
+        central = [{"quote": "We report the mean over 5 random seeds", "checks": ["B"], "claim_type": "theory",
+                    "scope": ["the loss"]}]
         cfg.max_checks = 1        # the incidental check came first; the central one still gets the slot
         rec = tasks._seal_plan(x, "plan", {"checks": [arith, cert], "central_claims": central}, final=False)
         assert [c["kind"] for c in rec["checks"]] == ["CERTIFICATE"] and rec["checks"][0]["central"]
@@ -248,11 +258,13 @@ def test_plan_spends_the_budget_on_central_claims_first():
         rec = tasks._seal_plan(x, "plan", {"checks": [{**arith, "incidental_why": "no central claim computes"}]}, final=False)
         assert rec["checks"][0]["central"] is False
         code = {"id": "B", "kind": "AUTHOR_CODE", "claim_quote": "We report the mean over 5 random seeds",
-                "target": {"quote": "reaches 61.4 accuracy", "value": "61.4"}}
+                "target": {"quote": "reaches 61.4 accuracy", "value": "61.4"}, "role": "target", "criterion": "stated",
+                "covers": ["the loss"]}
         assert "`metric`" in _refused(lambda: tasks._seal_plan(x, "plan", {"checks": [code], "central_claims": central},
                                                               final=False))   # AUTHOR_CODE: the planner's key
         rel = {"id": "B", "kind": "RECONSTRUCTION", "claim_quote": "We report the mean over 5 random seeds",
-               "target": {"quote": "Our method reaches 61.4", "relation": "acc_ours > acc_base"}}
+               "target": {"quote": "Our method reaches 61.4", "relation": "acc_ours > acc_base"}, "role": "target",
+               "criterion": "stated", "test": "performance", "covers": ["the loss"]}
         rec = tasks._seal_plan(x, "plan", {"checks": [rel], "central_claims": central}, final=False)
         assert rec["checks"][0]["target"]["names"] == ["acc_base", "acc_ours"] and rec["checks"][0]["printed"] == ""
         for bad in ("acc_ours", "acc_ours > 0.5 * acc_base", "a < b < c", "acc_ours == acc_base"):
@@ -333,31 +345,31 @@ def test_status_is_about_central_claims_and_conflicting_readings_are_recorded():
         plan = {"checks": [{"id": "C1", "kind": "CERTIFICATE", "concerns": [], "claim": "x", "statement": "Theorem 1"},
                            {"id": "C2", "kind": "ARITHMETIC", "concerns": [], "claim": "y", "printed": "26.7",
                             "target": {"quote": "q 26.7", "value": "26.7"}}],
-                "central_claims": [{"quote": "a", "page": 1, "checks": ["C1"], "why_unchecked": ""},
-                                   {"quote": "b", "page": 1, "checks": [], "why_unchecked": "figure"}]}
+                "central_claims": [{"quote": "a", "page": 1, "checks": ["C1"], "why_unchecked": "", "claim_type": "theory"},
+                                   {"quote": "b", "page": 1, "checks": [], "why_unchecked": "figure", "claim_type": "theory"}]}
         state.write_json(root / "sealed" / "plan.json", plan)
         assert report.scientific_status(root) == "CHECKS_PENDING"
-        state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "NO_VIOLATION_FOUND"})
+        state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "NO_VIOLATION_FOUND", "values": [0]})
         for s in ("ARITHMETIC_CONSISTENT", "ARITHMETIC_CONTRADICTION"):   # incidental: never lifts or sinks it
-            state.write_json(root / "checks" / "C2" / "outcome.json", {"status": s})
+            state.write_json(root / "checks" / "C2" / "outcome.json", {"status": s, "values": [0]})
             assert report.scientific_status(root) == "CENTRAL_NO_VIOLATION_FOUND"
         assert report._central(plan, report._checks(root, plan), [])[0]["claim_status"] == "NO_VIOLATION_FOUND"
         dev = {"printed": "for j = 1..J", "used": "j = 0..J-1", "why": "1-based leaves the range", "page": 6,
                "changes_claim": True}
         state.write_json(root / "checks" / "C1" / "check.json", {"deviations": [dev]})
         state.write_json(root / "checks" / "C1" / "outcome.json",
-                         {"status": "NO_VIOLATION_FOUND", "literal": {"undefined": 36}})
+                         {"status": "NO_VIOLATION_FOUND", "values": [0], "literal": {"undefined": 36}})
         assert report._central(plan, report._checks(root, plan), [])[0]["claim_status"] == "READING_CHANGED"
         assert report.scientific_status(root) == "CENTRAL_READING_CHANGED"      # a changed reading: not support
-        state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "PREMISE_NOT_MET"})
+        state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "PREMISE_NOT_MET", "values": [0]})
         assert report.scientific_status(root) == "CENTRAL_PREMISE_NOT_MET"      # an unmet premise: not a failure
         plan["checks"].append({"id": "C3", "kind": "CERTIFICATE", "concerns": [], "claim": "x", "statement": "Theorem 1"})
         plan["central_claims"][1]["checks"] = ["C3"]
         state.write_json(root / "checks" / "C1" / "check.json", {})
-        state.write_json(root / "checks" / "C3" / "outcome.json", {"status": "COUNTEREXAMPLE_FOUND"})
+        state.write_json(root / "checks" / "C3" / "outcome.json", {"status": "COUNTEREXAMPLE_FOUND", "values": [0]})
         conf = report.conflicts(report._checks(root, plan))       # same reading, opposite results
         assert conf == []                                         # C1's premise was never met: nothing to disagree
-        state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "NO_VIOLATION_FOUND"})
+        state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "NO_VIOLATION_FOUND", "values": [0]})
         conf = report.conflicts(report._checks(root, plan))       # same reading, opposite results
         assert len(conf) == 1 and not conf[0]["explained"] and conf[0]["checks"] == ["C1", "C3"]
         plan["checks"] = plan["checks"][:2] + [{**plan["checks"][2], "statement": "Lemma 2", "step": "hence x < 1"}]
@@ -587,7 +599,7 @@ def test_a_proof_candidate_that_violates_a_premise_or_precision_is_not_a_counter
     assert "exactly as printed" in lit["reason"] and "0 of 12 admissible" in lit["reason"]
     step = {"id": "C1", "kind": "CERTIFICATE", "evidence": "PROOF_AUDIT", "status": "COUNTEREXAMPLE_FOUND",
             "deviations": [{"changes_claim": True}]}
-    assert report._claim_status([step]) == "PROOF_GAP_FOUND"            # the printed step fails as printed
+    assert report._claim_status([step], claim_type="theory") == "PROOF_GAP_FOUND"   # the printed step fails as printed
     assert certificate([{"violated": 1, "premises": 0, "literal": "premise_not_met"}] * 3, True, True)["status"] \
         == "PREMISE_NOT_MET"
     crashed = certificate([{"violated": 0, "premises": 1}], False, False, crashed=2)
@@ -662,18 +674,21 @@ def test_every_claim_scope_item_is_covered_or_omitted_with_a_reason_and_undecide
         _seal(cfg, pid, "critic", {"reviews": []}, td)
         x = tasks._Ctx(cfg, pid)
         chk = {"id": "B", "kind": "CERTIFICATE", "claim_quote": "We report the mean over 5 random seeds",
-               "statement_quote": "The final loss is -0.52", "covers": ["PL", "MM"]}
-        claim = {"quote": "We report the mean over 5 random seeds", "checks": ["B"], "scope": ["PL", "MM", "RPC"]}
+               "statement_quote": "The final loss is -0.52", "covers": ["PL", "MM"], "role": "target"}
+        claim = {"quote": "We report the mean over 5 random seeds", "checks": ["B"], "scope": ["PL", "MM", "RPC"],
+                 "claim_type": "theory"}
         assert "RPC" in _refused(lambda: tasks._seal_plan(x, "plan", {"checks": [chk], "central_claims": [claim]},
                                                           final=False))
-        claim["omitted"] = [{"item": "RPC", "why": "its pairwise ECE needs the vendored Cython build, which failed"}]
+        claim["omitted"] = [{"item": "RPC", "why": "its pairwise ECE needs the vendored Cython build, which failed",
+                             "blocker": "other"}]
         _seal(cfg, pid, "plan", {"checks": [chk], "central_claims": [claim]}, td)
         state.write_json(td / pid / "checks" / "C1" / "outcome.json", {"status": "NOT_CHECKABLE", "reason": "refused"})
         phase, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
         assert phase == "plan" and [o["id"] for o in owed] == ["plan:2"]   # an undecided central claim: a follow-up
         assert "FOLLOW-UP" in Path(owed[0]["prompt"]).read_text(encoding="utf-8")
-        _seal(cfg, pid, "plan:2", {"checks": [{**chk, "id": "F1", "covers": []}],
-                                   "central_claims": [{"quote": claim["quote"], "checks": ["F1"]}]}, td)
+        _seal(cfg, pid, "plan:2", {"checks": [{**chk, "id": "F1", "covers": ["RPC"]}],
+                                   "central_claims": [{"quote": claim["quote"], "checks": ["F1"], "claim_type": "theory",
+                                                       "scope": ["RPC"]}]}, td)
         plan = tasks._Ctx(cfg, pid).plan()
         assert [c["id"] for c in plan["checks"]] == ["C1", "C7"] and plan["central_claims"][0]["checks"] == ["C1", "C7"]
         led = report.ledger(tasks._Ctx(cfg, pid))
@@ -696,8 +711,9 @@ def test_no_verifier_sees_a_script_the_harness_has_not_run():
             _seal(cfg, pid, f"lens:{lens}", {"concerns": []}, td)
         _seal(cfg, pid, "critic", {"reviews": []}, td)
         chk = {"id": "B", "kind": "CERTIFICATE", "claim_quote": "We report the mean over 5 random seeds",
-               "statement_quote": "The final loss is -0.52"}
-        _seal(cfg, pid, "plan", {"checks": [chk], "central_claims": [{"quote": chk["claim_quote"], "checks": ["B"]}]}, td)
+               "statement_quote": "The final loss is -0.52", "role": "target", "covers": ["the loss"]}
+        _seal(cfg, pid, "plan", {"checks": [chk], "central_claims": [{"quote": chk["claim_quote"], "checks": ["B"],
+                                                                      "claim_type": "theory", "scope": ["the loss"]}]}, td)
         script = "n = 1\nassert n\nok = n > 0\nprint('REFEREE_RESULT', {'violated': 0, 'premises_hold': 1})\n"
         b = [{"kind": k, "impl_quote": q, "paper_quote": "reaches 61.4 accuracy"} for k, q in
              (("hypotheses", "assert n"), ("claimed_bound", "ok = n > 0"), ("instance", "n = 1"))]
@@ -872,8 +888,9 @@ def test_the_result_schema_is_checked_apart_from_what_the_results_say():
             _seal(cfg, pid, f"lens:{lens}", {"concerns": []}, td)
         _seal(cfg, pid, "critic", {"reviews": []}, td)
         chk = {"id": "B", "kind": "CERTIFICATE", "claim_quote": "We report the mean over 5 random seeds",
-               "statement_quote": "The final loss is -0.52"}
-        _seal(cfg, pid, "plan", {"checks": [chk], "central_claims": [{"quote": chk["claim_quote"], "checks": ["B"]}]}, td)
+               "statement_quote": "The final loss is -0.52", "role": "target", "covers": ["the loss"]}
+        _seal(cfg, pid, "plan", {"checks": [chk], "central_claims": [{"quote": chk["claim_quote"], "checks": ["B"],
+                                                                      "claim_type": "theory", "scope": ["the loss"]}]}, td)
         script = "n = 1\nassert n\nok = n > 0\nprint('REFEREE_RESULT', {'violated': 0, 'premises_hold': 1})\n"
         b = [{"kind": k, "impl_quote": q, "paper_quote": "reaches 61.4 accuracy"} for k, q in
              (("hypotheses", "assert n"), ("claimed_bound", "ok = n > 0"), ("instance", "n = 1"))]
@@ -909,10 +926,12 @@ def test_a_paper_and_code_disagreement_is_computed_both_ways_never_chosen():
         _checkout(td, pid, {"analyze.py": f"import numpy\n{code_line}\n"})
         x = tasks._Ctx(cfg, pid)
         rd = {"id": "B", "kind": "RELEASED_DATA", "basis": "predictions", "claim_quote": "We report the mean over 5 random seeds",
-              "target": {"quote": "reaches 61.4 accuracy", "value": "61.4"},
+              "target": {"quote": "reaches 61.4 accuracy", "value": "61.4"}, "role": "target", "criterion": "stated",
+              "covers": ["accuracy"],
               "readings": [{"name": "paper", "source": "paper", "quote": "We use generation of samples"},
                            {"name": "code", "source": "analyze.py", "quote": code_line}]}
-        central = [{"quote": "We report the mean over 5 random seeds", "checks": ["B"]}]
+        central = [{"quote": "We report the mean over 5 random seeds", "checks": ["B"], "claim_type": "value",
+                    "scope": ["accuracy"]}]
         rec = tasks._seal_plan(x, "plan", {"checks": [rd], "central_claims": central}, final=False)
         assert [r["name"] for r in rec["checks"][0]["readings"]] == ["paper", "code"]
         assert rec["checks"][0]["readings"][0]["page"] == 1 and rec["checks"][0]["basis"] == "predictions"
@@ -971,11 +990,12 @@ def test_an_engineering_claim_gets_a_compatibility_test_never_a_benchmark():
     with tempfile.TemporaryDirectory() as t:
         cfg, pid = _project(Path(t))
         x = tasks._Ctx(cfg, pid)
-        compat = {"id": "B", "kind": "RECONSTRUCTION", "test": "compatibility",
-                  "claim_quote": "We report the mean over 5 random seeds",
+        compat = {"id": "B", "kind": "RECONSTRUCTION", "test": "compatibility", "role": "target", "criterion": "stated",
+                  "covers": ["the layer"], "claim_quote": "We report the mean over 5 random seeds",
                   "target": {"quote": "Our method reaches 61.4", "relation": "loss_first - loss_last > 0"},
                   "define": {"loss_first": "training loss after epoch 1", "loss_last": "training loss after the last epoch"}}
-        eng = [{"quote": "We report the mean over 5 random seeds", "claim_type": "engineering", "checks": ["B"]}]
+        eng = [{"quote": "We report the mean over 5 random seeds", "claim_type": "engineering", "checks": ["B"],
+                "scope": ["the layer"]}]
         rec = tasks._seal_plan(x, "plan", {"checks": [compat], "central_claims": eng}, final=False)
         assert rec["checks"][0]["test"] == "compatibility" and rec["central_claims"][0]["claim_type"] == "engineering"
         assert rec["checks"][0]["define"]["loss_first"].startswith("training loss")
@@ -1383,8 +1403,10 @@ def test_equal_summary_values_from_different_runs_are_replicates_not_duplicates(
     same = rows([{"dev": 0.0, "test_coverage": 0.8}] * 3)
     assert run(same, staged(0.0, 3), rng=False)["stages"]["a"]["n_independent"] == 1
     assert run(same, staged(0.0, 3), rng=False)["status"] == "INCONCLUSIVE"
-    # ...unless the seed is shown to reach a generator: draws that coincided, not one run repeated
-    assert run(same, staged(0.0, 3), rng=True)["status"] == "NO_VIOLATION_FOUND"
+    # 2026-10-01: a seed that reaches a generator somewhere in the script proves nothing about THIS stage (a stage on
+    # default_rng(0) inside a seeded script repeated itself six times and passed a sign test): identical lines with
+    # no per-line fingerprint stay one measurement
+    assert run(same, staged(0.0, 3), rng=True)["status"] == "INCONCLUSIVE"
     # a declared data fingerprint decides both ways
     fps = {0: "a", 1: "b", 2: "c"}
     assert run(rows([{"dev": 0.0}] * 3, fp=fps), staged(0.0, 3), rng=False)["status"] == "NO_VIOLATION_FOUND"
@@ -1406,7 +1428,8 @@ def test_equal_summary_values_from_different_runs_are_replicates_not_duplicates(
     fa = "fa < delta"
     zero = rows([{"fa": 0.0, "delta": 0.25} for _ in range(3)], trials={"fa": 400})
     z = run(zero, staged(0.25, 3), rng=True, r=fa)["stages"]["a"]
-    assert z["status"] == "RELATION_HOLDS" and z["events"] == 0 and z["trials"] == 1200 and z["ci"][1] < 0.004
+    # identical lines, no fingerprint: one run's 400 trials, never 1200 pooled
+    assert z["status"] == "RELATION_HOLDS" and z["events"] == 0 and z["trials"] == 400 and z["ci"][1] < 0.0092
     bad = rows([{"fa": 0.9, "delta": 0.25} for _ in range(3)], trials={"fa": 400})
     assert run(bad, staged(-0.65, 3), rng=True, r=fa)["stages"]["a"]["status"] == "RELATION_VIOLATED"
     edge = rows([{"fa": 0.25, "delta": 0.25} for _ in range(3)], trials={"fa": 400})
@@ -1445,10 +1468,14 @@ def test_the_seed_must_reach_a_random_generator_for_a_stochastic_script():
                  (("method", "fit()"), ("training", "fit()"), ("dataset", "load()"), ("metric", "acc = 61.0"),
                   ("comparison_target", "print("))]
         g = {"runs": 1, "metric": "acc", "outputs": ["acc"], "bindings": binds, "stochastic": True}
-        ignores = "acc = 61.0\nfit()\nload()\nrng = np.random.default_rng(7)\nprint('REFEREE_RESULT', acc)\n"
+        ignores = ("acc = 61.0\nfit()\nload()\nrng = np.random.default_rng(7)\n"
+                   "print('REFEREE_RESULT', {'acc': acc, 'data_fingerprint': fp})\n")
         assert "never reaches a random generator" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {**g, "script": ignores}, final=False))
         seeded = ignores.replace("default_rng(7)", "default_rng(args.seed)")
         assert tasks._seal_gen(x, "gen:C1.1", {**g, "script": seeded}, final=False)["seed_flow"] is True
+        # 2026-10-01: a stochastic script that prints no per-line fingerprint cannot show its replicates differ
+        assert "data_fingerprint" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {
+            **g, "script": seeded.replace(", 'data_fingerprint': fp", "")}, final=False))
         assert tasks._seal_gen(x, "gen:C1.1", {**g, "script": ignores, "stochastic": False}, final=False)["seed_flow"] is False
 
 
@@ -1463,7 +1490,8 @@ def test_a_check_whose_data_was_not_acquired_ends_as_a_blocker_and_no_surrogate_
         _seal(cfg, pid, "critic", {"reviews": []}, td)
         claim = "Method A beats method B on CIFAR-10-C with ResNet-32 by a wide margin"
         chk = {"id": "R", "kind": "RECONSTRUCTION", "claim_quote": claim, "target": {"quote": claim, "relation": "acc_a > acc_b"},
-               "covers": ["CIFAR-10-C"], "acquire": [{"source": "https://data.example.org/set.zip", "cited_in": "paper"}]}
+               "covers": ["CIFAR-10-C"], "acquire": [{"source": "https://data.example.org/set.zip", "cited_in": "paper"}],
+               "role": "target", "criterion": "stated", "test": "performance"}
         _seal(cfg, pid, "plan", {"checks": [chk], "central_claims": [{"quote": claim, "claim_type": "performance", "checks": ["R"],
                                                                      "scope": ["CIFAR-10-C"]}]}, td)
         x = tasks._Ctx(cfg, pid)
@@ -1494,7 +1522,8 @@ def test_a_check_whose_data_was_not_acquired_ends_as_a_blocker_and_no_surrogate_
                  (("method", "fit()"), ("training", "fit()"), ("dataset", "load()"), ("metric", "acc_a = 1"),
                   ("comparison_target", "print("))]
         g = {"runs": 1, "outputs": ["acc_a", "acc_b"], "bindings": binds, "stochastic": True}
-        sim = "acc_a = 1\nfit()\nload()\nrng = np.random.default_rng(args.seed)\nprint('REFEREE_RESULT', acc_a)\n"
+        sim = ("acc_a = 1\nfit()\nload()\nrng = np.random.default_rng(args.seed)\n"
+               "print('REFEREE_RESULT', {'acc_a': acc_a, 'data_fingerprint': fp})\n")
         assert "never reads /work/data" in _refused(lambda: tasks._seal_gen(x2, "gen:C1.1", {**g, "script": sim}, final=False))
         assert tasks._seal_gen(x2, "gen:C1.1", {**g, "script": sim + "open('/work/data/0/train.csv')\n"}, final=False)["seed_flow"]
 
@@ -1509,17 +1538,22 @@ def test_an_empirical_claim_keeps_its_requested_experiment():
         x = tasks._Ctx(cfg, pid)
         claim = "Method A beats method B on CIFAR-10-C with ResNet-32 by a wide margin"
         thm = "Theorem 1 states that the bound holds for every n"
-        cert = {"id": "T", "kind": "CERTIFICATE", "claim_quote": thm, "statement_quote": thm}
+        cert = {"id": "T", "kind": "CERTIFICATE", "claim_quote": thm, "statement_quote": thm, "role": "target"}
         run = {"id": "R", "kind": "RECONSTRUCTION", "claim_quote": claim, "target": {"quote": claim, "relation": "acc_a > acc_b"},
-               "covers": ["CIFAR-10-C"]}
+               "covers": ["CIFAR-10-C"], "role": "target", "criterion": "stated", "test": "performance"}
         cc = {"quote": claim, "claim_type": "performance", "scope": ["CIFAR-10-C"]}
 
         def seal(checks, claim_):
             return tasks._seal_plan(x, "plan", {"checks": checks, "central_claims": [claim_]}, final=False)
         # a proof of a related lemma cannot stand for the experiment; beside it, as supporting evidence, it can
         assert "cannot stand for the performance claim" in _refused(lambda: seal([cert], {**cc, "checks": ["T"], "omitted": []}))
-        rec = seal([{**cert, "role": "supporting"}], {**cc, "checks": ["T"], "blocker": "compute", "omitted": [
-            {"item": "CIFAR-10-C", "why": "needs 5 GB per run", "blocker": "compute"}]})
+        # 2026-10-01: an unmeasured `compute` estimate is refused; a measured run, a registry size or the paper's
+        # own statement of its compute is not
+        omit = {"item": "CIFAR-10-C", "why": "needs 5 GB per run", "blocker": "compute"}
+        assert "rests on a measurement" in _refused(lambda: seal([{**cert, "role": "supporting"}], {
+            **cc, "checks": ["T"], "omitted": [omit]}))
+        rec = seal([{**cert, "role": "supporting"}], {**cc, "checks": ["T"], "omitted": [
+            {**omit, "paper_quote": "Method A beats method B on CIFAR-10-C with ResNet-32"}]})
         assert rec["checks"][0]["role"] == "supporting"
         # an omission names what stops it, and 'data' rests on a search the harness ran
         assert "`blocker`" in _refused(lambda: seal([run], {**cc, "checks": ["R"], "scope": ["CIFAR-10-C", "MMLU"],
@@ -1539,8 +1573,10 @@ def test_an_empirical_claim_keeps_its_requested_experiment():
         # a claim with no check at all still names its blocker
         assert "`blocker`" in _refused(lambda: seal([], {"quote": "Method C uses GPT-4.1 as its labeler", "claim_type": "performance",
                                                         "scope": ["GPT-4.1"], "checks": [], "why_unchecked": "paid API"}))
-        seal([], {"quote": "Method C uses GPT-4.1 as its labeler", "claim_type": "performance", "scope": ["GPT-4.1"], "checks": [],
-                  "why_unchecked": "a paid closed API", "blocker": "credentials"})
+        gpt = {"quote": "Method C uses GPT-4.1 as its labeler", "claim_type": "performance", "scope": ["GPT-4.1"], "checks": [],
+               "why_unchecked": "a paid closed API", "blocker": "credentials"}
+        assert "hosted closed service" in _refused(lambda: seal([], gpt))     # credentials name the service or a gated record
+        seal([], {**gpt, "service": True})
 
 
 def test_completion_is_reported_apart_from_the_workflow_finishing_and_from_the_findings():
@@ -1558,25 +1594,29 @@ def test_completion_is_reported_apart_from_the_workflow_finishing_and_from_the_f
         mmlu = "Our LLM monitor reaches 61.4 accuracy on MMLU in the paper"
         gpt = "Method C uses GPT-4.1 as its labeler"
         rel = lambda q, r: {"quote": q, "relation": r}
-        checks = [{"id": "B", "kind": "CERTIFICATE", "claim_quote": thm, "statement_quote": thm},
-                  {"id": "R", "kind": "RECONSTRUCTION", "claim_quote": cifar, "target": rel(cifar, "acc_a > acc_b"),
+        run = {"role": "target", "criterion": "stated", "test": "performance"}
+        checks = [{"id": "B", "kind": "CERTIFICATE", "claim_quote": thm, "statement_quote": thm, "role": "target",
+                   "covers": ["Theorem 1"]},
+                  {"id": "R", "kind": "RECONSTRUCTION", "claim_quote": cifar, "target": rel(cifar, "acc_a > acc_b"), **run,
                    "covers": ["CIFAR-10-C"], "acquire": [{"source": "https://data.example.org/set.zip", "cited_in": "paper"}]},
                   {"id": "S", "kind": "CERTIFICATE", "claim_quote": cifar, "statement_quote": "The error bars use 95% CIs",
                    "role": "supporting"},
-                  {"id": "M", "kind": "RECONSTRUCTION", "claim_quote": mmlu, "target": rel(mmlu, "acc_llm > acc_base"), "covers": ["MMLU"]}]
-        central = [{"quote": thm, "claim_type": "theory", "checks": ["B"], "scope": []},
+                  {"id": "M", "kind": "RECONSTRUCTION", "claim_quote": mmlu, "target": rel(mmlu, "acc_llm > acc_base"), **run,
+                   "covers": ["MMLU"]}]
+        central = [{"quote": thm, "claim_type": "theory", "checks": ["B"], "scope": ["Theorem 1"]},
                    {"quote": cifar, "claim_type": "performance", "checks": ["R", "S"], "scope": ["CIFAR-10-C"]},
                    {"quote": mmlu, "claim_type": "performance", "checks": ["M"], "scope": ["MMLU"]},
                    {"quote": gpt, "claim_type": "performance", "checks": [], "scope": ["GPT-4.1"],
-                    "why_unchecked": "a paid closed API", "blocker": "credentials"}]
+                    "why_unchecked": "a paid closed API", "blocker": "credentials", "service": True}]
         _seal(cfg, pid, "plan", {"checks": checks, "central_claims": central}, td)
         done = {"runs_planned": 3, "runs_ended": 3, "runs_exited_ok": 3, "runs_failed": []}
         write = lambda cid, outcome, check=None: (state.write_json(td / pid / "checks" / cid / "outcome.json", outcome),
                                                   state.write_json(td / pid / "checks" / cid / "check.json", check or {}))
         write("C1", {"status": "COUNTEREXAMPLE_FOUND", "reason": "a violation", "values": [1], "execution": done})
         write("C2", {"status": "BLOCKED", "reason": "DATA BLOCKER (missing): x", "data_blocker": [{"source": "s", "class": "missing"}]})
-        write("C3", {"status": "NO_VIOLATION_FOUND", "reason": "held", "values": [0], "execution": done})
-        write("C4", {"status": "RELATION_HOLDS", "reason": "held", "values": [0.1, 0.2, 0.15], "execution": done},
+        # target checks are admitted before supporting ones (2026-10-01): M is C3, the supporting S is C4
+        write("C4", {"status": "NO_VIOLATION_FOUND", "reason": "held", "values": [0], "execution": done})
+        write("C3", {"status": "RELATION_HOLDS", "reason": "held", "values": [0.1, 0.2, 0.15], "execution": done},
               {"deviations": [{"printed": "", "used": "a simulated stand-in for the MMLU items", "changes_claim": True}]})
         led = report.ledger(tasks._Ctx(cfg, pid))
         pick = lambda prefix: next(r for r in led["completion"]["claims"] if r["claim"].startswith(prefix))
@@ -1585,7 +1625,7 @@ def test_completion_is_reported_apart_from_the_workflow_finishing_and_from_the_f
         assert th["experiment"] == "RAN_AS_SPECIFIED" and th["evidence"] == "FAILURE_FOUND"
         assert cf["experiment"] == "NOT_RUN" and cf["protocol_matched"] is None and cf["evidence"] == "NOTHING_DECIDED"   # ...says nothing about CIFAR
         assert cf["not_run"][0]["blocker"] == "data" and cf["not_run"][0]["basis"] == "harness" and cf["not_run"][0]["class"] == "missing"
-        assert cf["supporting"] == [{"check": "C3", "kind": "CERTIFICATE", "status": "NO_VIOLATION_FOUND", "state": "COMPLETED"}]
+        assert cf["supporting"] == [{"check": "C4", "kind": "CERTIFICATE", "status": "NO_VIOLATION_FOUND", "state": "COMPLETED"}]
         assert mm["experiment"] == "RAN_WITH_CHANGES" and mm["protocol_matched"] is False and "simulated stand-in" in mm["changes"][0]
         assert mm["evidence"] == "READING_CHANGED"                          # about the changed claim, never support of the printed one
         assert gp["experiment"] == "NOT_RUN" and gp["not_run"][0]["blocker"] == "credentials" and gp["not_run"][0]["basis"] == "planner"
@@ -1595,12 +1635,14 @@ def test_completion_is_reported_apart_from_the_workflow_finishing_and_from_the_f
         assert "data 1" in line and "credentials 1" in line and "not a measure of what was reproduced" in line
         table = report.table(led)
         assert "Completion, kept apart from what was found" in table and "experiment **NOT_RUN**" in table
-        assert "supporting only: C3" in table and "reached a terminal state" in table
+        assert "supporting only: C4" in table and "reached a terminal state" in table
         # a supporting check never lets an empirical claim read as supported
         assert report._claim_status([{"id": "C3", "kind": "CERTIFICATE", "evidence": "x", "status": "NO_VIOLATION_FOUND",
                                       "deviations": [], "role": "supporting"}], claim_type="performance") == "NOT_CHECKED"
-        assert report._claim_status([{"id": "C3", "kind": "CERTIFICATE", "evidence": "x", "status": "NO_VIOLATION_FOUND",
-                                      "deviations": [], "role": "supporting"}], claim_type="theory") == "NO_VIOLATION_FOUND"
+        # 2026-10-01 (invariant 24): nor a theorem — a simulation beside a theorem would otherwise read as more
+        # support than the exact instances of its certificate
+        assert report._claim_status([{"id": "C3", "kind": "RECONSTRUCTION", "evidence": "x", "status": "RELATION_HOLDS",
+                                      "deviations": [], "role": "supporting"}], claim_type="theory") == "NOT_CHECKED"
 
 
 def test_replicates_that_repeat_a_value_are_extended_once_when_only_more_of_them_can_decide():
@@ -1637,8 +1679,8 @@ def test_a_claim_that_ran_only_on_a_substitute_gets_the_follow_up_round():
             _seal(cfg, pid, f"lens:{lens}", {"concerns": []}, td)
         _seal(cfg, pid, "critic", {"reviews": []}, td)
         mmlu = "Our LLM monitor reaches 61.4 accuracy on MMLU in the paper"
-        chk = {"id": "M", "kind": "RECONSTRUCTION", "claim_quote": mmlu, "covers": ["MMLU"],
-               "target": {"quote": mmlu, "relation": "acc_llm > acc_base"}}
+        chk = {"id": "M", "kind": "RECONSTRUCTION", "claim_quote": mmlu, "covers": ["MMLU"], "role": "target",
+               "criterion": "stated", "test": "performance", "target": {"quote": mmlu, "relation": "acc_llm > acc_base"}}
         _seal(cfg, pid, "plan", {"checks": [chk], "central_claims": [
             {"quote": mmlu, "claim_type": "performance", "checks": ["M"], "scope": ["MMLU"]}]}, td)
         done = {"runs_planned": 3, "runs_ended": 3, "runs_exited_ok": 3, "runs_failed": []}
@@ -1781,8 +1823,17 @@ def test_one_fetch_per_plan_in_flight_and_a_follow_up_that_covers_an_omission_re
     follow = {"checks": [{"id": "C7", "covers": ["CIFAR10-C image monitoring"]}], "dropped": [],
               "central_claims": [{"quote": "q", "checks": ["C7"], "omitted": [], "why_unchecked": ""}]}
     merged = report.merged(first, follow)
-    assert [o["item"] for o in merged["central_claims"][0]["omitted"]] == ["URM"]                 # the experiment that ran is not also 'not run'
     assert merged["central_claims"][0]["checks"] == ["C1", "C7"]
+    # 2026-10-01: an omission stays on record until the check that covers it RAN — planning a follow-up is not running it
+    assert [o["item"] for o in merged["central_claims"][0]["omitted"]] == ["CIFAR10-C image monitoring", "URM"]
+    cc = {**merged["central_claims"][0], "page": 1, "claim_type": "performance", "scope": ["CIFAR10-C image monitoring", "URM"]}
+    chk = lambda cid, st, covers: {"id": cid, "kind": "RECONSTRUCTION", "role": "target", "state": st, "status": "RELATION_HOLDS",
+                                   "values": [1.0] if st == "COMPLETED" else None, "deviations": [], "covers": covers,
+                                   "data_changed": [], "reason": ""}
+    ran = report._completion_row(cc, {"C1": chk("C1", "NOT_RUN", []), "C7": chk("C7", "COMPLETED", ["CIFAR10-C image monitoring"])})
+    assert ran["scope_not_run"] == ["URM"] and ran["experiment"] == "RAN_PARTIAL" and ran["protocol_matched"] is False
+    planned = report._completion_row(cc, {"C1": chk("C1", "NOT_RUN", []), "C7": chk("C7", "NOT_STARTED", ["CIFAR10-C image monitoring"])})
+    assert planned["experiment"] == "NOT_RUN" and planned["scope_not_run"] == ["CIFAR10-C image monitoring", "URM"]
 
 
 def test_a_criterion_the_planner_supplied_makes_the_result_about_that_criterion():
@@ -1793,17 +1844,21 @@ def test_a_criterion_the_planner_supplied_makes_the_result_about_that_criterion(
         cfg, pid = _project(td)
         x = tasks._Ctx(cfg, pid)
         claim = "We report the mean over 5 random seeds"
-        rel = {"id": "R", "kind": "RECONSTRUCTION", "claim_quote": claim, "target": {"quote": claim, "relation": "chi2_formula < chi2_rival"}}
-        central = [{"quote": claim, "claim_type": "performance", "checks": ["R"]}]
+        rel = {"id": "R", "kind": "RECONSTRUCTION", "claim_quote": claim, "target": {"quote": claim, "relation": "chi2_formula < chi2_rival"},
+               "role": "target", "test": "performance", "covers": ["the fit"]}
+        central = [{"quote": claim, "claim_type": "performance", "checks": ["R"], "scope": ["the fit"]}]
         rec = tasks._seal_plan(x, "plan", {"checks": [{**rel, "criterion": "supplied"}], "central_claims": central}, final=False)
         assert rec["checks"][0]["criterion"] == "supplied"
-        assert tasks._seal_plan(x, "plan", {"checks": [rel], "central_claims": central}, final=False)["checks"][0]["criterion"] == "stated"
+        # 2026-10-01: an omitted criterion no longer defaults to 'stated' (which recorded no claim change)
+        assert "`criterion`" in _refused(lambda: tasks._seal_plan(x, "plan", {"checks": [rel], "central_claims": central}, final=False))
+        assert tasks._seal_plan(x, "plan", {"checks": [{**rel, "criterion": "stated"}], "central_claims": central},
+                                final=False)["checks"][0]["criterion"] == "stated"
         plan = {"checks": [rec["checks"][0]]}
         x2 = type("X", (), {"root": td, "paper": Paper(PAGES, ROWS), "cfg": cfg, "sealed": lambda self, tid: plan,
                             "plan": lambda self: plan})()
         binds = [{"kind": k, "impl_quote": q, "paper_quote": claim} for k, q in
                  (("method", "fit()"), ("training", "fit()"), ("dataset", "load()"), ("metric", "a = 1"), ("comparison_target", "print("))]
-        script = "a = 1\nfit()\nload()\nrng = np.random.default_rng(args.seed)\nprint('REFEREE_RESULT', a)\n"
+        script = "a = 1\nfit()\nload()\nrng = np.random.default_rng(args.seed)\nprint('REFEREE_RESULT', a, 'data_fingerprint')\n"
         g = {"script": script, "runs": 1, "outputs": ["chi2_formula", "chi2_rival"], "bindings": binds, "stochastic": True}
         sealed = tasks._seal_gen(x2, "gen:C1.1", g, final=False)
         dev = [d for d in sealed["deviations"] if "supplied the decision criterion" in d["used"]]
@@ -1824,7 +1879,7 @@ def test_an_experiment_that_trains_nothing_declares_training_not_applicable_inst
         pq = "reaches 61.4 accuracy"
         binds = [{"kind": k, "impl_quote": q, "paper_quote": pq} for k, q in
                  (("method", "run()"), ("dataset", "load()"), ("metric", "acc = 61.0"), ("comparison_target", "print("))]
-        script = "acc = 61.0\nrun()\nload()\nrng = np.random.default_rng(args.seed)\nprint('REFEREE_RESULT', acc)\n"
+        script = "acc = 61.0\nrun()\nload()\nrng = np.random.default_rng(args.seed)\nprint('REFEREE_RESULT', acc, 'data_fingerprint')\n"
         g = {"script": script, "runs": 1, "metric": "acc", "outputs": ["acc"], "stochastic": True}
         why = "nothing is trained: the stream is simulated and the test is a closed-form bound"
         assert tasks._seal_gen(x, "gen:C1.1", {**g, "bindings": binds}, final=False)["refused"]           # no training binding at all
@@ -2011,6 +2066,1212 @@ def test_a_closed_gate_refuses_only_the_sources_that_need_it_and_status_never_ad
         finally:
             tasks.advance, state.Config = real_adv, real_cfg
 
+
+
+# --- 2026-10-01 audit: classifications, blockers, completion and earned words ----------------------
+# 2026-10-01 audit: classifications fail closed, blockers rest on the harness's records, completion is
+# derived from what ran, support words are earned by the claim. Run: python tests/_t_lead.py
+
+CIFAR = "Method A beats method B on CIFAR-10-C with ResNet-32 by a wide margin"
+MMLU = "Our LLM monitor reaches 61.4 accuracy on MMLU in the paper"
+THM = "Theorem 1 states that the bound holds for every n"
+GPT = "Method C uses GPT-4.1 as its labeler"
+RUN = {"role": "target", "criterion": "stated", "test": "performance"}
+
+
+def _x(td: Path):
+    cfg, pid = _project_pages(td, DATA_PAGES)
+    return cfg, pid, tasks._Ctx(cfg, pid)
+
+
+def _run(cid="R", covers=("CIFAR-10-C",), **kw):
+    return {"id": cid, "kind": "RECONSTRUCTION", "claim_quote": CIFAR, "target": {"quote": CIFAR, "relation": "acc_a > acc_b"},
+            "covers": list(covers), **RUN, **kw}
+
+
+def _claim(**kw):
+    return {"quote": CIFAR, "claim_type": "performance", "checks": ["R"], "scope": ["CIFAR-10-C"], **kw}
+
+
+def _plan(x, checks, claims, final=False, tid="plan"):
+    return tasks._seal_plan(x, tid, {"checks": checks, "central_claims": claims}, final=final)
+
+
+def test_a_classification_left_out_is_refused_never_defaulted():
+    """A missing role read as 'target', a missing criterion as 'stated', a missing claim type switched every
+    empirical rule off, and on the planner's third attempt every claim-level error was sealed as it stood."""
+    with tempfile.TemporaryDirectory() as t:
+        cfg, pid, x = _x(Path(t))
+        _plan(x, [_run()], [_claim()])                                                   # complete: sealed
+        for drop, word in (("role", "`role`"), ("criterion", "`criterion`"), ("test", "`test`")):
+            c = _run()
+            c.pop(drop)
+            assert word in _refused(lambda: _plan(x, [c], [_claim()])), drop
+        assert "`role`" in _refused(lambda: _plan(x, [_run(role="Supporting")], [_claim()]))   # closed vocabulary, exact
+        cl = _claim()
+        cl.pop("claim_type")
+        assert "`claim_type`" in _refused(lambda: _plan(x, [_run()], [cl]))
+        assert "`scope`" in _refused(lambda: _plan(x, [_run()], [_claim(scope=[])]))
+        # the last attempt seals the strictest reading, visibly — never the error as it stood
+        cert = {"id": "T", "kind": "CERTIFICATE", "claim_quote": CIFAR, "statement_quote": THM, "role": "target",
+                "covers": ["CIFAR-10-C"]}
+        rec = _plan(x, [cert], [{**cl, "checks": ["T"]}], final=True)
+        cc = rec["central_claims"][0]
+        assert cc["claim_type"] == "" and cc["checks"] == [] and cc["sealed_with_errors"]   # a certificate never stands for it
+        assert rec["checks"][0]["central"] is False and rec["checks"][0]["incidental_why"]
+        assert report._empirical(cc["claim_type"])                                     # downstream: untyped is empirical
+        rec = _plan(x, [_run(covers=[])], [_claim()], final=True)                       # uncovered scope on the last attempt
+        assert rec["central_claims"][0]["omitted"][0]["item"] == "CIFAR-10-C"
+        assert rec["central_claims"][0]["omitted"][0]["blocker"] == "unstated"
+
+
+def test_a_follow_up_round_never_retypes_a_claim():
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid, x = _x(td)
+        state.write_json(td / ".gpu.json", False)
+        for lens in tasks.LENSES:
+            _seal(cfg, pid, f"lens:{lens}", {"concerns": []}, td)
+        _seal(cfg, pid, "critic", {"reviews": []}, td)
+        _seal(cfg, pid, "plan", {"checks": [_run()], "central_claims": [_claim()]}, td)
+        x = tasks._Ctx(cfg, pid)
+        f1 = _run("F1")
+        assert "never retypes" in _refused(lambda: _plan(x, [f1], [_claim(checks=["F1"], claim_type="theory")], tid="plan:2"))
+        assert _plan(x, [f1], [_claim(checks=["F1"])], tid="plan:2")["central_claims"][0]["claim_type"] == "performance"
+
+
+def _discovery(cfg, pid, cands: list[dict]) -> str:
+    return discover.search(cfg, pid, "Qwen2-VL-2B", registry="huggingface-models",
+                           get=lambda u: [{"id": c["id"], "author": "Qwen"} for c in cands]) and _patch_candidates(cfg, pid, cands)
+
+
+def _patch_candidates(cfg, pid, cands: list[dict]) -> str:
+    """The registry record as the harness logged it, with the gating and size fields a hub returns."""
+    f = discover.log_path(cfg, pid)
+    rows = [json.loads(ln) for ln in f.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    for c in rows[-1]["results"]["huggingface-models"]["candidates"]:
+        c.update(next(({k: v for k, v in d.items() if k != "id"} for d in cands if f"hf://models/{d['id']}" == c["source"]), {}))
+    f.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    return rows[-1]["id"]
+
+
+def test_a_blocker_rests_on_what_the_harness_holds():
+    """Sep-30 rerun 2 PPRM: open-weight Qwen models were given up as 'credentials' and as 'compute' against the
+    host's RAM with no measurement, and no registry search was run for them or for the QA benchmarks."""
+    with tempfile.TemporaryDirectory() as t:
+        cfg, pid, x = _x(Path(t))
+        cfg.allow_network = cfg.allow_data_search = True
+        did = _discovery(cfg, pid, [{"id": "Qwen/Qwen2-VL-2B", "gated": False, "private": False, "size_bytes": 4_400_000_000},
+                                    {"id": "Qwen/Qwen2.5-VL-32B", "gated": False, "private": False, "size_bytes": 67_000_000_000},
+                                    {"id": "meta/Gated-7B", "gated": "manual", "private": False, "size_bytes": 14_000_000_000}])
+        omit = lambda **o: _claim(scope=["CIFAR-10-C", "Qwen"], omitted=[{"item": "Qwen", "why": "the predictor sweep", **o}])
+        cred = {"blocker": "credentials", "discovery": [did]}
+        assert "hosted closed service" in _refused(lambda: _plan(x, [_run()], [omit(blocker="credentials")]))
+        assert "public and not gated" in _refused(lambda: _plan(x, [_run()], [omit(**cred, artifact="hf://models/Qwen/Qwen2-VL-2B")]))
+        _plan(x, [_run()], [omit(**cred, artifact="hf://models/meta/Gated-7B")])         # gated: the blocker stands
+        _plan(x, [_run()], [omit(blocker="credentials", service=True)])                  # a paid closed API
+        real = getattr(execute, "host", None)
+        execute.host = lambda cfg: {"cpus": 6, "ram_mb": 5926, "gpu": True, "vram_mb": 8188, "disk_free_gb": 200.0}
+        try:
+            comp = {"blocker": "compute", "discovery": [did]}
+            assert "rests on a measurement" in _refused(lambda: _plan(x, [_run()], [omit(blocker="compute")]))
+            assert "within this host's measured memory" in _refused(lambda: _plan(x, [_run()], [omit(
+                **comp, artifact="hf://models/Qwen/Qwen2-VL-2B")]))
+            _plan(x, [_run()], [omit(**comp, artifact="hf://models/Qwen/Qwen2.5-VL-32B")])   # 67 GB: beyond this host
+        finally:
+            if real is None:
+                del execute.host
+            else:
+                execute.host = real
+        _plan(x, [_run()], [omit(blocker="compute", paper_quote="Method A beats method B on CIFAR-10-C")])
+        state.write_json(x.root / "checks" / "C9" / "outcome.json", {"status": "BLOCKED", "reason": "RESOURCE BLOCKER: pilot 2h"})
+        _plan(x, [_run()], [omit(blocker="compute", failed_checks=["C9"])])               # a measured run past the budget
+        assert "rests on a measurement" in _refused(lambda: _plan(x, [_run()], [omit(blocker="compute", failed_checks=["C1"])]))
+        cfg.allow_data_search = False                       # with search off the harness holds nothing to check against
+        _plan(x, [_run()], [omit(blocker="credentials")])
+        rec = _plan(x, [_run()], [omit(blocker="credentials")], final=True)
+        assert not rec["central_claims"][0]["omitted"][0].get("unverified")
+        cfg.allow_data_search = True
+        rec = _plan(x, [_run()], [omit(blocker="credentials")], final=True)             # sealed on the last attempt: flagged
+        assert "hosted closed service" in rec["central_claims"][0]["omitted"][0]["unverified"]
+
+
+def test_a_supporting_check_covers_none_of_the_claim():
+    """Probe P7: a target covering CIFAR and a supporting simulation 'covering' MMLU read RAN_AS_SPECIFIED,
+    SUPPORT_FOUND, with MMLU never run and the follow-up round skipped."""
+    with tempfile.TemporaryDirectory() as t:
+        cfg, pid, x = _x(Path(t))
+        sim = {**_run("S", covers=["MMLU"]), "role": "supporting"}
+        both = _claim(checks=["R", "S"], scope=["CIFAR-10-C", "MMLU"])
+        assert "linked TARGET check" in _refused(lambda: _plan(x, [_run(), sim], [both]))
+        rec = _plan(x, [_run(), sim], [both], final=True)
+        assert [o["item"] for o in rec["central_claims"][0]["omitted"]] == ["MMLU"]
+        assert rec["checks"][0]["role"] == "target"                       # target checks are admitted first
+        cfg.max_checks = 1
+        rec = _plan(x, [sim, _run()], [both], final=True)
+        assert [c["proposed_id"] for c in rec["checks"]] == ["R"] and rec["dropped"][0]["check"] == "S"
+
+
+def test_an_engineering_claim_is_never_decided_by_another_kind_of_check():
+    with tempfile.TemporaryDirectory() as t:
+        cfg, pid, x = _x(Path(t))
+        rd = {"id": "R", "kind": "RELEASED_DATA", "basis": "predictions", "claim_quote": CIFAR, "role": "target",
+              "criterion": "stated", "covers": ["CIFAR-10-C"], "target": {"quote": CIFAR, "relation": "acc_a > acc_b"}}
+        assert "compatibility test" in _refused(lambda: _plan(x, [rd], [_claim(claim_type="engineering")]))
+        _plan(x, [rd], [_claim(claim_type="performance")])
+
+
+def _gen_x(td: Path, check: dict):
+    cfg, pid = _project_pages(td, DATA_PAGES)
+    plan = {"checks": [check]}
+    return type("X", (), {"root": td / pid, "paper": tasks._Ctx(cfg, pid).paper, "cfg": cfg, "sealed": lambda self, tid: plan,
+                          "plan": lambda self: plan})()
+
+
+BINDS = [{"kind": k, "impl_quote": q, "paper_quote": CIFAR} for k, q in
+         (("method", "fit()"), ("training", "fit()"), ("dataset", "load()"), ("metric", "acc_a = 1"), ("comparison_target", "print("))]
+SCRIPT = ("acc_a = 1\nfit()\nload()\nrng = np.random.default_rng(args.seed)\n"
+          "print('REFEREE_RESULT', {'acc_a': acc_a, 'data_fingerprint': fp})\n")
+
+
+def test_deviations_past_the_cap_are_refused_never_cut_unseen():
+    """Sep-30 rerun 1, conformal Porto C4: 9-11 deviations were declared each round, the seal kept 8 silently, and
+    the verifier's last REVISE asked for exactly the two it never saw: NOT_CHECKABLE."""
+    with tempfile.TemporaryDirectory() as t:
+        chk = {"id": "C1", "kind": "RECONSTRUCTION", "metric": "", "test": "performance",
+               "target": {"quote": CIFAR, "relation": "acc_a > acc_b", "names": ["acc_a", "acc_b"]}}
+        x = _gen_x(Path(t), chk)
+        devs = [{"printed": "", "used": f"choice {i}", "why": "open", "changes_claim": False} for i in range(tasks.MAX_DEVIATIONS + 1)]
+        g = {"script": SCRIPT, "runs": 1, "outputs": ["acc_a", "acc_b"], "bindings": BINDS, "stochastic": True}
+        assert "merge choices of one kind" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {**g, "deviations": devs}, final=False))
+        assert tasks._seal_gen(x, "gen:C1.1", {**g, "deviations": devs}, final=True)["refused"]
+        ok = tasks._seal_gen(x, "gen:C1.1", {**g, "deviations": devs[:tasks.MAX_DEVIATIONS]}, final=False)
+        assert len(ok["deviations"]) == tasks.MAX_DEVIATIONS
+
+
+def test_a_released_record_file_can_be_a_reading_and_a_certificate_has_none():
+    """No author repository: the released record's own README, notebook or column definition is the only
+    implementation there is; it is kept as quote-only text and may be one of the readings."""
+    with tempfile.TemporaryDirectory() as t:
+        chk = {"id": "C1", "kind": "RELEASED_DATA", "metric": "acc", "target": {"quote": MMLU, "value": "61.4"}}
+        x = _gen_x(Path(t), chk)
+        src = x.root / "checks" / "C1" / "record_src" / "0"
+        src.mkdir(parents=True)
+        line = "acc = (df.answer == df.pred).mean()  # unparsed rows count as wrong"
+        (src / "analysis.py").write_text(f"import pandas\n{line}\n", encoding="utf-8")
+        (src / "unlisted.py").write_text(f"{line}\n", encoding="utf-8")         # in the folder, never acquired
+        listing = [{"path": "0/analysis.py", "sha256": state.sha256((src / "analysis.py").read_bytes())}]
+        state.write_json(x.root / "checks" / "C1" / "data.json", {"files": [{"path": "0/a.csv"}], "record_src": listing})
+        script = ("rows = open('/work/data/0/a.csv').read()\nacc = 0.6\n"
+                  "print('REFEREE_RESULT', {'acc': acc, 'reading': r, 'cohort': ids})\n")
+        b = [{"kind": k, "impl_quote": q, "paper_quote": MMLU} for k, q in
+             (("dataset", "open('/work/data/0/a.csv')"), ("metric", "acc = 0.6"), ("comparison_target", "print("))]
+        paper = {"name": "paper", "source": "paper", "quote": "Our LLM monitor reaches 61.4 accuracy on MMLU"}
+        g = {"script": script, "runs": 1, "metric": "acc", "outputs": ["acc"], "bindings": b}
+        rec = tasks._seal_gen(x, "gen:C1.1", {**g, "readings": [paper, {"name": "record", "source": "record:0/analysis.py",
+                                                                         "quote": line}]}, final=False)
+        assert [r["source"] for r in rec["readings"]] == ["paper", "record:0/analysis.py"]
+        for bad in ({"quote": "acc = df.mean()  # something else entirely"}, {"source": "record:../../x.py"},
+                    {"source": "record:0/missing.py"}, {"source": "record:0/unlisted.py"}):
+            assert "released record" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {**g, "readings": [
+                paper, {"name": "record", "source": "record:0/analysis.py", "quote": line, **bad}]}, final=False)), bad
+        assert "same words" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {**g, "readings": [
+            paper, {**paper, "name": "again"}]}, final=False))
+        (src / "analysis.py").write_text(f"import pandas\n{line}\n# edited after the acquisition\n", encoding="utf-8")
+        assert "released record" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {**g, "readings": [
+            paper, {"name": "record", "source": "record:0/analysis.py", "quote": line}]}, final=False))   # sha256 changed
+    with tempfile.TemporaryDirectory() as t:
+        cfg, pid, x = _x(Path(t))
+        cert = {"id": "T", "kind": "CERTIFICATE", "claim_quote": THM, "statement_quote": THM, "role": "target", "covers": ["T1"],
+                "readings": [{"name": "paper", "source": "paper", "quote": THM}, {"name": "other", "source": "paper", "quote": GPT}]}
+        assert "CERTIFICATE states another reading" in _refused(lambda: _plan(x, [cert], [{
+            "quote": THM, "claim_type": "theory", "checks": ["T"], "scope": ["T1"]}]))
+
+
+def _chk(cid, **kw):
+    base = {"id": cid, "kind": "RECONSTRUCTION", "role": "target", "state": "COMPLETED", "status": "RELATION_HOLDS",
+            "values": [0.2, 0.3, 0.25], "deviations": [], "covers": ["CIFAR-10-C"], "data_changed": [], "evidence": "x",
+            "reason": "", "data_identity": {}}
+    return {**base, **kw}
+
+
+def _cc(**kw):
+    return {"quote": CIFAR, "page": 1, "claim_type": "performance", "checks": ["C1"], "scope": ["CIFAR-10-C"], "omitted": [], **kw}
+
+
+def _decide(cc, checks):
+    plan = {"central_claims": [cc], "checks": []}
+    return report._central(plan, checks, [])[0]
+
+
+def test_support_stands_only_on_the_requested_experiment_over_its_whole_scope():
+    """Sep-30 rerun 2 transformer C1: RELATION_HOLDS with 5 of 20 datasets not matching the paper (and the record cut
+    at 20 of 25 files) read SUPPORT_FOUND and lifted the headline; rerun 1: a sibling target that never ran was hidden
+    and the claim read RAN_AS_SPECIFIED."""
+    clean = _decide(_cc(), [_chk("C1")])
+    assert clean["claim_status"] == "SUPPORT_FOUND" and clean["completion"]["experiment"] == "RAN_AS_SPECIFIED"
+    moved = _decide(_cc(), [_chk("C1", data_changed=["dataset dp/flash: identity not affirmed"])])
+    assert moved["claim_status"] == "READING_CHANGED" and moved["completion"]["experiment"] == "RAN_WITH_CHANGES"
+    assert moved["completion"]["protocol_matched"] is False
+    sib = _decide(_cc(checks=["C1", "C2"], scope=["CIFAR-10-C", "MMLU"]),
+                  [_chk("C1"), _chk("C2", covers=["MMLU"], state="NOT_RUN", status="NOT_CHECKABLE", values=None, reason="refused")])
+    assert sib["completion"]["experiment"] == "RAN_PARTIAL" and sib["completion"]["protocol_matched"] is False
+    assert sib["claim_status"] == "PARTIAL_EVIDENCE" and sib["completion"]["scope_not_run"] == ["MMLU"]
+    assert any(b["item"] == "C2" for b in sib["completion"]["not_run"])
+    twin = _decide(_cc(checks=["C1", "C2"]), [_chk("C1"), _chk("C2", state="NOT_RUN", status="NOT_CHECKABLE", values=None,
+                                                                    reason="refused")])   # same scope, one never ran
+    assert twin["completion"]["experiment"] == "RAN_PARTIAL" and twin["completion"]["targets_not_run"] == ["C2"]
+    fail = _decide(_cc(checks=["C1", "C2"], scope=["CIFAR-10-C", "MMLU"]),
+                   [_chk("C1", status="RELATION_VIOLATED"), _chk("C2", covers=["MMLU"], state="NOT_RUN", status="BLOCKED",
+                                                                 values=None, reason="RESOURCE BLOCKER")])
+    assert fail["claim_status"] == "FAILURE_FOUND"                    # a failure found on what ran stands
+    arith = _decide(_cc(claim_type="value"), [_chk("C1", kind="ARITHMETIC", status="ARITHMETIC_CONSISTENT")])
+    assert arith["completion"]["experiment"] == "NOT_RUN" and arith["claim_status"] == "PARTIAL_EVIDENCE"
+    lemma = _decide(_cc(), [_chk("C1", kind="CERTIFICATE", status="COUNTEREXAMPLE_FOUND")])   # a legacy plan's link
+    assert lemma["claim_status"] == "NOT_CHECKED" and lemma["completion"]["supporting"][0]["check"] == "C1"
+    sup = _decide(_cc(claim_type=""), [_chk("C1", role="supporting")])   # untyped: the strictest rules
+    assert sup["claim_status"] == "NOT_CHECKED" and sup["completion"]["experiment"] == "NOT_RUN"
+    th = _decide(_cc(claim_type="theory", scope=["T1"]), [_chk("C1", kind="CERTIFICATE", status="NO_VIOLATION_FOUND", covers=["T1"])])
+    assert th["claim_status"] == "NO_VIOLATION_FOUND" and th["completion"]["experiment"] == "RAN_AS_SPECIFIED"
+
+
+def test_data_the_run_never_compared_with_the_paper_is_not_the_requested_data():
+    with tempfile.TemporaryDirectory() as t:
+        root = Path(t)
+        c = {"id": "C1", "kind": "RECONSTRUCTION", "acquire": [{"source": "s"}], "values": [1.0], "data_identity": {}}
+        state.write_json(root / "checks" / "C1" / "data.json", {"sources": [{"source": "s", "admitted_files": 3}], "n_files": 3})
+        assert any("no REFEREE_DATA" in g for g in report._data_changed(c, root))
+        ok = {**c, "data_identity": {"cifar": {"matches": True}}}
+        assert report._data_changed(ok, root) == []
+        for v in (False, None, "no"):
+            assert report._data_changed({**c, "data_identity": {"cifar": {"matches": v}}}, root)
+        assert report._data_changed({**ok, "kind": "CERTIFICATE"}, root) == []
+
+
+def test_support_words_are_earned_by_the_claim_not_only_by_the_check():
+    """Probe: 'C1 reproduces the paper' passed the gate while C1's claim ran with changes; the honest 'Nothing here
+    shows that any paper result was reproduced.' was withheld (a 30-character negation window)."""
+    cc = lambda exp, st: {"quote": "q", "checks": ["C1"], "claim_status": st, "completion": {"experiment": exp}}
+    chk = {"id": "C1", "kind": "RECONSTRUCTION", "status": "RELATION_HOLDS", "deviations": [], "data_changed": []}
+    led = {"checks": [chk], "central_claims": [cc("RAN_WITH_CHANGES", "READING_CHANGED")], "concerns": []}
+    assert report.unearned("C1 reproduces the paper's comparison.", led)
+    led["central_claims"] = [cc("RAN_AS_SPECIFIED", "SUPPORT_FOUND")]
+    assert not report.unearned("C1 reproduces the paper's comparison.", led)
+    assert report.unearned("C1 reproduces it.", {**led, "checks": [{**chk, "data_changed": ["cut listing"]}]})
+    assert not report.unearned("Nothing here shows that any paper result was reproduced.", led)
+    assert report.unearned("Nothing failed, and the main result was reproduced.", led)      # another clause asserts it
+
+
+def test_status_never_presents_an_interrupted_review_as_finished():
+    """Sep-30 rerun 2 conformal: the ledger was written before plan:2 added three checks; `run.py status` printed it
+    as CENTRAL_FAILURE_FOUND, 6 of 6 checks terminal, while 3 more were running. PPRM had no ledger and was not listed."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid = _project(td)
+        root = td / pid
+        state.write_json(root / "seals.json", {"plan": "x"})
+        assert report.progress(root).startswith("IN PROGRESS")
+        (root / "review.md").write_text("old", encoding="utf-8")
+        state.write_json(root / "seals.json", {"plan": "x", "report": "y"})
+        old = time.time() - 100
+        os.utime(root / "review.md", (old, old))
+        assert report.progress(root).startswith("IN PROGRESS")       # a seal written after the review
+        os.utime(root / "review.md", None)
+        assert report.progress(root) == "FINISHED"
+        state.write_json(root / "checks" / "C9" / "outcome.json", {"status": "INCONCLUSIVE"})
+        os.utime(root / "checks" / "C9" / "outcome.json", (time.time() + 50, time.time() + 50))
+        assert report.progress(root).startswith("IN PROGRESS")       # an outcome newer than the review
+
+
+def test_one_printed_definition_applied_differently_is_shown_side_by_side():
+    """Sep-30 rerun 2 transformer: C1, C3 and C4 dropped the unparsed rows the paper says it discarded, C2, C5 and C7
+    kept them, each re-finding the same sentence; nothing showed the disagreement."""
+    printed = "The remaining 1% of cases were discarded while preparing the final graphs"
+    d = lambda used: {"printed": printed, "page": 20, "used": used, "why": "", "changes_claim": False}
+    checks = [{"id": "C1", "deviations": [d("unparsed rows dropped")]}, {"id": "C2", "deviations": [d("every row kept")]},
+              {"id": "C3", "deviations": [d("unparsed rows dropped")]}]
+    out = report.definition_choices(checks)
+    assert len(out) == 1 and {tuple(u["checks"]) for u in out[0]["choices"]} == {("C1", "C3"), ("C2",)}
+    assert report.definition_choices([checks[0], checks[2]]) == []          # the same choice twice: nothing to show
+    assert report.definition_choices([{"id": "C1", "deviations": [d("a"), d("b")]}]) == []   # one check, not a disagreement
+
+
+def test_a_reading_not_yet_decided_beside_a_decided_one_is_no_disagreement():
+    """Replay of R0 conformal C5: 17 stages paired a decided reading with one that only more replicates could decide;
+    counting them as READINGS_DIFFER would assert a disagreement nobody measured."""
+    from harness.reconcile import READINGS_DIFFER, reconcile
+    dec = lambda staged, **kw: reconcile("RECONSTRUCTION", "", [e[1] for e in staged], "", {}, True, True, "", "gain > 0",
+                                         staged=staged, readings=["paper", "code"], **kw)
+    holds = [["s", m, "paper"] for m in (0.3, 0.31, 0.29)]
+    noisy = [["s", m, "code"] for m in (0.3, -0.2, 0.5)]
+    fails = [["s", m, "code"] for m in (-0.3, -0.31, -0.29)]
+    out = dec(holds + noisy)
+    assert out["status"] == "INCONCLUSIVE" and out["readings_undecided_in"] == ["s"]
+    assert dec(holds + fails)["status"] == READINGS_DIFFER                   # both decided, different findings
+    point = reconcile("RELEASED_DATA", "0.22", [0.0135, 0.214], "", {}, False, True, "", staged=[
+        ["s", 0.0135, "paper"], ["s", 0.214, "code"]], readings=["paper", "code"], deterministic=True)
+    assert point["status"] == READINGS_DIFFER                                 # values apart beyond the printed precision
+
+
+# --- 2026-10-01 audit: readings, replicate independence, proportions, certificates -----------------
+# The decision kernel's statistics: readings per stage, run-time independence of replicates, proportions,
+# certificates and the result schema (invariants 15, 16, 17, 19, 20, 21, 22). Each check fails if a guarantee breaks.
+# Run: python tests/_t_stats.py   (or pytest).
+
+def _rows(outs, stage="a", reading="", fps=None, trials=None, seeds=None):
+    """Per-run detail as execute.result_detail records it: one row per result line."""
+    return [{"seed": s, "stage": stage, "reading": reading, "out": o, "trials": dict(trials or {}),
+             "data_fp": (fps or {}).get(s)} for s, o in zip(seeds or range(len(outs)), outs)]
+
+
+def _rel(rel, detail, margins, stage="a", rng=None, det=False, kind="RECONSTRUCTION"):
+    staged = [[stage, m] for m in margins]
+    return reconcile(kind, "", margins, "", {}, kind == "RECONSTRUCTION", True, "", rel, staged=staged, detail=detail,
+                     rng=rng, deterministic=det)
+
+
+def _distinct(n):
+    return {i: f"fp{i}" for i in range(n)}
+
+
+# --- A. readings ---------------------------------------------------------------------------
+def test_readings_are_decided_per_stage_over_the_union_of_stages():
+    """Rerun compact C5: chain 1.294 vs trimmed 1.144 against a printed 1.0 (+-0.05), one stage each,
+    read 'every reading gives the same finding'. New3 compact C5: 21 of 60 stages differ between readings
+    while both aggregates read RELATION_VIOLATED; only the first reading's stages were shown."""
+    p, c = [1.0, 1.3, 1.58], [1.1, 1.15, 1.2]
+    st = [["trip", v, "chain"] for v in p] + [["trip", v, "trim"] for v in c]
+    r = reconcile("RECONSTRUCTION", "1.0", [e[1] for e in st], "", {}, True, True, "", staged=st, readings=["chain", "trim"])
+    assert r["status"] == READINGS_DIFFER and "trip" in r["reason"], r["reason"]
+    assert abs(r["readings"]["chain"]["stages"]["trip"]["reproduced"] - 1.293333) < 1e-5
+    assert abs(r["readings"]["trim"]["stages"]["trip"]["reproduced"] - 1.15) < 1e-9
+    assert r["stages"]["trip"]["status"] == READINGS_DIFFER                       # the cross-reading stage table
+    # two aggregates that agree while their stages do not
+    rel = "x >= 0"
+    dec = lambda staged, **kw: reconcile("RELEASED_DATA", "", [e[1] for e in staged], "", {}, False, True, "", rel,
+                                         staged=staged, readings=["paper", "code"], deterministic=True, **kw)
+    hidden = [["s1", 1, "paper"], ["s2", 1, "paper"], ["s3", -1, "paper"],
+              ["s1", 1, "code"], ["s2", -1, "code"], ["s3", 1, "code"]]
+    h = dec(hidden)
+    assert h["status"] == READINGS_DIFFER and "s2" in h["reason"] and "s3" in h["reason"] and "s1" not in h["reason"], h
+    assert h["readings"]["paper"]["stages"]["s3"]["status"] == "RELATION_VIOLATED"
+    assert h["readings"]["code"]["stages"]["s2"]["status"] == "RELATION_VIOLATED"   # every reading's own table is kept
+    assert h["stages"]["s1"]["status"] == "RELATION_HOLDS" and h["stages"]["s2"]["status"] == READINGS_DIFFER
+    # a reading missing in a stage the other reading measured: undecided, the stage named
+    miss = dec([["a", 2, "paper"], ["b", 2, "paper"], ["a", 2, "code"]])
+    assert miss["status"] == "INCONCLUSIVE" and miss["missing_readings"] == {"b": ["code"]}, miss
+    # agreement: the shared status stands, both tables are carried
+    same = dec([["a", 2, "paper"], ["b", 1, "paper"], ["a", 3, "code"], ["b", 0.5, "code"]])
+    assert same["status"] == "RELATION_HOLDS" and set(same["readings"]) == {"paper", "code"}
+    assert same["readings"]["code"]["stages"]["b"]["margin"] == 0.5 and same["stages"]["b"]["status"] == "RELATION_HOLDS"
+    # a point value per stage: equal statuses, values apart beyond the printed precision
+    pts = reconcile("RELEASED_DATA", "0.32", [0.30, 0.34], "", {}, False, True, "", staged=[["s", 0.30, "a"], ["s", 0.34, "b"]],
+                    readings=["a", "b"], deterministic=True)
+    assert pts["status"] == READINGS_DIFFER and "s" in pts["stages"], pts
+    close = reconcile("RELEASED_DATA", "0.3", [0.30, 0.31], "", {}, False, True, "", staged=[["s", 0.30, "a"], ["s", 0.31, "b"]],
+                      readings=["a", "b"], deterministic=True)
+    assert close["status"] == "RESOLVED_VERIFIED", close                      # within the printed 0.05
+    # unstaged readings keep their own top-level values
+    un = reconcile("RELEASED_DATA", "0.22", [0.0135, 0.214], "", {}, False, True, "",
+                   staged=[["", 0.0135, "paper"], ["", 0.214, "code"]], readings=["paper", "code"], deterministic=True)
+    assert un["status"] == READINGS_DIFFER and un["readings"]["paper"]["reproduced"] == 0.0135
+    # a stage not completed under both readings is partial, not a missing reading; the completed stages still compare
+    part = dec([["a", 1, "paper"], ["a", -1, "code"]], stage_errors={"b": "exit 1"}, failed={"0": "exit 1"})
+    assert part["status"] == "PARTIAL" and part["status_on_completed"] == READINGS_DIFFER, part
+
+
+def test_undeclared_reading_tags_are_never_pooled():
+    """Two definitions printed under `reading` by a check that declared none were pooled into one sample
+    (0.0135 and 0.214 vs 0.22 -> RESOLVED_VERIFIED; 2 readings x 3 seeds -> a t-test over n=6)."""
+    two = [["", 0.0135, "paper"], ["", 0.214, "code"]]
+    r = reconcile("RECONSTRUCTION", "0.22", [0.0135, 0.214], "", {}, True, True, "", staged=two)
+    assert r["status"] == "INCONCLUSIVE" and "reading" in r["reason"] and r.get("n") != 2, r
+    six = [["", v, rd] for rd, v in (("paper", 0.30), ("code", 0.31)) for _ in range(3)]
+    r6 = reconcile("RECONSTRUCTION", "", [e[1] for e in six], "", {}, True, True, "", "x > 0", staged=six)
+    assert r6["status"] == "INCONCLUSIVE" and r6.get("n") != 6, r6
+    other = reconcile("RELEASED_DATA", "0.22", [0.22, 0.22, 0.5], "", {}, False, True, "",
+                      staged=[["", 0.22, "paper"], ["", 0.22, "code"], ["", 0.5, "other"]], readings=["paper", "code"],
+                      deterministic=True)
+    assert other["status"] == "INCONCLUSIVE" and "other" in other["reason"], other
+    chk = {"kind": "RECONSTRUCTION", "metric": "m", "stochastic": False}
+    out = 'REFEREE_RESULT {"m": 0.0135, "reading": "paper"}\nREFEREE_RESULT {"m": 0.214, "reading": "code"}'
+    assert any("`reading`" in d and "declares no readings" in d for d in execute.result_schema({"stdout": out}, chk))
+    two_defs = {"kind": "RELEASED_DATA", "metric": "m", "readings": [{"name": "paper"}, {"name": "code"}]}
+    ints = 'REFEREE_RESULT {"m": 1, "reading": "paper", "cohort": 200}\nREFEREE_RESULT {"m": 2, "reading": "code", "cohort": 200}'
+    assert any("not a list of item ids" in d for d in execute.result_schema({"stdout": ints}, two_defs))
+    apart = ints.replace('"cohort": 200}\nREFEREE_RESULT {"m": 2, "reading": "code", "cohort": 200',
+                         '"cohort": 200}\nREFEREE_RESULT {"m": 2, "reading": "code", "cohort": 300')
+    assert execute.cohort_mismatch(apart, two_defs) == ["(no stage)"]       # still compared, never blind
+
+
+def test_a_certificate_reading_tag_never_makes_a_counterexample():
+    out = ('REFEREE_RESULT {"violated": 0, "premises_hold": 1, "reading": "paper"}\n'
+           'REFEREE_RESULT {"violated": 1, "premises_hold": 1, "reading": "code"}')
+    rows = execute.cert_rows(out)
+    assert rows[1]["reading"] == "code" and "reading" not in execute.cert_rows('REFEREE_RESULT {"violated": 0}')[0]
+    r = reconcile("CERTIFICATE", "", [], "", {}, False, True, "", cert=rows, readings=["paper", "code"])
+    assert r["status"] != "COUNTEREXAMPLE_FOUND" and r["status"] == "VIOLATION_UNDER_CHANGED_READING", r
+    lit = [{"violated": 0, "premises": 1, "literal": "fails", "reading": "code", "exact": False}]
+    assert certificate(lit, False, False)["status"] != "COUNTEREXAMPLE_FOUND"
+    plain = [{"violated": 1, "premises": 1, "literal": None, "exact": False}]
+    assert certificate(plain, False, False)["status"] == "COUNTEREXAMPLE_FOUND"     # an untagged instance still decides
+
+
+def _replay():
+    spec = importlib.util.spec_from_file_location("replay", Path(__file__).resolve().parent.parent / "tools" / "replay.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _check_dir(root: Path, cid: str, check: dict, rows: list, recs: list, outcome: dict) -> Path:
+    cdir = root / "checks" / cid
+    cdir.mkdir(parents=True, exist_ok=True)
+    state.write_json(cdir / "check.json", {"id": cid, **check})
+    state.write_json(cdir / "outcome.json", outcome)
+    (cdir / "seeds.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    with (root / "execution.jsonl").open("a", encoding="utf-8") as f:
+        f.writelines(json.dumps({"target": cid, "mode": "evidence", "returncode": 0, "stderr": "", "seconds": 5, **r}) + "\n"
+                     for r in recs)
+    return cdir
+
+
+def test_replay_decides_by_the_same_path_as_execute():
+    """tools/replay.py passed no `readings` cohort mismatch and counted only the first reading's stages."""
+    replay = _replay()
+    with tempfile.TemporaryDirectory() as t:
+        root = Path(t) / "p"
+        root.mkdir()
+        defs = [{"name": "paper", "source": "paper"}, {"name": "code", "source": "a.py"}]
+        moved = ('REFEREE_RESULT {"ece": 0.0135, "reading": "paper", "cohort": ["m1", "m2"]}\n'
+                 'REFEREE_RESULT {"ece": 0.214, "reading": "code", "cohort": ["m2", "m3"]}')
+        chk = {"kind": "RELEASED_DATA", "metric": "ece", "printed": "0.22", "runs": 1, "script_sha256": "s1", "readings": defs}
+        staged = execute.staged_values(moved, "", "ece")
+        cdir = _check_dir(root, "C1", chk, [{"key": "s1", "seed": 0, "values": [0.0135, 0.214], "staged": staged,
+                                             "seconds": 5, "error": "", "stage_errors": {}, "units": [], "schema": [],
+                                             "cohort_mismatch": ["(no stage)"], "detail": execute.result_detail(moved, 0)}],
+                          [{"script_sha256": "s1", "seed": 0, "stdout": moved}], {"status": READINGS_DIFFER})
+        got = replay.replay(cdir)
+        st = {}
+        execute.reuse_checkpoints(root, cdir, {"id": "C1", **chk}, st)
+        want = execute._reconciled({"id": "C1", **chk}, st, True, "", failure="")
+        assert got["new_status"] == want["status"] == "INCONCLUSIVE", (got["new_status"], want["status"])
+        # identical reruns are counted under every reading, not under the first one only
+        same = lambda s: 'REFEREE_RESULT {"stage": "a", "x": 0.5, "reading": "paper", "cohort": [1]}\n' \
+                         'REFEREE_RESULT {"stage": "a", "x": 0.7, "reading": "code", "cohort": [1]}'
+        chk2 = {"kind": "RECONSTRUCTION", "metric": "x", "printed": "0.5", "runs": 3, "script_sha256": "s2", "readings": defs,
+                "stochastic": True}
+        rows = [{"key": "s2", "seed": s, "values": [0.5, 0.7], "staged": execute.staged_values(same(s), "", "x"),
+                 "seconds": 5, "error": "", "stage_errors": {}, "units": [], "schema": [], "cohort_mismatch": [],
+                 "detail": execute.result_detail(same(s), s)} for s in range(3)]
+        c2 = _check_dir(root, "C2", chk2, rows, [{"script_sha256": "s2", "seed": s, "stdout": same(s)} for s in range(3)],
+                        {"status": "INCONCLUSIVE"})
+        g2 = replay.replay(c2)
+        assert g2["identical_stages"] == 2, g2
+
+
+# --- B. independence of replicates ---------------------------------------------------------
+def test_static_seed_flow_never_makes_repeated_lines_replicates():
+    """Synthetic: stage B draws from default_rng(0) inside a script whose --seed seeds stage A. The static
+    flow is True for the whole script, so 6 identical duplicates passed the sign test (n_independent 6) and
+    0/400 was pooled to 0/2400."""
+    same = _rows([{"gain": 0.2}] * 6)
+    a = independence.assess(same, "a", "", True)
+    assert not a["independent"] and a["state"] == "unproven" and "static" in a["basis"], a
+    r = _rel("gain > 0", same, [0.2] * 6, rng=True)["stages"]["a"]
+    assert r["status"] == "INCONCLUSIVE" and r["n_independent"] == 1, r
+    b = _rel("fa < delta", _rows([{"fa": 0.0, "delta": 0.005}] * 6, trials={"fa": 400}), [0.005] * 6, rng=True)["stages"]["a"]
+    assert b["status"] == "INCONCLUSIVE" and b["trials"] == 400 and b["n_independent"] == 1, b
+    twin = _rows([{"gain": 0.2}] * 6, fps={i: "same" for i in range(6)})     # identical lines, identical fingerprints
+    assert independence.assess(twin, "a", "", True)["state"] == "identical"
+    assert _rel("gain > 0", twin, [0.2] * 6, rng=True)["stages"]["a"]["n_independent"] == 1
+    shown = _rows([{"gain": 0.2}] * 6, fps=_distinct(6))                     # the run's own evidence decides
+    d = _rel("gain > 0", shown, [0.2] * 6, rng=False)["stages"]["a"]
+    assert d["status"] == "RELATION_HOLDS" and d["n_independent"] == 6, d
+    # a stochastic reconstruction owes a data fingerprint on every result line
+    chk = {"kind": "RECONSTRUCTION", "stochastic": True, "metric": "acc", "test": "performance"}
+    fp = lambda out: [x for x in execute.result_schema({"stdout": out}, chk) if "data_fingerprint" in x]
+    assert fp('REFEREE_RESULT {"acc": 0.8}\nREFEREE_RESULT {"acc": 0.7, "data_fingerprint": "ab"}')
+    assert not fp('REFEREE_RESULT {"acc": 0.8, "data_fingerprint": "ab"}')
+    assert not [x for x in execute.result_schema({"stdout": 'REFEREE_RESULT {"acc": 0.8}'}, {**chk, "stochastic": False})
+                if "data_fingerprint" in x]
+    assert not [x for x in execute.result_schema({"stdout": 'REFEREE_RESULT {"acc": 0.8}'}, {**chk, "test": "compatibility"})
+                if "data_fingerprint" in x]
+    with tempfile.TemporaryDirectory() as t:        # the harness's draft run is held to it too
+        root = Path(t)
+        plan = {"checks": [{"id": "C1", "kind": "RECONSTRUCTION", "metric": "", "test": "performance"}], "central_claims": []}
+        seals = {}
+        for tid, obj in (("plan", plan), ("gen:C1.1", {"metric": "acc", "stochastic": True})):
+            path = root / "sealed" / f"{tasks._safe(tid)}.json"
+            state.write_json(path, obj)
+            seals[tid] = state.sha256(path.read_bytes())
+        state.write_json(root / "seals.json", seals)
+        assert execute._smoke_check(root, "C1", 1).get("stochastic") is True
+
+
+def test_a_fixed_dataset_with_seeded_training_is_different_runs():
+    """Acquired data are fixed (one fingerprint), training is seeded: the other outputs differ, so the runs differ."""
+    fixed = _rows([{"gain": 0.2, "loss": v} for v in (.31, .29, .35, .30, .33, .28)], fps={i: "same" for i in range(6)})
+    assert independence.assess(fixed, "a", "", None)["state"] == "different"
+    r = _rel("gain > 0", fixed, [0.2] * 6)["stages"]["a"]
+    assert r["status"] == "RELATION_HOLDS" and r["n_independent"] == 6, r
+
+
+def test_a_compared_proportion_is_a_proportion_and_pooled_only_when_seeds_agree():
+    """Rerun compact C6: `binomial: {"margin": 20000}` on margin = coverage - phi; a seed's margin -0.0229 was
+    counted as -458 events and 10 seeds pooled to 10685/200000 while the seeds spread by ~0.05."""
+    mg = [0.00555, 0.09835, 0.06935, 0.1398, 0.0388, 0.0952, -0.0229, 0.04245, -0.0154, 0.08305]
+    neg = _rel("margin >= 0", _rows([{"margin": m} for m in mg], fps=_distinct(10), trials={"margin": 20000}), mg)["stages"]["a"]
+    assert "events" not in neg and neg["rule"].startswith("mean paired margin"), neg
+    chk = {"kind": "RECONSTRUCTION", "stochastic": True, "target": {"relation": "margin >= 0"}}
+    line = 'REFEREE_RESULT {"margin": -0.0229, "binomial": {"margin": 20000}, "data_fingerprint": "x"}'
+    assert any("binomial" in d for d in execute.result_schema({"stdout": line}, chk))
+    # every value a whole count of its trials, but the seeds disagree far beyond binomial noise: not pooled
+    cov = [0.70, 0.66, 0.74]
+    het = _rel("coverage >= phi", _rows([{"coverage": c, "phi": 0.69} for c in cov], fps=_distinct(3),
+                                         trials={"coverage": 20000}), [c - 0.69 for c in cov])["stages"]["a"]
+    assert het["status"] == "INCONCLUSIVE" and "events" not in het and het.get("binomial_not_pooled"), het
+    pos = [0.20555, 0.25, 0.18, 0.22, 0.24, 0.19]
+    p5 = _rel("margin >= 0", _rows([{"margin": m} for m in pos], fps=_distinct(6), trials={"margin": 20000}), pos)["stages"]["a"]
+    assert "events" not in p5 and p5["status"] == "RELATION_HOLDS" and p5["rule"].startswith("mean paired margin"), p5
+    # seeds that agree are pooled; zero events in every seed agree
+    hom = _rel("fa < delta", _rows([{"fa": k / 400, "delta": 0.25} for k in (2, 3, 2)], fps=_distinct(3),
+                                   trials={"fa": 400}), [0.25 - k / 400 for k in (2, 3, 2)])["stages"]["a"]
+    assert hom["status"] == "RELATION_HOLDS" and hom["events"] == 7 and hom["trials"] == 1200, hom
+    zero = _rel("fa < delta", _rows([{"fa": 0.0, "delta": 0.25}] * 3, fps=_distinct(3), trials={"fa": 400}), [0.25] * 3)
+    assert zero["stages"]["a"]["trials"] == 1200 and zero["stages"]["a"]["status"] == "RELATION_HOLDS"
+    third = _rel("fa < delta", _rows([{"fa": 1 / 3, "delta": 0.5}] * 3, fps=_distinct(3), trials={"fa": 400}),
+                 [0.5 - 1 / 3] * 3)["stages"]["a"]
+    assert "events" not in third, third                                       # 133.3 of 400 is not a count
+
+
+def test_checkpointed_seeds_without_detail_are_rebuilt_or_missing_never_identical():
+    with tempfile.TemporaryDirectory() as t:
+        root = Path(t) / "p"
+        root.mkdir()
+        out = lambda s: f'REFEREE_PROGRESS {{"units": ["a"]}}\nREFEREE_RESULT {{"stage": "a", "gain": 0.2, "n": {s}}}'
+        chk = {"kind": "RECONSTRUCTION", "stochastic": True, "seed_flow": True, "runs": 3, "script_sha256": "s1",
+               "target": {"relation": "gain > 0"}}
+        rows = [{"key": "s1", "seed": s, "values": [0.2], "staged": [["a", 0.2]], "seconds": 7, "error": "",
+                 "stage_errors": {}, "units": ["a"]} for s in range(3)]                  # written before `detail` existed
+        cdir = _check_dir(root, "C1", chk, rows, [{"script_sha256": "s1", "seed": s, "stdout": out(s)} for s in range(2)],
+                          {"status": "INCONCLUSIVE"})
+        st = {}
+        execute.reuse_checkpoints(root, cdir, {"id": "C1", **chk}, st)
+        assert [r for r in st["detail"] if r["seed"] == 1] == execute.result_detail(out(1), 1)
+        assert any(r.get("missing") and r["seed"] == 2 for r in st["detail"]), st["detail"]
+        res = execute._reconciled({"id": "C1", **chk}, st, True, "", failure="")["stages"]["a"]
+        assert res["status"] == "INCONCLUSIVE" and res.get("n_independent") != 1 and "did not vary" not in res["reason"], res
+        assert "seed" in res["reason"] and "2" in res["reason"]
+        assert st["seed_seconds"] == {"0": 7, "1": 7, "2": 7}
+        with (root / "execution.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"target": "C1", "mode": "evidence", "returncode": 0, "stderr": "", "script_sha256": "s1",
+                                "seed": 2, "stdout": out(2)}) + "\n")
+        st = {}
+        execute.reuse_checkpoints(root, cdir, {"id": "C1", **chk}, st)
+        res = execute._reconciled({"id": "C1", **chk}, st, True, "", failure="")["stages"]["a"]
+        assert res["n_independent"] == 3 and res.get("needs_replicates") == 6, res
+
+
+def test_the_extension_to_six_counts_the_time_already_spent():
+    with tempfile.TemporaryDirectory() as t:
+        cfg = state.Config()
+        cfg.projects, cfg.parallel, cfg.check_budget_s = Path(t), 2, 7200
+        state.write_json(Path(t) / ".gpu.json", False)
+        check = {"kind": "RECONSTRUCTION", "stochastic": True, "target": {"relation": "gain > 0"}, "runs": 3}
+        st = lambda pilot, **kw: {"values": [0.2] * 3, "staged": [["a", 0.2]] * 3, "seed": 3, "pilot_s": pilot, "width": 2,
+                                  "detail": _rows([{"gain": 0.2, "n": s} for s in range(3)]), **kw}
+        assert execute._extension(cfg, check, st(100), 3) == 6
+        # three more at 2000 s, two at a time, fit alone (3000 s); with the 6000 s already spent they do not
+        assert execute._extension(cfg, check, st(2000), 3) == 0
+        # the recorded seconds of the seeds count, not the pilot's alone
+        assert execute._extension(cfg, check, st(1000, seed_seconds={"0": 1000, "1": 3000, "2": 3000}), 3) == 0
+        assert execute._extension(cfg, check, st(1000, seed_seconds={"0": 1000, "1": 1000, "2": 1000}), 3) == 6
+
+
+def test_independent_replicates_of_one_point_value_are_decided_by_an_exact_test():
+    """Six independent replicates at 0.80 vs a printed 0.95 stayed INCONCLUSIVE ('a deterministic run')."""
+    d6 = _rows([{"acc": 0.8}] * 6, stage="", fps=_distinct(6))
+    pt = lambda printed, n, detail, **kw: reconcile("RECONSTRUCTION", printed, [0.8] * n, "", {}, True, True, "",
+                                                    detail=detail, **kw)
+    six = pt("0.95", 6, d6)
+    assert six["status"] == "FAILED_REPRODUCTION" and six["n_independent"] == 6 and "sign test" in six["rule"], six
+    three = pt("0.95", 3, d6[:3])
+    assert three["status"] == "INCONCLUSIVE" and three.get("needs_replicates") == 6 and "sign test" in three["reason"], three
+    assert pt("0.80", 3, d6[:3])["status"] == "RESOLVED_VERIFIED"
+    one = pt("0.95", 3, _rows([{"acc": 0.8}] * 3, stage=""))
+    assert one["status"] == "INCONCLUSIVE" and one["n_independent"] == 1 and "deterministic run" not in one["reason"], one
+    assert "one measurement" in one["reason"]
+    db = _rows([{"acc": 0.8}] * 3, stage="", fps=_distinct(3), trials={"acc": 100})
+    cp = pt("0.95", 3, db, metric="acc")
+    assert cp["status"] == "FAILED_REPRODUCTION" and cp["trials"] == 300, cp
+    assert pt("0.82", 3, db, metric="acc")["status"] == "RESOLVED_VERIFIED"
+    # outside the pooled interval [0.750, 0.844] but inside one replicate's own [0.708, 0.873]: noise, not a failure
+    near = pt("0.86", 3, db, metric="acc")
+    assert near["status"] == "INCONCLUSIVE" and near["one_run_ci"][1] > 0.86, near
+    cfg = state.Config()
+    st = {"values": [0.8] * 3, "staged": [["", 0.8]] * 3, "detail": d6[:3], "seed": 3, "pilot_s": 10}
+    assert execute._extension(cfg, {"kind": "RECONSTRUCTION", "stochastic": True, "printed": "0.95", "runs": 3}, st, 3) == 6
+
+
+def test_a_time_like_output_is_a_whole_token():
+    differ = lambda key: independence.assess(_rows([{"fa": 0.0, key: v} for v in (3, 4, 5)]), "a", "", None)["state"]
+    for key in ("intersection_size", "n_timesteps", "consecutive_alarms"):
+        assert differ(key) == "different", key
+    for key in ("seconds", "elapsed_s", "wall_time", "time", "runtime", "trainTime", "fit_secs"):
+        assert differ(key) != "different", key
+    # unresolved: `detection_time` (a delay in samples) shares the whole token `time` with a wall clock; it stays ignored,
+    # the conservative side (one wall-clock output must never turn duplicates into "different runs")
+    assert differ("detection_time") != "different"
+
+
+# --- C. certificates -----------------------------------------------------------------------
+def test_a_certificate_instance_is_admissible_only_when_its_premises_were_evaluated_and_hold():
+    row = lambda v, p, lit=None, **kw: {"violated": v, "premises": p, "literal": lit, "exact": False, **kw}
+    unsaid = certificate([row(0, None)] * 2, False, False)
+    assert unsaid["status"] == "INCONCLUSIVE" and unsaid["admissible"] == 0, unsaid
+    assert reconcile("CERTIFICATE", "", [0, 0], "", {}, False, True, "")["status"] == "INCONCLUSIVE"
+    mixed = certificate([row(0, 1), row(0, None)], False, False)
+    assert mixed["status"] == "NO_VIOLATION_FOUND" and "all 1 admissible" in mixed["reason"], mixed
+    fuzzy = row(0, 1, "fails", lhs=1.0, rhs=1.0 + 1e-12)
+    f = certificate([fuzzy], False, False)
+    assert f["status"] == "INCONCLUSIVE" and f.get("below_precision") == 1, f
+    assert certificate([{**fuzzy, "exact": True}], False, False)["status"] == "COUNTEREXAMPLE_FOUND"
+    assert certificate([row(0, 1, "fails", lhs=1.0, rhs=2.0)], False, False)["status"] == "COUNTEREXAMPLE_FOUND"
+    defects = execute.result_schema({"stdout": 'REFEREE_RESULT {"violated": 0}'}, {"kind": "CERTIFICATE"})
+    assert any("premises_hold" in d for d in defects), defects
+    assert execute.result_schema({"stdout": 'REFEREE_RESULT {"violated": 0, "premises_hold": 1}'}, {"kind": "CERTIFICATE"}) == []
+
+
+# --- D. data identity ----------------------------------------------------------------------
+def test_a_check_that_acquired_data_owes_a_data_identity_line():
+    chk = {"kind": "RECONSTRUCTION", "stochastic": False, "metric": "acc", "acquire": [{"url": "https://zenodo.org/r/1"}]}
+    ids = lambda out, err="", c=chk: [d for d in execute.result_schema({"stdout": out, "stderr": err}, c) if "REFEREE_DATA" in d]
+    res = 'REFEREE_RESULT {"acc": 1}'
+    assert ids(res)
+    assert not ids(res, 'REFEREE_DATA {"dataset": "d", "matches": true}')          # either stream
+    assert ids(res + '\nREFEREE_DATA {"dataset": "d", "matches": "yes"}')
+    assert not ids(res, c={**chk, "acquire": []})
+
+
+# --- 2026-10-01 audit: public-data acquisition -----------------------------------------------------
+# Public-data acquisition: citations, partial sets, failure classes, content validation, hub downloads,
+# discovery metadata, host facts and quote-only released code. Run: python tests/_t_data.py [test_name ...]
+
+# --- 1. citation edges -------------------------------------------------------------------------
+def test_a_source_copied_from_prose_loses_the_sentences_punctuation_only():
+    """Conformal paper: "https://doi.org/10.24432/C55W25." was planned with its full stop; the dotted URL 404s and
+    read as a permanent-looking DATA BLOCKER."""
+    from harness.evidence import clean_source
+    for raw, want in (("https://doi.org/10.24432/C55W25.", "https://doi.org/10.24432/C55W25"),
+                      ("https://x.org/a.csv),", "https://x.org/a.csv"), ("(https://x.org/a.csv)", "https://x.org/a.csv"),
+                      ('"https://x.org/a.zip";', "https://x.org/a.zip"), ("<https://x.org/a>", "https://x.org/a"),
+                      ("https://x.org/a]", "https://x.org/a"), ("https://x.org/a}:", "https://x.org/a"),
+                      ("https://x.org/a’", "https://x.org/a"), ("https://zeno­do.org/records/1", "https://zenodo.org/records/1"),
+                      ("https://en.wikipedia.org/wiki/Foo_(bar)", "https://en.wikipedia.org/wiki/Foo_(bar)"),
+                      ("https://en.wikipedia.org/wiki/Foo_(bar)).", "https://en.wikipedia.org/wiki/Foo_(bar)"),
+                      ("hf://datasets/o/n.", "hf://datasets/o/n"), ("https://x.org/data/", "https://x.org/data/")):
+        assert clean_source(raw) == want, (raw, clean_source(raw), want)
+    p = Paper(["The data are at https://doi.org/10.24432/C55W25. We use it."])
+    hit = p.cites("https://doi.org/10.24432/C55W25.")
+    assert hit and not any(v.endswith(".") for v in hit["variants"]), hit
+
+
+CITE_PAGES = ["Weights: https://huggingface.co/acme/net-7b and corpus huggingface.co/datasets/acme/corpus.\n"
+              "Records: https://zenodo.org/record/7654321 and www.zenodo.org/records/5550001 and "
+              "https://zeno­do.org/records/4440001 too.\nDOI https://doi.org/10.5555/ABC.Def is printed in capitals."]
+
+
+def test_one_record_cited_in_another_url_form_is_the_same_citation():
+    p = Paper(CITE_PAGES)
+    hit = p.cites("https://zenodo.org/records/7654321")
+    assert hit and "https://zenodo.org/record/7654321" in hit["variants"], ("record/ vs records/", hit)   # the printed reading kept
+    assert p.cites("https://zenodo.org/record/5550001"), "records/ printed, record/ planned"
+    www = p.cites("https://zenodo.org/records/5550001")
+    assert www and www["span"].startswith("www."), ("an optional www.", www)
+    assert p.cites("https://www.zenodo.org/records/7654321"), "www. planned, none printed"
+    assert p.cites("hf://models/acme/net-7b"), "a printed model URL cites hf://models"
+    assert p.cites("hf://datasets/acme/corpus"), "a printed dataset URL cites hf://datasets"
+    soft = p.cites("https://zenodo.org/records/4440001")
+    assert soft and not any("­" in v for v in soft["variants"]), ("a soft hyphen is folded out of variants", soft)
+    case = p.cites("https://doi.org/10.5555/abc.def")
+    assert case and "https://doi.org/10.5555/ABC.Def" in case["variants"], ("the printed case is an alternate", case)
+    for wrong in ("https://zenodo.org/records/765432", "https://zenodo.org/record/765432", "https://zenodo.org/records/76543210",
+                  "https://example.org/record/7654321", "https://ww.zenodo.org/records/5550001", "hf://datasets/acme/net-7b",
+                  "hf://models/acme/corpus", "hf://models/acme/net-7"):
+        assert p.cites(wrong) is None, wrong                                     # another record, host or hub kind is refused
+
+
+# --- 2. a partial file set is partial ----------------------------------------------------------------
+def _record_server(files: dict, routes_extra: dict | None = None, md5s: dict | None = None):
+    """A repository with a records API: files {name: bytes | None (listed, 404)}; md5s overrides a published md5."""
+    from harness import fetcher
+    box: dict = {}
+    listing = lambda: json.dumps({"files": [
+        {"key": n, "size": len(b) if b is not None else 7, "checksum": "md5:" + ((md5s or {}).get(n) or hashlib.md5(b or b"").hexdigest()),
+         "links": {"self": f"http://{box['host']}/files/{n}"}} for n, b in files.items()]}).encode()
+    routes = {"/records/5": lambda h: (200, {"Content-Type": "text/html"}, b"<html>record</html>"),
+              "/api/records/5": lambda h: (200, {}, listing())}
+    routes.update({f"/files/{n}": (lambda h, b=b: (200, {}, b)) for n, b in files.items() if b is not None})
+    routes.update(routes_extra or {})
+    srv, host = _serve(routes)
+    box["host"] = host
+    fetcher.RECORD_APIS[host] = f"http://{host}/api/records/{{id}}"
+    return srv, host
+
+
+def test_a_set_with_a_named_file_missing_is_partial_never_ok_never_shared_and_blocks_a_required_source():
+    """Sep-30 rerun, transformer C3: 11 of 20 files of a record were admitted (the rest failed their published md5),
+    yet the manifest said `ok`, data_blocker was empty and the set was shared with other checks."""
+    from harness import fetcher
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        srv, host = _record_server({"a.csv": b"a,b\n1,2\n", "b.csv": b"a,b\n3,4\n", "c.csv": None},
+                                   md5s={"b.csv": "0" * 32})
+        try:
+            src = {"source": f"http://{host}/records/5", "include": ["*.csv", "d.csv", "*.parquet"]}
+            rec = _fetch(fetcher, td, [src])[0]
+            assert [a["file"] for a in rec["admitted"]] == ["a.csv"], rec["admitted"]
+            miss = {m["file"]: m["class"] for m in rec.get("missing") or []}
+            assert miss == {"b.csv": "content_invalid", "c.csv": "missing"}, ("named files not admitted are recorded", rec.get("missing"))
+            assert rec.get("unmatched_include") == ["d.csv", "*.parquet"], rec.get("unmatched_include")
+            man = fetcher.manifest(str(td / "data"), [rec])
+            assert man["status"] == "partial", man["status"]
+            plan = [{**src, "required": True}]
+            blk = execute.data_blocker(plan, man)
+            assert len(blk) == 1 and blk[0]["class"] == "missing" and blk[0]["incomplete"], ("a required incomplete source blocks", blk)
+            assert {m["file"] for m in blk[0]["missing"]} == {"b.csv", "c.csv", "d.csv"}, blk[0]["missing"]   # a glob is a gap, not a name
+            assert execute.data_blocker([{**src, "required": False}], man) == []
+            gaps = execute.data_gaps(man)
+            assert len(gaps) == 4 and any("b.csv" in g for g in gaps) and any("*.parquet" in g for g in gaps), gaps
+            whole = _fetch(fetcher, td / "w", [{"source": f"http://{host}/records/5", "include": ["a.csv"]}])[0]
+            wman = fetcher.manifest(str(td / "w" / "data"), [whole])
+            assert wman["status"] == "ok" and execute.data_gaps(wman) == [] and not execute.data_blocker(
+                [{"source": whole["source"], "required": True}], wman), wman
+            # a partial set is never shared with another check of the same plan; a complete one is
+            root = td / "proj"
+            state.write_json(root / "checks" / "C1" / "data.json", {**man, "fetched_at": "t", "plan": plan, "volume": "v1"})
+            real = execute.docker_status, execute.start, execute._volume_gone
+            execute.docker_status, execute._volume_gone = (lambda: (True, "")), (lambda v: False)
+            started: list = []
+            execute.start = lambda *a, **k: started.append(a) or {"container": "x"}
+            try:
+                got = execute.fetch(state.Config(), root, "C2", plan)
+                assert got is None and len(started) == 1, ("a partial set was shared", got)
+                state.write_json(root / "checks" / "C1" / "data.json", {**wman, "fetched_at": "t", "plan": plan, "volume": "v1"})
+                got = execute.fetch(state.Config(), root, "C3", plan)
+                assert got and got.get("shared_with") == "C1", got
+            finally:
+                execute.docker_status, execute.start, execute._volume_gone = real
+        finally:
+            fetcher.RECORD_APIS.pop(host, None)
+            srv.shutdown()
+
+
+def test_a_named_file_that_only_failed_in_transit_is_a_fault_of_this_run():
+    from harness import fetcher
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        srv, host = _record_server({"a.csv": b"a,b\n1,2\n", "busy.csv": b"x"},
+                                   routes_extra={"/files/busy.csv": lambda h: (503, {}, b"busy")})
+        try:
+            src = {"source": f"http://{host}/records/5", "include": ["*.csv"], "required": True}
+            rec = _fetch(fetcher, td, [src])[0]
+            man = fetcher.manifest(str(td / "data"), [rec])
+            blk = execute.data_blocker([src], man)
+            assert blk and blk[0]["class"] == "transient", ("a 503 on one file is INCONCLUSIVE, never BLOCKED", blk)
+        finally:
+            fetcher.RECORD_APIS.pop(host, None)
+            srv.shutdown()
+
+
+def test_an_include_that_names_a_member_of_a_matched_archive_is_matched():
+    """R2 conformal C5 shape: include ['*.zip', 'train*'] — `train*` names a member of the zip it took whole."""
+    from harness import fetcher
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        srv, host = _serve({"/ds": lambda h: (200, {"Content-Type": "text/html"}, b'<a href="/static/ds.zip">zip</a>'),
+                            "/static/ds.zip": lambda h: (200, {}, _zip({"train.csv.zip": "nested", "solution.csv": "a,b\n"}))})
+        rec = _fetch(fetcher, td, [{"source": f"http://{host}/ds", "include": ["*.zip", "train*"]}])[0]
+        man = fetcher.manifest(str(td / "data"), [rec])
+        assert len(rec["admitted"]) == 2 and not rec.get("unmatched_include") and man["status"] == "ok", (rec.get("unmatched_include"), man["status"])
+        srv.shutdown()
+
+
+# --- 3. failure classes --------------------------------------------------------------------------
+def test_an_alternate_reading_never_outranks_the_primary_readings_failure():
+    """The always-generated `zen-odo.org` reading fails DNS (transient) and outranked the record's own 404: a missing
+    source read INCONCLUSIVE."""
+    from harness import fetcher
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        srv, host = _serve({"/busy": lambda h: (503, {}, b"busy")})
+        rec = _fetch(fetcher, td, [{"source": f"http://{host}/gone", "alternates": ["http://127.0.0.1:1/gone"]}])[0]
+        assert rec["failure_class"] == "missing", ("the primary reading's 404 decides", rec["failure_class"], rec["attempts"])
+        rec = _fetch(fetcher, td / "b", [{"source": f"http://{host}/busy", "alternates": [f"http://{host}/gone"]}])[0]
+        assert rec["failure_class"] == "transient", rec["failure_class"]
+        srv.shutdown()
+
+
+def test_hub_errors_are_classified_by_their_http_status():
+    from harness import fetcher
+
+    class HfHubHTTPError(OSError):
+        def __init__(self, msg, response=None):
+            super().__init__(msg)
+            self.response = response
+
+    class RepositoryNotFoundError(HfHubHTTPError):
+        pass
+
+    class GatedRepoError(RepositoryNotFoundError):
+        pass
+
+    class LocalEntryNotFoundError(HfHubHTTPError, FileNotFoundError):
+        pass
+
+    class ReadTimeout(Exception):          # an httpx-style timeout is no OSError
+        pass
+    r = lambda c: types.SimpleNamespace(status_code=c)
+    for e, want in ((RepositoryNotFoundError("x", r(401)), "inaccessible"), (GatedRepoError("x", r(403)), "inaccessible"),
+                    (RepositoryNotFoundError("x", r(404)), "missing"), (HfHubHTTPError("x", r(503)), "transient"),
+                    (HfHubHTTPError("x", r(429)), "transient"), (RepositoryNotFoundError("no response"), "missing"),
+                    (GatedRepoError("no response"), "inaccessible"), (LocalEntryNotFoundError("offline"), "transient"),
+                    (ReadTimeout("slow"), "transient")):
+        assert fetcher.classify(e)[0] == want, (type(e).__name__, getattr(e, "response", None), fetcher.classify(e), want)
+
+
+def test_a_short_transfer_that_repeats_is_transient_not_invalid_content():
+    from harness import fetcher
+    with tempfile.TemporaryDirectory() as t:
+        td, good = Path(t), b"x" * 50000
+        srv, host = _serve({"/cut.bin": lambda h: (200, {"Content-Length": str(len(good))}, good[:1000])})
+        f = fetcher.Fetcher(str(td / "cache"), 1 << 30, [], sleep=lambda s: None, tries=3, timeout=5)
+        try:
+            f.get(f"http://{host}/cut.bin", str(td / "d"))
+            raise AssertionError("a cut transfer was admitted")
+        except fetcher.FetchError as e:
+            assert e.klass == "transient" and len(e.attempts) == 3, (e.klass, len(e.attempts))
+        srv.shutdown()
+
+
+# --- 4. one HTML detector; archives by suffix; extraction cap; include in the fallback ---------------------
+def test_one_html_detector_and_archives_unpacked_by_suffix_only():
+    from harness import fetcher
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        pages = {"bom.csv": b"\xef\xbb\xbf<!DOCTYPE html><html><body>log in</body></html>",
+                 "comment.csv": b"<!-- served by a proxy -->\n<html><body>log in</body></html>",
+                 "xhtml.csv": b'<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" '
+                              b'"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">\n<html xmlns="http://www.w3.org/1999/xhtml"></html>'}
+        files = {**pages, "webdata.jsonl": b'{"url": "u", "page": "<html><body>hi</body></html>"}\n',
+                 "arrays.npz": _zip({"a.npy": "x" * 50}), "book.xlsx": _zip({"xl/workbook.xml": "<w/>"}),
+                 "model.pt": _zip({"archive/data.pkl": "p"}), "set.xml": b'<?xml version="1.0"?>\n<dataset><row>1</row></dataset>'}
+        routes = {"/": lambda h: (200, {"Content-Type": "text/html"}, "".join(f'<a href="/{n}">{n}</a>' for n in files).encode())}
+        routes.update({f"/{n}": (lambda h, b=b: (200, {"Content-Type": "application/octet-stream"}, b)) for n, b in files.items()})
+        srv, host = _serve(routes)
+        rec = _fetch(fetcher, td, [{"source": f"http://{host}/", "include": list(files)}])[0]
+        got = sorted(a["file"] for a in rec["admitted"])
+        assert got == ["arrays.npz", "book.xlsx", "model.pt", "set.xml", "webdata.jsonl"], ("pages rejected, zips by suffix kept whole", got)
+        assert sorted(r["file"] for r in rec["rejected"]) == sorted(pages), rec["rejected"]
+        for n, b in pages.items():
+            (td / n).write_bytes(b)
+            assert fetcher.is_html(str(td / n), {}), n                    # the same detector, wherever a page is judged
+        srv.shutdown()
+
+
+def test_extracted_bytes_count_against_the_storage_cap():
+    """A 1 MB member compressed to ~1 KB: extraction is bounded by the storage cap, not by the archive's size."""
+    import zipfile
+    from harness import fetcher
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("zeros.bin", b"\0" * (1 << 20))
+        srv, host = _serve({"/bomb.zip": lambda h: (200, {}, buf.getvalue())})
+        f = fetcher.Fetcher(str(td / "cache"), 200_000, [], sleep=lambda s: None, tries=3, timeout=5)
+        rec = fetcher.acquire(f, {"source": f"http://{host}/bomb.zip"}, str(td / "data" / "0"), str(td / "tmp"), "0")
+        assert rec["admitted"] == [] and not (td / "data" / "0" / "zeros.bin").exists(), ("a zip bomb was unpacked", rec["admitted"])
+        assert rec["failure_class"] == "storage", rec["failure_class"]
+        srv.shutdown()
+
+
+def test_the_landing_page_fallback_never_admits_a_file_include_does_not_name():
+    """Sep-30 rerun, conformal C8: include named the members of the dataset ZIP; the fallback followed every data link and
+    admitted the site's web-app manifest.json as data."""
+    from harness import fetcher
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        srv, host = _serve({"/ds": lambda h: (200, {"Content-Type": "text/html"},
+                                              b'<a href="/manifest.json">m</a><a href="/static/ds.zip">zip</a>'),
+                            "/manifest.json": lambda h: (200, {}, b'{"name": "web app", "icons": []}'),
+                            "/static/ds.zip": lambda h: (200, {}, _zip({"train.csv.zip": "n", "other.csv": "a\n"}))})
+        rec = _fetch(fetcher, td, [{"source": f"http://{host}/ds", "include": ["train.csv*"]}])[0]
+        assert [a["file"] for a in rec["admitted"]] == ["train.csv.zip"], rec["admitted"]
+        srv.shutdown()
+
+
+# --- 5. a records listing reaches a file inside one of its archives -----------------------------------------
+def test_include_reaches_a_file_inside_a_records_archive():
+    from harness import fetcher
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        bundle = _zip({"inner/train.csv": "a\n1\n", "inner/test.csv": "a\n2\n"})
+        srv, host = _record_server({"a.csv": b"a\n0\n", "bundle.zip": bundle})
+        try:
+            rec = _fetch(fetcher, td, [{"source": f"http://{host}/records/5", "include": ["a.csv", "train.csv"]}])[0]
+            got = sorted(a["file"] for a in rec["admitted"])
+            assert got == ["a.csv", "inner/train.csv"], ("include named a member of the record's archive", got)
+            assert not rec.get("unmatched_include") and any("members" in r for r in rec["recovery"]), rec
+        finally:
+            fetcher.RECORD_APIS.pop(host, None)
+            srv.shutdown()
+        many = {f"part{i}.zip": _zip({f"x{i}.csv": "1"}) for i in range(fetcher.MAX_ARCHIVES + 1)}
+        srv, host = _record_server({"a.csv": b"a\n0\n", **many})
+        try:
+            rec = _fetch(fetcher, td / "m", [{"source": f"http://{host}/records/5", "include": ["a.csv", "train.csv"]}])[0]
+            assert [a["file"] for a in rec["admitted"]] == ["a.csv"] and rec["unmatched_include"] == ["train.csv"], rec   # no guessing
+        finally:
+            fetcher.RECORD_APIS.pop(host, None)
+            srv.shutdown()
+
+
+# --- 6. the Hugging Face path -----------------------------------------------------------------------
+def _fake_hub(repos: dict, raise_on: dict | None = None):
+    """A stand-in huggingface_hub: repos {repo: {path: bytes}}; snapshot_download also leaves the hub's own
+    `.cache/huggingface` metadata (an empty .lock among it) in local_dir, as the real one does."""
+    import fnmatch
+    import os
+    mod = types.ModuleType("huggingface_hub")
+
+    class HfApi:
+        def repo_info(self, repo, repo_type=None, revision=None, files_metadata=False):
+            if repo in (raise_on or {}):
+                raise raise_on[repo]
+            return types.SimpleNamespace(sha="abc123", siblings=[types.SimpleNamespace(rfilename=k, size=len(v))
+                                                                 for k, v in repos[repo].items()])
+
+    def snapshot_download(repo, repo_type=None, revision=None, allow_patterns=None, ignore_patterns=None, local_dir=None):
+        for k, v in repos[repo].items():
+            if any(fnmatch.fnmatchcase(k, p) for p in allow_patterns or ["*"]) and not any(
+                    fnmatch.fnmatchcase(k, p) for p in ignore_patterns or []):
+                os.makedirs(os.path.dirname(os.path.join(local_dir, k)) or local_dir, exist_ok=True)
+                Path(local_dir, k).write_bytes(v)
+        meta = Path(local_dir, ".cache", "huggingface", "download")
+        meta.mkdir(parents=True, exist_ok=True)
+        (meta / "x.lock").write_bytes(b"")
+        (meta.parent / ".gitignore").write_text("*")
+        return local_dir
+    mod.HfApi, mod.snapshot_download = HfApi, snapshot_download
+    return mod
+
+
+def _with_hub(mod, fn):
+    from harness import fetcher
+    saved, run = sys.modules.get("huggingface_hub"), fetcher.subprocess.run
+    sys.modules["huggingface_hub"] = mod
+    fetcher.subprocess.run = lambda *a, **k: types.SimpleNamespace(returncode=0)   # never a real pip install
+    try:
+        return fn()
+    finally:
+        fetcher.subprocess.run = run
+        if saved is None:
+            sys.modules.pop("huggingface_hub", None)
+        else:
+            sys.modules["huggingface_hub"] = saved
+
+
+def test_hub_snapshot_files_are_validated_and_the_storage_cap_is_cumulative():
+    """R2 PPRM C3: the hub's `.cache/huggingface/*` metadata and 0-byte `.lock` files were admitted as data; and the cap
+    test compared each repository alone with the cap (`need > cap`), never the running total."""
+    from harness import fetcher
+    repos = {"o/set": {"data/train.parquet": b"P" * 120, "data/test.parquet": b"Q" * 80, "README.md": b"# set\n", ".gitattributes": b"*"},
+             "o/two": {"w.safetensors": b"W" * 150}}
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+
+        def go():
+            f = fetcher.Fetcher(str(td / "cache"), 300, [], sleep=lambda s: None, tries=1, timeout=5)
+            a = fetcher.acquire(f, {"source": "hf://datasets/o/set", "include": ["*.parquet"]}, str(td / "data" / "0"), str(td / "tmp"), "0")
+            b = fetcher.acquire(f, {"source": "hf://models/o/two"}, str(td / "data" / "1"), str(td / "tmp"), "1")
+            return a, b
+        a, b = _with_hub(_fake_hub(repos), go)
+        on_disk = sorted(p.relative_to(td / "data" / "0").as_posix() for p in (td / "data" / "0").rglob("*") if p.is_file())
+        assert on_disk == ["data/test.parquet", "data/train.parquet"], ("only validated repository files", on_disk)
+        assert sorted(x["file"] for x in a["admitted"]) == ["data/test.parquet", "data/train.parquet"] and a["failure_class"] == ""
+        assert b["admitted"] == [] and b["failure_class"] == "storage", ("200 + 150 bytes pass a cap of 300", b["failure_class"])
+
+        class RepositoryNotFoundError(OSError):
+            response = types.SimpleNamespace(status_code=404)
+        r = _with_hub(_fake_hub(repos, {"o/none": RepositoryNotFoundError("404")}), lambda: _fetch(fetcher, td / "n", [{"source": "hf://models/o/none"}]))
+        assert r[0]["failure_class"] == "missing", r[0]["failure_class"]
+
+
+# --- 7. include patterns match case-sensitively, as in the Linux container --------------------------------
+def test_include_patterns_are_case_sensitive_on_every_host():
+    from harness import fetcher
+    assert fetcher.pick(["http://h/A.CSV", "http://h/b.csv"], ["*.csv"]) == ["http://h/b.csv"], fetcher.pick(["http://h/A.CSV", "http://h/b.csv"], ["*.csv"])
+    assert not fetcher._named("Data/X.CSV", ["*.csv"]) and fetcher._named("Data/X.CSV", ["*.CSV"])
+
+
+# --- 8. discovery of models and gated artifacts --------------------------------------------------------
+def _hub_registry(seen: list):
+    def get(url: str):
+        seen.append(url)
+        if "huggingface.co/api/models" in url:
+            return [{"id": "acme/net-7b", "author": "acme", "createdAt": "2025-01-01T00:00:00Z", "downloads": 9, "tags": ["text"],
+                     "gated": False, "private": False, "usedStorage": 30_000_000_000,
+                     "safetensors": {"parameters": {"BF16": 7_000_000_000, "F32": 1000}, "total": 7_000_001_000}},
+                    {"id": "acme/closed", "gated": "manual", "private": False, "usedStorage": 5_000}]
+        if "huggingface.co/api/datasets" in url:
+            return [{"id": "acme/corpus", "author": "acme", "gated": "auto", "private": False, "usedStorage": 123_456}]
+        if "zenodo" in url:
+            return {"hits": {"hits": []}}
+        return {"data": []}
+    return get
+
+
+def test_hub_candidates_carry_gating_and_size_and_a_repeated_query_is_not_searched_again():
+    from harness import discover
+    with tempfile.TemporaryDirectory() as t:
+        cfg, pid = _project_pages(Path(t), CITE_PAGES)
+        seen: list = []
+        rec = discover.search(cfg, pid, "acme net", get=_hub_registry(seen))
+        m = {c["source"]: c for c in rec["results"]["huggingface-models"]["candidates"]}
+        net = m.get("hf://models/acme/net-7b") or {}
+        assert net.get("gated") is False and net.get("private") is False and net.get("params") == 7_000_001_000, net
+        assert net.get("size_bytes") == 14_000_004_000 and net.get("size_basis") == "safetensors", net
+        assert m["hf://models/acme/closed"].get("gated") == "manual" and m["hf://models/acme/closed"].get("size_bytes") == 5_000
+        ds = rec["results"]["huggingface"]["candidates"][0]
+        assert ds.get("gated") == "auto" and ds.get("size_bytes") == 123_456 and ds.get("size_basis") == "usedStorage", ds
+        hub = [u for u in seen if "huggingface.co" in u]
+        assert all("expand=gated" in u and "expand=author" in u for u in hub) and "safetensors" not in next(
+            u for u in hub if "/api/datasets" in u), hub
+        assert discover.returned(cfg, pid, rec["id"], "hf://models/acme/net-7b")["size_bytes"] == 14_000_004_000
+        n = len(seen)
+        again = discover.search(cfg, pid, "  ACME   net ", get=_hub_registry(seen))
+        assert again["id"] == rec["id"] and len(seen) == n and len(discover.records(cfg, pid)) == 1, ("a repeated query re-searched", again.get("id"))
+        cfg.max_discoveries = 1
+        assert discover.search(cfg, pid, "acme net", get=_hub_registry(seen))["id"] == rec["id"]    # reuse costs no budget
+        assert "budget" in discover.search(cfg, pid, "acme other", get=_hub_registry(seen))["error"]
+        cfg.max_discoveries = 5
+        assert discover.search(cfg, pid, "acme net", registry="zenodo", get=_hub_registry(seen))["id"] == "D2"   # another registry set
+        listing = {"files": [{"key": "a.csv", "size": 5, "checksum": "md5:" + "1" * 32, "links": {"self": "https://zenodo.org/x/a.csv"}}]}
+        calls: list = []
+        one = discover.files(cfg, pid, "https://zenodo.org/records/42", get=lambda u: calls.append(u) or listing)
+        two = discover.files(cfg, pid, "https://zenodo.org/records/42", get=lambda u: calls.append(u) or listing)
+        assert one["id"] == two["id"] and len(calls) == 1, (one.get("id"), two.get("id"), calls)
+
+
+# --- 9. host facts a compute blocker can be compared against ---------------------------------------------
+def test_the_host_is_measured_with_gpu_memory_and_free_disk_once_per_process():
+    with tempfile.TemporaryDirectory() as t:
+        cfg = state.Config()
+        cfg.projects = Path(t)
+        calls: list = []
+        real = execute._docker, execute.gpu, execute._gpu_mb
+
+        def docker(argv, timeout):
+            calls.append(argv)
+            return (0, f"8 {16000 * 2 ** 20} {t}\n") if argv[:2] == ["docker", "info"] else (1, "no")
+        execute._docker, execute.gpu, execute._gpu_mb = docker, (lambda c: True), (lambda: "24576")
+        try:
+            getattr(execute, "_HOST", {}).clear()
+            h = execute.host(cfg)
+            assert h["cpus"] == 8 and h["ram_mb"] == 16000 and h["gpu"] is True and h["vram_mb"] == 24576, h
+            assert isinstance(h["disk_free_gb"], float) and h["disk_free_gb"] > 0, h
+            facts = execute.host_facts(cfg)
+            assert "24576 MB" in facts and "GB free" in facts, facts
+            n = len(calls)
+            execute.host(cfg), execute.host_facts(cfg)
+            assert len(calls) == n, "measured again within one process"
+            execute._HOST.clear()
+            away: list = []
+            execute._docker, execute.gpu = (lambda a, timeout: away.append(a) or (1, "daemon away")), (lambda c: False)
+            h = execute.host(cfg)
+            assert h == {"cpus": None, "ram_mb": None, "gpu": False, "vram_mb": None, "disk_free_gb": None}, h
+            assert "unknown" in execute.host_facts(cfg)
+            assert len(away) == 2, ("a failed measurement was kept for the whole process", len(away))
+        finally:
+            execute._docker, execute.gpu, execute._gpu_mb = real
+            execute._HOST.clear()
+
+
+# --- 10. released code as quote-only text on the host -------------------------------------------------------
+def test_released_code_is_never_data_but_its_text_reaches_the_host_for_quoting():
+    import contextlib
+    from harness import fetcher
+    nb = json.dumps({"cells": [{"cell_type": "markdown", "source": ["# Fit\n"]},
+                               {"cell_type": "code", "source": ["q = fit(c)\n", "print(q)\n"]}]}).encode()
+    big = b"x = 1\n" * 60000                                                    # 360 KB of code: cut at the per-file cap
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        srv, host = _record_server({"data.csv": b"a\n1\n", "analysis.py": b"def fit(c):\n    return c ** 0.5\n",
+                                    "login.py": b"<!DOCTYPE html><html><body>Please sign in</body></html>",
+                                    "notebook.ipynb": nb, "README.md": b"# Released\nrun analysis.py\n", "huge.py": big,
+                                    "bundle.zip": _zip({"rows.csv": "a\n2\n", "src/model.py": "class M: pass\n"})})
+        try:
+            src = {"source": f"http://{host}/records/5", "include": ["*.csv", "*.zip"]}
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                man = fetcher.main({"REFEREE_CAP": str(1 << 30), "REFEREE_SOURCES": json.dumps([src])}, out_dir=str(td / "data"),
+                                   tmp=str(td / "tmp"), cache=str(td / "cache"))
+        finally:
+            fetcher.RECORD_APIS.pop(host, None)
+            srv.shutdown()
+        on_disk = sorted(p.relative_to(td / "data").as_posix() for p in (td / "data").rglob("*") if p.is_file())
+        assert on_disk == ["0/data.csv", "0/rows.csv"], ("code never reaches /work/data", on_disk)
+        listed = {x["path"]: x for x in man.get("record_src") or []}
+        assert set(listed) == {"0/analysis.py", "0/notebook.ipynb", "0/README.md", "0/huge.py", "0/src/model.py"}, sorted(listed)
+        assert listed["0/huge.py"].get("cut") and listed["0/huge.py"]["bytes"] <= fetcher.SRC_FILE, listed["0/huge.py"]
+        assert any(c.startswith("0/login.py") for c in man.get("record_src_cut") or []) and man.get("record_src_n_cut") == 1, man.get("record_src_cut")
+        # the host side: execute.fetch collects the container's stdout and writes the text under checks/<id>/record_src
+        root, plan = td / "proj", [{**src, "required": True}]
+        real = execute.docker_status, execute.start, execute.collect
+        execute.docker_status = lambda: (True, "")
+        execute.start = lambda *a, **k: {"container": "x"}
+        execute.collect = lambda rec, timeout: {**rec, "returncode": 0, "stdout": out.getvalue(), "stderr": "", "seconds": 1}
+        try:
+            assert execute.fetch(state.Config(), root, "C1", plan) is None
+            d = execute.fetch(state.Config(), root, "C1", plan)
+        finally:
+            execute.docker_status, execute.start, execute.collect = real
+        rs = root / "checks" / "C1" / "record_src"
+        assert d and {x["path"] for x in d.get("record_src") or []} == set(listed), d and d.get("record_src")
+        text = (rs / "0" / "notebook.ipynb").read_text(encoding="utf-8")
+        assert "q = fit(c)" in text and '"cells"' not in text, text                         # the cells' sources, as plain text
+        assert (rs / "0" / "src" / "model.py").read_text(encoding="utf-8") == "class M: pass\n"
+        for x in d["record_src"]:
+            assert hashlib.sha256((rs / x["path"]).read_bytes()).hexdigest() == x["sha256"], x
+        assert not d.get("record_src_lost"), d.get("record_src_lost")
+        # a stdout whose text line was cut off: the listed files that never arrived are recorded, never silently absent
+        execute.docker_status, execute.start = (lambda: (True, "")), (lambda *a, **k: {"container": "y"})
+        execute.collect = lambda rec, timeout: {**rec, "returncode": 0, "seconds": 1, "stderr": "", "stdout": "\n".join(
+            ln for ln in out.getvalue().splitlines() if not ln.startswith("REFEREE_RECORD_SRC "))}
+        try:
+            assert execute.fetch(state.Config(), root, "C2", [{**plan[0], "include": ["*.csv", "*.zip", "x"]}]) is None
+            d2 = execute.fetch(state.Config(), root, "C2", [{**plan[0], "include": ["*.csv", "*.zip", "x"]}])
+        finally:
+            execute.docker_status, execute.start, execute.collect = real
+        assert d2["record_src"] == [] and sorted(d2.get("record_src_lost") or []) == sorted(listed), d2.get("record_src_lost")
+
+
+def test_record_src_from_a_container_is_written_only_inside_its_folder_and_only_as_listed():
+    import base64
+    import zlib
+    with tempfile.TemporaryDirectory() as t:
+        cdir = Path(t) / "checks" / "C1"
+        good = "print('ok')\n"
+        items = [{"dir": "0", "path": "a.py", "text": good}, {"dir": "0", "path": "../../evil.py", "text": "x"},
+                 {"dir": "0", "path": "b.py", "text": "tampered"}]
+        line = "REFEREE_RECORD_SRC " + base64.b64encode(zlib.compress(json.dumps(items).encode())).decode()
+        listing = [{"path": "0/a.py", "bytes": len(good), "sha256": hashlib.sha256(good.encode()).hexdigest()},
+                   {"path": "0/../../evil.py", "bytes": 1, "sha256": hashlib.sha256(b"x").hexdigest()},
+                   {"path": "0/b.py", "bytes": 2, "sha256": hashlib.sha256(b"original").hexdigest()}]
+        kept = execute.record_src(cdir, line + "\n", listing)
+        assert [x["path"] for x in kept] == ["0/a.py"], kept
+        assert not (Path(t) / "evil.py").exists() and not (cdir / "record_src" / "0" / "b.py").exists()
 
 if __name__ == "__main__":
     fns = [v for k, v in dict(globals()).items() if k.startswith("test_")]

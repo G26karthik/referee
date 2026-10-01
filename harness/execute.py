@@ -363,18 +363,55 @@ def cohort_mismatch(stdout: str, check: dict) -> list[str]:
                   if want and len({rs.get(r) for r in want if r in rs}) > 1)
 
 
+def _data_identity(rec: dict, check: dict) -> list[str]:
+    """A check that acquired data prints, per dataset, a REFEREE_DATA line saying whether what it read
+    matches the paper's own description (`matches`: true or false), in either stream."""
+    if not check.get("acquire"):
+        return []
+    ids = json_lines((rec.get("stdout") or "") + "\n" + (rec.get("stderr") or ""), "REFEREE_DATA")
+    if not ids:
+        return ["the check acquired data, but the run printed no REFEREE_DATA line (each dataset's identity against "
+                "the paper's own description, with `matches` true or false)"]
+    if any(not isinstance(d.get("matches"), bool) for d in ids):
+        return ["a REFEREE_DATA line carries no boolean `matches` (true or false: does the data read match the paper's "
+                "own description)"]
+    return []
+
+
 def result_schema(rec: dict, check: dict) -> list[str]:
     """What a completed run's result lines owe the script contract and did not deliver, by name
     only (a value is never shown): the compared outputs on some line; a result line for every
     declared unit, and none under a stage name it did not declare; every declared reading in every
-    stage, each with its `cohort`, the same cohort for all. A defect is the script's to fix: it
-    says nothing about the paper."""
-    names, out = compared_names(check), []
+    stage, each with its `cohort` (a list of item ids), the same cohort for all, and no `reading` the
+    check does not declare; a `data_fingerprint` on every result line of a stochastic reconstruction
+    (the run's own evidence that its replicates differ); `binomial` outputs that are proportions of
+    their counted trials; `premises_hold` on every certificate instance; a REFEREE_DATA identity for
+    acquired data. A defect is the script's to fix: it says nothing about the paper."""
+    names, out = compared_names(check), _data_identity(rec, check)
     if check.get("kind") == "CERTIFICATE":
-        return [] if cert_rows(rec.get("stdout") or "") else ["no REFEREE_RESULT line carries `violated` (0 or 1)"]
+        rows = cert_rows(rec.get("stdout") or "")
+        if not rows:
+            return out + ["no REFEREE_RESULT line carries `violated` (0 or 1)"]
+        if (k := sum(1 for r in rows if r["premises"] is None)):
+            out.append(f"{k} of {len(rows)} certificate result line(s) carry no `premises_hold` (0 or 1): an instance "
+                       "whose premises were not evaluated is not admissible")
+        return out
     lines = [d for d in json_lines(rec.get("stdout") or "", "REFEREE_RESULT") if all(n in _num(d) for n in names)]
     if names and not lines:
         out.append(f"no REFEREE_RESULT line carries every compared output {names}")
+    if (bad := sorted({k for d in lines if isinstance(d.get("binomial"), dict) for k, t in d["binomial"].items()
+                       if k in _num(d) and isinstance(t, (int, float)) and not isinstance(t, bool) and t >= 1
+                       and not (0 <= _num(d)[k] <= 1 and abs(_num(d)[k] * t - round(_num(d)[k] * t)) <= 1e-6)})):
+        out.append(f"output(s) {bad[:10]} declared under `binomial` are not proportions of their counted trials (a "
+                   "value outside [0, 1], or value x trials not a whole number)")
+    if (check.get("kind") == "RECONSTRUCTION" and check.get("stochastic") is not False and check.get("test") != "compatibility"
+            and (k := sum(1 for d in lines if not d.get("data_fingerprint")))):
+        out.append(f"{k} of {len(lines)} result line(s) of a stochastic reconstruction carry no `data_fingerprint` (a "
+                   "sha256 of the random draws / data that stage consumed): without it, repeated values are one "
+                   "measurement, never replicates")
+    if not check.get("readings") and (tags := sorted({str(d["reading"])[:40] for d in lines if d.get("reading")})):
+        out.append(f"result line(s) carry a `reading` {tags[:10]} but the check declares no readings: they are never "
+                   "pooled, and nothing is decided on them")
     if check.get("kind") in ("RECONSTRUCTION", "RELEASED_DATA") and lines:
         declared, printed = units(rec), {str(d.get("stage") or "")[:80] for d in lines}
         if declared and (miss := sorted(declared - printed)):
@@ -393,6 +430,9 @@ def result_schema(rec: dict, check: dict) -> list[str]:
                 out.append(f"{where}: a reading's result line carries no `cohort` (the items it was computed over)")
             elif len({rs[r] for r in want if r in rs}) > 1:
                 out.append(f"{where}: the readings were computed on different cohorts")
+        if want and any(d.get("cohort") is not None and not isinstance(d.get("cohort"), list) for d in lines):
+            out.append("a reading's `cohort` is not a list of item ids (the models, items or rows it was computed "
+                       "over): a count or a label does not show the readings shared their items")
     return out[:20]                                             # ponytail: 20 defects per run
 
 
@@ -413,7 +453,9 @@ def split_units(declared: set, staged: list, run_failed: bool, why: str) -> tupl
 def cert_rows(stdout: str) -> list[dict]:
     """A certificate's instances: `violated`, `premises` (1/0 when the script evaluated every
     premise of the exact claim; None when it did not say), `literal` (the text as printed),
-    `lhs`/`rhs` (floats) and `exact` (the script also printed both sides as exact strings)."""
+    `lhs`/`rhs` (floats), `exact` (the script also printed both sides as exact strings) and, only
+    when the line names one, the `reading` it was computed under (never a counterexample to the
+    printed claim: reconcile.certificate)."""
     rows = []
     for d in json_lines(stdout, "REFEREE_RESULT"):
         if d.get("violated") in (0, 1):
@@ -423,7 +465,8 @@ def cert_rows(stdout: str) -> list[dict]:
                                                                              "premise_not_met") else None,
                          **{k: float(d[k]) for k in ("lhs", "rhs") if isinstance(d.get(k), (int, float))
                             and not isinstance(d.get(k), bool)},
-                         "exact": all(isinstance(d.get(k), str) and d.get(k) for k in ("lhs_exact", "rhs_exact"))})
+                         "exact": all(isinstance(d.get(k), str) and d.get(k) for k in ("lhs_exact", "rhs_exact")),
+                         **({"reading": str(d["reading"])[:40]} if d.get("reading") else {})})
     return rows
 
 
@@ -691,20 +734,56 @@ DATA_MOUNT = f"{MOUNT}/data"
 FETCHER = Path(__file__).with_name("fetcher.py")   # mounted read-only into the network-on container that runs it
 
 
+def _named_missing(r: dict) -> list[dict]:
+    """The NAMED files a source's set lacks: listed or include-matched files not admitted, and include names without
+    a wildcard that matched no file (a glob that matched nothing is a gap of the set, not a missing name)."""
+    return list(r.get("missing") or []) + [{"file": p, "class": "missing", "why": "no file of the source has this name"}
+                                           for p in r.get("unmatched_include") or [] if not re.search(r"[*?\[]", p)]
+
+
 def data_blocker(sources: list[dict], man: dict) -> list[dict]:
     """The required sources of a check that admitted no file, each with the class of its failure
     (fetcher.failure_class): what a planner and a reader need to tell a bug from a network fault, a
-    missing file, an inaccessible source or content that failed validation."""
+    missing file, an inaccessible source or content that failed validation. A required source that admitted
+    files but lacks a NAMED one is blocked too (`incomplete`), with the class of what kept that file out —
+    a transfer fault stays a fault of this run, never a finding about the source."""
+    from .fetcher import RANK
     got = {str(r.get("dir")): r for r in man.get("sources") or []}
     out = []
     for i, s in enumerate(sources):
         r = got.get(str(i)) or {}
         if s.get("required", True) and not r.get("admitted_files"):
-            errs = [a.get("error") for a in (r.get("attempts") or []) + (r.get("followed") or []) if a.get("error")]
+            errs = [a.get("error") for a in (r.get("attempts") or []) + (r.get("followed") or []) if a.get("error")
+                    and not a.get("text_only") and not a.get("speculative")]
             out.append({"source": s["source"], "class": r.get("failure_class") or "bug",
                         "detail": (errs[-1] if errs else r.get("error") or "the acquisition returned no record")[:300],
                         "rejected": [f"{x.get('file')}: {x.get('why')}" for x in (r.get("rejected") or [])[:5]],
                         "recovery": (r.get("recovery") or [])[:5]})
+        elif s.get("required", True) and (gone := _named_missing(r)):
+            seen = {m.get("class") for m in gone}
+            out.append({"source": s["source"], "class": next((k for k in RANK if k in seen), "missing"), "incomplete": True,
+                        "detail": (f"incomplete: {len(gone)} named file(s) of this source were not admitted "
+                                   f"({r.get('admitted_files')} were): " + "; ".join(
+                                       f"{m['file']} [{m.get('class')}]: {m.get('why', '')[:80]}" for m in gone[:5]))[:300],
+                        "missing": gone[:50], "rejected": [f"{x.get('file')}: {x.get('why')}" for x in (r.get("rejected") or [])[:5]],
+                        "recovery": (r.get("recovery") or [])[:5]})
+    return out
+
+
+def data_gaps(data: dict) -> list[str]:
+    """What an acquired set lacks against its plan, one short line each — a source that admitted nothing, a cut in the
+    files followed, a named file not admitted, an `include` pattern that matched nothing; [] when it is complete.
+    The data an experiment ran on is what was requested only if this is empty."""
+    out = []
+    for r in data.get("sources") or []:
+        src = str(r.get("source") or "?")[:120]
+        if not r.get("admitted_files"):
+            out.append(f"{src}: no file admitted ({r.get('failure_class') or 'unknown'})")
+        if t := r.get("truncated"):
+            out.append(f"{src}: {t.get('followed')} of {t.get('matched')} matching files followed (a cap); not followed: "
+                       + ", ".join(map(str, (t.get("not_followed") or [])[:5])))
+        out += [f"{src}: {m.get('file')} not admitted ({m.get('class')}: {str(m.get('why', ''))[:120]})" for m in r.get("missing") or []]
+        out += [f"{src}: include {p!r} matched no file" for p in r.get("unmatched_include") or []]
     return out
 
 
@@ -722,6 +801,32 @@ def truncated(man: dict) -> bool:
     """Did the acquisition follow fewer files than matched (a cap)? Such a set is what its own check was given, never
     a complete acquisition of the plan: it is not shared with another check, and a reopened check fetches again."""
     return any(s.get("truncated") for s in man.get("sources") or [])
+
+
+def record_src(cdir: Path, stdout: str, listing: list[dict]) -> list[dict]:
+    """The quote-only text of released code, notebooks and READMEs the fetcher sent on its own stdout line, written
+    to checks/<id>/record_src/<source>/<path> (never mounted into a run, never executed) so a reading of a released
+    implementation can be quoted. Only files the manifest lists, whose sha256 matches, inside that folder: -> kept."""
+    import base64
+    import zlib
+    out = cdir / "record_src"
+    shutil.rmtree(out, ignore_errors=True)
+    line = next((ln.split(" ", 1)[1] for ln in (stdout or "").splitlines() if ln.startswith("REFEREE_RECORD_SRC ")), "")
+    try:
+        items = json.loads(zlib.decompress(base64.b64decode(line))) if line else []
+    except (ValueError, zlib.error):
+        items = []
+    want, kept = {x.get("path"): x for x in listing if isinstance(x, dict)}, []
+    for it in items if isinstance(items, list) else []:
+        rel = f"{it.get('dir')}/{it.get('path')}"
+        x, raw = want.get(rel), str(it.get("text", "")).encode("utf-8")
+        p = (out / rel).resolve()
+        if not x or state.sha256(raw) != x.get("sha256") or out.resolve() not in p.parents:
+            continue
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(raw)
+        kept.append(x)
+    return kept
 
 
 def fetch(cfg: state.Config, root: Path, cid: str, sources: list[dict]) -> dict | None:
@@ -746,6 +851,7 @@ def fetch(cfg: state.Config, root: Path, cid: str, sources: list[dict]) -> dict 
         d = {"sources": [{"source": s["source"], "dir": str(i), "failure_class": "gate", "admitted_files": 0,
                           "attempts": [], "error": f"refused: {why}"} for i, (s, why) in enumerate(zip(sources, shut))],
              "files": [], "n_files": 0, "bytes": 0, "status": "none", "fetched_at": state.now()}
+        shutil.rmtree(cdir / "record_src", ignore_errors=True)      # no text of an earlier acquisition outlives it
         state.write_json(f, d)
         return d
     run_sources = [{**s, "refused": why} if why else s for s, why in zip(sources, shut)]
@@ -755,10 +861,13 @@ def fetch(cfg: state.Config, root: Path, cid: str, sources: list[dict]) -> dict 
     if not st.get("rec"):   # the same sources, already acquired for another check of this paper: shared, read-only
         for other in sorted(Path(root).glob("checks/*/data.json")):
             o = state.read_json(other) or {}
-            if other.parent.name != cid and o.get("fetched_at") and o.get("n_files") and not truncated(o) and not _volume_gone(
-                    o.get("volume") or data_volume(root, other.parent.name)) and [
+            if other.parent.name != cid and o.get("fetched_at") and o.get("n_files") and o.get("status") != "partial" and not (
+                    data_gaps(o)) and not _volume_gone(o.get("volume") or data_volume(root, other.parent.name)) and [
                     {k: s.get(k) for k in ("source", "include")} for s in o.get("plan", [])] == [
-                    {k: s.get(k) for k in ("source", "include")} for s in sources]:
+                    {k: s.get(k) for k in ("source", "include")} for s in sources]:   # a partial set is never shared
+                if (other.parent / "record_src").is_dir():
+                    shutil.rmtree(cdir / "record_src", ignore_errors=True)
+                    shutil.copytree(other.parent / "record_src", cdir / "record_src")
                 state.write_json(f, {**o, "shared_with": other.parent.name})
                 return state.read_json(f)
     plan_key = [{k: s.get(k) for k in ("source", "include")} for s in sources]
@@ -781,6 +890,10 @@ def fetch(cfg: state.Config, root: Path, cid: str, sources: list[dict]) -> dict 
                                  "failure_class": "infrastructure" if infra else "bug", "error": failure_text(done)}
                                 for i, s in enumerate(sources)],
                     "files": [], "n_files": 0, "bytes": 0, "status": "none"}
+        listed = d.get("record_src") or []
+        d["record_src"] = record_src(cdir, done.get("stdout", ""), listed)
+        if lost := [x.get("path") for x in listed if x not in d["record_src"]]:   # never silent: listed, not received intact
+            d["record_src_lost"] = lost[:50]
         state.write_json(f, {**d, "plan": sources, "volume": data_volume(root, cid), "fetched_at": state.now(),
                              "seconds": done.get("seconds")})
         return state.read_json(f)
@@ -865,24 +978,55 @@ def smoke(cfg: state.Config, root: Path, cid: str, r: int, kind: str, attributed
 
 
 def _smoke_check(root: Path, cid: str, r: int) -> dict:
-    """The check as its draft will run: the plan's check with the round's sealed script fields."""
+    """The check as its draft will run: the plan's check with the round's sealed script fields (its
+    metric, readings and `stochastic`, so a stochastic draft is held to its data fingerprints)."""
     from .tasks import _sealed
     from .report import merged
     plan = merged(_sealed(Path(root), "plan"), _sealed(Path(root), "plan:2")) or {"checks": []}
     c = next((k for k in plan["checks"] if k["id"] == cid), {})
     g = _sealed(Path(root), f"gen:{cid}.{r}") or {}
     return {**c, "metric": g.get("metric") or c.get("metric", ""),
+            **({"stochastic": g["stochastic"]} if isinstance(g.get("stochastic"), bool) else {}),
             "readings": (c.get("readings") or []) + [x for x in g.get("readings") or []
                                                      if x["name"] not in {y["name"] for y in c.get("readings") or []}]}
 
 
+_HOST: dict = {}   # measured once per process (per projects dir): every task brief states it, none waits on it twice
+
+
+def host(cfg: state.Config) -> dict:
+    """This host as measured, for a plan seal to compare a `compute` blocker against: {cpus, ram_mb (for containers),
+    gpu, vram_mb (the first GPU's memory), disk_free_gb (where Docker keeps volumes)}; None where not measurable
+    (the daemon away; Docker's root not on this host's filesystem, as under Docker Desktop). Unknown is never 0, and
+    a failed measurement is not kept: the next call asks again."""
+    key = str(cfg.projects)
+    if key not in _HOST:
+        rc, out = _docker(["docker", "info", "--format", "{{.NCPU}} {{.MemTotal}} {{.DockerRootDir}}"], 30)
+        if rc != 0:
+            return {"cpus": None, "ram_mb": None, "gpu": False, "vram_mb": None, "disk_free_gb": None}
+        parts = out.strip().split(maxsplit=2) if rc == 0 else []
+        num = lambda i: int(parts[i]) if len(parts) > i and parts[i].isdigit() else None
+        g = bool(parts) and gpu(cfg)                     # a daemon that cannot answer is no answer about the GPU
+        vram = _gpu_mb() if g else ""
+        root_dir = Path(parts[2]) if len(parts) > 2 else None
+        try:
+            disk = round(shutil.disk_usage(root_dir).free / 2 ** 30, 1) if root_dir and root_dir.is_dir() else None
+        except OSError:
+            disk = None
+        _HOST[key] = {"cpus": num(0), "ram_mb": num(1) // 2 ** 20 if num(1) else None, "gpu": g,
+                      "vram_mb": int(vram.split(",")[0]) if vram.split(",")[0].strip().isdigit() else None, "disk_free_gb": disk}
+    return dict(_HOST[key])
+
+
 def host_facts(cfg: state.Config) -> str:
     """What this host offers a check, measured (not assumed), for planners and script authors."""
-    rc, out = _docker(["docker", "info", "--format", "{{.NCPU}} {{.MemTotal}}"], 30)
-    cpus, mem = (out.split() + ["?", "?"])[:2] if rc == 0 else ("?", "?")
-    return (f"one Docker host: {cpus} CPUs, {int(mem) // 2 ** 20 if mem.isdigit() else '?'} MB RAM for containers, "
-            f"GPU inside containers: {'YES (CUDA; use it where the method trains a network)' if gpu(cfg) else 'no'}; "
-            f"{cfg.parallel} runs at a time; one run at most {cfg.run_timeout_s // 60} min; all runs of one check at "
+    h, q = host(cfg), lambda v, unit: f"{v} {unit}" if v is not None else f"unknown {unit}"
+    gpu_s = ("YES (CUDA; use it where the method trains a network), " + (f"{h['vram_mb']} MB GPU memory" if h["vram_mb"]
+             else "GPU memory unknown")) if h["gpu"] else "no"
+    return (f"one Docker host: {q(h['cpus'], 'CPUs')}, {q(h['ram_mb'], 'MB RAM')} for containers, GPU inside containers: "
+            f"{gpu_s}; disk for data: " + (f"{h['disk_free_gb']:g} GB free" if h["disk_free_gb"] is not None else
+                                           "free space unknown (Docker's storage is not measurable from this host)") +
+            f"; {cfg.parallel} runs at a time; one run at most {cfg.run_timeout_s // 60} min; all runs of one check at "
             f"most {cfg.check_budget_s / 3600:g} h (configured); acquired data at most {cfg.max_data_gb} GB per check")
 
 
@@ -914,26 +1058,7 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
                   stage="prepare" if check.get("prepare") else "run", done_seeds=[], failed_seeds={},
                   image=run_image(envinfo.get("image", DEFAULT_IMAGE),    # one image for every run of the check
                                   kind in ("AUTHOR_CODE", "RECONSTRUCTION") and gpu(cfg)))
-        for row in _checkpoints(cdir, check):          # ended seeds of this exact script/command are kept
-            st["values"] += row["values"]
-            st["cert"] += row.get("cert") or []
-            st["staged"] += row.get("staged") or []
-            st.setdefault("detail", []).extend(row.get("detail") or [])
-            st["done_seeds"].append(row["seed"])
-            if row.get("error"):
-                st["failed_seeds"][str(row["seed"])] = row["error"]
-            st["ok_runs"] = st.get("ok_runs", 0) + (not row.get("error"))
-            st["units"] = sorted(set(st.get("units") or []) | set(row.get("units") or []))
-            # A reused seed follows the same rule as a new one: a completed run's unit printed under
-            # another name is a labeling defect, not an incomplete stage.
-            errs, defects = split_units(set(row.get("units") or []), row.get("staged") or [], bool(row.get("error")), "")
-            for s in errs:                                  # only a declared unit can be incomplete
-                if s in (row.get("stage_errors") or {}):
-                    st.setdefault("stage_errors", {}).setdefault(s, row["stage_errors"][s])
-            st["schema_defects"] = sorted(set(st.get("schema_defects") or []) | set(defects) | set(row.get("schema") or []))
-            st["cohort_mismatch"] = sorted(set(st.get("cohort_mismatch") or []) | set(row.get("cohort_mismatch") or []))
-            st.setdefault("pilot_s", row.get("seconds") or 0)
-        st["seed"], st["reused"] = len(st["done_seeds"]), len(st["done_seeds"])
+        reuse_checkpoints(root, cdir, check, st)       # ended seeds of this exact script/command are kept
         log = root / "execution.jsonl"          # this exact script was killed for memory before: one seed at a time
         if check.get("script_sha256") and log.exists() and any(
                 r.get("script_sha256") == check["script_sha256"] and r.get("returncode") == 137
@@ -1019,7 +1144,7 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         for s, e in failed_stages.items():
             st.setdefault("stage_errors", {}).setdefault(s, e)
         # Execution and the result contract are recorded apart from what the results say.
-        if kind in ("RECONSTRUCTION", "RELEASED_DATA") and not ev["failed"]:
+        if kind in ("RECONSTRUCTION", "RELEASED_DATA", "CERTIFICATE") and not ev["failed"]:
             defects = sorted(set(defects) | set(result_schema(done, check)))
         mism = cohort_mismatch(done["stdout"], check) if check.get("readings") else []
         st["schema_defects"] = sorted(set(st.get("schema_defects") or []) | set(defects))[:40]   # ponytail: 40 kept
@@ -1037,8 +1162,11 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         st["values"] += vs
         st.setdefault("cert", []).extend(rows)
         st.setdefault("staged", []).extend(staged)
-        detail = result_detail(done["stdout"], int(key)) if kind in ("RECONSTRUCTION", "RELEASED_DATA") and not ev["failed"] else []
+        # A run that measured and then failed keeps its measurements (staged), so it keeps the lines that say
+        # whether its replicates differed too: a measurement without them would be unprovable, not identical.
+        detail = result_detail(done["stdout"], int(key)) if kind in ("RECONSTRUCTION", "RELEASED_DATA") else []
         st.setdefault("detail", []).extend(detail)
+        st.setdefault("seed_seconds", {})[key] = done.get("seconds") or 0
         st["seed"] += 1
         st.setdefault("done_seeds", []).append(int(key))
         state.append_jsonl(cdir / "seeds.jsonl", {"key": _ckpt_key(check), "seed": int(key), "values": vs,
@@ -1174,11 +1302,23 @@ def budget(cfg: state.Config, check: dict) -> tuple[int, str]:
             (cfg.check_budget_s, "SH_CHECK_BUDGET_S"))
 
 
+def _projected(cfg: state.Config, check: dict, st: dict, runs: int, spent: float = 0.0) -> tuple[float, int, str, int]:
+    """(seconds needed, budget, its setting, runs at a time): the time already `spent` plus the timed
+    pilot's projection of the remaining runs."""
+    w = 1 if check["kind"] == "AUTHOR_CODE" else max(1, min(cfg.parallel, st.get("width", cfg.parallel)))
+    limit, setting = budget(cfg, check)
+    return spent + st.get("pilot_s", 0) * (runs - st["seed"]) / w, limit, setting, w
+
+
+def _spent(st: dict) -> float:
+    """The seconds the check's completed seeds took (each seed's own run time; the pilot's where unrecorded)."""
+    secs, pilot = st.get("seed_seconds") or {}, st.get("pilot_s", 0)
+    return sum(v or pilot for v in secs.values()) + pilot * max(0, st.get("seed", 0) - len(secs))
+
+
 def _over_budget(cfg: state.Config, check: dict, st: dict, runs: int) -> str:
     """The documented blocker when the timed pilot projects the remaining runs past the budget."""
-    w = 1 if check["kind"] == "AUTHOR_CODE" else max(1, min(cfg.parallel, st.get("width", cfg.parallel)))
-    need = st.get("pilot_s", 0) * (runs - st["seed"]) / w
-    limit, setting = budget(cfg, check)
+    need, limit, setting, w = _projected(cfg, check, st, runs)
     if need <= limit:
         return ""
     fmt = lambda sec: f"{sec / 3600:.1f} h" if sec >= 3600 else f"{sec / 60:.0f} min" if sec >= 60 else f"{sec:.0f} s"
@@ -1202,16 +1342,17 @@ def _extension(cfg: state.Config, check: dict, st: dict, runs: int) -> int:
     """The replicate count to extend a finished stochastic experiment to, or 0. Independent replicates that
     repeat one value (a recovery ratio of 1.0, no false alarm) are decided by an exact sign test, which reaches
     95% only from SIGN_MIN of them; a margin within t*SE at fewer than SIGN_MIN replicates is wide mostly because
-    t(2)=4.3: when only more replicates stand between the check and a decision, and the extra runs fit the
-    check's time budget, the harness runs them (once, never fewer than planned, never a downscale, and whatever
-    direction the result leans). The protocol records the extension and why."""
+    t(2)=4.3: when only more replicates stand between the check and a decision, and the time its seeds already
+    took plus the extra runs fit the check's time budget, the harness runs them (once, never fewer than planned,
+    never a downscale, and whatever direction the result leans). The protocol records the extension and why."""
     from .reconcile import SIGN_MIN
     if (check["kind"] != "RECONSTRUCTION" or check.get("test") == "compatibility" or check.get("stochastic") is False
             or st.get("runs_extended") or runs >= SIGN_MIN or st.get("failed_seeds")):
         return 0
     if not _wants(_reconciled(check, st, True, "", failure="")):
         return 0
-    return SIGN_MIN if not _over_budget(cfg, check, st, SIGN_MIN) else 0
+    need, limit, _, _ = _projected(cfg, check, st, SIGN_MIN, spent=_spent(st))
+    return SIGN_MIN if need <= limit else 0
 
 
 def _reconciled(check: dict, st: dict, authorized: bool, why: str, failure: str | None = None) -> dict:
@@ -1227,7 +1368,8 @@ def _reconciled(check: dict, st: dict, authorized: bool, why: str, failure: str 
                      readings=[r["name"] for r in check.get("readings") or []],
                      cohort_mismatch=st.get("cohort_mismatch"),
                      deterministic=kind == "RELEASED_DATA" or check.get("stochastic") is False,
-                     test=check.get("test", ""), detail=st.get("detail"), rng=check.get("seed_flow"))
+                     test=check.get("test", ""), detail=st.get("detail"), rng=check.get("seed_flow"),
+                     metric=check.get("metric", ""))
 
 
 def _stage_summary(staged: list) -> dict:
@@ -1250,6 +1392,60 @@ def _checkpoints(cdir: Path, check: dict) -> list[dict]:
             seen.add(row["seed"])
             out.append(row)
     return out
+
+
+def _seed_record(log: list[dict], check: dict, seed: int) -> dict | None:
+    """The last evidence run of this exact approved script for `seed` that printed result lines."""
+    return next((r for r in reversed(log) if r.get("target") == check.get("id") and r.get("mode") == "evidence"
+                 and r.get("script_sha256") == check.get("script_sha256") and int(r.get("seed") or 0) == seed
+                 and "REFEREE_RESULT " in (r.get("stdout") or "")), None)
+
+
+def reuse_checkpoints(root: Path, cdir: Path, check: dict, st: dict, fresh: bool = False) -> list[dict]:
+    """Fold the ended seeds of this exact script/command (seeds.jsonl) into a check's state, as a new
+    poll reuses them and as tools/replay.py re-decides them — one path, so the two cannot drift. A row
+    written before per-run `detail` existed gets it rebuilt from that seed's own stdout in
+    execution.jsonl (same script sha, same seed); failing that, its stages carry a `missing` marker:
+    evidence missing, never identical runs. `fresh` (replay) re-derives the result schema and cohort
+    comparison from the recorded stdout under the current rules."""
+    rows, scripted = _checkpoints(cdir, check), check["kind"] in ("RECONSTRUCTION", "RELEASED_DATA")
+    want = [r for r in rows if scripted and (fresh or (r.get("staged") and not r.get("detail")))]
+    f = Path(root) / "execution.jsonl"
+    log = [json.loads(x) for x in f.read_text(encoding="utf-8").splitlines()] if want and f.exists() else []
+    for k, v in (("values", []), ("cert", []), ("staged", []), ("detail", []), ("done_seeds", []), ("failed_seeds", {})):
+        st.setdefault(k, v)
+    for row in rows:
+        st["values"] += row["values"]
+        st["cert"] += row.get("cert") or []
+        st["staged"] += row.get("staged") or []
+        rec = _seed_record(log, check, int(row["seed"])) if row in want else None
+        detail = result_detail(rec.get("stdout") or "", int(row["seed"])) if rec else (row.get("detail") or [])
+        if not detail and row.get("staged") and scripted:
+            detail = [{"seed": int(row["seed"]), "stage": e[0], "reading": e[2] if len(e) > 2 else "", "out": {},
+                       "trials": {}, "data_fp": None, "missing": True}
+                      for e in {(e[0], e[2] if len(e) > 2 else ""): e for e in row["staged"]}.values()]
+        st["detail"] += detail
+        st["done_seeds"].append(row["seed"])
+        st.setdefault("seed_seconds", {})[str(row["seed"])] = row.get("seconds") or 0
+        if row.get("error"):
+            st["failed_seeds"][str(row["seed"])] = row["error"]
+        st["ok_runs"] = st.get("ok_runs", 0) + (not row.get("error"))
+        st["units"] = sorted(set(st.get("units") or []) | set(row.get("units") or []))
+        # A reused seed follows the same rule as a new one: a completed run's unit printed under
+        # another name is a labeling defect, not an incomplete stage.
+        errs, defects = split_units(set(row.get("units") or []), row.get("staged") or [], bool(row.get("error")), "")
+        for s in errs:                                  # only a declared unit can be incomplete
+            if s in (row.get("stage_errors") or {}):
+                st.setdefault("stage_errors", {}).setdefault(s, row["stage_errors"][s])
+        schema, mism = set(row.get("schema") or []), set(row.get("cohort_mismatch") or [])
+        if fresh and rec and not row.get("error"):
+            schema = set(result_schema(rec, check))
+            mism = set(cohort_mismatch(rec.get("stdout") or "", check)) if check.get("readings") else set()
+        st["schema_defects"] = sorted(set(st.get("schema_defects") or []) | set(defects) | schema)[:40]   # ponytail: 40 kept
+        st["cohort_mismatch"] = sorted(set(st.get("cohort_mismatch") or []) | mism)
+        st.setdefault("pilot_s", row.get("seconds") or 0)
+    st["seed"], st["reused"] = len(st["done_seeds"]), len(st["done_seeds"])
+    return rows
 
 
 def ckpt_volume(cdir: Path, seed: int) -> str:

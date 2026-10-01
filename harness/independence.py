@@ -2,17 +2,21 @@
 
 Equal summary values do not say the runs were the same experiment: an exact-recovery indicator
 is 1 in every replicate of a working method, and a false-alarm rate is 0 in every replicate of a
-valid test. The old rule read "the compared value repeated" as "the seed did not vary the run"
-and decided nothing. The evidence is the runs themselves:
+valid test. Nor does a script that feeds `--seed` to some generator say that THIS stage's draws
+depend on it (a stage may draw from a fixed generator inside a seeded script). The evidence is the
+runs themselves, per stage, at run time:
 
-  - the OTHER outputs of a stage's result lines (coverage, counts, sizes) differ between seeds;
-  - the script's own fingerprint of the data it generated (`data_fingerprint`) differs;
-  - or, when neither is available, the script demonstrably feeds `--seed` to a random generator
-    (a static flow check), so identical summaries are draws that coincided.
+  - the OTHER outputs of a stage's result lines (coverage, counts, sizes) differ between seeds:
+    different runs, whatever the data fingerprints say (fixed acquired data, seeded training);
+  - else the script's own fingerprint of the random draws / data that stage consumed
+    (`data_fingerprint`, on every result line) differs: draws that differ, a summary that coincided;
+  - identical lines with identical fingerprints are one run repeated (one measurement), and
+    identical lines without fingerprints are unproven (one measurement, never replicates).
 
-Only when the lines are identical AND nothing shows the seed reaches a generator (or a
-declared fingerprint is identical) are the runs one measurement. A time-like output is ignored:
-it differs between two runs of the same experiment.
+The static seed flow (`seed_flow`) is recorded as context only: it never makes repeated lines
+independent replicates. A seed whose per-run lines were not recorded is evidence missing, never
+identical. A time-like output (a whole name token such as `seconds`, `elapsed`, `wall_time`) is
+ignored: it differs between two runs of the same experiment.
 """
 from __future__ import annotations
 
@@ -24,7 +28,16 @@ import re
 _SINKS = {"default_rng", "randomstate", "seed", "manual_seed", "manual_seed_all", "seedsequence", "pcg64",
           "mt19937", "philox", "sfc64", "prngkey", "set_seed", "seed_everything"}
 _SINK_KW = {"random_state", "seed", "rng", "generator", "random_seed", "seeds"}
-_TIMEY = re.compile(r"time|sec|elapsed|duration|latency|wall|runtime|clock|stamp", re.I)
+# Whole name tokens of a wall clock (`fit_secs`, `trainTime`, `elapsed_s`); a substring (`intersection_size`,
+# `n_timesteps`) is not one. `time` is a token of a wall clock and of a delay counted in samples alike
+# (`detection_time`): it stays ignored, the side on which a clock output can never make duplicates "different runs".
+_CLOCK = {"time", "times", "sec", "secs", "seconds", "elapsed", "duration", "latency", "wall", "walltime", "wallclock",
+          "runtime", "clock", "timestamp", "stamp"}
+_TOKENS = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])")
+
+
+def _timey(name: str) -> bool:
+    return any(t.lower() in _CLOCK for t in _TOKENS.findall(name))
 
 
 def _names(node: ast.AST) -> set[str]:
@@ -84,37 +97,44 @@ def seed_flow(script: str) -> bool | None:
 
 def _fp(rows: list[dict]) -> str:
     """The outputs of one seed's result lines for a stage, less anything time-like."""
-    body = [{k: v for k, v in sorted(r.get("out", {}).items()) if not _TIMEY.search(k)} for r in rows]
+    body = [{k: v for k, v in sorted(r.get("out", {}).items()) if not _timey(k)} for r in rows]
     return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def assess(detail: list[dict] | None, stage: str, reading: str, rng: bool | None) -> dict:
-    """The state of one stage's replicates: `different` (shown), `seeded` (identical summaries, but the
-    seed reaches a random generator), `identical` (a declared data fingerprint repeats), `unproven`
-    (identical lines and nothing showing the seed varied them) or `single`/`unknown`.
-    `independent` is true for `different` and `seeded`."""
+    """The state of one stage's replicates, from what the runs printed: `different` (their other outputs
+    differ, or their data fingerprints do), `identical` (identical lines and fingerprints: one run repeated),
+    `unproven` (identical lines, no fingerprint on every line), `unknown` (a seed's lines were not recorded)
+    or `single`. Only `different` is `independent`. `rng` (the static seed flow) is context, never evidence."""
     by_seed: dict[int, list[dict]] = {}
     for r in detail or []:
         if r.get("stage", "") == stage and r.get("reading", "") == reading:
             by_seed.setdefault(int(r["seed"]), []).append(r)
     if not detail:
         return {"state": "unknown", "independent": False, "n": 0, "basis": "no per-run result lines were recorded"}
+    lost = sorted(s for s, rs in by_seed.items() if any(r.get("missing") for r in rs))
+    if lost:
+        return {"state": "unknown", "independent": False, "n": len(by_seed),
+                "basis": f"the per-run result lines of seed(s) {lost[:10]} were not recorded, so whether the replicates "
+                         "differed is unknown (evidence missing, not identical runs)"}
     if len(by_seed) < 2:
         return {"state": "single", "independent": False, "n": len(by_seed), "basis": "fewer than two seeds"}
-    declared = {s: tuple(sorted(str(r["data_fp"]) for r in rs if r.get("data_fp"))) for s, rs in by_seed.items()}
-    if all(declared.values()):
-        k = len(set(declared.values()))
-        return {"state": "different" if k > 1 else "identical", "independent": k > 1, "n": len(by_seed),
-                "distinct": k, "basis": f"the script's own data fingerprints: {k} distinct in {len(by_seed)} seeds"}
     lines = {s: _fp(rs) for s, rs in by_seed.items()}
     k = len(set(lines.values()))
     if k > 1:
         return {"state": "different", "independent": True, "n": len(by_seed), "distinct": k,
                 "basis": f"the runs' result lines differ in their outputs ({k} distinct in {len(by_seed)} seeds), "
                          "though the compared value may repeat"}
-    if rng:
-        return {"state": "seeded", "independent": True, "n": len(by_seed), "distinct": 1,
-                "basis": "the result lines are identical, but --seed reaches a random generator in the script "
-                         "(a static check): the draws differ and their summary coincided"}
+    fps = {s: tuple(sorted(str(r.get("data_fp") or "") for r in rs)) for s, rs in by_seed.items()}
+    flow = (f"; the static seed flow ({'--seed reaches a generator somewhere in the script' if rng else 'none found'}) "
+            "is context, not evidence about this stage" if rng is not None else "")
+    if all(all(r.get("data_fp") for r in rs) for rs in by_seed.values()):
+        k = len(set(fps.values()))
+        return {"state": "different" if k > 1 else "identical", "independent": k > 1, "n": len(by_seed), "distinct": k,
+                "basis": (f"identical result lines, but the script's own data fingerprints of this stage's draws differ "
+                          f"({k} distinct in {len(by_seed)} seeds): draws that differ, a summary that coincided" if k > 1 else
+                          f"identical result lines and identical data fingerprints in {len(by_seed)} seeds: one run "
+                          "repeated") + flow}
     return {"state": "unproven", "independent": False, "n": len(by_seed), "distinct": 1,
-            "basis": "the result lines are identical and nothing shows the seed varied the run"}
+            "basis": "the result lines are identical and not every line carries a `data_fingerprint`, so nothing the "
+                     "runs printed shows the seed varied this stage" + flow}

@@ -102,7 +102,9 @@ class Paper:
         `owner/name` hub id, or an identifier that names the same record (a DOI for its landing page,
         a Zenodo record for its DOI). A PDF breaks a URL across lines and hyphenates it at a line end
         ("zen-\\nodo.org"): both readings are searched, the printed one first, and the span is returned
-        as printed with the URL variants that span can mean (`variants`). None if nothing cites it."""
+        as printed with the URL variants that span can mean (`variants`, in the printed case; on a registry's own
+        host an optional `www.`, and a Zenodo `record/` for `records/`, are the same URL). None if nothing cites it."""
+        src = clean_source(src)
         for needle, kind in citation_needles(src):
             n = flat(needle)
             for hay, idx, form in ((self.flat, None, "as printed"), (self.soft, self.soft_idx, "line-break hyphen dropped")):
@@ -110,14 +112,16 @@ class Paper:
                 while at >= 0:
                     a, b = (at, at + len(n) - 1) if idx is None else (idx[at], idx[at + len(n) - 1])
                     lo, hi = self.offs[a], self.offs[b] + 1
-                    if _cite_bounded(self.text, lo, hi, kind, src):
+                    www = kind == "url" and needle.split("/")[0] in _WWW_SAME
+                    if _cite_bounded(self.text, lo, hi, kind, src, www):
+                        lo -= 4 if www and self.text[:lo].lower().endswith("www.") else 0
                         span = self.text[lo:hi]
-                        hard = re.sub(r"\s+", "", span)
-                        soft = re.sub(r"\s+", "", re.sub(r"-\s+", "", span))
+                        hard = re.sub(r"[\s­]+", "", span)
+                        soft = re.sub(r"[\s­]+", "", re.sub(r"-\s+", "", span))
                         scheme = src.split("://", 1)[0]
                         alts = [f"{scheme}://{v}" for v in dict.fromkeys((soft, hard))] if kind == "url" else []
                         return {"span": span, "page": self.page_of(lo), "form": form, "as": kind,
-                                "variants": [v for v in alts if v.lower() != src.lower()]}
+                                "variants": [v for v in alts if v != src]}
                     at = hay.find(n, at + 1)
         return None
 
@@ -138,34 +142,52 @@ class Paper:
 
 
 _ZENODO_DOI = re.compile(r"10\.5281/zenodo\.(\d+)", re.I)
+_CLOSES = {")": "(", "]": "[", "}": "{", ">": "<"}
+_WWW_SAME = ("zenodo.org", "figshare.com", "huggingface.co")   # registries whose www. host is the same repository
+
+
+def clean_source(src: str) -> str:
+    """A source as a plan copied it out of prose: invisible characters (a soft hyphen, a zero-width space) and
+    whitespace out, a wrapping bracket or quote off its start, and the sentence's own punctuation off its end — a
+    . , ; : ! ? or quote, or a closing bracket that opens nowhere in it (`wiki/Foo_(bar)` keeps its own)."""
+    s = re.sub(r"[\s­​‌‍⁠﻿]+", "", src or "").lstrip("<([{\"'“‘")
+    while s and (s[-1] in ".,;:!?\"'”’»" or s[-1] in _CLOSES and s.count(s[-1]) > s.count(_CLOSES[s[-1]])):
+        s = s[:-1]
+    return s
 
 
 def citation_needles(src: str) -> list[tuple[str, str]]:
     """(needle, kind) for each way a text may cite `src`, the printed URL first: the URL without its
-    scheme, a hub id, and the identifier of the same record (a DOI page <-> its DOI, a Zenodo
-    record <-> its DOI). The equivalences are those of the registries, never of a particular paper."""
+    scheme (a registry's host without `www.`, which may be printed or not), a hub id, and the identifier of the same record
+    (a DOI page <-> its DOI, a Zenodo record <-> its DOI, `record/N` <-> `records/N`). The equivalences are
+    those of the registries, never of a particular paper."""
     if src.startswith("hf://"):
         return [(src[5:].partition("/")[2].split("@")[0], "hf")]
     host, _, path = src.split("://", 1)[1].rstrip("/").partition("/")
     host = host.lower()
+    host = host[4:] if host.startswith("www.") and host[4:] in _WWW_SAME else host
     out = [(f"{host}/{path}" if path else host, "url")]
     if host in ("doi.org", "dx.doi.org") and path.startswith("10."):
         out.append((path, "id"))
         if m := _ZENODO_DOI.fullmatch(path):
             out += [(f"zenodo.org/{p}/{m[1]}", "url") for p in ("records", "record")]
-    elif host == "zenodo.org" and (m := re.match(r"records?/(\d+)", path)):
-        out.append((f"10.5281/zenodo.{m[1]}", "id"))
+    elif host == "zenodo.org" and (m := re.match(r"(records?)/(\d+)(.*)", path)):
+        out += [(f"zenodo.org/{p}/{m[2]}{m[3]}", "url") for p in ("records", "record") if p != m[1]]
+        out.append((f"10.5281/zenodo.{m[2]}", "id"))
     return out
 
 
-def _cite_bounded(text: str, lo: int, hi: int, kind: str, src: str) -> bool:
-    """Is text[lo:hi] a whole URL or id, not the middle of a longer name? A sentence's full stop may follow."""
+def _cite_bounded(text: str, lo: int, hi: int, kind: str, src: str, www: bool = False) -> bool:
+    """Is text[lo:hi] a whole URL or id, not the middle of a longer name? A sentence's full stop may follow.
+    A hub id may follow its hub's own URL prefix (`huggingface.co/` for a model, `.../datasets/` for a dataset)."""
     before = text[:lo]
     if kind == "hf":
-        hub = f"huggingface.co/{src[5:].partition('/')[0]}/"
-        if not before.lower().endswith(hub) and before and (before[-1].isalnum() or before[-1] in "_./-"):
+        sub = "datasets/" if src[5:].startswith("datasets/") else ""
+        if not before.lower().endswith((f"huggingface.co/{sub}", f"hf.co/{sub}")) and before and (
+                before[-1].isalnum() or before[-1] in "_./-"):
             return False
     else:
+        before = before[:-4] if www and before.lower().endswith("www.") else before
         if before and (before[-1].isalnum() or before[-1] in "_.-"):
             return False
     if hi < len(text) and text[hi] == "/":

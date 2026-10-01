@@ -129,10 +129,12 @@ Load each dataset exactly as the paper and code specify and print its REFEREE_DA
      applying only selection the paper states — no editing, resampling or regeneration?
   3. Is the compared output the number the printed target (or the stated relation) is about,
      computed from the files — never a flag computed against the printed number?
-  4. PAPER VS CODE: if the checkout ships code that computes this quantity, does its definition
-     (estimator, pooled items or positions, selection, aggregation) match the paper's text? If
-     they differ and the script does not compute both as readings on the same data and cohort,
-     REVISE. A script that follows only the code, or only the paper, while they differ is REVISE.
+  4. PAPER VS CODE: if the checkout ships code that computes this quantity, or the released record
+     does (its code or README under record_src, a precomputed column, rows the paper says were
+     discarded but the files hold), does its definition (estimator, pooled items or positions,
+     selection, aggregation) match the paper's text? If they differ and the script does not compute
+     both as readings on the same data and cohort, REVISE. A script that follows only the code, or
+     only the paper, while they differ is REVISE.
   5. Is the declared basis honest: an audit of released result files, or a recomputation from
      released predictions or scores?
 

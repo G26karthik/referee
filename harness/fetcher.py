@@ -14,9 +14,14 @@ What it guarantees, each because a run once got it wrong:
   - Nothing is admitted to an experiment before its content is validated: not an HTML page, an empty
     or corrupt file, an archive with an unsafe path, a file whose published checksum disagrees, or
     executable source code (acquired artifacts are data; code enters only through the gated route).
+    Released code, notebooks and READMEs are kept as TEXT only (`record_src`), for quoting, never as data.
+  - A set is complete or says what it lacks: a named file not admitted (`missing`), an `include` pattern that
+    matched nothing (`unmatched_include`), a cut (`truncated`). The primary reading of a citation decides
+    a failure's class; its alternates rank below it.
 """
 from __future__ import annotations
 
+import base64
 import fnmatch
 import hashlib
 import html
@@ -37,8 +42,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+import zlib
 
-CODE = (".py", ".ipynb", ".sh", ".bash", ".zsh", ".ps1", ".bat", ".r", ".rmd", ".m", ".jl", ".c", ".cc", ".cpp", ".h",
+CODE =(".py", ".ipynb", ".sh", ".bash", ".zsh", ".ps1", ".bat", ".r", ".rmd", ".m", ".jl", ".c", ".cc", ".cpp", ".h",
         ".hpp", ".cu", ".java", ".js", ".ts", ".go", ".rs", ".lua", ".pl", ".rb", ".php")
 DATA = (".zip", ".tar", ".tgz", ".gz", ".bz2", ".xz", ".csv", ".tsv", ".json", ".jsonl", ".parquet", ".npz", ".npy",
         ".pkl", ".h5", ".hdf5", ".arff", ".xlsx", ".feather", ".arrow", ".txt", ".data", ".names", ".mat", ".pt",
@@ -48,9 +54,18 @@ TEXT = (".csv", ".tsv", ".txt", ".json", ".jsonl", ".arff", ".md", ".data", ".na
 # resolved to its files through the API, with the checksums it publishes.
 RECORD_APIS = {"zenodo.org": "https://zenodo.org/api/records/{id}", "figshare.com": "https://api.figshare.com/v2/articles/{id}"}
 # ponytail: 20 files followed from one landing page (links are unvetted), 500 from a repository record (its own
-# listing, sizes and checksums; the storage cap bounds the bytes), 3 tries per URL, 2 alternate readings of a citation.
+# listing, sizes and checksums; the storage cap bounds the bytes), 3 tries per URL, 2 alternate readings of a citation,
+# 3 archives opened for an `include` that named no listed file or link (it may name what they hold).
 # A cut is never silent: `rec["truncated"]` names how many matched and which were not followed.
-MAX_FOLLOW, MAX_RECORD_FILES, TRIES, MAX_ALTERNATES = 20, 500, 3, 2
+MAX_FOLLOW, MAX_RECORD_FILES, TRIES, MAX_ALTERNATES, MAX_ARCHIVES = 20, 500, 3, 2, 3
+# ponytail: quote-only text of released code, notebooks and READMEs: 256 KB kept per file, 2 MB per check, 50 files
+# fetched for their text alone per source (each at most 1 MB, a notebook 16 MB, read whole to decode its cells); at most
+# 640 KB of it (compressed, base64) on stdout, which keeps only its last 1 MB beside the manifest. Every cut is recorded
+# (`record_src_cut`).
+SRC_FILE, SRC_TOTAL, SRC_FILES, SRC_NOTEBOOK, SRC_WIRE = 256 << 10, 2 << 20, 50, 16 << 20, 640 << 10
+ARCHIVES = (".zip", ".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tar.xz", ".tbz2", ".txz")   # unpacked by suffix only
+RANK = ("bug", "denied", "storage", "inaccessible", "transient", "missing", "content_invalid", "no_data", "protocol")
+_DOC = re.compile(r"(?:^|/)readme[^/]*$|\.(?:md|rst)$", re.I)
 
 
 class FetchError(Exception):
@@ -59,15 +74,28 @@ class FetchError(Exception):
         self.klass, self.attempts = klass, attempts or []
 
 
+def _by_status(c: int) -> str:
+    return ("transient" if c in (408, 425, 429) or c >= 500 else "missing" if c in (404, 410) else
+            "inaccessible" if c in (401, 402, 403, 451) else "protocol")
+
+
 def classify(e: BaseException) -> tuple[str, str]:
-    """(failure class, message). An exception of this code's own is a `bug`, never missing data."""
+    """(failure class, message). An exception of this code's own is a `bug`, never missing data. A hub client's
+    error is classed by the HTTP status it carries (`response.status_code`), else by its kind."""
     if isinstance(e, FetchError):
         return e.klass, str(e)
     if isinstance(e, urllib.error.HTTPError):
-        c = e.code
-        k = ("transient" if c in (408, 425, 429) or c >= 500 else "missing" if c in (404, 410) else
-             "inaccessible" if c in (401, 402, 403, 451) else "protocol")
-        return k, f"HTTP {c} {e.reason}"
+        return _by_status(e.code), f"HTTP {e.code} {e.reason}"
+    if isinstance(code := getattr(getattr(e, "response", None), "status_code", None), int):
+        return _by_status(code), f"HTTP {code} {type(e).__name__}: {e}"[:500]
+    names = {c.__name__ for c in type(e).__mro__}
+    if any(k in n for n in names for k in ("Timeout", "ConnectError", "NetworkError", "TransportError", "OfflineMode",
+                                           "LocalEntryNotFound")):
+        return "transient", f"{type(e).__name__}: {e}"
+    if names & {"GatedRepoError"}:
+        return "inaccessible", f"{type(e).__name__}: {e}"
+    if names & {"RepositoryNotFoundError", "RevisionNotFoundError", "EntryNotFoundError"}:
+        return "missing", f"{type(e).__name__}: {e}"
     if isinstance(e, ssl.SSLError):
         return "protocol", f"TLS: {e}"
     if isinstance(e, urllib.error.URLError):
@@ -121,12 +149,85 @@ def _base(url: str) -> str:
     return os.path.basename(urllib.parse.unquote(urllib.parse.urlparse(url).path.rstrip("/")))
 
 
+def _head(path: str, n: int) -> bytes:
+    with open(path, "rb") as f:
+        return f.read(n)
+
+
+def _src_limit(name: str) -> int:
+    return SRC_NOTEBOOK if name.lower().endswith(".ipynb") else SRC_FILE + 1
+
+
+def _src_fetchable(name: str, size) -> bool:
+    """Is a released text file small enough to fetch for its text alone (its size known)?"""
+    return size is not None and size <= (SRC_NOTEBOOK if name.lower().endswith(".ipynb") else 4 * SRC_FILE)
+
+
+def _safe_rel(name: str) -> str:
+    """A relative path that stays inside its folder on any host ("" if it cannot)."""
+    parts = [p for p in name.replace("\\", "/").split("/") if p not in ("", ".")]
+    return "" if not parts or ".." in parts else "/".join(re.sub(r'[<>:"|?*\x00-\x1f]', "_", p) for p in parts)
+
+
+def _as_text(path: str, data: bytes) -> str:
+    """A notebook as the plain text of its cells' sources; anything else decoded as UTF-8."""
+    if path.lower().endswith(".ipynb"):
+        try:
+            cells = json.loads(data.decode("utf-8")).get("cells") or []
+            return "\n\n".join(f"# %% [{c.get('cell_type', '?')}] cell {i + 1}\n" + (
+                "".join(c["source"]) if isinstance(c.get("source"), list) else str(c.get("source") or ""))
+                for i, c in enumerate(cells))
+        except (ValueError, AttributeError, TypeError, KeyError):
+            pass
+    return data.decode("utf-8", "replace")
+
+
 class Fetcher:
     def __init__(self, cache: str, cap: int, deny: list[str], sleep=time.sleep, tries: int = TRIES, timeout: int = 120):
         self.cache, self.cap, self.deny, self.sleep, self.tries, self.timeout, self.total = cache, cap, deny, sleep, tries, timeout, 0
+        self.unpacked, self.idx, self.src, self.src_bytes, self.src_cut = 0, "0", [], 0, []
 
     def denied(self, s: str) -> bool:
         return any(d and d in s.lower() for d in self.deny)
+
+    def room(self) -> int:
+        """Bytes left under the storage cap: downloads and what archives unpacked to both count."""
+        return self.cap - self.total - self.unpacked
+
+    def keep(self, name: str, data: bytes, origin: str = "") -> None:
+        """The TEXT of a released file that is never data — code, a notebook (its cells' sources), a README — kept for
+        quoting a reading of the released implementation; never mounted, never run. Capped; a cut is recorded."""
+        path = _safe_rel(name)
+        if not path or any(x["dir"] == self.idx and x["path"] == path for x in self.src):
+            return
+        if not path.lower().endswith((".html", ".htm")) and looks_html(data[:8192]):     # a login page is no released code
+            self.src_cut.append(f"{self.idx}/{path}: an HTML page, not the file it was named for")
+            return
+        text = _as_text(path, data)
+        raw = text.encode("utf-8")
+        cut = len(raw) > SRC_FILE
+        if cut:
+            text = raw[:SRC_FILE].decode("utf-8", "ignore")
+            raw = text.encode("utf-8")
+        if self.src_bytes + len(raw) > SRC_TOTAL:
+            self.src_cut.append(f"{self.idx}/{path}")
+            return
+        self.src_bytes += len(raw)
+        self.src.append({"dir": self.idx, "path": path, "text": text, "bytes": len(raw), "from": origin,
+                         "sha256": hashlib.sha256(raw).hexdigest(), **({"cut": f"its first {SRC_FILE} bytes"} if cut else {})})
+
+    def wire(self) -> tuple[list[dict], str]:
+        """(listing, payload): the kept text as one compressed line for stdout, within SRC_WIRE (what does not fit is cut,
+        recorded), and the listing the manifest carries (path `<source>/<path>`, bytes, sha256)."""
+        items = list(self.src)
+        enc = ""
+        while items:
+            enc = base64.b64encode(zlib.compress(json.dumps([{k: x[k] for k in ("dir", "path", "text")} for x in items]).encode(), 9)).decode()
+            if len(enc) <= SRC_WIRE:
+                break
+            self.src_cut.append(f"{items[-1]['dir']}/{items.pop()['path']}")
+            enc = ""
+        return [{"path": f"{x['dir']}/{x['path']}", **{k: x[k] for k in ("bytes", "sha256", "from", "cut") if k in x}} for x in items], enc
 
     def get(self, url: str, dest: str, md5: str = "", size: int | None = None) -> tuple[str, dict]:
         """Download `url` (or read it from the cache) into `dest`; -> (path, info). `info` carries the
@@ -134,8 +235,9 @@ class Fetcher:
         The cache keeps that metadata, so a cached response resolves links exactly as a fresh one.
         Where the repository publishes a checksum or a size, a transfer that disagrees (cut short,
         corrupted) is retried like a network fault, is never cached, and a cached copy that disagrees
-        is purged. Several containers share the cache, so every write goes to a temp name of its own and
-        is renamed into place whole."""
+        is purged. A cut that repeats at every try is a fault of the transfer (`transient`); content that
+        disagrees with its published checksum at every try is `content_invalid`. Several containers share the
+        cache, so every write goes to a temp name of its own and is renamed into place whole."""
         if self.denied(url):
             raise FetchError("denied", "source denied by SH_DENY_SOURCES")
         key = hashlib.sha256(url.encode()).hexdigest()[:16]
@@ -169,11 +271,11 @@ class Fetcher:
                     break
                 except Exception as e:                    # noqa: BLE001 - classified, never swallowed
                     klass, msg = classify(e)
-                    if isinstance(e, FetchError) and klass not in ("corrupt",):
+                    if isinstance(e, FetchError) and klass not in ("corrupt", "short"):
                         raise
                     failed.append({"try": i + 1, "class": klass, "error": msg[:300], "redirects": hop.chain})
-                    if klass not in ("transient", "corrupt") or i == self.tries - 1:
-                        raise FetchError("content_invalid" if klass == "corrupt" else klass, msg, failed) from e
+                    if klass not in ("transient", "corrupt", "short") or i == self.tries - 1:
+                        raise FetchError({"corrupt": "content_invalid", "short": "transient"}.get(klass, klass), msg, failed) from e
                     self.sleep(2 ** i)
             info.update(retries=failed, bytes=os.path.getsize(cpath))
             tmp = f"{cpath}.meta.json.{uuid.uuid4().hex}"
@@ -195,21 +297,21 @@ class Fetcher:
         """Stream the response to a temp file of its own, check it against what was promised (Content-Length,
         the published size and md5), and only then rename it into the cache."""
         n = int(r.headers.get("Content-Length") or 0)
-        if self.total + n > self.cap:
+        if n > self.room():
             raise FetchError("storage", f"{n} bytes would pass the storage cap ({self.cap} bytes, SH_MAX_DATA_GB)")
         tmp, got, h = f"{cpath}.part.{uuid.uuid4().hex}", 0, hashlib.md5()
         try:
             with open(tmp, "wb") as f:
                 while b := r.read(1 << 20):
                     got += len(b)
-                    if self.total + got > self.cap:
+                    if got > self.room():
                         raise FetchError("storage", f"passed the storage cap ({self.cap} bytes, SH_MAX_DATA_GB)")
                     h.update(b)
                     f.write(b)
-            if n and got != n:
-                raise FetchError("corrupt", f"the transfer ended after {got} of {n} bytes")
-            if size is not None and got != size:
-                raise FetchError("corrupt", f"{got} bytes arrived, the published size is {size}")
+            if n and got < n:                               # cut short in transit
+                raise FetchError("short", f"the transfer ended after {got} of {n} bytes")
+            if size is not None and got != size:            # whole as sent, yet not the published file: corrupt
+                raise FetchError("short" if got < size and not n else "corrupt", f"{got} bytes arrived, the published size is {size}")
             if md5 and h.hexdigest() != md5.lower():
                 raise FetchError("corrupt", f"md5 {h.hexdigest()} differs from the published {md5}")
             _put(tmp, cpath)
@@ -233,12 +335,22 @@ def filename(info: dict, url: str) -> str:
     return name if name not in ("", ".", "..") else "index.html"
 
 
+def looks_html(head: bytes) -> bool:
+    """The one test for "this is a web page", wherever a response or a file is judged: past a byte-order mark,
+    whitespace, an XML prolog and comments, the document opens with an HTML doctype or element. Data that merely
+    holds HTML strings (a crawl's JSONL) is no page."""
+    h = head.decode("utf-16", "ignore").encode("utf-8", "ignore") if head[:2] in (b"\xff\xfe", b"\xfe\xff") else head
+    h = h.removeprefix(b"\xef\xbb\xbf").lstrip().lower()
+    while h.startswith((b"<?xml", b"<!--")):
+        end = h.find(b"?>" if h.startswith(b"<?") else b"-->")
+        if end < 0:
+            return False
+        h = h[end + (2 if h.startswith(b"<?") else 3):].lstrip()
+    return h.startswith((b"<!doctype html", b"<html"))
+
+
 def is_html(path: str, info: dict) -> bool:
-    if "html" in (info.get("content_type") or "").lower():
-        return True
-    with open(path, "rb") as f:
-        head = f.read(2048).lstrip().lower()
-    return head.startswith((b"<!doctype html", b"<html")) or b"<html" in head[:512]
+    return "html" in (info.get("content_type") or "").lower() or looks_html(_head(path, 8192))
 
 
 def html_links(page: str, final_url: str, hosts: set[str]) -> list[str]:
@@ -256,11 +368,14 @@ def html_links(page: str, final_url: str, hosts: set[str]) -> list[str]:
     return sorted(out)
 
 
+def _path(url: str) -> str:
+    return urllib.parse.unquote(urllib.parse.urlparse(url).path).lstrip("/")
+
+
 def pick(links: list[str], include: list[str]) -> list[str]:
     """The links to follow: those the plan's `include` patterns name, else the data and archive files."""
     if include:
-        return [u for u in links if any(fnmatch.fnmatch(_base(u), p) or fnmatch.fnmatch(
-            urllib.parse.urlparse(u).path.lstrip("/"), p) for p in include)]
+        return [u for u in links if _named(_path(u), include)]
     return [u for u in links if urllib.parse.urlparse(u).path.lower().endswith(DATA)]
 
 
@@ -295,35 +410,58 @@ def record_listing(j: dict) -> list[dict]:
 
 
 def _named(name: str, patterns: list[str]) -> bool:
-    return any(fnmatch.fnmatch(os.path.basename(name), p) or fnmatch.fnmatch(name, p) for p in patterns)
+    """Does a pattern name this file (its path or its basename)? Case-sensitive on every host, as in the container."""
+    return any(fnmatch.fnmatchcase(os.path.basename(name), p) or fnmatch.fnmatchcase(name, p) for p in patterns)
 
 
-def admit(path: str, name: str, dest: str, expect_md5: str = "", members: list[str] | None = None) -> tuple[list[dict], list[dict]]:
+def _archive(name: str) -> bool:
+    return name.lower().endswith(ARCHIVES)
+
+
+def _dot(name: str) -> bool:
+    """A path under a dot-name (`.gitattributes`, a hub's `.cache/`): repository metadata, never data."""
+    return any(p.startswith(".") for p in name.replace("\\", "/").split("/") if p)
+
+
+def _textual(name: str) -> bool:
+    """Released code, a notebook or a README: its text is kept for quoting (`record_src`)."""
+    return name.lower().endswith(CODE) or bool(_DOC.search(name))
+
+
+def admit(path: str, name: str, dest: str, expect_md5: str = "", members: list[str] | None = None, *,
+          keep=None, limit: int | None = None) -> tuple[list[dict], list[dict]]:
     """Validate one downloaded file and place it under `dest`: -> (admitted, rejected). Rejected files
     are removed; each rejection says why. `members`: the plan's `include` patterns, applied to the
     files INSIDE an archive when they named no link on the page (they named what the download holds):
-    the members they match are kept, all of them if none matches."""
+    the members they match are kept, all of them if none matches. Only an archive SUFFIX unpacks (an .npz,
+    .xlsx or .pt is a zip and stays whole), into the folder its name has. `limit`: the bytes an archive may
+    unpack to (what is left under the storage cap; a zip bomb is refused whole). `keep(name, bytes, origin)`
+    receives the text of released code, notebooks and READMEs, whole files or members (quote-only text)."""
     rej = lambda why, cls="content_invalid": ([], [{"file": name, "class": cls, "why": why}])
     low = name.lower()
+    if keep and _textual(name):
+        keep(name, _head(path, _src_limit(name)), name)
     if low.endswith(CODE):
         return rej("executable source code is not admitted as data", "code_excluded")
     size = os.path.getsize(path)
     if size == 0:
         return rej("the file is empty")
-    with open(path, "rb") as f:
-        head = f.read(2048)
-    if not low.endswith((".html", ".htm")) and (head.lstrip().lower().startswith((b"<!doctype html", b"<html"))):
+    if not low.endswith((".html", ".htm")) and looks_html(_head(path, 8192)):
         return rej("an HTML page, not the data it was named for")
     if expect_md5 and _md5(path) != expect_md5.lower():
         return rej(f"md5 {_md5(path)} differs from the published {expect_md5}")
     sha = _sha(path)
     os.makedirs(dest, exist_ok=True)
     kept, dropped = [], []
+    zipped, tarred = low.endswith(".zip"), _archive(low) and not low.endswith(".zip")
     # A name that claims to be an archive must be one: a truncated ZIP is not even recognised as a ZIP.
-    if (low.endswith(".zip") and not zipfile.is_zipfile(path)) or (
-            low.endswith((".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tar.xz")) and not tarfile.is_tarfile(path)):
+    if (zipped and not zipfile.is_zipfile(path)) or (tarred and not tarfile.is_tarfile(path)):
         return rej("the file is named as an archive but is not a readable one (truncated or corrupt)")
-    if low.endswith((".gz", ".bz2", ".xz")) and not tarfile.is_tarfile(path):
+    over = lambda n: rej(f"the archive unpacks to {n} bytes, past the {limit} bytes left under the storage cap "
+                         "(SH_MAX_DATA_GB): refused whole", "storage")
+    sub = os.path.dirname(name.replace("\\", "/"))
+    at = lambda m: f"{sub}/{m}" if sub else m
+    if low.endswith((".gz", ".bz2", ".xz")) and not tarred:
         import bz2, gzip, lzma
         try:                                              # a compressed single file: it must decompress to its end
             with {"gz": gzip, "bz2": bz2, "xz": lzma}[low.rsplit(".", 1)[1]].open(path, "rb") as z:
@@ -332,40 +470,50 @@ def admit(path: str, name: str, dest: str, expect_md5: str = "", members: list[s
         except (OSError, EOFError, lzma.LZMAError) as e:
             return rej(f"the compressed file does not decompress: {type(e).__name__}: {e}")
     stage = tempfile.mkdtemp(prefix=".extract-", dir=dest)      # extracted whole or not at all
+    into = os.path.join(stage, sub)
     try:
-        if zipfile.is_zipfile(path):
+        if zipped:
             with zipfile.ZipFile(path) as z:
-                bad = z.testzip()
-                if bad:
-                    return rej(f"the archive is corrupt at {bad}")
                 for m in z.namelist():
                     if m.startswith("/") or ".." in m.split("/"):
                         return rej(f"unsafe path in archive: {m}", "content_invalid")
-                inside = [m for m in z.infolist() if not m.is_dir() and not m.filename.lower().endswith(CODE)]
-                pick_ = [m.filename for m in inside if _named(m.filename, members)] if members else []
-                for m in z.infolist():
-                    if m.is_dir():
-                        continue
-                    if pick_ and m.filename not in pick_ and not m.filename.lower().endswith(CODE):
-                        continue
-                    if m.filename.lower().endswith(CODE):
-                        dropped.append({"file": m.filename, "class": "code_excluded", "why": "source code inside an archive"})
-                        continue
-                    z.extract(m, stage)
-                    kept.append(m.filename)
-        elif tarfile.is_tarfile(path):
+                files = [m for m in z.infolist() if not m.is_dir()]
+                data = [m for m in files if not m.filename.lower().endswith(CODE)]
+                chosen = ([m for m in data if _named(m.filename, members)] if members else []) or data
+                if limit is not None and sum(m.file_size for m in chosen) > limit:   # a member never unpacks past its size
+                    return over(sum(m.file_size for m in chosen))
+                bad = z.testzip()
+                if bad:
+                    return rej(f"the archive is corrupt at {bad}")
+                for m in files:
+                    if keep and _textual(m.filename):
+                        with z.open(m) as fh:
+                            keep(at(m.filename), fh.read(_src_limit(m.filename)), name)
+                dropped += [{"file": m.filename, "class": "code_excluded", "why": "source code inside an archive"}
+                            for m in files if m not in data]
+                for m in chosen:
+                    z.extract(m, into)
+                    kept.append(at(m.filename))
+        elif tarred:
             with tarfile.open(path) as t:
-                for m in t.getmembers():
+                every = t.getmembers()
+                for m in every:
                     if m.name.startswith("/") or ".." in m.name.split("/"):
                         return rej(f"unsafe path in archive: {m.name}")
-                every = [m for m in t.getmembers() if m.isfile() and not m.name.lower().endswith(CODE)]
-                chosen = [m for m in every if _named(m.name, members)] if members else []
-                members = chosen or every
+                files = [m for m in every if m.isfile()]
+                data = [m for m in files if not m.name.lower().endswith(CODE)]
+                chosen = ([m for m in data if _named(m.name, members)] if members else []) or data
+                if limit is not None and sum(m.size for m in chosen) > limit:
+                    return over(sum(m.size for m in chosen))
+                for m in files:
+                    if keep and _textual(m.name):
+                        keep(at(m.name), t.extractfile(m).read(_src_limit(m.name)), name)
                 dropped += [{"file": m.name, "class": "code_excluded", "why": "source code inside an archive"}
-                            for m in t.getmembers() if m.isfile() and m.name.lower().endswith(CODE)]
-                t.extractall(stage, members=members, filter="data")
-                kept = [m.name for m in members]
+                            for m in files if m not in data]
+                t.extractall(into, members=chosen, filter="data")
+                kept = [at(m.name) for m in chosen]
         else:
+            os.makedirs(os.path.dirname(os.path.join(stage, name)), exist_ok=True)
             shutil.move(path, os.path.join(stage, name))
             kept = [name]
         for root_, _, fs in os.walk(stage):                     # complete: move it into place
@@ -379,48 +527,107 @@ def admit(path: str, name: str, dest: str, expect_md5: str = "", members: list[s
         shutil.rmtree(stage, ignore_errors=True)
     if not kept:
         return [], dropped or [{"file": name, "class": "content_invalid", "why": "the archive holds no data file"}]
-    return [{"file": k, "from": name, "source_sha256": sha, "source_bytes": size} for k in kept], dropped
+    return [{"file": k, "from": name, "source_sha256": sha, "source_bytes": size,
+             "bytes": os.path.getsize(os.path.join(dest, k))} for k in kept], dropped
 
 
-def _hf(s: dict, dest: str, cap: int, deny: list[str], rec: dict) -> None:
+def _hf(f: Fetcher, s: dict, dest: str, tmp: str, rec: dict) -> None:
+    """A hub repository through its documented client: the files `include` names (repository metadata, empty
+    placeholders and code aside), each validated by `admit` like any download; its code and README as text only.
+    The bytes count against the same storage cap as every other download of the check."""
     src = s["source"]
     kind, _, repo = src[5:].partition("/")
     repo, _, rev = repo.partition("@")
-    if any(d and d in repo.lower() for d in deny):
+    if f.denied(repo):
         raise FetchError("denied", "source denied by SH_DENY_SOURCES")
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub"], check=True)
+    try:
+        import huggingface_hub  # noqa: F401
+    except ImportError:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub"], check=True)
     from huggingface_hub import HfApi, snapshot_download
     info = HfApi().repo_info(repo, repo_type=kind.rstrip("s"), revision=rev or None, files_metadata=True)
     pats = s.get("include") or ["*"]
-    files = [x for x in info.siblings or [] if any(fnmatch.fnmatch(x.rfilename, p) for p in pats)]
-    need = sum(x.size or 0 for x in files)
-    if need > cap:
-        raise FetchError("storage", f"{need} bytes would pass the storage cap ({cap} bytes, SH_MAX_DATA_GB)")
-    snapshot_download(repo, repo_type=kind.rstrip("s"), revision=info.sha, allow_patterns=pats,
-                      ignore_patterns=[f"*{c}" for c in CODE], local_dir=dest)
-    rec.update(revision=info.sha, files_matched=len(files))
-    rec["admitted"] = [{"file": x.rfilename, "from": src} for x in files if not x.rfilename.lower().endswith(CODE)]
+    sib = [x for x in info.siblings or [] if x.size != 0 and not _dot(x.rfilename)]
+    data = {x.rfilename: x for x in sib if _named(x.rfilename, pats) and not x.rfilename.lower().endswith(CODE)}
+    text = {x.rfilename: x for x in [x for x in sib if _textual(x.rfilename) and _src_fetchable(x.rfilename, x.size)][:SRC_FILES]}
+    need = sum(x.size or 0 for x in {**text, **data}.values())
+    if need > f.room():
+        raise FetchError("storage", f"{need} bytes would pass the storage cap ({f.cap} bytes, SH_MAX_DATA_GB; "
+                                    f"{f.cap - f.room()} already taken by this check)")
+    os.makedirs(tmp, exist_ok=True)
+    local = tempfile.mkdtemp(prefix="hub-", dir=tmp)       # the client's own metadata stays here, never in `dest`
+    try:
+        snapshot_download(repo, repo_type=kind.rstrip("s"), revision=info.sha, allow_patterns=sorted({**text, **data}),
+                          local_dir=local)
+        rec.update(revision=info.sha, files_matched=len(data))
+        for name in [*data, *[t for t in text if t not in data]]:
+            p = os.path.join(local, name)
+            if not os.path.isfile(p):
+                if name in data:
+                    rec["missing"].append({"file": name, "class": "missing", "why": "listed by the hub, absent from its snapshot"})
+                continue
+            f.total += os.path.getsize(p)
+            if name not in data:
+                f.keep(name, _head(p, _src_limit(name)), src)
+                continue
+            ok, bad = admit(p, name, dest, keep=f.keep, limit=f.room())
+            f.unpacked += sum(o["bytes"] for o in ok if o["file"] != o["from"])
+            rec["admitted"] += [{**o, "from": src if o["file"] == o["from"] else o["from"]} for o in ok]
+            rec["rejected"] += bad
+            _missing(rec, name, ok, bad)
+    finally:
+        shutil.rmtree(local, ignore_errors=True)
+
+
+def _missing(rec: dict, name: str, ok: list, bad: list) -> None:
+    """A NAMED file (listed by its repository, or matched by `include`) that admitted nothing is missing from the set."""
+    if ok:
+        rec["_hit"].append(name)
+    elif (b := next((b for b in bad if b.get("class") != "code_excluded"), None)) is not None:
+        rec["missing"].append({"file": name, "class": b.get("class") or "content_invalid", "why": b.get("why", "")[:200]})
 
 
 def _follow(f: Fetcher, targets: list[dict], dest: str, tmp: str, rec: dict, members: list[str] | None = None,
             limit: int = MAX_FOLLOW) -> None:
-    if len(targets) > limit:              # never silent: the plan, the script author and the report are told
-        rec["truncated"] = {"matched": len(targets), "followed": limit,
-                            "not_followed": [t.get("name") or t["url"] for t in targets[limit:]][:30]}
-    for t in targets[:limit]:
-        row = {"url": t["url"]}
+    named = [t for t in targets if not t.get("speculative")]
+    if len(named) > limit:                # never silent: the plan, the script author and the report are told
+        rec["truncated"] = {"matched": len(named), "followed": limit,
+                            "not_followed": [t.get("name") or t["url"] for t in named[limit:]][:30]}
+    for t in named[:limit] + [t for t in targets if t.get("speculative")]:
+        row = {"url": t["url"], **({"speculative": True} if t.get("speculative") else {})}
+        name = t.get("name") or _path(t["url"])
         try:
             p, info = f.get(t["url"], tmp, t.get("md5", ""), t.get("bytes"))
             row.update(final_url=info.get("final_url"), http_status=info.get("http_status"), redirects=info.get("redirects"),
                        from_cache=info.get("from_cache", False), bytes=info.get("bytes"))
-            ok, bad = admit(p, t.get("name") or filename(info, t["url"]), dest, t.get("md5", ""), members)
+            ok, bad = admit(p, t.get("name") or filename(info, t["url"]), dest, t.get("md5", ""), t.get("members", members),
+                            keep=f.keep, limit=f.room())
+            f.unpacked += sum(o["bytes"] for o in ok if o["file"] != o["from"])
             rec["admitted"] += ok
             rec["rejected"] += bad
             row["admitted"] = len(ok)
+            if t.get("named"):
+                _missing(rec, name, ok, bad)
         except FetchError as e:
             row.update({"class": e.klass, "error": str(e)[:300], "tries": e.attempts})
+            if t.get("named"):
+                rec["missing"].append({"file": name, "class": e.klass, "why": str(e)[:200]})
         except Exception as e:                            # noqa: BLE001 - this code's own error: recorded as one
             row.update({"class": "bug", "error": f"{type(e).__name__}: {e}"[:300]})
+            if t.get("named"):
+                rec["missing"].append({"file": name, "class": "bug", "why": row["error"][:200]})
+        rec["followed"].append(row)
+
+
+def _texts(f: Fetcher, targets: list[dict], tmp: str, rec: dict) -> None:
+    """Released code, notebooks and READMEs a record lists beside its data: fetched for their text alone."""
+    for t in targets:
+        row = {"url": t["url"], "text_only": True}
+        try:
+            p, _ = f.get(t["url"], tmp, t.get("md5", ""), t.get("bytes"))
+            f.keep(t["name"], _head(p, _src_limit(t["name"])), t["name"])
+        except FetchError as e:
+            row.update({"class": e.klass, "error": str(e)[:300]})
         rec["followed"].append(row)
 
 
@@ -430,61 +637,77 @@ def _web(f: Fetcher, url: str, s: dict, dest: str, tmp: str, rec: dict) -> None:
                             "http_status": info.get("http_status"), "content_type": info.get("content_type"),
                             "from_cache": info.get("from_cache", False), "retries": info.get("retries") or []})
     if not is_html(p, info):
-        ok, bad = admit(p, filename(info, url), dest)
+        ok, bad = admit(p, filename(info, url), dest, keep=f.keep, limit=f.room())
+        f.unpacked += sum(o["bytes"] for o in ok if o["file"] != o["from"])
         rec["admitted"] += ok
         rec["rejected"] += bad
         return
     final = info.get("final_url") or url
     rec["landing"] = {"final_url": final, "sha256": _sha(p), "bytes": os.path.getsize(p)}
     include = s.get("include") or []
-    targets: list[dict] = []
-    members: list[str] | None = None
+    texts: list[dict] = []
     listed = record_files(f, final, tmp)
     if listed is not None:
         rec["recovery"].append(f"documented mechanism: the repository records API for {final}")
-        targets = [t for t in listed if not include or any(fnmatch.fnmatch(t["name"], pat) for pat in include)]
+        listed = [t for t in listed if t.get("bytes") != 0 and not _dot(t["name"])]
+        targets = [{**t, "named": True} for t in listed if not include or _named(t["name"], include)]
+        pool = listed
+        took = {t["url"] for t in targets}
+        texts = [t for t in listed if t["url"] not in took and _textual(t["name"]) and _src_fetchable(t["name"], t.get("bytes"))][:SRC_FILES]
     else:
         with open(p, encoding="utf-8", errors="replace") as fh:
             page = fh.read()
         hosts = {urllib.parse.urlparse(final).netloc.lower(), urllib.parse.urlparse(url).netloc.lower()}
         links = html_links(page, final, hosts)
         rec["links"] = links[:200]
-        targets = [{"url": u} for u in pick(links, include)]
-        if include and not targets and 0 < len(pick(links, [])) <= 3:
-            # `include` names no link on the page: the planner could not see the page, so it may have named what the
-            # download holds. The page's own few data links are followed and the patterns filter their members.
-            targets = [{"url": u} for u in pick(links, [])]
-            members = include
-            rec["recovery"].append(f"no link on the landing page matched {include}: its {len(targets)} data link(s) were followed "
-                                   "and `include` was applied to their members")
+        targets = [{"url": u, "named": bool(include)} for u in pick(links, include)]
+        pool = [{"url": u} for u in pick(links, [])]
+    unmatched = [q for q in include if not any(_named(t.get("name") or _path(t["url"]), [q]) for t in targets)]
+    took = {t["url"] for t in targets}
+    arch = [t for t in pool if _archive(t.get("name") or _path(t["url"])) and t["url"] not in took]
+    if unmatched and 0 < len(arch) <= MAX_ARCHIVES:
+        # `include` names no file the record lists or the page links: the planner could not see inside the download, so
+        # it may have named what an archive holds. The few archives are followed and the patterns filter their members.
+        # These follows are speculative: what they fail at is recorded, never counted as a missing named file.
+        targets += [{**t, "named": False, "speculative": True, "members": unmatched} for t in arch]
+        where = "file of the record" if listed is not None else "link on the landing page"
+        rec["recovery"].append(f"no {where} matched {unmatched}: its {len(arch)} archive(s) were followed "
+                               "and `include` was applied to their members")
     if not targets and "doi.org" in urllib.parse.urlparse(url).netloc:
         doi = urllib.parse.urlparse(url).path.lstrip("/")
         try:
             j, _ = f.json("https://api.datacite.org/dois/" + urllib.parse.quote(doi), tmp)
-            targets = [{"url": u} for u in (j.get("data", {}).get("attributes", {}).get("contentUrl") or []) if u.startswith("http")]
+            targets = [{"url": u, "named": True} for u in (j.get("data", {}).get("attributes", {}).get("contentUrl") or [])
+                       if u.startswith("http")]
             rec["recovery"].append("the DOI registry's content URLs" + (f": {len(targets)} found" if targets else ": none"))
         except FetchError as e:
             rec["recovery"].append(f"the DOI registry could not be read: {e.klass}")
-    if not targets:
+    if targets:
+        _follow(f, targets, dest, tmp, rec, None, MAX_RECORD_FILES if listed is not None else MAX_FOLLOW)
+    _texts(f, texts, tmp, rec)
+    if not rec["admitted"] and all(t.get("speculative") for t in targets):
         rec["attempts"].append({"url": final, "class": "no_data",
                                 "error": "the landing page exposes no downloadable file matching `include` or a data suffix"})
-        return
-    _follow(f, targets, dest, tmp, rec, members, MAX_RECORD_FILES if listed is not None else MAX_FOLLOW)
 
 
 def acquire(f: Fetcher, s: dict, dest: str, tmp: str, idx: str) -> dict:
-    """One source -> its record. Tries the citation as planned, then (bounded) the other printed readings of it."""
-    rec: dict = {"source": s["source"], "dir": idx, "attempts": [], "admitted": [], "rejected": [], "followed": [], "recovery": []}
+    """One source -> its record. Tries the citation as planned, then (bounded) the other printed readings of it.
+    Every row says which reading it belongs to (0: as planned); what is missing is that of the last reading tried."""
+    rec: dict = {"source": s["source"], "dir": idx, "attempts": [], "admitted": [], "rejected": [], "followed": [], "recovery": [],
+                 "missing": []}
     if s.get("refused"):                  # a gate the caller closed for this source: recorded, nothing is sent
         rec.update(failure_class="gate", error=f"refused: {s['refused']}")
         return rec
+    f.idx = idx
     urls = [s["source"]] + [a for a in s.get("alternates") or [] if a != s["source"]][:MAX_ALTERNATES]
     for n, url in enumerate(urls):
         if n:
             rec["recovery"].append(f"another reading of the printed citation: {url}")
+        a0, f0, r0 = len(rec["attempts"]), len(rec["followed"]), len(rec["rejected"])
+        rec["missing"], rec["_hit"] = [], []
         try:
             if url.startswith("hf://"):
-                _hf({**s, "source": url}, dest, f.cap, f.deny, rec)
+                _hf(f, {**s, "source": url}, dest, tmp, rec)
             else:
                 _web(f, url, s, dest, tmp, rec)
         except FetchError as e:
@@ -492,21 +715,27 @@ def acquire(f: Fetcher, s: dict, dest: str, tmp: str, idx: str) -> dict:
         except Exception as e:                            # noqa: BLE001
             k, msg = classify(e)
             rec["attempts"].append({"url": url, "class": k, "error": msg[:300]})
+        for row in rec["attempts"][a0:] + rec["followed"][f0:] + rec["rejected"][r0:]:
+            row["reading"] = n
         if rec["admitted"]:
             break
+    names = rec.pop("_hit", []) + [m["file"] for m in rec["missing"]] + [
+        x for a in rec["admitted"] for x in (a["file"], a.get("from") or "") if x]
+    rec["unmatched_include"] = [q for q in s.get("include") or [] if not any(_named(x, [q]) for x in names)]
     rec["failure_class"] = "" if rec["admitted"] else failure_class(rec)
     return rec
 
 
 def failure_class(rec: dict) -> str:
-    """Why nothing was admitted, as one class: the most actionable of everything that went wrong."""
-    seen = [a.get("class") for a in rec["attempts"] + rec["followed"] if a.get("class")]
-    if rec["rejected"] and not seen:
-        seen = ["content_invalid"]
-    for k in ("bug", "denied", "storage", "inaccessible", "transient", "missing", "content_invalid", "no_data", "protocol"):
-        if k in seen:
-            return k
-    return "content_invalid" if rec["rejected"] else "no_data"
+    """Why nothing was admitted, as one class: the most actionable of what went wrong in the FIRST reading of the
+    citation that shows a failure (an alternate reading — a hyphen variant whose host does not resolve — never
+    outranks the planned one). Speculative follows and text-only fetches decide nothing."""
+    rows = [(a.get("reading", 0), a["class"]) for a in rec["attempts"] + rec["followed"]
+            if a.get("class") and not a.get("speculative") and not a.get("text_only")]
+    rows += [(r.get("reading", 0), r.get("class") or "content_invalid") for r in rec["rejected"] if r.get("class") != "code_excluded"]
+    first = min((n for n, _ in rows), default=0)
+    seen = {k for n, k in rows if n == first}
+    return next((k for k in RANK if k in seen), "content_invalid" if rec["rejected"] else "no_data")
 
 
 def manifest(out_dir: str, recs: list[dict]) -> dict:
@@ -524,9 +753,9 @@ def manifest(out_dir: str, recs: list[dict]) -> dict:
             files.append(row)
     for r in recs:
         r["admitted_files"] = sum(1 for x in files if x["path"].split("/")[0] == str(r["dir"]))
+    whole = lambda r: r["admitted_files"] and not (r.get("truncated") or r.get("missing") or r.get("unmatched_include"))
     return {"sources": recs, "files": files[:2000], "n_files": len(files), "bytes": sum(r["bytes"] for r in files),
-            "status": "ok" if recs and all(r["admitted_files"] and not r.get("truncated") for r in recs)
-            else "partial" if files else "none"}
+            "status": "ok" if recs and all(whole(r) for r in recs) else "partial" if files else "none"}
 
 
 def main(environ=os.environ, out_dir: str = "/data", tmp: str = "/root/.cache/referee-tmp",
@@ -535,6 +764,11 @@ def main(environ=os.environ, out_dir: str = "/data", tmp: str = "/root/.cache/re
     recs = [acquire(f, s, os.path.join(out_dir, str(i)), tmp, str(i)) for i, s in enumerate(json.loads(environ["REFEREE_SOURCES"]))]
     shutil.rmtree(tmp, ignore_errors=True)
     m = manifest(out_dir, recs)
+    m["record_src"], wire = f.wire()          # quote-only text: its own line, before the manifest (stdout keeps its tail)
+    if f.src_cut:
+        m["record_src_cut"], m["record_src_n_cut"] = f.src_cut[:50], len(f.src_cut)
+    if wire:
+        print("REFEREE_RECORD_SRC " + wire)
     print("REFEREE_MANIFEST " + json.dumps(m))
     return m
 

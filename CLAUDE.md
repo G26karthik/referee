@@ -76,7 +76,10 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     code define the compared quantity differently, both are declared `readings` (each re-found:
     paper verbatim, code literal in a tracked file) and computed in ONE run on the same data and
     cohort (`reading`, `cohort` per result line); each is decided, neither is presumed right, and
-    differing results are READINGS_DIFFER (claim READINGS_DISAGREE).
+    differing results are READINGS_DIFFER (claim READINGS_DISAGREE). Without a checkout, a released record's
+    own code, notebooks or README are kept as quote-only text (`checks/<id>/record_src`, never mounted or run)
+    and may be a reading (`record:<n>/<path>`). One printed sentence that several checks applied differently is
+    listed side by side (`definition_choices`) and shown to the follow-up round; nothing picks one.
 16. **A counterexample satisfies every premise of the exact claim.** Certificates report
     `premises_hold` per instance; a violation on an inadmissible instance is nothing, one found
     only under a changed reading is VIOLATION_UNDER_CHANGED_READING, no admissible instance is
@@ -162,7 +165,29 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     candidates, why none is the dataset) or on a check that failed to acquire it. The ledger's
     `completion` and the report keep apart: the workflow reached a terminal state (any status), the
     requested experiment RAN, its protocol matched (no claim-changing deviation, data identity, scope), and
-    what the evidence says. No sentence may imply a paper was reproduced because a report exists.
+    what the evidence says. No sentence may imply a paper was reproduced because a report exists. Completion is
+    derived from harness facts: only target checks of an experiment kind run an empirical claim's experiment; a
+    scope item counts as run only when a target check covering it COMPLETED; a target sibling that did not run
+    makes it RAN_PARTIAL (protocol not matched); the acquisition's own gaps (`execute.data_gaps`: a cut listing,
+    a named file missing or rejected, an include matching nothing), an identity line that does not affirm the
+    paper's description, or no identity line for acquired data make it RAN_WITH_CHANGES. The claim status follows:
+    support stands only on RAN_AS_SPECIFIED (RAN_PARTIAL: PARTIAL_EVIDENCE; a changed reading or data:
+    READING_CHANGED); a failure found on what ran stands. A supporting check speaks for no claim of any type. A
+    support word in model prose is earned only by a check whose claim found support run as specified.
+    `run.py status` recomputes from disk and says IN PROGRESS until review.md is newer than every outcome and seal.
+
+25. **Classifications fail closed.** Every field that decides which rule applies is a closed vocabulary
+    the seal requires, never a default: a central claim's `claim_type` and `scope`, a check's `role` and
+    (except a CERTIFICATE) `criterion`, a RECONSTRUCTION's `test`, a RELEASED_DATA's `basis`, every omission's
+    `blocker`. A follow-up round never retypes a claim. On the last attempt an invalid claim is sealed at its
+    strictest reading and says so (`sealed_with_errors`): untyped = empirical, a link its kind cannot carry is
+    removed, uncovered scope is recorded as omitted with blocker `unstated`, an unverifiable blocker is flagged
+    `unverified`. Downstream, an unknown value reads as the strictest (`matches` not true = the data changed).
+    A blocker rests on the harness's own records wherever it can: `data` on its registry searches,
+    `credentials` on a hosted closed service or the registry record of a gated or private artifact (a public,
+    ungated one is acquired), `compute` on a measured RESOURCE BLOCKER, the artifact's registry size against the
+    measured host, or the paper's own statement of its compute; `protocol`/`other` are the planner's word,
+    reported as such. Deviations are capped (16) by refusal, never by silent truncation.
 
 ## Dependency recovery (documented, isolated, recorded)
 
@@ -194,7 +219,7 @@ python run.py discover <paper-id> "<dataset name>" [--registry zenodo|datacite|h
 python run.py discover <paper-id> --files <record url>     # the files of a cited repository record (names, sizes, md5)
 python run.py reopen <paper-id> <check> <why>              # redo a check that ended WITHOUT a finding, after a harness fix
 python run.py env <paper-id>                               # authors' env (the harness starts it)
-python run.py status [<paper-id>]
+python run.py status [<paper-id>]                          # read-only, recomputed: FINISHED only if review.md is newest
 python run.py pack <out.zip> [<paper-id> ...] --clean      # zip artifacts, then delete clones/venvs
 python tests/test_kernel.py
 python tools/replay.py <projects dir> [--out f.json]              # re-decide recorded runs, no model or container
@@ -227,3 +252,8 @@ launch uses the copy cached at session start.
 - After a run: `run.py pack <zip> --clean` so clones, venvs and data do not accumulate.
 - There is no adjudicated ground truth here: never claim precision/recall; a self-written
   test passing is not evidence that a scientific invariant holds.
+- Finish end to end before refactoring: get a complete report for a paper; no new phases,
+  checkpoints or test scaffolding unless a bug blocks progress.
+- "Apply fixes only" means edit code and run `tests/test_kernel.py`; do not run papers.
+- Docker is the only backend and other sessions share it: never restart Docker Desktop or
+  remove containers/volumes you did not create.
