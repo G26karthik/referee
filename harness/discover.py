@@ -77,9 +77,11 @@ def _datacite(q: str, get) -> list[dict]:
 
 
 # What a hub search returns with each repository. With `expand`, the answer holds only the fields named, so the
-# card fields are named too; `safetensors` exists for models only (an unknown name fails the whole search).
-_HF_EXPAND = {"datasets": ("author", "createdAt", "downloads", "tags", "gated", "private", "usedStorage"),
-              "models": ("author", "createdAt", "downloads", "tags", "gated", "private", "usedStorage", "safetensors")}
+# card fields are named too; `safetensors` exists for models only, and `usedStorage` is refused by the list endpoints
+# (HTTP 400, measured 2026-10-01): an unknown name fails the whole search, so a refused expansion falls back to the
+# plain search (the gating and size fields then read unknown, never false).
+_HF_EXPAND = {"datasets": ("author", "createdAt", "downloads", "tags", "gated", "private"),
+              "models": ("author", "createdAt", "downloads", "tags", "gated", "private", "safetensors")}
 _DTYPE_BYTES = {"F64": 8, "I64": 8, "U64": 8, "F32": 4, "I32": 4, "U32": 4, "F16": 2, "BF16": 2, "I16": 2, "U16": 2,
                 "F8_E4M3": 1, "F8_E5M2": 1, "I8": 1, "U8": 1, "BOOL": 1}
 
@@ -88,8 +90,14 @@ def _hub(kind: str, registry: str, q: str, get) -> list[dict]:
     """Hub repositories with what a plan seal needs to judge a blocker: `gated` (False, "auto" or "manual"), `private`,
     `size_bytes` (weights from the safetensors dtype counts, else the repository's storage; `size_basis` says which)
     and `params`; None where the hub did not say."""
-    j = get(f"https://huggingface.co/api/{kind}?" + urllib.parse.urlencode(
-        {"search": q, "limit": PER_REGISTRY, "expand": list(_HF_EXPAND[kind])}, doseq=True))
+    base = {"search": q, "limit": PER_REGISTRY}
+    try:
+        j = get(f"https://huggingface.co/api/{kind}?" + urllib.parse.urlencode({**base, "expand": list(_HF_EXPAND[kind])},
+                                                                              doseq=True))
+    except OSError as e:
+        if "400" not in str(e):
+            raise
+        j = get(f"https://huggingface.co/api/{kind}?" + urllib.parse.urlencode(base))
     out = []
     for d in [d for d in j if isinstance(d, dict) and d.get("id")][:PER_REGISTRY] if isinstance(j, list) else []:
         st = d.get("safetensors") if isinstance(d.get("safetensors"), dict) else {}

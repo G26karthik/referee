@@ -2930,6 +2930,42 @@ def test_a_tls_failure_is_a_fault_of_this_run_never_a_data_blocker():
         assert state.read_json(cdir / "outcome.json")["status"] == "INCONCLUSIVE"        # this run's fault, not the source's
 
 
+def test_a_search_that_failed_is_no_search():
+    """2026-10-01 run, PPRM: every Hugging Face search answered HTTP 400 (the list endpoints refuse `expand=usedStorage`),
+    and the planner gave up MMLU and the Qwen models as `data` on those failed searches; the seal accepted them."""
+    from harness import discover
+    seen = []
+    def hub(url):
+        seen.append(url)
+        if "usedStorage" in url or "expand=bogus" in url:
+            raise OSError("HTTPError: HTTP Error 400: Bad Request")
+        return [{"id": "Qwen/Qwen2-VL-2B-Instruct", "author": "Qwen", "gated": False, "private": False,
+                 "safetensors": {"parameters": {"BF16": 2208985600}, "total": 2208985600}}] if "expand" in url else [
+                {"id": "Qwen/Qwen2-VL-2B-Instruct", "author": "Qwen"}]
+    got = discover._hub("models", "huggingface-models", "Qwen2-VL-2B-Instruct", hub)
+    assert "usedStorage" not in seen[0] and got[0]["gated"] is False and got[0]["size_bytes"] == 2 * 2208985600
+    real = discover._HF_EXPAND
+    discover._HF_EXPAND = {**real, "models": ("bogus",)}                  # a hub that refuses an expansion
+    try:
+        plain = discover._hub("models", "huggingface-models", "Qwen2-VL-2B-Instruct", hub)
+    finally:
+        discover._HF_EXPAND = real
+    assert plain[0]["source"] == "hf://models/Qwen/Qwen2-VL-2B-Instruct" and plain[0]["gated"] is None   # unknown, never false
+    with tempfile.TemporaryDirectory() as t:
+        cfg, pid, x = _x(Path(t))
+        cfg.allow_network = cfg.allow_data_search = True
+        bad = discover.search(cfg, pid, "MMLU", registry="huggingface", get=lambda u: (_ for _ in ()).throw(
+            OSError("HTTPError: HTTP Error 400: Bad Request")))
+        omit = _claim(scope=["CIFAR-10-C", "MMLU"], omitted=[{"item": "MMLU", "why": "no record", "blocker": "data",
+                                                               "discovery": [bad["id"]]}])
+        assert "every search it cites failed" in _refused(lambda: _plan(x, [_run()], [omit]))
+        plan = {"central_claims": [{**omit, "page": 1, "omitted": [dict(o) for o in omit["omitted"]]}], "checks": []}
+        report._failed_searches(x.root, plan)
+        assert "failed" in plan["central_claims"][0]["omitted"][0]["unverified"]       # a plan sealed before: flagged
+        ok = discover.search(cfg, pid, "MMLU", registry="zenodo", get=lambda u: {"hits": {"hits": []}})
+        _plan(x, [_run()], [{**omit, "omitted": [{**omit["omitted"][0], "discovery": [bad["id"], ok["id"]]}]}])   # one answered
+
+
 def test_hub_errors_are_classified_by_their_http_status():
     from harness import fetcher
 

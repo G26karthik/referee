@@ -478,9 +478,25 @@ def _workflow(checks: list[dict]) -> dict:
                                        if (c.get("environment") or {}).get("recovery")}}
 
 
+def _failed_searches(root: Path, plan: dict) -> None:
+    """A blocker sealed on searches that all failed (no registry answered) rests on nothing: flagged unverified,
+    whatever the seal accepted when it was sealed."""
+    f = root / "discovery.jsonl"
+    recs = {r["id"]: r for r in (json.loads(ln) for ln in f.read_text(encoding="utf-8").splitlines() if ln.strip())
+            if "results" in r} if f.exists() else {}
+    for cc in plan.get("central_claims") or []:
+        for o in [*(cc.get("omitted") or []), cc]:
+            ids = [d for d in o.get("discovery") or [] if d in recs]
+            if o.get("blocker") in ("data", "credentials", "compute") and ids and all(
+                    v.get("error") for d in ids for v in recs[d]["results"].values()):
+                o["unverified"] = (o.get("unverified") or f"every search it cites ({', '.join(ids)}) failed: a failed "
+                                   "search shows nothing about the dataset or model")
+
+
 def ledger(x) -> dict:
     """Every report claim joined to its machine artifact; written to ledger.json."""
     plan = x.plan() or {"checks": [], "central_claims": [], "dropped": []}
+    _failed_searches(x.root, plan)
     checks = _checks(x.root, plan)
     conf = conflicts(checks)
     central = _central(plan, checks, conf)

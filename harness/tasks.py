@@ -871,7 +871,12 @@ def _blocker(x: _Ctx, e: dict, errors: list[str], label: str) -> str:
     b, n0 = e.get("blocker"), len(errors)
     searched = x.cfg.allow_network and x.cfg.allow_data_search
     recs = {r["id"]: r for r in discover.records(x.cfg, x.pid)}
-    ids = [d for d in e.get("discovery") or [] if d in recs and "results" in recs[d]]
+    cited = [d for d in e.get("discovery") or [] if d in recs and "results" in recs[d]]
+    # A search counts only where a registry answered: one that failed (an HTTP error, a timeout) shows nothing.
+    ids = [d for d in cited if any(not v.get("error") for v in recs[d]["results"].values())]
+    if b in ("data", "credentials", "compute") and searched and cited and not ids:
+        errors.append(f"{label}: every search it cites failed ({'; '.join(sorted({v['error'][:80] for d in cited for v in recs[d]['results'].values() if v.get('error')}))}): "
+                      "a failed search shows nothing about the dataset or model — search again")
     art_src = str(e.get("artifact") or "").strip()
     art = next((h for d in ids if (h := discover.returned(x.cfg, x.pid, d, art_src))), None) if art_src else None
     outcome = lambda k: state.read_json(x.root / "checks" / str(k) / "outcome.json") or {}
