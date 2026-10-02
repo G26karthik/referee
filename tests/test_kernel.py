@@ -1427,6 +1427,8 @@ def test_recovery_uses_documented_mechanisms_and_the_printed_alternatives():
         try:
             rec = _fetch(fetcher, td, [{"source": f"http://{host}/records/7", "include": ["a.csv", "b.csv"]}])[0]
             assert [a["file"] for a in rec["admitted"]] == ["a.csv"] and any("records API" in r for r in rec["recovery"])
+            assert rec["listing"] == ["a.csv", "b.csv", "big.tar"]                     # the record's complete listing, kept
+            assert execute.unrequested(td, {"sources": [rec]})["0"]["not_requested"] == ["b.csv", "big.tar"]
             bad = [x for x in rec["followed"] if x.get("class") == "content_invalid"]      # its checksum disagrees, at every transfer
             assert len(bad) == 1 and "md5" in bad[0]["error"] and len(bad[0]["tries"]) == 3 and not rec["rejected"]
             # the first citation reading is unreachable; the second printed reading is where the record is
@@ -3326,6 +3328,8 @@ def test_the_remaining_runs_are_projected_from_the_seeds_own_times():
     need, limit, _, _ = execute._projected(cfg, recon, slow, 6, spent=execute._spent(slow))
     assert need == 300 + 2600 + 2700 + 3 * 2600 and need > limit                   # a slow later seed raises it
     assert execute._projected(cfg, recon, {"pilot_s": 500, "seed": 1, "seed_seconds": {"0": 500}}, 3)[0] == 1000   # one seed: pilot
+    two = lambda a, b: execute._projected(cfg, recon, {"pilot_s": a, "seed": 2, "seed_seconds": {"0": a, "1": b}}, 3)[0]
+    assert two(300, 2600) == 2600 and two(2600, 300) == 2600                    # two seeds: the slower, never the minimum
 
 
 def test_a_tls_failure_is_a_fault_of_this_run_never_a_data_blocker():

@@ -1402,7 +1402,7 @@ def _projected(cfg: state.Config, check: dict, st: dict, runs: int, spent: float
     w = 1 if check["kind"] == "AUTHOR_CODE" or gpu_run(cfg, check) else max(1, min(cfg.parallel, st.get("width", cfg.parallel)))
     limit, setting = budget(cfg, check)
     secs = sorted(v for v in (st.get("seed_seconds") or {}).values() if v)
-    per = secs[(len(secs) - 1) // 2] if len(secs) >= 2 else st.get("pilot_s", 0)   # completed seeds' median, else the pilot
+    per = secs[len(secs) // 2] if len(secs) >= 2 else st.get("pilot_s", 0)   # completed seeds' upper median, else the pilot
     return spent + per * (runs - st["seed"]) / w, limit, setting, w
 
 

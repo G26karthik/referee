@@ -591,7 +591,8 @@ def _hf(f: Fetcher, s: dict, dest: str, tmp: str, rec: dict) -> None:
     info = HfApi().repo_info(repo, repo_type=kind.rstrip("s"), revision=rev or None, files_metadata=True)
     pats = s.get("include") or ["*"]
     sib = [x for x in info.siblings or [] if x.size != 0 and not _dot(x.rfilename)]
-    rec["listing"] = [x.rfilename for x in sib][:MAX_RECORD_FILES]     # the hub's own listing of the repository
+    if len(sib) < MAX_RECORD_FILES:                                    # the hub's own listing, only when complete
+        rec["listing"] = [x.rfilename for x in sib]
     data = {x.rfilename: x for x in sib if _named(x.rfilename, pats) and not x.rfilename.lower().endswith(CODE)}
     text = {x.rfilename: x for x in [x for x in sib if _textual(x.rfilename) and _src_fetchable(x.rfilename, x.size)][:SRC_FILES]}
     need = sum(x.size or 0 for x in {**text, **data}.values())
