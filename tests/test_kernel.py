@@ -1973,8 +1973,23 @@ def test_one_fetch_per_plan_in_flight_and_a_follow_up_that_covers_an_omission_re
                                    "data_changed": [], "reason": ""}
     ran = report._completion_row(cc, {"C1": chk("C1", "NOT_RUN", []), "C7": chk("C7", "COMPLETED", ["CIFAR10-C image monitoring"])})
     assert ran["scope_not_run"] == ["URM"] and ran["experiment"] == "RAN_PARTIAL" and ran["protocol_matched"] is False
+    # Oct-02 PPRM review: "not run — LLM QA ...: data" was printed beside C7, which covered that item and COMPLETED.
+    # An omission a completed target check covers ran: it is no longer a reason anything did not run.
+    assert [b["item"] for b in ran["not_run"]] == ["URM"], ran["not_run"]
     planned = report._completion_row(cc, {"C1": chk("C1", "NOT_RUN", []), "C7": chk("C7", "NOT_STARTED", ["CIFAR10-C image monitoring"])})
     assert planned["experiment"] == "NOT_RUN" and planned["scope_not_run"] == ["CIFAR10-C image monitoring", "URM"]
+    assert {b["item"] for b in planned["not_run"]} >= {"CIFAR10-C image monitoring", "URM"}      # planned is not run
+    with tempfile.TemporaryDirectory() as t:                  # the report alone is written again; the old one is kept
+        cfg, pid = _project(Path(t))
+        root = state.pdir(cfg, pid)
+        assert "no sealed report" in tasks.reopen(cfg, pid, "report", "x")["error"]
+        (root / "sealed").mkdir(exist_ok=True)
+        state.write_json(root / "sealed" / "report.json", {"prose": "p"})
+        (root / "review.md").write_text("old review", encoding="utf-8")
+        state.write_json(root / "seals.json", {"plan": 1, "report": state.sha256((root / "sealed" / "report.json").read_bytes())})
+        out = tasks.reopen(cfg, pid, "report", "a report-code fix")
+        assert out["kept"] == "review.reopened.1.md" and (root / "review.reopened.1.md").read_text(encoding="utf-8") == "old review"
+        assert set(state.read_json(root / "seals.json")) == {"plan"} and (root / "sealed" / "report.withdrawn.1.json").exists()
 
 
 def test_a_criterion_the_planner_supplied_makes_the_result_about_that_criterion():

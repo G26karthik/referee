@@ -316,13 +316,15 @@ def _central(plan: dict, checks: list[dict], conf: list[dict]) -> list[dict]:
     return out
 
 
-def _blockers(cc: dict, cs: list[dict], unrun: list[str] = ()) -> list[dict]:
+def _blockers(cc: dict, cs: list[dict], unrun: list[str] = (), done: set = frozenset()) -> list[dict]:
     """What kept a claim's requested experiment from running, each with who says so: the harness (a recorded
     data blocker, a measured resource limit, a refusal, a scope item whose check did not complete) or the planner
-    (an omission's stated reason, with what the seal could not verify of it)."""
+    (an omission's stated reason, with what the seal could not verify of it). An omission that a COMPLETED target
+    check covers (`done`: a follow-up round ran it) is no reason anything did not run (Oct-02 PPRM review)."""
     out = [{"item": o["item"], "blocker": o.get("blocker") or "unstated", "why": o["why"][:300], "basis": "planner",
             **({"searched": o["discovery"]} if o.get("discovery") else {}),
-            **({"unverified": o["unverified"]} if o.get("unverified") else {})} for o in cc.get("omitted") or [] if o.get("why")]
+            **({"unverified": o["unverified"]} if o.get("unverified") else {})} for o in cc.get("omitted") or []
+           if o.get("why") and flat(o["item"]) not in done]
     if not cc["checks"] and cc.get("why_unchecked"):
         out.append({"item": "(the whole claim)", "blocker": cc.get("blocker") or "unstated", "why": cc["why_unchecked"][:300],
                     "basis": "planner", **({"searched": cc["discovery"]} if cc.get("discovery") else {}),
@@ -380,7 +382,7 @@ def _completion_row(cc: dict, by_id: dict) -> dict:
             "data_mismatch": mismatch, "scope_not_run": unrun, "targets_not_run": unran, "ran": [c["id"] for c in ran],
             "supporting": [{"check": c["id"], "kind": c["kind"], "status": c["status"], "state": c["state"]}
                            for c in cs if c.get("role") == "supporting" or (empirical and c["kind"] == "CERTIFICATE")],
-            "not_run": _blockers(cc, cs, unrun) if exp != "RAN_AS_SPECIFIED" else []}
+            "not_run": _blockers(cc, cs, unrun, done) if exp != "RAN_AS_SPECIFIED" else []}
 
 
 def _completion(checks: list[dict], claims: list[dict]) -> dict:

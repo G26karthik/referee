@@ -549,6 +549,22 @@ def reopen(cfg: state.Config, pid: str, cid: str, why: str) -> dict:
     root = state.pdir(cfg, pid)
     if cid == "plan:2":
         return _replan(cfg, pid, root, why)
+    if cid == "report":            # the report alone is written again after a fix of how it is computed; no outcome moves
+        with state.lock(root / ".lock"):
+            seals = state.read_json(root / "seals.json", {}) or {}
+            if "report" not in seals:
+                return {"error": "no sealed report to withdraw"}
+            n = len(list(root.glob("review.reopened.*.md"))) + 1
+            for src, dst in ((root / "sealed" / "report.json", root / "sealed" / f"report.withdrawn.{n}.json"),
+                             (root / "review.md", root / f"review.reopened.{n}.md")):
+                if src.exists():
+                    src.replace(dst)
+            seals.pop("report")
+            state.write_json(root / "seals.json", seals)
+            tried = state.read_json(root / "attempts.json", {}) or {}
+            state.write_json(root / "attempts.json", {k: v for k, v in tried.items() if k != "report"})
+            state.append_jsonl(root / "log.jsonl", {"event": "reopen", "check": "report", "why": why[:500]})
+            return {"reopened": "report", "kept": f"review.reopened.{n}.md"}
     with state.lock(root / ".lock"):
         cdir = root / "checks" / cid
         o = state.read_json(cdir / "outcome.json")
