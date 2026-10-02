@@ -181,12 +181,22 @@ def files(cfg: state.Config, pid: str, url: str, get=_get) -> dict:
         return {"error": "public data search is off (SH_ALLOW_DATA_SEARCH and SH_ALLOW_NETWORK): nothing was sent"}
     from . import fetcher
     url = url.strip()
-    zen = canon(url)
-    page = f"https://{zen}" if zen.startswith("zenodo.org/") else url
-    api = fetcher.record_api(page)
+    if any(d and d in url.lower() for d in cfg.deny_sources):
+        return {"error": "source denied by SH_DENY_SOURCES: nothing was sent"}
+    hub = url.startswith("hf://")
+    if hub:                                    # a hub repository: the hub's own listing of it (Oct-01: CMExam's
+        kind, _, repo = url[5:].partition("/")  # format was guessed, three patterns named nothing)
+        if kind not in ("datasets", "models") or repo.count("/") != 1:
+            return {"error": f"{url!r} is not hf://datasets/<owner>/<name> or hf://models/<owner>/<name>"}
+        api = f"https://huggingface.co/api/{kind}/{repo}?blobs=true"
+    else:
+        zen = canon(url)
+        page = f"https://{zen}" if zen.startswith("zenodo.org/") else url
+        api = fetcher.record_api(page)
     if not api:
         return {"error": f"{url!r} is not a record page of a repository with a records API "
-                         f"({', '.join(fetcher.RECORD_APIS)}); a landing page's files are found when it is fetched"}
+                         f"({', '.join(fetcher.RECORD_APIS)}) nor an hf:// repository; a landing page's files are "
+                         "found when it is fetched"}
     with state.lock(state.pdir(cfg, pid) / ".discovery.lock"):
         done = records(cfg, pid)
         if old := next((r for r in done if r.get("api") == api and r.get("files") and not r.get("error")), None):
@@ -194,10 +204,16 @@ def files(cfg: state.Config, pid: str, url: str, get=_get) -> dict:
         if _spent(done) >= cfg.max_discoveries:
             return {"error": f"the discovery budget of {cfg.max_discoveries} searches (SH_MAX_DISCOVERIES) is spent"}
         try:
-            listing = fetcher.record_listing(get(api))
+            if hub:                            # what the fetcher would take: no dot-paths, no empty placeholders
+                j = get(api)
+                listing = [{"name": s["rfilename"], "bytes": s.get("size"), "md5": ""} for s in j.get("siblings") or []
+                           if s.get("size") != 0 and not fetcher._dot(s["rfilename"])]
+                hub_meta = {k: j.get(k) for k in ("gated", "private") if j.get(k) not in (None, False)}
+            else:
+                listing, hub_meta = fetcher.record_listing(get(api)), {}
             rec = {"id": f"F{len(done) + 1}", "files_of": url, "api": api, "files": [
                 {"name": f["name"], "bytes": f["bytes"], "md5": f["md5"]} for f in listing],
-                "total_bytes": sum(f["bytes"] or 0 for f in listing)}
+                "total_bytes": sum(f["bytes"] or 0 for f in listing), **hub_meta}
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
             rec = {"id": f"F{len(done) + 1}", "files_of": url, "api": api, "files": [], "error": f"{type(e).__name__}: {e}"[:300]}
         state.append_jsonl(log_path(cfg, pid), rec)

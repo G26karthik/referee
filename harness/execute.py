@@ -71,12 +71,15 @@ def gpu_run(cfg: state.Config, check: dict) -> bool:
 def gpu_busy() -> bool:
     """Does a running REFEREE container hold the GPU (Docker's own record of the device request)? A daemon that cannot
     answer is busy: never a second run on a GPU nobody can see."""
-    rc, ids = _docker(["docker", "ps", "-q", "--filter", "label=referee=1"], 60)
-    if rc != 0:
-        return True
-    if not ids.split():
+    found = []
+    for label in ("referee=1", "referee.sync=1"):       # detached steps, and synchronous drafts
+        rc, ids = _docker(["docker", "ps", "-q", "--filter", f"label={label}"], 60)
+        if rc != 0:
+            return True
+        found += ids.split()
+    if not found:
         return False
-    rc, out = _docker(["docker", "inspect", "-f", "{{json .HostConfig.DeviceRequests}}", *ids.split()], 60)
+    rc, out = _docker(["docker", "inspect", "-f", "{{json .HostConfig.DeviceRequests}}", *found], 60)
     return rc != 0 or any(x.strip() not in ("", "null", "[]") for x in out.splitlines())
 
 
@@ -145,7 +148,7 @@ def run(argv: list[str], *, mounts: list[tuple[Path, str, bool]], workdir: str, 
         target: str, meta: dict | None = None) -> dict:
     """One process in a fresh container. Never raises: every ending is data."""
     name = f"referee-{uuid.uuid4().hex[:12]}"
-    launch = ["docker", "run", "--rm", "--name", name, "-w", workdir]
+    launch = ["docker", "run", "--rm", "--name", name, "--label", "referee.sync=1", "-w", workdir]   # seen by gpu_busy
     for host, inside, ro in mounts:   # a named volume stays a name (resolving it made an empty host dir)
         launch += ["-v", f"{_src(host)}:{inside}{':ro' if ro else ''}"]
     launch += (["--network", "none"] if not network else []) + (["--gpus", "all"] if gpus else [])
@@ -837,6 +840,34 @@ def data_gaps(data: dict) -> list[str]:
     return out
 
 
+def unrequested(root: Path, data: dict) -> dict:
+    """Per source of an acquisition: the data files its record's COMPLETE listing names that this plan did not take
+    (the fetcher's records-API or hub listing, else a `run.py discover --files` listing of the same record; never a
+    landing page's capped links). Not a gap — a plan may take 3 of 25 files — and never "not released" either (Oct-01
+    transformer: a record of 25 files, 20 requested, the other 4 called unreleased)."""
+    import os
+    from .discover import canon
+    from .fetcher import _dot, _textual
+    log = Path(root) / "discovery.jsonl"
+    listed = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines() if x.strip()] if log.exists() else []
+    out = {}
+    for s in data.get("sources") or []:
+        names = s.get("listing")
+        if names is None:
+            f = next((r for r in reversed(listed) if r.get("files") and not r.get("error")
+                      and canon(r.get("files_of", "")) == canon(s.get("source", ""))), None)
+            names = [x["name"] for x in f["files"]] if f else None
+        if not names:
+            continue
+        got = {v for a in s.get("admitted") or [] for k in ("file", "from") if (v := str(a.get(k) or ""))}
+        got |= {os.path.basename(v) for v in got}
+        miss = [n for n in names if n not in got and os.path.basename(n) not in got and not _dot(n) and not _textual(n)]
+        if miss:
+            out[str(s.get("dir"))] = {"source": s.get("source"), "not_requested": miss[:200],
+                                      "listed": len([n for n in names if not _dot(n) and not _textual(n)])}
+    return out
+
+
 def data_volume(root: Path, cid: str) -> str:
     return _cname("data", Path(root).resolve(), cid)
 
@@ -1370,7 +1401,9 @@ def _projected(cfg: state.Config, check: dict, st: dict, runs: int, spent: float
     pilot's projection of the remaining runs."""
     w = 1 if check["kind"] == "AUTHOR_CODE" or gpu_run(cfg, check) else max(1, min(cfg.parallel, st.get("width", cfg.parallel)))
     limit, setting = budget(cfg, check)
-    return spent + st.get("pilot_s", 0) * (runs - st["seed"]) / w, limit, setting, w
+    secs = sorted(v for v in (st.get("seed_seconds") or {}).values() if v)
+    per = secs[(len(secs) - 1) // 2] if len(secs) >= 2 else st.get("pilot_s", 0)   # completed seeds' median, else the pilot
+    return spent + per * (runs - st["seed"]) / w, limit, setting, w
 
 
 def _spent(st: dict) -> float:
@@ -1669,6 +1702,10 @@ def try_script(cfg: state.Config, pid: str, cid: str, script: str, c: dict) -> d
     ok, why = docker_status()
     if not ok:
         return {"error": why}
+    if c.get("kind") == "RECONSTRUCTION" and gpu(cfg) and gpu_busy():   # never beside a timed run on the one GPU
+        return {"error": "the GPU is held by another run (a timed evidence run or a draft): this draft was not run and "
+                         "does not count against your drafts; try again in a few minutes, or finish without one",
+                "retry": True}
     try:
         env_dir, envinfo = with_packages(cfg, root, *script_env(cfg, root, c.get("kind", ""),
                                                               bool(c.get("repo_attributed"))), script)

@@ -1238,6 +1238,62 @@ def test_download_failures_are_classified_and_only_transient_ones_are_retried():
         assert fetcher.failure_class({"attempts": [{"class": "bug"}, {"class": "missing"}], "followed": [], "rejected": []}) == "bug"
 
 
+def test_a_file_the_record_lists_but_the_plan_did_not_request_is_never_called_unreleased():
+    """Oct-01 transformer: Zenodo 18281512 lists 25 files (discovery.jsonl F1); the plan requested 20; C2's identity lines
+    then called flash_vanaddition and the algorithmic-addition files "not among the files released". What a COMPLETE
+    listing names and the plan did not take is reported as not requested (never a gap: a plan may take 3 of 25)."""
+    with tempfile.TemporaryDirectory() as t:
+        root = Path(t)
+        state.append_jsonl(root / "discovery.jsonl", {"id": "F1", "files_of": "https://zenodo.org/records/7", "files": [
+            {"name": n, "bytes": 9, "md5": ""} for n in ("a.csv", "b.csv", "c.csv", "README.md", "run.py")]})
+        data = {"sources": [{"source": "https://zenodo.org/records/7", "dir": "0", "admitted_files": 1,
+                             "admitted": [{"file": "a.csv", "from": "a.csv"}]},
+                            {"source": "https://x.org/page", "dir": "1", "admitted_files": 1,
+                             "admitted": [{"file": "z.csv"}]}]}                                    # a landing page: no listing
+        got = execute.unrequested(root, data)
+        assert got == {"0": {"source": "https://zenodo.org/records/7", "not_requested": ["b.csv", "c.csv"], "listed": 3}}, got
+        assert not execute.data_gaps(data)                                   # not requested is no gap
+        hub = {"sources": [{"source": "hf://datasets/o/n", "dir": "0", "listing": ["data/train.parquet", "data/test.parquet"],
+                            "admitted": [{"file": "data/test.parquet", "from": "hf://datasets/o/n"}]}]}
+        assert execute.unrequested(root, hub)["0"]["not_requested"] == ["data/train.parquet"]   # the fetcher's own listing
+        lines = report._unrequested_lines({"id": "C2", "not_requested": got,
+                                           "data_identity": {"b": {"source": "/work/data/0/b.csv", "observed": {"file_present": False},
+                                                                   "matches": False}}})
+        assert "this plan did not request: b.csv, c.csv" in lines[0] and "not absent from the release" in lines[0]
+        assert "b.csv" in lines[1] and "the record lists this file" in lines[1]
+
+
+def test_a_hub_repository_is_listed_before_include_is_chosen_and_a_denied_one_never_asked():
+    """Oct-01 PPRM: `discover --files` listed only records-API sources, so the planner guessed CMExam's format
+    (`*.jsonl`, `*.csv`, `*.parquet`) and three patterns that name nothing read as data gaps. A hub repository is
+    listed from the hub's own API (what the fetcher would take: no dot-paths, no empty files); a denied one is refused
+    before anything is sent."""
+    from harness import discover
+    sent = []
+
+    def get(url):
+        sent.append(url)
+        return {"id": "fzkuji/CMExam", "gated": False, "private": False, "siblings": [
+            {"rfilename": "test.json", "size": 6434215}, {"rfilename": "train.json", "size": 48807760},
+            {"rfilename": ".gitattributes", "size": 2}, {"rfilename": "empty.json", "size": 0}, {"rfilename": "README.md", "size": 9}]}
+    with tempfile.TemporaryDirectory() as t:
+        cfg, pid = _project(Path(t))
+        cfg.allow_network = cfg.allow_data_search = True
+        rec = discover.files(cfg, pid, "hf://datasets/fzkuji/CMExam", get=get)
+        assert sent == ["https://huggingface.co/api/datasets/fzkuji/CMExam?blobs=true"], sent
+        assert [f["name"] for f in rec["files"]] == ["test.json", "train.json", "README.md"] and rec["total_bytes"] == 6434215 + 48807760 + 9
+        assert discover.files(cfg, pid, "hf://datasets/fzkuji/CMExam", get=get).get("reused")      # answered from the log
+        sent.clear()
+        bad = discover.files(cfg, pid, "hf://datasets/ICML-2026-agent-repro/verdicts", get=get)
+        assert "denied" in bad["error"] and sent == []                                         # nothing was sent
+        assert "hf://" in discover.files(cfg, pid, "hf://spaces/a/b", get=get)["error"] and sent == []
+        def down(url):
+            raise OSError("HTTP Error 401: Unauthorized")
+        failed = discover.files(cfg, pid, "hf://models/o/gated-model", get=down)
+        assert failed["error"] and not failed["files"]
+        assert discover._spent(discover.records(cfg, pid)) == 1                               # a failed listing costs nothing
+
+
 def test_a_named_file_that_arrives_packed_is_acquired_and_says_so():
     """Oct-01 conformal C5: the UCI Porto archive holds `train.csv.zip`; the plan named `train.csv` (the paper's name).
     Every file arrived, yet `train.csv` read as matching nothing and the check ended a DATA BLOCKER (missing). A named
@@ -2253,6 +2309,28 @@ def _plan(x, checks, claims, final=False, tid="plan"):
     return tasks._seal_plan(x, tid, {"checks": checks, "central_claims": claims}, final=final)
 
 
+def test_an_other_blocker_sealed_on_a_spent_search_budget_says_so():
+    """Oct-01 PPRM: the Qwen 3B/7B/32B predictors and the 7B filter were omitted as `other` because "the 12-search budget
+    is spent" — a setting of this run, read by nobody as one. The seal records the harness fact beside every
+    `other`/`protocol` omission, and the review prints it; `other` stays the planner's word."""
+    with tempfile.TemporaryDirectory() as t:
+        cfg, pid, x = _x(Path(t))
+        om = {"item": "Qwen 7B predictor", "why": "no successful search and the budget is spent", "blocker": "other"}
+        claim = _claim(scope=["CIFAR-10-C", "Qwen 7B predictor"], omitted=[om])
+        rec = _plan(x, [_run()], [claim])
+        assert "budget_spent" not in rec["central_claims"][0]["omitted"][0]                     # budget left: no note
+    with tempfile.TemporaryDirectory() as t:
+        cfg, pid, x = _x(Path(t))
+        for i in range(cfg.max_discoveries):
+            state.append_jsonl(x.root / "discovery.jsonl", {"id": f"D{i + 1}", "query": f"q{i}", "results": {"zenodo": {"candidates": []}}})
+        rec = _plan(x, [_run()], [claim])
+        o = rec["central_claims"][0]["omitted"][0]
+        assert o["budget_spent"] == f"{cfg.max_discoveries} of {cfg.max_discoveries}", o
+        row = report._completion_row({**rec["central_claims"][0], "page": 1}, {})
+        b = next(b for b in row["not_run"] if b["item"] == "Qwen 7B predictor")
+        assert b["blocker"] == "other" and b["budget_spent"]                                       # the planner's word, and the fact
+
+
 def test_a_classification_left_out_is_refused_never_defaulted():
     """A missing role read as 'target', a missing criterion as 'stated', a missing claim type switched every
     empirical rule off, and on the planner's third attempt every claim-level error was sealed as it stood."""
@@ -3185,6 +3263,69 @@ def test_a_gpu_holds_one_run_and_the_budget_counts_its_runs_one_at_a_time():
         assert execute.gpu_run(cfg, recon) is False and execute.gpu_run(cfg, {"kind": "CERTIFICATE"}) is False
     finally:
         execute._docker, execute.gpu = real
+
+
+def test_a_draft_never_shares_the_gpu_with_a_timed_run_and_a_skipped_one_costs_no_try():
+    """Oct-01 PPRM: drafts (`run.py try`) of C7/C8 ran on the GPU beside C9's timed evidence run (gpu_overlap.txt). A
+    synchronous draft on a GPU host now waits its turn: it is not run while another run holds the GPU, says so, and
+    does not count against the draft budget; it is itself visible to gpu_busy (label referee.sync)."""
+    seen = []
+    real = execute.docker_status, execute.gpu, execute.gpu_busy, execute._docker
+    try:
+        execute.docker_status, execute.gpu, execute.gpu_busy = (lambda: (True, "")), (lambda c: True), (lambda: True)
+        with tempfile.TemporaryDirectory() as t:
+            cfg, pid = _project(Path(t))
+            cfg.allow_script_exec = True
+            res = execute.try_script(cfg, pid, "C1", "print(1)", {"kind": "RECONSTRUCTION"})
+            assert res["retry"] and "GPU" in res["error"], res
+            cpu = execute.try_script(cfg, pid, "C1", "print(1)", {"kind": "CERTIFICATE"})   # not given the GPU: not held back
+            assert not cpu.get("retry")
+        def docker(a, timeout):                       # a sync draft holding the GPU is seen
+            seen.append(a)
+            if a[:2] == ["docker", "ps"]:
+                return (0, "") if "label=referee=1" in a else (0, "sss\n")
+            return 0, "[{\"Driver\":\"\",\"Count\":-1}]\n"
+        execute._docker, execute.gpu_busy = docker, real[2]
+        assert execute.gpu_busy() and any("label=referee.sync=1" in a for a in seen)
+    finally:
+        execute.docker_status, execute.gpu, execute.gpu_busy, execute._docker = real
+    launch = []
+    real_run = subprocess.run
+    try:
+        subprocess.run = lambda argv, **k: launch.append(argv) or subprocess.CompletedProcess(argv, 0, "", "")
+        execute.run(["true"], mounts=[], workdir="/", image="x", network=False, timeout=5, mode="try", target="t", gpus=True)
+    finally:
+        subprocess.run = real_run
+    assert "referee.sync=1" in launch[0]                                            # the draft carries its label
+    with tempfile.TemporaryDirectory() as t:                                        # a skipped draft is not counted
+        cfg, pid = _project(Path(t))
+        root = state.pdir(cfg, pid)
+        (root / "tasks").mkdir(exist_ok=True)
+        (root / "tasks" / "gen__C1.1.md").write_text("task", encoding="utf-8")
+        (Path(t) / "s.py").write_text("print(1)", encoding="utf-8")
+        saved = execute.try_script
+        try:
+            execute.try_script = lambda *a, **k: {"error": "the GPU is held by a timed run", "retry": True}
+            assert tasks.try_(cfg, pid, "gen:C1.1", str(Path(t) / "s.py"))["retry"]
+            assert not (root / "checks" / "C1" / "tries.jsonl").exists()
+        finally:
+            execute.try_script = saved
+
+
+def test_the_remaining_runs_are_projected_from_the_seeds_own_times():
+    """Oct-02 PPRM C8: the extension to 6 replicates was refused on the pilot's 2682 s, measured while another check
+    shared the GPU; seeds 1 and 2 took 284 s and 290 s alone. Once two or more seeds have completed, the projection
+    uses their median (never the minimum); a slower later seed raises it."""
+    cfg = state.Config()
+    cfg.parallel = 1
+    recon = {"kind": "RECONSTRUCTION"}
+    fast = {"pilot_s": 2682, "seed": 3, "seed_seconds": {"0": 2682, "1": 284, "2": 290}}
+    need, limit, _, _ = execute._projected(cfg, recon, fast, 6, spent=execute._spent(fast))
+    assert need == 2682 + 284 + 290 + 3 * 290 and need <= limit                    # extension fits: 4126 s
+    slow = {"pilot_s": 300, "seed": 3, "seed_seconds": {"0": 300, "1": 2600, "2": 2700}}
+    need, limit, _, _ = execute._projected(cfg, recon, slow, 6, spent=execute._spent(slow))
+    assert need == 300 + 2600 + 2700 + 3 * 2600 and need > limit                   # a slow later seed raises it
+    assert execute._projected(cfg, recon, {"pilot_s": 500, "seed": 1, "seed_seconds": {"0": 500}}, 3)[0] == 1000   # one seed: pilot
 
 
 def test_a_tls_failure_is_a_fault_of_this_run_never_a_data_blocker():

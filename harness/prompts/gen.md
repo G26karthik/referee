@@ -44,6 +44,8 @@ THE SCRIPT CONTRACT
     them from /work/data (the harness refuses a script that never does). A simulation, a smaller stand-in
     or a different dataset in their place is a different experiment: never write one to make a check
     "work"; if the files are not what the paper describes, print the REFEREE_DATA mismatch and continue.
+    A file the record lists that this plan did not acquire (THE RECORD ALSO LISTS) is "not acquired by this
+    check", never "not released"; say which, in the mismatch.
   - REPLICATES ARE DIFFERENT RUNS. Every random generator (sampling, splits, simulation, initialisation)
     is seeded from `--seed`; the harness refuses a stochastic script whose seed reaches none. A stochastic
     script adds `"data_fingerprint": "<sha256 of the random draws THIS stage consumed>"` to EVERY result line

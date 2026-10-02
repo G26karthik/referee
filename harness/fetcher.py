@@ -591,6 +591,7 @@ def _hf(f: Fetcher, s: dict, dest: str, tmp: str, rec: dict) -> None:
     info = HfApi().repo_info(repo, repo_type=kind.rstrip("s"), revision=rev or None, files_metadata=True)
     pats = s.get("include") or ["*"]
     sib = [x for x in info.siblings or [] if x.size != 0 and not _dot(x.rfilename)]
+    rec["listing"] = [x.rfilename for x in sib][:MAX_RECORD_FILES]     # the hub's own listing of the repository
     data = {x.rfilename: x for x in sib if _named(x.rfilename, pats) and not x.rfilename.lower().endswith(CODE)}
     text = {x.rfilename: x for x in [x for x in sib if _textual(x.rfilename) and _src_fetchable(x.rfilename, x.size)][:SRC_FILES]}
     need = sum(x.size or 0 for x in {**text, **data}.values())
@@ -693,6 +694,8 @@ def _web(f: Fetcher, url: str, s: dict, dest: str, tmp: str, rec: dict) -> None:
     if listed is not None:
         rec["recovery"].append(f"documented mechanism: the repository records API for {final}")
         listed = [t for t in listed if t.get("bytes") != 0 and not _dot(t["name"])]
+        if len(listed) < MAX_RECORD_FILES:                # a complete listing: what the plan did not take is known
+            rec["listing"] = [t["name"] for t in listed]
         targets = [{**t, "named": True} for t in listed if not include or _named(t["name"], include)]
         pool = listed
         took = {t["url"] for t in targets}

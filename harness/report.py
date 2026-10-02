@@ -20,6 +20,7 @@ from pathlib import Path
 
 from . import state
 from .evidence import flat
+from . import execute
 from .execute import EVIDENCE
 from .reconcile import FAILURE, PARTIAL, READINGS_DIFFER, SUPPORT
 
@@ -188,6 +189,21 @@ def _done(c: dict) -> str:
             f"{' (claim reading changed)' if _changed(c) else ''}: {c['status']}{extra}")
 
 
+def _unrequested_lines(c: dict) -> list[str]:
+    """What the source's complete listing names that this plan did not request: said by the harness, beside the data
+    identity lines, so a file left out by the plan never reads as missing from the release."""
+    out, named = [], {f for u in (c.get("not_requested") or {}).values() for f in u["not_requested"]}
+    for d, u in sorted((c.get("not_requested") or {}).items()):
+        out.append(f"  - source `{u['source']}`: its record lists {u['listed']} data file(s); this plan did not request: "
+                   + ", ".join(u["not_requested"][:12]) + (f" (+{len(u['not_requested']) - 12} more)" if len(u["not_requested"]) > 12 else "")
+                   + " — not acquired by this check, not absent from the release")
+    for name, ident in (c.get("data_identity") or {}).items():
+        src = str((ident or {}).get("source") or "") if isinstance(ident, dict) else ""
+        if src.rsplit("/", 1)[-1] in {n.rsplit("/", 1)[-1] for n in named}:
+            out.append(f"  - dataset {name} ({src.rsplit('/', 1)[-1]}): the record lists this file; this plan did not request it")
+    return out
+
+
 def _measured_before(c: dict) -> str:
     """What a run printed before a resource limit ended it: kept beside the blocker, deciding nothing."""
     st = c.get("pilot_stages") or {}
@@ -254,6 +270,7 @@ def _checks(root: Path, plan: dict) -> list[dict]:
                     "stages": o.get("stages"), "status_on_completed": o.get("status_on_completed"),
                     "completed_stages": o.get("completed_stages"),
                     "failed_seeds": o.get("failed_seeds"), "data_identity": o.get("data_identity"), "data": o.get("data"),
+                    "not_requested": execute.unrequested(root, state.read_json(cdir / "data.json") or {}),
                     "resource": o.get("resource"), "stage_times": o.get("stage_times"), "peak_mb": o.get("peak_mb"),
                     "environment": o.get("environment"), "authorization": o.get("authorization", ""),
                     "commit": o.get("commit", ""), "history": history,
@@ -323,7 +340,8 @@ def _blockers(cc: dict, cs: list[dict], unrun: list[str] = (), done: set = froze
     check covers (`done`: a follow-up round ran it) is no reason anything did not run (Oct-02 PPRM review)."""
     out = [{"item": o["item"], "blocker": o.get("blocker") or "unstated", "why": o["why"][:300], "basis": "planner",
             **({"searched": o["discovery"]} if o.get("discovery") else {}),
-            **({"unverified": o["unverified"]} if o.get("unverified") else {})} for o in cc.get("omitted") or []
+            **({"unverified": o["unverified"]} if o.get("unverified") else {}),
+            **({"budget_spent": o["budget_spent"]} if o.get("budget_spent") else {})} for o in cc.get("omitted") or []
            if o.get("why") and flat(o["item"]) not in done]
     if not cc["checks"] and cc.get("why_unchecked"):
         out.append({"item": "(the whole claim)", "blocker": cc.get("blocker") or "unstated", "why": cc["why_unchecked"][:300],
@@ -591,6 +609,9 @@ def table(led: dict) -> str:
              + (f"; data identity mismatch: {', '.join(r['data_mismatch'])}" if r["data_mismatch"] else "")
              + "".join(f"; not run — {b['item']}: {b['blocker']}" + (f" ({b['class']})" if b.get("class") else "")
                        + f" [{b['basis']}" + (f"; NOT verified: {_cell(b['unverified'], 120)}" if b.get("unverified") else "")
+                       + (f"; the search budget was spent when this was planned ({b['budget_spent']} searches, "
+                          "SH_MAX_DISCOVERIES): a setting of this run, not evidence that anything named is absent"
+                          if b.get("budget_spent") else "")
                        + "]" for b in r["not_run"][:6])
              + "".join(f"; supporting only: {x['check']} {x['kind']} {x['status']}" for x in r["supporting"])
              for r in comp["claims"]]
@@ -794,6 +815,7 @@ def render(x, led: dict, rep: dict | None) -> str:
                              f"`checks/{c['id']}/data.json` (fetched {d.get('fetched_at', '?')})")
             for name, ident in (c.get("data_identity") or {}).items():
                 lines.append(f"  - dataset {name}: {_said(_cell(json.dumps(ident, ensure_ascii=False), 300), led)}")
+            lines += _unrequested_lines(c)
         lines.append("")
     hist = [(c["id"], h) for c in led["checks"] for h in c.get("history") or []]
     wd = led.get("withdrawn_checks") or []

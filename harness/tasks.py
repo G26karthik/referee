@@ -307,7 +307,8 @@ def _followup_text(ledger: dict, undecided: list[dict]) -> str:
     listed = "\n".join(f"- {cc['quote']!r} ({cc.get('claim_type') or 'untyped'}): {cc['claim_status']}; the requested "
                        f"experiment: {ran[cc['quote']]['experiment']}" + "".join(
                            f" [{b['item']}: {b['blocker']}{' ' + b['class'] if b.get('class') else ''}, asserted by the "
-                           f"{b['basis']}{'; NOT verified: ' + b['unverified'][:160] if b.get('unverified') else ''}]"
+                           f"{b['basis']}{'; NOT verified: ' + b['unverified'][:160] if b.get('unverified') else ''}"
+                           f"{'; the search budget was spent when it was planned, which shows nothing about the data' if b.get('budget_spent') else ''}]"
                            for b in ran[cc["quote"]]["not_run"][:6]) for cc in ledger["central_claims"] if cc["quote"] in ran)
     choices = "\n".join(f"- {d['printed'][:160]!r} (p{d['page']}): " + "; ".join(
         f"{u['checks']}: {u['used'][:120]!r}{' (changes the claim)' if u['changes_claim'] else ''}" for u in d["choices"])
@@ -351,6 +352,9 @@ def _data_text(x: _Ctx, cid: str) -> str:
             + f"\n{d.get('n_files', 0)} files, {d.get('bytes', 0)} bytes:\n{files}\n"
             + ("NOT COMPLETE — what the experiment needs and did not get: " + "; ".join(execute.data_gaps(d))[:1500] + "\n"
                if execute.data_gaps(d) else "")
+            + "".join(f"THE RECORD ALSO LISTS (released, but not requested by this plan, so not under {execute.DATA_MOUNT}/{k}/): "
+                      + ", ".join(u["not_requested"][:40]) + " — a REFEREE_DATA line says 'not acquired', never 'not released'\n"
+                      for k, u in execute.unrequested(x.root, d).items())
             + ("RELEASED RECORD TEXT (code, notebooks, README; quote-only, never run; Read it under "
                f"{(x.root / 'checks' / cid / 'record_src').as_posix()}/, cite a reading as record:<path>):\n"
                + "\n".join(f"  {r['path']} ({r['bytes']} bytes)" for r in d["record_src"][:60]) + "\n"
@@ -1000,6 +1004,7 @@ def _enum(v, allowed: tuple) -> str:
 def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     errors, checks, dropped = [], [], []
     concern_ids = {c["id"] for c in x.concerns()}
+    spent = discover._spent(discover.records(x.cfg, x.pid))   # searches this paper used: a fact beside `other`/`protocol`
     base = x.sealed("plan") if tid == "plan:2" else None      # a follow-up round adds to the first plan
     attributed = base["repo_is_authors"] if base else (x.checkout / ".git").is_dir() and obj.get("repo_is_authors") is True
     # Follow-up ids continue after every id the first round used (a check dropped there left a gap).
@@ -1167,6 +1172,8 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         for o in [o for o in omitted if o["why"] and o["blocker"] != "unstated"]:
             if (why := _blocker(x, o, cerrs, f"{label} omitted {o['item']!r}")):
                 o["unverified"] = why[:400]
+            if o["blocker"] in ("other", "protocol") and spent >= x.cfg.max_discoveries:
+                o["budget_spent"] = f"{spent} of {x.cfg.max_discoveries}"   # a fact beside the planner's word (Oct-01)
         if not links and (why := _blocker(x, claim_blocker, cerrs, f"{label} has no check; why_unchecked")):
             claim_blocker["unverified"] = why[:400]
         errors += cerrs
@@ -1470,5 +1477,6 @@ def try_(cfg: state.Config, pid: str, tid: str, script_path: str) -> dict:
     script = Path(script_path).read_text(encoding="utf-8")
     plan = report.merged(_sealed(root, "plan"), _sealed(root, "plan:2")) or {"checks": []}
     res = execute.try_script(cfg, pid, cid, script, next((k for k in plan["checks"] if k["id"] == cid), {}))
-    state.append_jsonl(cdir / "tries.jsonl", {"task": tid, "script_sha256": state.sha256(script), **res})
+    if not res.get("retry"):                     # a draft the harness did not run (the GPU was held) costs no try
+        state.append_jsonl(cdir / "tries.jsonl", {"task": tid, "script_sha256": state.sha256(script), **res})
     return res

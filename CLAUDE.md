@@ -110,7 +110,8 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     What a run printed before its limit is kept beside the blocker (`pilot_stages`), deciding
     nothing. A run given the GPU holds it alone (no second GPU run, draft or evidence, starts beside it) and
     is projected one at a time against the budget: a limit measured under another run's load measures
-    the sharing, not the protocol. Completed seeds are checkpointed
+    the sharing, not the protocol; a synchronous draft waits too (`referee.sync`) and costs no try. Remaining
+    runs are projected from the completed seeds' median time (the pilot's until two completed). Completed seeds are checkpointed
     (seeds.jsonl) and reused; each seed has a scratch volume at /work/ckpt. Planners and script
     authors are told the measured host (CPUs, container RAM, GPU yes/no).
 20. **Completed measurements survive later failures.** A script prints one result line per
@@ -145,7 +146,8 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     HTML page, an empty or corrupt file, a bad checksum, executable source code). A cap on the files followed
     is never silent: a landing page follows 20 links, a repository record its own listing (up to 500), and a
     cut is recorded (`truncated`), shown to planner, script author and report, and never shared as a complete
-    set. Every attempt, redirect
+    set. A record's COMPLETE listing (records API, hub siblings, `discover --files`, hf:// too) also names what a plan
+    did not request: script author and report say "not requested", never "not released". Every attempt, redirect
     and file sha256 is kept (`checks/<id>/data.json`); admitted files mount read-only at /work/data. A
     check whose required data was not admitted ends as a DATA BLOCKER (or INCONCLUSIVE for a network
     fault of this run) before any script is written — a simulation in its place would be a different
@@ -193,7 +195,7 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     `credentials` on a hosted closed service or the registry record of a gated or private artifact (a public,
     ungated one is acquired), `compute` on a measured RESOURCE BLOCKER, the artifact's registry size against the
     measured host, or the paper's own statement of its compute; `protocol`/`other` are the planner's word,
-    reported as such. Deviations are capped (16) by refusal, never by silent truncation.
+    reported as such, beside the harness fact that the search budget was spent when it was planned (`budget_spent`). Deviations are capped (16) by refusal, never by silent truncation.
 
 ## Dependency recovery (documented, isolated, recorded)
 
