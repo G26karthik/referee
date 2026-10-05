@@ -388,6 +388,35 @@ def counts(c: dict) -> dict:
             "reconciles": units == with_result + undef + missing + len(lost) and not lost}
 
 
+_OUTPUTS_SHOWN = 4    # ponytail: compared outputs averaged per stage for the reader; every output is in seeds.jsonl
+
+
+def stage_outputs(cdir: Path, run: dict, c: dict) -> dict:
+    """{stage: {output: mean over the seeds}} for the outputs a check compares (the relation's names and the planner's
+    defined outputs, else its metric), from the result lines its approved script printed (seeds.jsonl): the magnitudes
+    behind a margin, for the reader. A reading is kept apart as `stage [reading]`. Decides nothing."""
+    from .evidence import relation
+    rel = (c.get("target") or {}).get("relation") or ""
+    try:
+        names = relation(rel)[3] if rel else []
+    except ValueError:
+        names = []
+    names = list(dict.fromkeys(names + list((c.get("define") or {}).keys()) + ([run.get("metric")] if run.get("metric") else [])))
+    f, key = Path(cdir) / "seeds.jsonl", run.get("script_sha256") or f"{run.get('command', '')}|{run.get('seed_flag', '')}"
+    if not names or not f.exists():
+        return {}
+    acc: dict = {}
+    for row in (json.loads(x) for x in f.read_text(encoding="utf-8").splitlines() if x.strip()):
+        if row.get("key") != key:
+            continue
+        for d in row.get("detail") or []:
+            st = (d.get("stage") or "") + (f" [{d['reading']}]" if d.get("reading") else "")
+            for n in names[:_OUTPUTS_SHOWN]:
+                if isinstance((d.get("out") or {}).get(n), (int, float)):
+                    acc.setdefault(st, {}).setdefault(n, []).append(float(d["out"][n]))
+    return {st: {n: round(sum(v) / len(v), 6) for n, v in by.items()} for st, by in list(acc.items())[:400]}
+
+
 def _counts(stages: dict) -> str:
     n: dict = {}
     for p in stages.values():
@@ -436,10 +465,13 @@ def _checks(root: Path, plan: dict) -> list[dict]:
                     "not_requested": execute.unrequested(root, state.read_json(cdir / "data.json") or {}),
                     "resource": o.get("resource"), "stage_times": o.get("stage_times"), "peak_mb": o.get("peak_mb"),
                     "environment": o.get("environment"), "authorization": o.get("authorization", ""),
-                    "commit": o.get("commit", ""), "history": history,
+                    "commit": o.get("commit", ""), "history": history, "units": o.get("units") or [],
+                    "fidelity": run.get("fidelity") or [], "runs_source": run.get("runs_source", ""),
+                    "outputs": stage_outputs(cdir, run, c), "ended_at": o.get("finished_at", ""),
                     "records": "execution.jsonl" if o.get("runs") or (o.get("protocol") or {}).get(
                         "seeds_reused_from_checkpoints") else ""})
         out[-1]["data_changed"] = _data_changed(out[-1], root)
+        out[-1]["counts"] = counts(out[-1])
         # A failure about the printed claim counts once an independent auditor, shown the failing instances, found it
         # does not rest on a reading or choice the paper's words leave open (tasks._audits; it can only lower).
         out[-1]["audit_owed"] = needs_audit(root, c)
@@ -497,6 +529,8 @@ def _central(plan: dict, checks: list[dict], conf: list[dict]) -> list[dict]:
                     "supporting": [k for k in cc["checks"] if k in by_id and by_id[k].get("role") == "supporting"],
                     "claim_status": st, "completion": {**row, "evidence": st},
                     "deviations": sum(len(by_id[k]["deviations"]) for k in cc["checks"] if k in by_id)})
+        from .reviewer import decision
+        out[-1]["decision"] = decision(out[-1], by_id)
     return out
 
 

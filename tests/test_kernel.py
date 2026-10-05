@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -4588,6 +4589,140 @@ def test_the_follow_up_round_does_not_wait_on_a_long_run():
             assert "generation of samples" not in undecided and "mean over 5" in undecided
         finally:
             execute.poll, execute.remaining_s = real
+
+
+def _claim_row(st, ctype="performance", exp="RAN_AS_SPECIFIED", checks=(), **kw):
+    return {"id": "K1", "quote": "q", "claim_type": ctype, "claim_status": st, "checks": list(checks),
+            "completion": {"experiment": exp, "changes": [], "scope_not_run": [], "not_run": [], **kw.pop("comp", {})}, **kw}
+
+
+def test_every_main_claim_gets_one_decision_with_a_specific_reason():
+    """Oct-05 review: a reviewer needs one decision per main claim — Verified only when the requested test ran as
+    specified and supports it within its scope; otherwise Not verified with the specific reason. A theorem is never
+    verified by finite cases, a failed proof step is not a false theorem, missing evidence is not falsity."""
+    from harness.reviewer import decision
+    chk = lambda **kw: {"id": "C1", "kind": "RECONSTRUCTION", "role": "target", "status": "RELATION_HOLDS",
+                        "values": [1.0], "counts": {}, **kw}
+    d = lambda cc, cs=(): decision(cc, {c["id"]: c for c in cs})
+    assert d(_claim_row("SUPPORT_FOUND", checks=["C1"]), [chk()])["decision"] == "VERIFIED"
+    cases = [(_claim_row("PARTIAL_EVIDENCE", exp="RAN_PARTIAL", comp={"scope_not_run": ["SVHN"]}), "incomplete_coverage"),
+             (_claim_row("NO_VIOLATION_FOUND", "theory", "RAN_AS_SPECIFIED"), "finite_cases_only"),
+             (_claim_row("SUPPORT_FOUND", "theory"), "finite_cases_only"),
+             (_claim_row("FAILURE_FOUND", "theory"), "false_as_printed"), (_claim_row("FAILURE_FOUND"), "contradicted"),
+             (_claim_row("PROOF_GAP_FOUND", "theory"), "proof_step_invalid"), (_claim_row("PREMISE_NOT_MET", "theory"), "premise_impossible"),
+             (_claim_row("READING_CHANGED", exp="RAN_WITH_CHANGES"), "changed_protocol"),
+             (_claim_row("READINGS_DISAGREE"), "interpretation_uncertain"), (_claim_row("CHECKS_DISAGREE"), "checks_disagree"),
+             (_claim_row("NOT_CHECKED", exp="NOT_RUN", why_unchecked="no code"), "not_checked"),
+             (_claim_row("NOT_CHECKED", exp="NOT_RUN", comp={"not_run": [{"item": "IHDP", "blocker": "data", "basis": "harness",
+                                                                  "why": "404"}]}), "blocked"),
+             (_claim_row("PENDING"), "pending")]
+    for cc, want in cases:
+        got = d(cc)
+        assert got["decision"] == "NOT_VERIFIED" and got["reason"] == want, (cc["claim_status"], got)
+        assert got["reason_text"] and isinstance(got["because"], list)
+    undecided = d(_claim_row("NOTHING_DECIDED", checks=["C1"]), [chk(status="INCONCLUSIVE")])
+    assert undecided["reason"] == "undecided" and "not decided" in undecided["because"][0]
+    cert = {"id": "C1", "kind": "CERTIFICATE", "role": "target", "status": "NO_VIOLATION_FOUND", "values": [0] * 60,
+            "literal": {"undefined": 60}, "counts": {}}
+    assert d(_claim_row("READING_CHANGED", "theory", checks=["C1"]), [cert])["reason"] == "notation_defect"
+    depends = chk(status="RELATION_VIOLATED", audit={"verdict": "DEPENDS"})
+    assert d(_claim_row("READING_CHANGED", checks=["C1"]), [depends])["reason"] == "interpretation_uncertain"
+    assert d(_claim_row("NOT_CHECKED", exp="NOT_RUN", why_unchecked="x"))["because"][-1].startswith("why no test (planner")
+
+
+def test_the_reviewer_page_is_built_from_the_record_and_publishes_only_checked_prose():
+    """Oct-05 review: the reviewer report must give, per claim, the decision before its limits, what ran on what, the
+    numbers with their uncertainty and denominators, what was not tested, and evidence references — and model prose
+    that invents a number or a status word must not reach the page."""
+    from harness import reviewer
+    with tempfile.TemporaryDirectory() as t:
+        root = Path(t)
+        st = {"interaction": {"status": "RELATION_HOLDS", "margin": 0.0973, "band": 0.0319, "n": 100, "n_independent": 100},
+              "tree": {"status": "RELATION_HOLDS", "margin": 0.0598, "band": 0.0198, "n": 100, "n_independent": 100},
+              "neural": {"status": "UNDEFINED", "reason": "no treated units"}}
+        c1 = {"id": "C1", "kind": "RECONSTRUCTION", "role": "target", "status": "RELATION_HOLDS", "claim": "q", "covers": ["GRACE", "TARNet"],
+              "target": {"relation": "err_base - err_grace > 0"}, "stages": st, "values": [0.1] * 200,
+              "outputs": {"interaction": {"err_base": 1.0891, "err_grace": 0.9918}, "tree": {"err_base": 0.7826, "err_grace": 0.7228}},
+              "execution": {"runs_planned": 100, "runs_ended": 100}, "units": ["interaction", "tree", "neural"],
+              "fidelity": [{"aspect": "metric", "paper": "RMSE of the CATE", "code": {"file": "eval.py", "quote": "x"},
+                            "used": "RMSE of the CATE", "agrees": False, "explained": "the code averages over seeds first"}],
+              "deviations": [], "script_sha256": "8b7df4c174ee0000", "records": "execution.jsonl", "commit": "58d2f643aa",
+              "data_identity": {}, "runs_source": "paper", "reason": "", "basis": "fresh_run"}
+        c1["counts"] = report.counts(c1)
+        claims = [{"id": "K1", "statement": "GRACE has lower error than the baselines.", "quote": "GRACE consistently surpasses",
+                   "page": 6, "claim_type": "performance", "checks": ["C1"], "claim_status": "PARTIAL_EVIDENCE",
+                   "completion": {"experiment": "RAN_PARTIAL", "changes": [], "scope_not_run": ["BART", "IHDP"],
+                                  "not_run": [{"item": "BART", "blocker": "cap", "basis": "planner", "why": "budget"}]}},
+                  {"id": "K2", "statement": "The layer has a sparse form.", "quote": "Theorem 5.1", "page": 5,
+                   "claim_type": "theory", "checks": [], "claim_status": "NOT_CHECKED", "why_unchecked": "no exact form",
+                   "completion": {"experiment": "NOT_RUN", "changes": [], "scope_not_run": [], "not_run": []}}]
+        by = {"C1": c1}
+        for cc in claims:
+            cc["decision"] = reviewer.decision(cc, by)
+        led = {"paper": {"title": "GRACE", "sha256": "ab" * 32, "arxiv_id": "", "source": "OpenReview tSZaHvpxCd"},
+               "source": {"url": "https://github.com/x/GRACE", "commit": "58d2f643aa11"}, "checks": [c1],
+               "central_claims": claims, "workflow": {"finished": 1, "checks_planned": 1}, "concerns": []}
+        x = types.SimpleNamespace(root=root, paper=Paper(["GRACE consistently surpasses the baselines. Theorem 5.1 holds."]))
+        rep = {"overview": "The paper proposes GRACE, a tree layer trained with gradients.",
+               "claims": [{"id": "K1", "explanation": "GRACE had lower error in two settings. It improved error by 37.2% there."},
+                          {"id": "K2", "explanation": "The theorem was not tested."}],
+               "terms": [{"term": "RMSE", "definition": "root mean squared error, lower is better"}],
+               "open_questions": ["Which seeds were used for the baselines? This is verified in Table 2."]}
+        page = reviewer.render(x, led, rep)
+        assert "| K1. GRACE has lower error than the baselines. | **Not verified** | incomplete coverage |" in page
+        assert "**Unresolved claims:** K1, K2." in page
+        assert page.index("**Decision: Not verified.**") < page.index("**Not tested:**")       # the finding before its limits
+        assert "0.9918" in page and "0.0973 ± 0.0319" in page and "100 (100)" in page            # magnitudes and uncertainty
+        assert "3 settings declared = 2 with a result + 1 undefined + 0 missing" in page          # denominators reconcile
+        assert "Not tested:** BART, IHDP" in page and "budget" in page
+        assert "37.2%" not in page and "withheld" in page                                        # an invented number
+        assert "This is verified in Table 2" not in page                                         # an unearned status word
+        assert "GRACE, a tree layer trained with gradients" in page and "root mean squared error" in page
+        assert "the code averages over seeds first" in page                                      # paper vs code, explained
+        assert "Evidence: C1 · script `8b7df4c174ee`" in page
+        assert not re.search(r"^#+ .*\bC\d+\b", page, re.M)                                       # no check codes as headings
+        assert len(page.split()) < 1100                                                          # about two pages
+
+
+def test_another_reproduction_record_is_compared_only_after_the_decisions_are_sealed():
+    """Oct-05 review: HF verdicts are another reproduction record, not ground truth. One is registered only after
+    REFEREE's own decisions are sealed, its findings are quoted verbatim from the registered file with whether the two
+    tests are comparable, and no decision moves."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid = _claims_project(td)
+        ref = td / "hf.md"
+        ref.write_text("The logbook reports RMSE 0.0471 for GRACE versus 0.0802 for the best baseline on toy_1, judged toy.",
+                       encoding="utf-8")
+        assert "error" in tasks.register_reference(cfg, pid, str(ref), "HF logbook")
+        _seal(cfg, pid, "claims", {"claims": _K}, td)
+        for lens in tasks.LENSES:
+            _seal(cfg, pid, f"lens:{lens}", {"concerns": []}, td)
+        _seal(cfg, pid, "critic", {"reviews": []}, td)
+        _seal(cfg, pid, "plan", {"checks": [], "central_claims": [
+            {"id": k, "why_unchecked": "no test fits this fixture", "blocker": "other"} for k in ("K1", "K2", "K3")]}, td)
+        cfg.max_followup_checks = 0
+        phase, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
+        assert phase == "report" and "Decisions on the main claims" in Path(owed[0]["prompt"]).read_text(encoding="utf-8")
+        _seal(cfg, pid, "report", {"overview": "A paper.", "claims": [{"id": k, "explanation": "Not tested."}
+                                                                     for k in ("K1", "K2", "K3")]}, td)
+        assert tasks._plan(tasks._Ctx(cfg, pid))[0] == "done"
+        before = report.ledger(tasks._Ctx(cfg, pid))["central_claims"]
+        assert tasks.register_reference(cfg, pid, str(ref), "HF logbook")["registered"]
+        phase, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
+        assert phase == "compare" and [o["id"] for o in owed] == ["compare"]
+        entry = {"id": "K2", "reference_finding": "The record reports lower error for GRACE on toy_1.",
+                 "comparable": "partly", "why": "the record ran two datasets with five seeds; REFEREE ran none",
+                 "agreement": "not_comparable", "source": "HF logbook"}
+        x = tasks._Ctx(cfg, pid)
+        assert "verbatim" in _refused(lambda: tasks._seal_compare(x, "compare", {"claims": [
+            {**entry, "quotes": ["the record says GRACE is verified everywhere"]}]}, final=False))
+        _seal(cfg, pid, "compare", {"claims": [{**entry, "quotes": ["RMSE 0.0471 for GRACE versus 0.0802"]}]}, td)
+        assert tasks._plan(tasks._Ctx(cfg, pid))[0] == "done"
+        page = (td / pid / "reviewer.md").read_text(encoding="utf-8")
+        assert "Other reproduction record (HF logbook)" in page and "Comparable: partly" in page
+        after = report.ledger(tasks._Ctx(cfg, pid))["central_claims"]
+        assert [c["decision"] for c in after] == [c["decision"] for c in before]                 # nothing moved
 
 
 if __name__ == "__main__":

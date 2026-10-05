@@ -59,7 +59,7 @@ SEVERITY = ("NOTE", "MINOR", "MAJOR", "FATAL")
 CLASSES = ("CONFIRMED_FINDING", "PLAUSIBLE_CONCERN", "OPEN_QUESTION", "DISMISSED")
 PROMPTS = Path(__file__).parent / "prompts"
 _EFFORT = {"lens": "high", "critic": "high", "claims": "high", "plan": "high", "bind": "high", "gen": "high", "vision": "medium",
-           "verify": "high", "report": "medium", "audit": "high"}
+           "verify": "high", "report": "medium", "audit": "high", "compare": "medium"}
 
 
 class SealError(ValueError):
@@ -291,13 +291,108 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
     if running:
         return "verify", [], running
     if x.sealed("report") is None:
+        from . import reviewer
+        draft = reviewer.render(x, ledger, None)          # the harness's own page, before any model text
         return "report", [x.task("report", "report", _template(
-            "report", title=title, table=report.table(ledger), concerns=_concern_lines(ledger["concerns"]),
-            checks=json.dumps(ledger["checks"], ensure_ascii=False, indent=1)[:40_000],
-            central=json.dumps(ledger["central_claims"], ensure_ascii=False, indent=1)),
-            paper=False)], []   # the writer works from the ledger; its quotes are already in it
+            "report", title=title, draft=draft[:30_000],
+            checks=json.dumps([_brief(c) for c in ledger["checks"]], ensure_ascii=False, indent=1)[:40_000],
+            central=json.dumps([{k: cc.get(k) for k in ("id", "statement", "quote", "claim_type", "scope", "decision",
+                                                        "completion", "checks", "why_unchecked")}
+                                for cc in ledger["central_claims"]], ensure_ascii=False, indent=1)[:40_000]))], []
+    # Another reproduction record (an HF logbook) is compared only once the decisions are sealed: it is shown beside each
+    # claim with whether the tests are comparable, and never changes a decision.
+    if references(x) and x.sealed("compare") is None:
+        return "compare", [_compare_task(x, ledger)], []
     report.render(x, ledger, x.sealed("report"))
+    from . import reviewer
+    reviewer.render(x, ledger, x.sealed("report"), x.sealed("compare"))
     return "done", [], []
+
+
+def _brief(c: dict) -> dict:
+    """What a report writer needs of one check (statuses, numbers, deviations), without the raw value lists."""
+    return {k: c.get(k) for k in ("id", "kind", "role", "claim", "covers", "status", "state", "reason", "rule", "basis",
+                                  "test", "target", "stages", "outputs", "counts", "readings", "fidelity", "deviations",
+                                  "data_identity", "literal", "admissible", "status_on_completed", "data_changed", "audit")
+            if c.get(k) not in (None, "", [], {})}
+
+
+def references(x: _Ctx) -> list[dict]:
+    """The other reproduction records the operator registered for this paper (run.py reference), each still hashing to
+    what was registered."""
+    reg = state.read_json(x.root / "reference" / "index.json", []) or []
+    return [r for r in reg if (x.root / "reference" / r["file"]).is_file()
+            and state.sha256((x.root / "reference" / r["file"]).read_bytes()) == r["sha256"]]
+
+
+def register_reference(cfg: state.Config, pid: str, path: str, source: str) -> dict:
+    """Register another reproduction record (an HF logbook or verdict file) for a paper whose review is sealed: it is
+    copied into the project and hashed, and a comparison task is owed. Refused before the report is sealed, so it can
+    never inform a decision."""
+    root = state.pdir(cfg, pid)
+    with state.lock(root / ".lock"):
+        if _sealed(root, "report") is None:
+            return {"error": "the review is not sealed yet: a reference record is compared only after REFEREE's own decisions"}
+        src = Path(path)
+        data = src.read_bytes()
+        reg = state.read_json(root / "reference" / "index.json", []) or []
+        name = f"{len(reg) + 1}_{re.sub(r'[^A-Za-z0-9_.-]+', '_', src.name)[:80]}"
+        (root / "reference").mkdir(parents=True, exist_ok=True)
+        (root / "reference" / name).write_bytes(data)
+        reg.append({"file": name, "source": source[:80], "sha256": state.sha256(data), "registered_at": state.now(),
+                    "original": str(src)[:300]})
+        state.write_json(root / "reference" / "index.json", reg)
+        seals = state.read_json(root / "seals.json", {}) or {}
+        if "compare" in seals:                    # a new record: the comparison is made again over all of them
+            seals.pop("compare")
+            state.write_json(root / "seals.json", seals)
+        state.append_jsonl(root / "log.jsonl", {"event": "reference", "file": name, "source": source[:80]})
+        return {"registered": name, "sha256": state.sha256(data)}
+
+
+def _compare_task(x: _Ctx, ledger: dict) -> dict:
+    refs = references(x)
+    return x.task("compare", "compare", _template(
+        "compare", title=x.meta["title"],
+        refs="\n".join(f"- {(x.root / 'reference' / r['file']).as_posix()} (source: {r['source']})" for r in refs),
+        central=json.dumps([{k: cc.get(k) for k in ("id", "statement", "quote", "claim_type", "scope", "decision", "checks")}
+                            for cc in ledger["central_claims"]], ensure_ascii=False, indent=1)[:30_000],
+        checks=json.dumps([_brief(c) for c in ledger["checks"]], ensure_ascii=False, indent=1)[:40_000]),
+        tuple(x.root / "reference" / r["file"] for r in refs), paper=False)
+
+
+def _seal_compare(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
+    """One entry per main claim: what the other record found (its own words, verbatim from a registered file), whether
+    the two tests are comparable (data, metric, settings, estimator) and why, and whether they agree. The record's
+    verdict words are its own, quoted; nothing here moves a REFEREE decision."""
+    refs = references(x)
+    texts = {r["file"]: flat((x.root / "reference" / r["file"]).read_text(encoding="utf-8", errors="replace")) for r in refs}
+    ids = {cc.get("id") for cc in (x.plan() or {}).get("central_claims", []) if cc.get("id")}
+    errors, out = [], []
+    for e in [e for e in obj.get("claims") or [] if isinstance(e, dict)][:40]:
+        k = str(e.get("id") or "")
+        if k not in ids:
+            errors.append(f"claim id {k!r} is not one of {sorted(ids)}")
+            continue
+        quotes = [str(q) for q in e.get("quotes") or [] if str(q).strip()][:4]
+        bad = [q[:80] for q in quotes if len(flat(q)) < 15 or not any(flat(q) in t for t in texts.values())]
+        if bad:
+            errors.append(f"{k}: quote(s) {bad} are not verbatim text (15+ chars) of a registered record")
+            quotes = [q for q in quotes if q[:80] not in bad]
+        comparable = _enum(e.get("comparable"), ("yes", "partly", "no"))
+        agreement = _enum(e.get("agreement"), ("agrees", "disagrees", "not_comparable", "not_covered"))
+        why = str(e.get("why") or "").strip()
+        if not comparable or not agreement or len(why) < 20:
+            errors.append(f"{k}: `comparable` (yes|partly|no), `agreement` (agrees|disagrees|not_comparable|not_covered) "
+                          "and `why` (what differs: data, metric, settings, estimator, seeds) are required")
+        if agreement in ("agrees", "disagrees") and not quotes:
+            errors.append(f"{k}: an agreement or disagreement rests on the record's own words (`quotes`)")
+            agreement = "not_comparable"
+        out.append({"id": k, "source": str(e.get("source") or (refs[0]["source"] if refs else "reference"))[:80],
+                    "reference_finding": str(e.get("reference_finding") or "")[:600], "quotes": quotes,
+                    "comparable": comparable or "no", "agreement": agreement or "not_comparable", "why": why[:800]})
+    _fail_or_drop(errors, final)
+    return {"claims": out, "notes": str(obj.get("notes") or "")[:2000]}
 
 
 def _discovery_text(x: _Ctx) -> str:
@@ -668,7 +763,7 @@ def reopen(cfg: state.Config, pid: str, cid: str, why: str) -> dict:
         keep = bool(o.get("resource")) and o.get("authorized") is not False and (cdir / "script.py").exists()
         gone = [t for t in seals if t == f"audit:{cid}"] + ([] if keep else [
             t for t in seals if t.split(":", 1)[0] in ("bind", "gen", "verify") and _check_of(t) == cid])
-        gone += [t for t in ("report",) if t in seals]        # a report written before this check was redone describes another ledger
+        gone += [t for t in ("report", "compare") if t in seals]   # written before this check was redone: another ledger
         for t in gone:
             seals.pop(t)
             (root / "sealed" / f"{_safe(t)}.json").unlink(missing_ok=True)
@@ -1996,12 +2091,23 @@ def _seal_vision(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
 
 
 def _seal_report(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
-    return {"summary_md": str(obj.get("summary_md") or "")[:8000]}
+    """The plain-language parts of the reviewer page (reviewer.render checks each before it is published)."""
+    ids = {cc.get("id") for cc in (x.plan() or {}).get("central_claims", []) if cc.get("id")}
+    claims = [{"id": str(e.get("id")), "explanation": str(e.get("explanation") or "")[:1200]}
+              for e in obj.get("claims") or [] if isinstance(e, dict) and str(e.get("id")) in ids]
+    if ids and (miss := sorted(ids - {c["id"] for c in claims})) and not final:
+        raise SealError(f"every main claim needs an `explanation`: missing {miss}")
+    return {"overview": str(obj.get("overview") or "")[:1400], "claims": claims,
+            "terms": [{"term": str(t.get("term"))[:60], "definition": str(t.get("definition") or "")[:400]}
+                      for t in obj.get("terms") or [] if isinstance(t, dict) and t.get("term")][:12],
+            "open_questions": [str(q)[:400] for q in obj.get("open_questions") or [] if isinstance(q, str)][:5],
+            # the trace (review.md) still shows one summary: the overview
+            "summary_md": str(obj.get("summary_md") or obj.get("overview") or "")[:8000]}
 
 
 VALIDATORS = {"lens": _seal_lens, "critic": _seal_critic, "claims": _seal_claims, "plan": _seal_plan, "bind": _seal_bind,
               "gen": _seal_gen, "verify": _seal_verify, "report": _seal_report, "vision": _seal_vision,
-              "audit": _seal_audit}
+              "audit": _seal_audit, "compare": _seal_compare}
 _EMPTY = {"lens": {"concerns": [], "dropped": []}, "critic": {"reviews": []}, "claims": {"claims": [], "dropped": []},
           "plan": {"checks": [], "central_claims": [], "dropped": [], "repo_is_authors": False, "repo_note": ""},
           "bind": {"identity": {"established": False, "reason": "malformed binding answer"}, "command": "",
@@ -2009,7 +2115,8 @@ _EMPTY = {"lens": {"concerns": [], "dropped": []}, "critic": {"reviews": []}, "c
           "gen": {"refused": True, "notes": "malformed answer"},
           "verify": {"verdict": "UNCHECKABLE", "required_changes": "", "notes": "malformed verifier answer",
                      "quotes": [], "script_sha256": ""},
-          "report": {"summary_md": ""}, "vision": {"read": {}, "notes": "malformed answer"},
+          "report": {"summary_md": "", "overview": "", "claims": [], "terms": [], "open_questions": []},
+          "compare": {"claims": [], "notes": "malformed answer"}, "vision": {"read": {}, "notes": "malformed answer"},
           "audit": {"verdict": "UNRESOLVED", "depends_on": [], "quotes": [], "notes": "malformed answer"}}
 
 

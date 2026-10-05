@@ -1,55 +1,42 @@
 {{security}}
 
-You are writing the REVIEWER-FACING SUMMARY of an automated first-pass review of one paper.
-A human referee decides; you help them see what matters fast. Everything below was produced
-by the harness: concerns whose quotes were re-found in the paper, and checks whose statuses
-the harness computed itself. You may not change a status.
+You write the PLAIN-LANGUAGE PARTS of a reviewer-facing report on one paper. A human referee decides; they must
+understand the paper's claims, what REFEREE tested and what it found, without first reading the paper. Everything
+that decides is already computed by the harness and printed in the draft below: each claim's decision and reason,
+what ran, the numbers, the counts, what was not tested. You may not change a decision, add a finding or add a number.
 
-Paper: {{title}}
+Paper: {{title}}   (full text under READ, page-tagged)
 
-=== STATUS TABLE (the harness prints this above your text, verbatim) ===
-{{table}}
+=== THE DRAFT REPORT (the harness prints all of this; your parts go where it says "no overview" and under each claim) ===
+{{draft}}
 
-=== CONCERNS (final severity, after the critic) ===
-{{concerns}}
-
-=== CHECKS (harness statuses and reasons) ===
-{{checks}}
-
-=== CENTRAL CLAIMS ===
+=== THE MAIN CLAIMS (ids, decisions, the checks behind them) ===
 {{central}}
 
-Write, in plain Markdown, a summary a referee can read in a few minutes (the harness cuts
-anything past 8000 characters):
-  1. **Summary** — what the paper claims and what this review established, in 3-5 sentences.
-  2. **Most important concerns** — the few that bear on central claims, each with its id, the
-     paper's own words (quote), and why it matters. Severity and confidence are model
-     judgments; say so where it matters.
-  3. **What the checks established** — central-claim checks first, then incidental ones
-     (say "incidental": no central claim rests on them). Per check id: what was run, against
-     which printed number or stated relation, its status in plain words, and any recorded
-     deviation or conflicting reading. A BLOCKED or INCONCLUSIVE check established nothing
-     either way; say what blocked it (the recorded reason: data, configured time budget,
-     measured memory, a script error). A PARTIAL check measured some stages and not others:
-     report the completed stages' results as limited to those stages, and what stopped the rest.
-     A result under claim-changing deviations (READING_CHANGED) is about the changed claim, not
-     the printed one, and so is a failure an independent audit found resting on a reading or a choice
-     the paper leaves open (say what it rests on). A `cap` blocker is a configured setting of this run
-     (a time budget, the search or check budget, the data cap), a `fault` is this run's network or host:
-     neither is a property of the experiment or the data. A data-identity mismatch (the data used differ from the paper's own
-     description) is a finding to state plainly. Keep what the workflow completed apart from
-     what it established; a concern stands only as far as its linked check established it.
-  4. **Requested experiments** — from the Completion block of the status table, for each central
-     empirical claim: did the experiment the claim names RUN, did its protocol match (data, models,
-     scope), what does the evidence say, and what stopped it if it did not run (the blocker, and whether
-     the harness or the planner says so). A simulation or a proof beside it is supporting evidence, never
-     the experiment. Do not write or imply that a paper was reproduced because a report exists or the
-     workflow finished.
-  5. **Open questions for the authors** — concrete questions that would settle what remains.
-RULES (enforced): no accept/reject recommendation, score or verdict on the paper. The words
-verified, reproduced, confirmed, validated, replicated, refuted, disproved, counterexample,
-contradicted may appear only in a sentence that names the check id (C1, C2, ...) whose status
-earns them; a report that breaks this is replaced by the table alone. Write a concern's class
-exactly as given (CONFIRMED_FINDING), never as words ("confirmed finding").
+=== THE CHECKS (statuses, reasons, numbers, deviations) ===
+{{checks}}
 
-Write ONLY this JSON to the output path you were given: {"summary_md": "..."}
+WRITE, in plain English close to ASD-STE100 Simplified Technical English:
+  - Short sentences (at most 20 words). One idea per sentence. Active voice. Common words.
+  - Define every technical term the first time you use it, in a few words, or list it under `terms`.
+  - Put the finding first, then its limits.
+  - Use only numbers that appear in the draft or the checks (copy them with the same digits). Do not compute new
+    numbers (no new percentages, ratios or differences). Say "most", "all", "some" instead.
+  - Never write a check code (C3) or a claim code (K2) as a heading; you may cite one in parentheses as evidence.
+  - Do not use the words verified, reproduced, confirmed, validated, replicated, refuted, disproved, counterexample or
+    contradicted: the decision line already says what the harness decided. Say "the test supports", "the test did
+    not support", "no case violated", "the test could not run".
+  - Missing evidence is not evidence against a claim. A blocked or undecided test shows nothing either way. A test on
+    finite cases never proves a theorem. A failed proof step does not show the theorem is false.
+
+1. `overview` (at most 130 words): what problem the paper addresses, what it proposes, and how it supports its claims
+   (experiments, proofs). No judgement.
+2. `claims`: for EACH claim id, an `explanation` (at most 120 words) of why the decision came out as it did: what was
+   tested (data, method, metric, scope) in plain words, what the result means, and the specific limit or reason
+   (which settings were not run, what changed from the paper, which reading the result depends on, what blocked it).
+3. `terms`: up to 10 technical terms a reviewer needs, each with a one-sentence definition.
+4. `open_questions`: up to 4 concrete questions for the authors that would settle what remains open.
+
+Write ONLY this JSON to the output path you were given:
+{"overview": "", "claims": [{"id": "K1", "explanation": ""}], "terms": [{"term": "", "definition": ""}],
+ "open_questions": [""]}

@@ -9,6 +9,7 @@ workers writing a check script use `try`; `exec` and `env` poll to completion by
   python run.py reopen <paper-id> <check> <why>             # a check that ended without a finding, after a harness fix
   python run.py env <paper-id>          # build the authors' environment (started by the harness)
   python run.py stop <paper-id> <check> <why>   # the operator ends a running check
+  python run.py reference <paper-id> <file> [--source NAME]   # another reproduction record, after the review is sealed
   python run.py status [<paper-id>]
   python run.py pack <out.zip> [<paper-id> ...] [--clean]
 """
@@ -53,6 +54,8 @@ def main(argv: list[str]) -> int:
     sub.add_parser("env").add_argument("pid")
     so = sub.add_parser("stop")
     so.add_argument("pid"), so.add_argument("check"), so.add_argument("why")
+    rf = sub.add_parser("reference")   # another reproduction record, compared only after the review is sealed
+    rf.add_argument("pid"), rf.add_argument("file"), rf.add_argument("--source", default="reference record")
     st = sub.add_parser("status")
     st.add_argument("pid", nargs="?")
     p = sub.add_parser("pack")
@@ -75,6 +78,8 @@ def main(argv: list[str]) -> int:
     elif a.cmd == "discover":         # public registries only; grants no code, no clone, no execution
         print(json.dumps(discover.files(cfg, a.pid, a.files) if a.files else discover.search(cfg, a.pid, a.query, a.registry),
                          indent=1, ensure_ascii=False))
+    elif a.cmd == "reference":        # never before REFEREE's own decisions are sealed
+        print(json.dumps(tasks.register_reference(cfg, a.pid, a.file, a.source)))
     elif a.cmd == "reopen":           # a check that ended without a finding, after its cause was fixed
         print(json.dumps(tasks.reopen(cfg, a.pid, a.check, a.why)))
     elif a.cmd == "exec":             # poll one started check to its end (the harness polls it anyway)
