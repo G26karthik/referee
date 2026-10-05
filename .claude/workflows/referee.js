@@ -58,15 +58,27 @@ async function run(kind, prompt, opts) {
   return agent(prompt, opts)
 }
 
-function controller(source, label, abandon) {
+// The harness's own statuses; a reply with any other is the controller's, not the harness's (Oct-06: a controller ran
+// the command in the background, read nothing, returned status "RUNNING" with no tasks, and the review read that as
+// finished and stopped polling its running experiments).
+const HARNESS_STATUS = ['waiting', 'workflow_finished']
+const RELAYS = 3
+
+async function controller(source, label, abandon) {
   // `abandon`: task ids two workers could not answer; the harness ends each first (an honest nothing; a check's is
   // INCONCLUSIVE, a fault of this run) so one stuck task never stops the rest of the review.
   const extra = abandon && abandon.length ? ` --abandon "${abandon.join(',')}" --why "two workers produced no sealable answer"` : ''
-  return run('controller',
-    `Run exactly this shell command (Bash, timeout 600000 ms) and return its JSON stdout fields ` +
-    `verbatim (paper_id, phase, status, blocked_reason, running, scientific_status, completion, tasks). Do nothing else:\n\n` +
-    sh(`run.py tasks "${source}" --json --wait 540${extra}`),
-    { label, phase: 'Review', model: CONTROLLER_MODEL, effort: 'low', schema: STATE })
+  let st = null
+  for (let i = 0; i < RELAYS; i++) {
+    st = await run('controller',
+      `Run exactly this shell command in the FOREGROUND (Bash, timeout 600000 ms; never run_in_background, never sleep) ` +
+      `and return its JSON stdout fields verbatim (paper_id, phase, status, blocked_reason, running, scientific_status, ` +
+      `completion, tasks). Do nothing else:\n\n` + sh(`run.py tasks "${source}" --json --wait 540${i ? '' : extra}`),
+      { label: i ? `${label}:relay${i + 1}` : label, phase: 'Review', model: CONTROLLER_MODEL, effort: 'low', schema: STATE })
+    if (st && HARNESS_STATUS.includes(st.status)) return st
+    log(`${source}: the controller relayed no harness state (status ${st && st.status}); asking again`)
+  }
+  return st
 }
 
 function worker(pid, t, prior) {
@@ -93,7 +105,7 @@ async function review(source) {
   const rounds = [], fails = {}, why = {}, abandoned = {}
   let st = await controller(source, `tasks:${source}`)
   let waits = 0
-  for (let round = 0; st && round < MAX_ROUNDS; round++) {
+  for (let round = 0; st && HARNESS_STATUS.includes(st.status) && round < MAX_ROUNDS; round++) {
     const pid = st.paper_id
     const ready = st.tasks.filter(t => (fails[t.id] || 0) < 2)
     if (!ready.length) {
