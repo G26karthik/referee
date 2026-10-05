@@ -290,6 +290,12 @@ def ran_line(c: dict, root: Path) -> str:
     return "; ".join(parts)
 
 
+def flat_eq(a, b) -> bool:
+    """Do two model-written reasons say the same thing (one may be a cut copy of the other)?"""
+    a, b = report.flat(str(a or ""))[:120], report.flat(str(b or ""))[:120]
+    return bool(a) and (a.startswith(b) or b.startswith(a))
+
+
 def brief(c: dict) -> str:
     """One line for the main text: the kind of test, the datasets it read (by name), and its runs."""
     n, data = c.get("counts") or {}, list(c.get("data_identity") or {})[:3]
@@ -554,8 +560,8 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
                          f"({'harness record' if b.get('basis') == 'harness' else (b.get('basis') or 'planner') + ' says'})")
         if len(why_not) > 3:
             lines.append(f"  - {len(why_not) - 3} more items with a stated reason are in `ledger.json`.")
-        if not tgt and cc.get("why_unchecked"):
-            lines.append(f"- **No test ran.** The planner's reason: {_short(cc['why_unchecked'], 300)}")
+        if not tgt and cc.get("why_unchecked") and not any(flat_eq(b.get("why"), cc["why_unchecked"]) for b in why_not):
+            lines.append(f"- **No test ran.** The planner's reason: {_sentence(cc['why_unchecked'], 300)}")
         o = other.get(k)
         if o:
             said = "; ".join(f"\"{_short(q, 160)}\"" for q in o.get("quotes") or [])

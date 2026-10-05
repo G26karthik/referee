@@ -4939,6 +4939,15 @@ def test_the_reviewer_page_states_each_test_once_and_stays_near_two_pages():
         assert claims[0]["decision"]["reason"] == "blocked"                             # its one test was blocked
         main = page.split("## Test details")[0]
         assert "config.yaml values" not in main and "on toy k=5; 1 of 100 planned runs" in main, main   # the gist up top
+        why = "The claim needs every baseline on all three DGPs at four sizes, which no slot is left for."
+        k7 = {"id": "K7", "statement": "claim K7", "quote": "GRACE outperformed the baselines", "page": 6,
+              "claim_type": "performance", "checks": [], "claim_status": "NOT_CHECKED", "why_unchecked": why,
+              "completion": {"experiment": "NOT_RUN", "changes": [], "scope_not_run": ["GRACE"], "not_run": [
+                  {"item": "(the whole claim)", "blocker": "cap", "basis": "planner", "why": why[:90]}]}}
+        k7["decision"] = reviewer.decision(k7, {})
+        page = reviewer.render(types.SimpleNamespace(root=Path(t), paper=Paper(["GRACE outperformed the baselines."])),
+                               {**led, "central_claims": [k7]}, None)
+        assert page.count("which no slot is left") == 1, page                            # the planner's reason once
 
 
 def test_a_decision_never_says_a_changed_reading_held_when_it_failed_or_that_the_printed_text_was_not_tested():
