@@ -96,7 +96,13 @@ of YOUR script that realize it — the harness checks they occur in the script).
 {{required}}.
 If a required ingredient cannot be written without inventing a detail the paper omits, say so
 in `notes` and leave its quotes empty: an honest refusal is a correct outcome; a fabricated
-binding is not. The one ingredient an experiment may not HAVE is `training`: a simulation, a
+binding is not. Refuse only when NO faithful version of the experiment can be written. Run time is
+never a reason to refuse: the harness times a pilot and records a resource blocker itself. A
+detail the paper leaves open (an untuned or rebuilt baseline, an unstated hyperparameter) is a
+declared deviation, not a refusal. Methods or settings you cannot obtain (code not released, an
+external repository the sandbox cannot fetch) are left out and named in `notes` and in a
+deviation (`changes_claim` true), while every method you CAN run is run: an experiment on part of
+the named methods is partial evidence, reported as such; a whole refusal decides nothing. The one ingredient an experiment may not HAVE is `training`: a simulation, a
 sequential test, an optimisation or an exact computation trains nothing. Then give it as
 {"kind": "training", "not_applicable": "<why nothing is trained or fitted here>"} (at least a sentence; the
 verifier checks it) — do not refuse an experiment whose other ingredients are all bound, and do not
