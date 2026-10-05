@@ -176,8 +176,10 @@ def _status_words(c: dict) -> str:
         words += (f"; {n['units_with_result']} of {n['units_declared']} settings with a result"
                   + (f", {n['units_undefined']} undefined" if n.get("units_undefined") else "")
                   + (f", {n['units_not_completed']} missing" if n.get("units_not_completed") else ""))
+    if st == "BLOCKED" and str(c.get("reason", "")).startswith("RESOURCE BLOCKER"):
+        words = words.replace("not run", "stopped at a resource limit" + (" after its pilot run" if (n.get("launches") or 0) else ""), 1)
     if st in ("BLOCKED", "NOT_CHECKABLE", "INCONCLUSIVE") and c.get("reason"):
-        words += f" — {_short(c['reason'], 200)}"
+        words += f" — {_short(c['reason'], 200).rstrip('.')}"
     return words
 
 
@@ -273,12 +275,12 @@ def ran_line(c: dict, root: Path) -> str:
     if ident:
         parts.append("data: " + "; ".join(ident))
     elif fid.get("data"):
-        parts.append("data: " + _sentence(fid["data"]["used"], 160))
+        parts.append("data: " + _sentence(fid["data"]["used"], 130))
     for a in ("model", "metric", "baselines"):
         if fid.get(a):
-            parts.append(f"{a}: {_sentence(fid[a]['used'], 160)}")
+            parts.append(f"{a}: {_sentence(fid[a]['used'], 130)}")
     if c.get("covers"):
-        parts.append("scope: " + ", ".join(c["covers"][:10]) + (" …" if len(c["covers"]) > 10 else ""))
+        parts.append("scope: " + ", ".join(c["covers"][:6]) + (f" and {len(c['covers']) - 6} more" if len(c["covers"]) > 6 else ""))
     n = c.get("counts") or {}
     if n.get("launches"):
         planned = n.get("launches_planned")
@@ -337,9 +339,10 @@ def fidelity_notes(c: dict) -> list[str]:
                                                                          if f.get("reading") else _sentence(f.get("explained"), 200)))
     for d in c.get("deviations") or []:
         if d.get("changes_claim"):
-            out.append("changed from the paper: " + _sentence(d.get("used"), 200) + (f" (only in reading {d['reading']})"
+            out.append("changed from the paper: " + _sentence(d.get("used"), 160) + (f" (only in reading {d['reading']})"
                                                                                    if d.get("reading") else ""))
-    return out[:5]
+    more = len(out) - 4
+    return out[:4] + ([f"{more} more paper/code differences or changes are listed in `review.md`."] if more > 0 else [])
 
 
 def evidence_line(c: dict, led: dict) -> str:
@@ -513,11 +516,11 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
         # Only a reason of its own is listed: an item whose test did not finish says so under "What ran" already.
         why_not = [b for b in comp.get("not_run") or [] if not (b.get("item", "").startswith("C") and b["item"][1:].isdigit())
                    and b.get("blocker") not in ("not run", "pending")]
-        for b in why_not[:4]:
-            lines.append(f"  - {b['item']}: {b['blocker']} — {_sentence(b.get('why'), 200)} "
+        for b in why_not[:3]:
+            lines.append(f"  - {b['item']}: {b['blocker']} — {_sentence(b.get('why'), 160)} "
                          f"({'harness record' if b.get('basis') == 'harness' else (b.get('basis') or 'planner') + ' says'})")
-        if len(why_not) > 4:
-            lines.append(f"  - {len(why_not) - 4} more items with a stated reason are in `ledger.json`.")
+        if len(why_not) > 3:
+            lines.append(f"  - {len(why_not) - 3} more items with a stated reason are in `ledger.json`.")
         if not tgt and cc.get("why_unchecked"):
             lines.append(f"- **No test ran.** The planner's reason: {_short(cc['why_unchecked'], 300)}")
         o = other.get(k)
