@@ -18,13 +18,14 @@ Host (measured): {{host}}
 {{listing}}
 
 STEP 1 — CENTRAL CLAIMS. List every distinct claim the abstract, the contribution list and the
-conclusion say the paper shows (at most 8, most important first), each as a verbatim quote: its
+conclusion say the paper shows (at most 8, most important first; more is refused), each as a verbatim quote: its
 headline experiments, its theorems, and its engineering claims (e.g. "can replace a layer of an
 existing model" is exercised by swapping it in and training — it is NOT a qualitative claim). For
-each give `scope`: every method, dataset, setting and metric the claim names or compares (e.g.
-["RPC", "PL", "Mallows", "political", "movies"]). Every scope item is either in the `covers` of a
+each give `scope`: every method, dataset, setting and metric the claim names or compares, ONE per
+entry (e.g. ["RPC", "PL", "Mallows", "political", "movies"] — never "MMLU, CMExam and PubMedQA" in one
+entry: the harness refuses a listing entry). Every scope item is either in the `covers` of a
 check linked to the claim, or listed in the claim's `omitted` with a concrete reason AND a `blocker`
-(data | credentials | compute | protocol | other). A claim with no check gets a concrete
+(data | credentials | compute | cap | protocol | other). A claim with no check gets a concrete
 `why_unchecked` and a `blocker` naming what NO kind below overcomes, with what the harness can check
 it against (it refuses a blocker its own records contradict):
   - data: "no public record of the dataset exists after searching the registries" — `discovery` ids,
@@ -32,10 +33,14 @@ it against (it refuses a blocker its own records contradict):
   - credentials: a paid closed API (`service`: true), or a gated or private record — `artifact` is a
     candidate a registry search returned (search --registry huggingface-models for a model) whose record
     shows it gated; a public, ungated model or dataset is acquired, never given up;
-  - compute: `failed_checks` (a check whose measured run exceeded this host: a RESOURCE BLOCKER), or
-    `artifact` (a registry candidate whose size exceeds the host's measured memory), or `paper_quote` (the
-    paper's own words stating the compute it used: "trained on 64 TPUs for 3 days") — never an estimate
-    nobody measured: when in doubt, propose the check, and the harness's timed pilot measures it;
+  - compute: `failed_checks` (a check whose run of THIS item hit a measured limit of this host: memory, GPU
+    memory, disk), or `artifact` (a registry candidate whose size exceeds the host's measured memory), or
+    `paper_quote` (the paper's own words stating the compute it used: "trained on 64 TPUs for 3 days") — never
+    an estimate nobody measured: when in doubt, propose the check, and the harness's timed pilot measures it;
+  - cap: a configured cap of this run was reached — a check that ended at a time budget (SH_RUN_TIMEOUT_S,
+    SH_CHECK_BUDGET_S), the data cap or a denied source (`failed_checks`), the search budget spent, or every
+    check slot used. A cap is a setting, not a property of the experiment, and is reported as one; a check's
+    measured run is evidence only for the items that check covered (link it, or give the item its own check);
   - protocol: name the detail the paper omits and why no declared deviation can supply it (an
     unspecified hyperparameter or schedule IS a declared deviation, not a blocker);
   - other.
@@ -103,7 +108,9 @@ central claim can use the slot, and say why in `incidental_why`. Kinds:
                  code fixes is declared by the script author as a deviation; a check that needs
                  many open details is still the requested experiment: its script declares each one as a
                  protocol choice (a deviation), and a different experiment is never chosen for being
-                 cheaper. Give `test`:
+                 cheaper. Units whose costs differ by far (a small and a very large model, a cheap and an
+                 expensive setting) are SEPARATE checks: one that cannot finish within the run limits never
+                 takes the feasible one with it. Give `test`:
                  "performance" (a comparison or a printed number, over independent seeded
                  replicates at the paper's protocol) or "compatibility" (an ENGINEERING claim: the
                  component is swapped into one stated configuration and must integrate, run and
@@ -141,7 +148,9 @@ Two ways to a source:
           {{discover_files_cmd}} "<record url>"
       (names, sizes, checksums). Name the files the claim needs; a bare suffix pattern such as "*.csv" takes
       every file of that kind, and a cut (more files matched than are followed) is reported to you, to the
-      script author and in the report.
+      script author and in the report. Every DATA file the listing names is either in `include` or in
+      `"exclude": [{"pattern": "...", "why": "why this claim does not need them"}]` — the seal refuses a file
+      left out unseen, and one the run's own listing shows was left out reads as a gap of the acquisition.
   (b) The paper only NAMES the dataset ("CIFAR-10-C", "the Porto taxi trajectories", "MMLU"): search the
       public registries with the harness's own command, which sends nothing but your query:
           {{discover_cmd}} "<query>" [--registry zenodo|datacite|huggingface|huggingface-models]
@@ -163,7 +172,9 @@ Two ways to a source:
 A claim that states no comparison and no number (a qualitative description: "fits well", "is robust") is not
 decided by a comparison you invent: if you test it against a rival, a baseline or a threshold of your own, say
 `"criterion": "supplied"` — the harness then records that as a claim-changing deviation, and the result
-speaks for your criterion, never for the claim as printed.
+speaks for your criterion, never for the claim as printed. The script's verifier states the criterion
+again, independently: if either of you says `supplied`, it is supplied. A failure the checks find is also
+read by an independent auditor, shown the failing instances, before it counts against the printed claim.
 
 TARGETS. Every kind except CERTIFICATE compares against ONE `target`:
   - a table cell: {"row_quote": the row label exactly as printed in the rows file,
@@ -187,7 +198,7 @@ Write ONLY this JSON to the output path you were given:
  "central_claims": [{"quote": "verbatim", "claim_type": "engineering|performance|value|theory",
                      "scope": ["every method/dataset/setting it names"],
                      "checks": ["C1"], "omitted": [{"item": "a scope item", "why": "concrete reason",
-                       "blocker": "data|credentials|compute|protocol|other", "discovery": [],
+                       "blocker": "data|credentials|compute|cap|protocol|other", "discovery": [],
                        "not_the_dataset": "", "failed_checks": [], "artifact": "", "service": false,
                        "paper_quote": ""}],
                      "why_unchecked": "", "blocker": "", "discovery": [], "not_the_dataset": "", "failed_checks": [],

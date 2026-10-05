@@ -27,6 +27,16 @@ Does it stay the test the spec names (a compatibility test is not a benchmark; a
 released results is not a recomputation)? Where the checkout's code and the paper define the
 compared quantity differently, does it compute every reading on the same data and cohort?
 
+YOUR OWN KEYS (state them independently of the planner and the author; they never block an approval —
+either key can only make the result about a changed claim):
+  - `criterion`: "stated" if the claim's own sentence states the comparison or number this check's target
+    encodes (the compared quantities and the direction are in the sentence), else "supplied" (a "fits well",
+    "is robust" claim tested by a rival, a threshold, a held-out test or a grid of settings someone chose).
+  - `claim_changing`: the indices (from 0, positions in `deviations`) of EVERY deviation that changes what is
+    compared or what the claim says, whatever its author marked: a substituted algorithm, model, dataset, split
+    or procedure (even one the paper calls equivalent), a step of the paper's procedure left out, a range or
+    grid of settings the claim does not state, a quantity computed as a flag against the printed value.
+
 HOW THE HARNESS WILL DECIDE (approve only if you accept that this script's output, read this
 way, tests the claim):
 {{decide}}
@@ -49,4 +59,6 @@ in `quotes`, the paper text you relied on (verbatim; the harness re-finds each).
 
 Write ONLY this JSON to the output path you were given:
 {"verdict": "APPROVE|REVISE|UNCHECKABLE", "required_changes": "", "quotes": ["verbatim paper text"],
- "notes": "short reason"}
+ "criterion": "stated|supplied", "claim_changing": [0], "notes": "short reason"}
+A revised script's `revisions` say which claim-changing choices of the previous round it dropped and why: check
+that the script really no longer departs from the paper there.

@@ -37,7 +37,9 @@ THE SCRIPT CONTRACT
     observed and expected are recorded either way. It is false when the data differ from that
     description (another dataset, split, version or subset, files missing, counts outside what the
     paper allows): the harness then reports the result as about different data. A mismatch is a finding: report it
-    and CONTINUE with the other units — never exit on it (that would discard what completed).
+    and CONTINUE with the other units — never exit on it (that would discard what completed). A dataset this check
+    covers (see Covers above) that you could not load goes in that line's `"missing": ["<the scope item>"]`: it then
+    reads as not run — never leave it out silently.
   - It never reads the paper's printed result to produce its own, and never compares with it:
     it computes; the harness compares.
   - ACQUIRED DATA IS THE EXPERIMENT'S DATA. If the manifest above lists acquired files, the script reads
@@ -76,9 +78,13 @@ THE SCRIPT CONTRACT
     settings), never the metric's name.
   - Keep one run within the host's per-run limit. The harness times the first run as a pilot and
     stops with a documented blocker if the stated run count cannot finish; a long run may save
-    progress under /work/ckpt (a per-seed scratch volume) and resume from it after a restart. Use
-    the GPU when the host has one and the method trains a network (e.g. pass the authors' own
-    GPU switch); say which device ran: `REFEREE_PROGRESS {"note": "device <name>"}`.
+    progress under /work/ckpt (a per-seed scratch volume) and resume from it after a restart. Run the
+    units cheapest first and do each unit's own work right before its result line (train what a unit
+    needs when that unit starts, not every model up front): a unit that cannot finish in time then never
+    takes a finished one with it. Use the GPU when the host has one and the method trains a network (e.g.
+    pass the authors' own GPU switch); the harness gives the GPU only to a script that imports a GPU library
+    (or declares one), so a numpy simulation runs beside a GPU run instead of after it. Say which device ran:
+    `REFEREE_PROGRESS {"note": "device <name>"}`.
   - For a claim over several units, the result lines carry `"stage": "<unit>"` (the declared name).
 
 BINDINGS. For each required kind below, give `paper_quote` (the paper's own words, copied
@@ -119,7 +125,16 @@ is inconsistent with itself (a cell size that contradicts the grid size; a count
 is a `deviation` with the paper's words, what you used and `changes_claim`. Run a draft and compare what your
 REFEREE_DATA reports (counts, sizes) with the numbers the paper prints before you submit: a cohort twice the
 printed size is a wrong filter, not a finding. Each round the verifier finds one more undeclared choice costs
-one of your few revisions.
+one of your few revisions. A substituted algorithm, model or procedure — even one the paper says is
+equivalent, even one it proves equivalent — and a step of the paper's procedure left out (a trimming, a
+selection, a stopping rule) change what is compared: `changes_claim` true. The verifier states its own list of
+claim-changing deviations; either list makes one claim-changing.
+
+REVISIONS. When you revise a script, every claim-changing deviation of the previous round stays declared
+unless the script no longer departs from the paper there; then say so in `revision_notes`:
+[{"was": "<the earlier deviation's `used` text>", "why": "what in the script changed"}] (also `"was": "runs"`
+if you run fewer instances or seeds than before). The seal refuses a claim-changing choice dropped or relabelled
+silently: a revision fixes what the verifier named, never weakens the claim to pass.
 
 REPLICATION. If the paper states how many seeds/runs/instances this used, set `runs` to it and
 copy the sentence into `runs_quote`; never fewer than the paper used. A RECONSTRUCTION is run at least 3 times (seeds
@@ -144,6 +159,7 @@ Write ONLY this JSON to the output path you were given:
  "metric": "the compared output's name (not for CERTIFICATE or a relation target)",
  "outputs": ["every name the result line carries"],
  "deviations": [],
+ "revision_notes": [],
  "bindings": [{"kind": "...", "paper_quote": "...", "impl_quote": "..."}],
  "checked_statement": "conclusion|proof_step (CERTIFICATE only)",
  "premise_argument": "CERTIFICATE only: a general argument, if you have one, that a printed premise can never hold (the verifier checks it; it is reported as your reasoning, not as a result)",

@@ -14,7 +14,7 @@ reconciling numbers, and computing every status.
 
 ## Pipeline
 
-`ingest -> 4 lenses -> critic -> planner -> per check: bind | gen -> verify (1 revision) -> execute + reconcile -> report writer -> done`
+`ingest -> 4 lenses -> critic -> planner -> per check: bind | gen -> verify (1 revision) -> execute + reconcile -> audit (a failure) -> follow-up plan -> report writer -> done`
 
 | File | Responsibility |
 |---|---|
@@ -53,8 +53,15 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
    of its own seed flag varies); refuse rather than shrink.
 7. **Experiment identity** is established by two independent keys (planner and binding
    verifier name the same verbatim command and metric key at the pinned commit).
-8. **Severity only moves down** (evidence-class caps; the critic can only lower).
-9. **Checks are independent**; a blocked check ends that check, not the paper.
+8. **Severity only moves down** (evidence-class caps; the critic can only lower). So do the
+   second keys: the verifier states `criterion` and `claim_changing` (deviation indices) independently
+   of planner and author; either key's `supplied` / claim-changing stands. A failure about the printed
+   claim counts only after an independent audit (`audit:<id>`, shown the failing instances unmasked) finds
+   it STANDS on the paper's words; DEPENDS (an open reading, a supplied choice, re-found) or UNRESOLVED
+   makes it about a changed claim, shown beside what it rests on. Until audited the claim is PENDING.
+9. **Checks are independent**; a blocked check ends that check, not the paper. A task no worker can
+   answer is ended (`run.py tasks --abandon`: an honest nothing; a check's is INCONCLUSIVE), never left
+   to stall the review; the harness says "executions running" whenever a run is in flight.
 10. **Execution is auditable**: every process leaves an ExecutionRecord (argv, image,
     commit, script sha, times, exit code, stdout/stderr) in `execution.jsonl`.
 11. **No paper-specific logic**, names, thresholds or special cases.
@@ -110,7 +117,11 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     What a run printed before its limit is kept beside the blocker (`pilot_stages`), deciding
     nothing. A run given the GPU holds it alone (no second GPU run, draft or evidence, starts beside it) and
     is projected one at a time against the budget: a limit measured under another run's load measures
-    the sharing, not the protocol; a synchronous draft waits too (`referee.sync`) and costs no try. Remaining
+    the sharing, not the protocol; a synchronous draft waits too (`referee.sync`) and costs no try. Only a
+    run that can use the GPU is given it (`execute.wants_gpu`: a GPU library imported or declared, a dynamic
+    import, or a checkout it may drive): a CPU script never queues behind a GPU run. SH_PARALLEL counts
+    script runs (evidence runs and drafts); a fetch or an install takes no slot. A refused replicate extension is
+    recorded (`extension_refused`, its setting). Remaining
     runs are projected from the completed seeds' median time (the pilot's until two completed). Completed seeds are checkpointed
     (seeds.jsonl) and reused; each seed has a scratch volume at /work/ckpt. Planners and script
     authors are told the measured host (CPUs, container RAM, GPU yes/no).
@@ -147,7 +158,11 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     is never silent: a landing page follows 20 links, a repository record its own listing (up to 500), and a
     cut is recorded (`truncated`), shown to planner, script author and report, and never shared as a complete
     set. A record's COMPLETE listing (records API, hub siblings, `discover --files`, hf:// too) also names what a plan
-    did not request: script author and report say "not requested", never "not released". Every attempt, redirect
+    did not request: script author and report say "not requested", never "not released"; every data file it names
+    is in `include` or in `exclude` with a reason when the planner was shown that listing (`discover --files`): the
+    seal refuses one left out unseen, and one still left out (a lenient last attempt) is a gap of the acquisition
+    (RAN_WITH_CHANGES); a listing only the fetcher saw is shown, never counted. A covered dataset a script could not load is named in its
+    REFEREE_DATA line's `missing`, and reads as not run. Every attempt, redirect
     and file sha256 is kept (`checks/<id>/data.json`); admitted files mount read-only at /work/data. A
     check whose required data was not admitted ends as a DATA BLOCKER (or INCONCLUSIVE for a network
     fault of this run) before any script is written — a simulation in its place would be a different
@@ -159,6 +174,10 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     READING_CHANGED, never support or failure of the printed claim. Every scope item a central
     claim names (methods, datasets) is covered by a check or omitted with a reason; a central
     claim still undecided after all checks gets one follow-up plan (plan:2, SH_MAX_FOLLOWUP_CHECKS).
+    A follow-up claim may link a check an earlier round ran (its covers count). Re-planning never removes a
+    claim: a withdrawn follow-up plan stays sealed (`plan:2.withdrawn.N`) and every claim it listed stays in
+    the ledger (NOT_CHECKED, blocker `withdrawn`) until a later round takes it up; a quote inside an earlier
+    claim is that claim; more than 8 claims are refused, never cut unseen.
     Superseded outcomes stay visible in the report. Every check names its basis (an audit of
     released result files, a recomputation from released predictions, a fresh run) and the
     report says which. A central claim has a `claim_type`; an engineering claim (a component
@@ -169,8 +188,11 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     claim (performance, value, engineering) is satisfied only by the experiment on what it names; a
     certificate, a simulation or a stand-in is a `role: supporting` check, reported beside the claim with
     its own outcome and never counted toward it. What is not run names its `blocker` (data, credentials,
-    compute, protocol, other); `data` rests on a registry search the harness ran (and, if it returned
-    candidates, why none is the dataset) or on a check that failed to acquire it. The ledger's
+    compute, cap, protocol, other); `data` rests on a registry search the harness ran (and, if it returned
+    candidates, why none is the dataset) or on a check that failed to acquire it. The harness's own words
+    keep apart a fact about the data (`data`), a measured limit of this host (`compute`: memory, GPU memory,
+    disk), a configured cap of this run (`cap`: SH_RUN_TIMEOUT_S, SH_CHECK_BUDGET_S, SH_MAX_DATA_GB, a denied
+    source, the search or check budget) and a fault of this run's network, host or code (`fault`). The ledger's
     `completion` and the report keep apart: the workflow reached a terminal state (any status), the
     requested experiment RAN, its protocol matched (no claim-changing deviation, data identity, scope), and
     what the evidence says. No sentence may imply a paper was reproduced because a report exists. Completion is
@@ -193,9 +215,15 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     `unverified`. Downstream, an unknown value reads as the strictest (`matches` not true = the data changed).
     A blocker rests on the harness's own records wherever it can: `data` on its registry searches,
     `credentials` on a hosted closed service or the registry record of a gated or private artifact (a public,
-    ungated one is acquired), `compute` on a measured RESOURCE BLOCKER, the artifact's registry size against the
-    measured host, or the paper's own statement of its compute; `protocol`/`other` are the planner's word,
+    ungated one is acquired), `compute` on a measured hardware RESOURCE BLOCKER of a check that ran that item,
+    the artifact's registry size against the measured host, or the paper's own statement of its compute; `cap`
+    on a cap the harness recorded as reached; `protocol`/`other` are the planner's word,
     reported as such, beside the harness fact that the search budget was spent when it was planned (`budget_spent`). Deviations are capped (16) by refusal, never by silent truncation.
+    A scope entry that lists several items is several (`report.parts`; refused, split on the last attempt).
+26. **Self-correction keeps the scope.** A revised script that drops or relabels a claim-changing deviation
+    of its previous round, or runs fewer instances or seeds, says why in `revision_notes` (shown to the
+    verifier, kept in the ledger); unexplained on the last attempt, the deviation is carried forward. A
+    revision fixes what was named; it never weakens the experiment to pass.
 
 ## Dependency recovery (documented, isolated, recorded)
 
@@ -220,7 +248,7 @@ its author with the error (within SH_MAX_REVISIONS = 3).
 ## Commands (repo venv; on Windows set PYTHONUTF8=1)
 
 ```bash
-python run.py tasks <paper.pdf|paper-id> --json [--wait 540]
+python run.py tasks <paper.pdf|paper-id> --json [--wait 540] [--abandon <task-id,...> --why <text>]
 python run.py seal <paper-id> <task-id> <answer.json>
 python run.py try <paper-id> <gen-task-id> <script.py>      # draft run, masked, never evidence
 python run.py discover <paper-id> "<dataset name>" [--registry zenodo|datacite|huggingface]   # public data only

@@ -1,7 +1,7 @@
 """REFEREE CLI. The workflow (.claude/workflows/referee.js) uses `tasks` and `seal`;
 workers writing a check script use `try`; `exec` and `env` poll to completion by hand.
 
-  python run.py tasks <paper.pdf|paper-id> [--json] [--wait SECONDS]
+  python run.py tasks <paper.pdf|paper-id> [--json] [--wait SECONDS] [--abandon <task-id,...> --why <text>]
   python run.py seal <paper-id> <task-id> <answer.json>
   python run.py try <paper-id> <gen-task-id> <script.py>
   python run.py discover <paper-id> "<dataset name>" [--registry zenodo|datacite|huggingface|huggingface-models]
@@ -36,6 +36,9 @@ def main(argv: list[str]) -> int:
     t.add_argument("source")
     t.add_argument("--json", action="store_true")
     t.add_argument("--wait", type=int, default=0)
+    t.add_argument("--abandon", default="", help="comma-separated task ids no worker could answer: each is ended first "
+                                                "(an honest nothing; a check's is INCONCLUSIVE, a fault of this run)")
+    t.add_argument("--why", default="two workers produced no sealable answer")
     s = sub.add_parser("seal")
     s.add_argument("pid"), s.add_argument("task"), s.add_argument("file")
     tr = sub.add_parser("try")
@@ -58,8 +61,9 @@ def main(argv: list[str]) -> int:
     cfg = state.Config()
 
     if a.cmd == "tasks":
+        ended = [tasks.abandon(cfg, a.source, tid.strip(), a.why) for tid in a.abandon.split(",") if tid.strip()]
         res = tasks.advance(cfg, a.source, a.wait)
-        print(json.dumps(res, indent=None if a.json else 2, ensure_ascii=False))
+        print(json.dumps({**res, **({"abandoned": ended} if ended else {})}, indent=None if a.json else 2, ensure_ascii=False))
     elif a.cmd == "seal":
         try:
             print(json.dumps(tasks.seal(cfg, a.pid, a.task, a.file)))

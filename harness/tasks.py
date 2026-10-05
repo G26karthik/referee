@@ -45,16 +45,21 @@ ROLES = ("target", "supporting")
 # registry record of the artifact (gated, private) unless it is a hosted closed service, `compute` against
 # a measured run, the registry's size of the artifact and the measured host, or the paper's own statement of
 # its compute. `protocol` and `other` are the planner's word, reported as such.
-BLOCKERS = ("data", "credentials", "compute", "protocol", "other")
+# `cap` is a configured cap of this run (a time budget, the search or check budget, the data cap) — a fact the harness
+# holds, never a property of the experiment; it rests on the harness's own record of the cap being reached.
+BLOCKERS = ("data", "credentials", "compute", "cap", "protocol", "other")
 CRITERIA = ("stated", "supplied")
 # ponytail: 16 deviations per script; more is several choices of one kind, merged into one entry. Past the cap
 # a script is refused, never cut: a verifier must see every departure it judges.
 MAX_DEVIATIONS = 16
+# ponytail: 8 central claims per plan round cover a paper's abstract, contributions and conclusion; more is refused, and
+# on the last attempt each claim past the cap is recorded as dropped, never cut unseen.
+MAX_CLAIMS = 8
 SEVERITY = ("NOTE", "MINOR", "MAJOR", "FATAL")
 CLASSES = ("CONFIRMED_FINDING", "PLAUSIBLE_CONCERN", "OPEN_QUESTION", "DISMISSED")
 PROMPTS = Path(__file__).parent / "prompts"
 _EFFORT = {"lens": "high", "critic": "high", "plan": "high", "bind": "high", "gen": "high", "vision": "medium",
-           "verify": "high", "report": "medium"}
+           "verify": "high", "report": "medium", "audit": "high"}
 
 
 class SealError(ValueError):
@@ -119,8 +124,9 @@ class _Ctx:
         return _sealed(self.root, tid)
 
     def plan(self) -> dict | None:
-        """The plan with its follow-up round merged in (checks C1..Cn, then the follow-up's)."""
-        return report.merged(self.sealed("plan"), self.sealed("plan:2"))
+        """The plan with its follow-up round merged in (checks C1..Cn, then the follow-up's), and the claims of any
+        follow-up plan the operator withdrew."""
+        return report.merged(self.sealed("plan"), self.sealed("plan:2"), report.withdrawn_plans(self.root))
 
     def tracked(self) -> set[str]:
         if not hasattr(self, "_tracked"):
@@ -253,6 +259,7 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
             x.waiting.add(c["id"])
     for c in plan["checks"]:
         tasks += _step(x, c)
+    tasks += _audits(x, plan)
     running = [c["id"] for c in plan["checks"] if execute.poll(x.cfg, x.pid, c["id"])] + sorted(x.waiting)
     if tasks or running:
         return "verify", tasks, running
@@ -301,8 +308,9 @@ def _plan_task(x: _Ctx, tid: str, followup: str) -> dict:
 
 
 def _followup_text(ledger: dict, undecided: list[dict]) -> str:
-    done = [{k: c.get(k) for k in ("id", "kind", "claim", "role", "status", "reason", "stages", "data_identity", "data_blocker")
-             if c.get(k) is not None} for c in ledger["checks"]]
+    done = [{k: c.get(k) for k in ("id", "kind", "claim", "role", "covers", "status", "state", "reason", "stages",
+                                   "data_identity", "data_blocker", "not_requested", "pilot_stages")
+             if c.get(k) not in (None, {}, [])} for c in ledger["checks"]]
     ran = {r["claim"]: r for r in ledger["completion"]["claims"]}
     listed = "\n".join(f"- {cc['quote']!r} ({cc.get('claim_type') or 'untyped'}): {cc['claim_status']}; the requested "
                        f"experiment: {ran[cc['quote']]['experiment']}" + "".join(
@@ -310,6 +318,10 @@ def _followup_text(ledger: dict, undecided: list[dict]) -> str:
                            f"{b['basis']}{'; NOT verified: ' + b['unverified'][:160] if b.get('unverified') else ''}"
                            f"{'; the search budget was spent when it was planned, which shows nothing about the data' if b.get('budget_spent') else ''}]"
                            for b in ran[cc["quote"]]["not_run"][:6]) for cc in ledger["central_claims"] if cc["quote"] in ran)
+    rests = "\n".join(f"- {c['id']} {c['status']}: tested as {d['tested_as'][:160]!r}; the claim may hold under "
+                      f"{d['alternative'][:200]!r}" + (f" (the paper: {d['printed'][:120]!r})" if d.get("printed") else "")
+                      for c in ledger["checks"] if (c.get("audit") or {}).get("verdict") == "DEPENDS"
+                      for d in c["audit"]["depends_on"])
     choices = "\n".join(f"- {d['printed'][:160]!r} (p{d['page']}): " + "; ".join(
         f"{u['checks']}: {u['used'][:120]!r}{' (changes the claim)' if u['changes_claim'] else ''}" for u in d["choices"])
         for d in ledger.get("definition_choices") or [])
@@ -328,13 +340,18 @@ def _followup_text(ledger: dict, undecided: list[dict]) -> str:
               "`protocol` blocker whose missing details a script could declare as deviations is attempted.\n"
             + (f"\n=== ONE PRINTED DEFINITION, SEVERAL CHOICES (checks that applied the same sentence of the paper "
                f"differently; a follow-up may compute both as `readings` in one check) ===\n{choices}\n" if choices else "")
+            + (f"\n=== FAILURES AN INDEPENDENT AUDIT FOUND RESTING ON A READING OR CHOICE THE PAPER LEAVES OPEN (not "
+               f"counted against the claim; a check that computes the claim under the alternative too — `readings`, or a "
+               f"certificate's `literal` — decides it) ===\n{rests}\n" if rests else "")
             + "\nPropose NEW checks only (ids F1, F2, ...), up to the budget, for (a) the undecided claims above, where a "
               "different route, a cited public artifact to acquire, or a narrower but still paper-faithful test can decide "
               "what the first round could not, and (b) any headline claim of the abstract, the contribution list or the "
               "conclusion that the list above does not contain (re-read them). Repeat nothing that already ran. "
               "`central_claims` lists ONLY those claims (the same quote for (a); a new verbatim quote with its scope for "
-              "(b)), each with the new check ids or a concrete `why_unchecked` naming the blocker. Proposing nothing is "
-              "correct when nothing more can be decided.\n")
+              "(b)), each with the new check ids or a concrete `why_unchecked` naming the blocker. A claim may also list the id "
+              "of a check above (C1, ...) that already ran the experiment it names: that check's `covers` count for the claim, "
+              "so a scope item it ran is never written as an omission. Proposing nothing is correct when nothing more can be "
+              "decided.\n")
 
 
 def _data_text(x: _Ctx, cid: str) -> str:
@@ -355,6 +372,8 @@ def _data_text(x: _Ctx, cid: str) -> str:
             + "".join(f"THE RECORD ALSO LISTS (released, but not requested by this plan, so not under {execute.DATA_MOUNT}/{k}/): "
                       + ", ".join(u["not_requested"][:40]) + " — a REFEREE_DATA line says 'not acquired', never 'not released'\n"
                       for k, u in execute.unrequested(x.root, d).items())
+            + "".join(f"EXCLUDED BY THE PLAN from source {i} ({e['pattern']}): {e['why']}\n"
+                      for i, s in enumerate(d.get("plan") or []) for e in s.get("exclude") or [])
             + ("RELEASED RECORD TEXT (code, notebooks, README; quote-only, never run; Read it under "
                f"{(x.root / 'checks' / cid / 'record_src').as_posix()}/, cite a reading as record:<path>):\n"
                + "\n".join(f"  {r['path']} ({r['bytes']} bytes)" for r in d["record_src"][:60]) + "\n"
@@ -491,7 +510,8 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
             tries = (cdir / "tries.jsonl").read_text(encoding="utf-8")[-6000:] if (cdir / "tries.jsonl").exists() else "(none)"
             proposal = json.dumps({"script": (cdir / f"script.{r}.py").read_text(encoding="utf-8"), **{
                 k: g.get(k) for k in ("runs", "runs_quote", "metric", "outputs", "bindings", "deviations",
-                                      "checked_statement", "premise_argument")}}, ensure_ascii=False, indent=1)
+                                      "checked_statement", "premise_argument", "revisions") if g.get(k) is not None}},
+                ensure_ascii=False, indent=1)
             smoke = f"(not run: {sm['skipped']})" if sm.get("skipped") else (
                      f"returncode {sm.get('returncode')}, {sm.get('seconds')}s"
                      + (" (stopped at the draft time limit: it was still running)" if sm.get("timed_out") else "")
@@ -501,14 +521,19 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
             return [_verify_task(x, c, r, spec + _data_text(x, cid), proposal, tries, smoke)]
         if v["verdict"] == "APPROVE":
             runs, source = run_count(x.cfg, c, g)
+            devs, crit = _two_keys(c, g, v)
             check = {**c, "runs": runs, "runs_quote": g.get("runs_quote", "") if source == "paper" else "",
                      "runs_source": source, "stochastic": g.get("stochastic"), "seed_flow": g.get("seed_flow"),
                      "readings": _merge_readings(c.get("readings"), g.get("readings")),
-                     "script_sha256": g["script_sha256"], "metric": g.get("metric", c["metric"]),
-                     "deviations": g.get("deviations", []), "premise_argument": g.get("premise_argument", ""),
+                     "script_sha256": g["script_sha256"], "metric": g.get("metric", c["metric"]), "criterion": crit,
+                     "deviations": devs, "premise_argument": g.get("premise_argument", ""),
+                     "revisions": [x.sealed(f"gen:{cid}.{k}").get("revisions") for k in range(2, r + 1)
+                                   if (x.sealed(f"gen:{cid}.{k}") or {}).get("revisions")],
                      "approval": {"approved": True, "script_sha256": v["script_sha256"],
                                   "notes": v.get("notes", "")[:1000]}}
             shutil.copyfile(cdir / f"script.{r}.py", cdir / "script.py")
+            # A script that cannot use the GPU never holds it (execute.wants_gpu): it runs beside a GPU run, not after it.
+            check["gpu"] = execute.wants_gpu((cdir / "script.py").read_text(encoding="utf-8"), (x.checkout / ".git").is_dir())
             return _start(x, check)
         if v["verdict"] == "UNCHECKABLE" or r == rounds:
             why = "unCheckable" if v["verdict"] == "UNCHECKABLE" else f"{rounds} rounds rejected"
@@ -518,6 +543,31 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
         return _terminal(cdir, c, "INCONCLUSIVE", f"the script failed in the harness's run in each of {rounds} rounds; "
                          f"last error: {last}")
     return []
+
+
+def _supplied(c: dict, by: str = "planner") -> dict:
+    """The deviation a REFEREE-chosen decision criterion is: a qualitative claim tested by a relation, rival, baseline or
+    threshold someone chose speaks for that criterion, never for the claim as printed."""
+    return {"printed": "", "page": None, "changes_claim": True, **({"changes_claim_by": by} if by != "planner" else {}),
+            "used": f"REFEREE's {by} supplied the decision criterion "
+                    f"({(c.get('target') or {}).get('relation') or c.get('metric') or 'the compared output'}) for a claim "
+                    "whose sentence states no such comparison or number",
+            "why": "the claim is qualitative; any threshold, rival or baseline is REFEREE's, so a result speaks for that "
+                   "criterion and never for the claim as the paper states it"}
+
+
+def _two_keys(c: dict, g: dict, v: dict) -> tuple[list[dict], str]:
+    """The approved check's deviations and criterion with the verifier's independent key applied: a deviation either key
+    calls claim-changing is claim-changing, and a criterion either key calls supplied is supplied (only ever downward)."""
+    devs = [dict(d) for d in g.get("deviations") or []]
+    for i in v.get("claim_changing") or []:
+        if 0 <= i < len(devs) and not devs[i].get("changes_claim"):
+            devs[i].update(changes_claim=True, changes_claim_by="verifier")
+    crit = c.get("criterion", "")
+    if c.get("kind") != "CERTIFICATE" and crit != "supplied" and v.get("criterion") == "supplied":
+        devs.append(_supplied(c, "verifier"))
+        crit = "supplied"
+    return devs, crit
 
 
 def run_count(cfg: state.Config, c: dict, g: dict) -> tuple[int, str]:
@@ -583,7 +633,8 @@ def reopen(cfg: state.Config, pid: str, cid: str, why: str) -> dict:
         # approved script runs again (its gen/verify seals kept, its completed seeds reused from seeds.jsonl), so a
         # measurement is never re-rolled by rewriting the script. Anything else is written and approved again.
         keep = bool(o.get("resource")) and o.get("authorized") is not False and (cdir / "script.py").exists()
-        gone = [] if keep else [t for t in seals if t.split(":", 1)[0] in ("bind", "gen", "verify") and _check_of(t) == cid]
+        gone = [t for t in seals if t == f"audit:{cid}"] + ([] if keep else [
+            t for t in seals if t.split(":", 1)[0] in ("bind", "gen", "verify") and _check_of(t) == cid])
         gone += [t for t in ("report",) if t in seals]        # a report written before this check was redone describes another ledger
         for t in gone:
             seals.pop(t)
@@ -626,14 +677,17 @@ def _replan(cfg: state.Config, pid: str, root: Path, why: str) -> dict:
                 d.rename(d.with_name(f"{c['id']}.withdrawn.{n}"))
                 moved.append(c["id"])
         seals = state.read_json(root / "seals.json", {}) or {}
-        gone = [t for t in seals if t in ("plan:2", "report") or (t.split(":", 1)[0] in ("bind", "gen", "verify")
+        gone = [t for t in seals if t in ("plan:2", "report") or (t.split(":", 1)[0] in ("bind", "gen", "verify", "audit")
                                                                   and _check_of(t) in {c["id"] for c in follow["checks"]})]
         n = len(list((root / "sealed").glob("plan__2.withdrawn.*.json"))) + 1
-        (root / "sealed" / "plan__2.json").replace(root / "sealed" / f"plan__2.withdrawn.{n}.json")
+        kept = root / "sealed" / f"plan__2.withdrawn.{n}.json"
+        (root / "sealed" / "plan__2.json").replace(kept)
         for t in gone:
             seals.pop(t)
             if t != "plan:2":
                 (root / "sealed" / f"{_safe(t)}.json").unlink(missing_ok=True)
+        # Still sealed under its own name: its checks are set aside, never its claims (report.merged accounts for them).
+        seals[f"plan:2.withdrawn.{n}"] = state.sha256(kept.read_bytes())
         state.write_json(root / "seals.json", seals)
         tried = state.read_json(root / "attempts.json", {}) or {}
         state.write_json(root / "attempts.json", {k: v for k, v in tried.items() if k not in gone})
@@ -682,6 +736,43 @@ def _start(x: _Ctx, check: dict) -> list:
     return []
 
 
+_AUDIT_LINES = 60   # ponytail: result lines shown to an auditor (failing ones first); every line is in execution.jsonl
+
+
+def _audits(x: _Ctx, plan: dict) -> list[dict]:
+    """An independent audit owed for every failure about the printed claim (report.needs_audit): a fresh reader, shown the
+    failing instances unmasked, looks for a premise the paper states that they miss, a reading of open text, or a choice
+    REFEREE supplied that the failure rests on. Like the critic, it can only lower: a failure it finds resting on such a
+    thing reads as about a changed claim, never as support, and is shown beside what it rests on (invariant 16)."""
+    return [_audit_task(x, c) for c in plan["checks"]
+            if report.needs_audit(x.root, c) and x.sealed(f"audit:{c['id']}") is None]
+
+
+def _audit_task(x: _Ctx, c: dict) -> dict:
+    cdir = x.root / "checks" / c["id"]
+    o, run = state.read_json(cdir / "outcome.json") or {}, state.read_json(cdir / "check.json") or {}
+    log = x.root / "execution.jsonl"
+    rows = [json.loads(ln) for ln in log.read_text(encoding="utf-8").splitlines() if ln.strip()] if log.exists() else []
+    lines = [f"seed {r.get('seed')}: {ln.strip()}" for r in rows if r.get("target") == c["id"] and r.get("mode") == "evidence"
+             and r.get("script_sha256") == run.get("script_sha256")
+             for ln in (r.get("stdout") or "").splitlines() if ln.startswith("REFEREE_RESULT")]
+    bad = lambda ln: bool(re.search(r'"violated":\s*1\b|"literal":\s*"fails"', ln))
+    lines = sorted(lines, key=lambda ln: not bad(ln))[:_AUDIT_LINES]
+    shown = {k: o.get(k) for k in ("status", "reason", "rule", "admissible", "literal", "relation", "margin", "n")
+             if o.get(k) not in (None, "")}
+    shown["stages"] = {s: {k: p.get(k) for k in ("status", "reason", "margin", "n")} for s, p in (o.get("stages") or {}).items()
+                       if p.get("status") != "RELATION_HOLDS"}
+    script = cdir / "script.py"
+    return x.task(f"audit:{c['id']}", "audit", _template(
+        "audit", title=x.meta["title"], pages_dir=x.pages_dir, check_id=c["id"], kind=c["kind"], status=o.get("status"),
+        claim=c["claim"], spec=_spec_text(c), outcome=json.dumps(shown, ensure_ascii=False, indent=1)[:6000],
+        script=script.as_posix() if script.exists() else "(no script: the authors' documented command)",
+        deviations=json.dumps([{"index": i, **{k: d.get(k) for k in ("printed", "used", "why", "changes_claim")}}
+                               for i, d in enumerate(run.get("deviations") or [])], ensure_ascii=False, indent=1)[:8000],
+        results="\n".join(lines)[:12_000] or "(no result lines recorded)"),
+        (script,) if script.exists() else ())
+
+
 def _verify_task(x: _Ctx, c: dict, r: int, spec: str, proposal: str, tries: str, smoke: str = "") -> dict:
     return x.task(f"verify:{c['id']}.{r}", "verify", _template(
         "verify", title=x.meta["title"], pages_dir=x.pages_dir, check_id=c["id"], kind=c["kind"], claim=c["claim"],
@@ -705,6 +796,10 @@ def _spec_text(c: dict) -> str:
             "fresh_run": "a FRESH RUN (training, simulation) in the sandbox",
             "exact_instances": "exact instances", "paper_numbers": "the paper's own printed numbers"}.get(c["basis"], "")
             + ")")
+    if c.get("covers") and c.get("kind") in ("AUTHOR_CODE", "RELEASED_DATA", "RECONSTRUCTION"):
+        parts.append("Covers (the claim's scope items this check runs): " + json.dumps(c["covers"], ensure_ascii=False)
+                     + " — every one is computed; a dataset among them that the script cannot load is named in its "
+                       "REFEREE_DATA line's `missing` list (it then reads as not run), never dropped silently.")
     if c.get("target"):
         parts.append(f"Printed target: {json.dumps(c['target'], ensure_ascii=False)}")
     if c.get("define"):
@@ -743,9 +838,42 @@ def advance(cfg: state.Config, source: str, wait: int = 0) -> dict:
             break
         time.sleep(15)
     return {"paper_id": pid, "phase": phase, "status": "workflow_finished" if phase == "done" else "waiting",
-            "blocked_reason": f"executions running: {', '.join(running)}" if running and not tasks else "",
+            "blocked_reason": blocked_reason(running), "running": running,
             "scientific_status": report.scientific_status(root), "completion": report.completion_line(root),
             "tasks": tasks}
+
+
+def blocked_reason(running: list[str]) -> str:
+    """Said whenever an execution is in flight, tasks owed or not: a workflow whose owed tasks no worker could answer must
+    still keep polling the runs that are going (Oct-01 PPRM: it stopped while C8 and C9 ran)."""
+    return f"executions running: {', '.join(running)}" if running else ""
+
+
+def abandon(cfg: state.Config, pid: str, tid: str, why: str) -> dict:
+    """The workflow ends a task no worker could answer (two workers, no sealable answer — a permission block, a crash):
+    it is sealed as an honest nothing with the reason, so one stuck task never stalls the rest of the review. A check
+    whose binding, script or approval is abandoned ends INCONCLUSIVE — a fault of this run, nothing about the paper — and
+    may be reopened; an abandoned audit leaves its failure UNRESOLVED, so it is not counted (fail closed)."""
+    root = state.pdir(cfg, pid)
+    with state.lock(root / ".lock"):
+        x = _Ctx(cfg, pid)
+        if tid not in {t["id"] for t in _plan(x)[1]}:
+            return {"error": f"'{tid}' is not a pending task"}
+        role = tid.split(":")[0]
+        rec = {**_EMPTY[role], "abandoned": why[:500]}
+        out = root / "sealed" / f"{_safe(tid)}.json"
+        state.write_json(out, rec)
+        seals = state.read_json(root / "seals.json", {}) or {}
+        seals[tid] = state.sha256(out.read_bytes())
+        state.write_json(root / "seals.json", seals)
+        if role in ("bind", "gen", "verify"):
+            cid = _check_of(tid)
+            c = next(k for k in x.plan()["checks"] if k["id"] == cid)
+            if not (root / "checks" / cid / "outcome.json").exists():
+                _terminal(root / "checks" / cid, c, "INCONCLUSIVE", f"no worker produced a sealable answer for {tid} ({why[:300]}): "
+                          "a fault of this run, nothing about the paper; the check may be reopened")
+        state.append_jsonl(root / "log.jsonl", {"event": "abandon", "task": tid, "why": why[:500]})
+    return {"abandoned": tid}
 
 
 # --- sealing ----------------------------------------------------------------------------
@@ -866,6 +994,17 @@ def _target(x: _Ctx, t: dict, errors: list[str], cid: str) -> dict | None:
     return hit and {"quote": hit["quote"], "value": value, "page": hit["page"]}
 
 
+_parts = report.parts
+
+
+def unaccounted_names(names: list[str] | None, include: list[str], exclude: list[dict]) -> list[str]:
+    """The data files of a record's listing that `include` does not name and no `exclude` entry (with its reason) names;
+    code, notebooks, READMEs and dot-paths are text or metadata, never data."""
+    from .fetcher import _dot, _named, _textual
+    pats = [e["pattern"] for e in exclude or []]
+    return [n for n in names or [] if not _dot(n) and not _textual(n) and not _named(n, include) and not _named(n, pats)]
+
+
 _SOURCE = re.compile(r"https?://[^\s\"'<>]+|hf://(?:datasets|models)/[\w.-]+/[\w.-]+(?:@[\w.-]+)?")
 
 
@@ -889,8 +1028,22 @@ def _acquire(x: _Ctx, c: dict, errs: list[str], cid: str) -> list[dict]:
         if not src.startswith("hf://") and "@" in src.split("://", 1)[1].split("/", 1)[0]:
             errs.append(f"{cid}: acquire source {src[:120]!r} carries user info before its host; refused")
             continue
+        exc = [{"pattern": str(e.get("pattern") or "")[:200], "why": str(e.get("why") or "").strip()[:400]}
+               for e in s.get("exclude") or [] if isinstance(e, dict) and str(e.get("pattern") or "").strip()][:20]
+        if bad := [e["pattern"] for e in exc if len(e["why"]) < 10]:
+            errs.append(f"{cid}: each `exclude` entry gives the reason this claim does not need those files: {bad[:5]}")
         rec = {"source": src, "include": inc, "cited_in": cited, "why": str(s.get("why") or "")[:400],
-               "required": s.get("required") is not False}
+               "required": s.get("required") is not False, **({"exclude": exc} if exc else {})}
+        # Every data file the record's listing names is requested or excluded with a reason: a file left out unseen made
+        # an acquisition read complete (Oct-01 transformer: 20 of 25, the plan's own `why` said 24). Only a listing the
+        # planner was shown (`discover --files`) binds it; a listing the fetcher alone saw stays informational.
+        names = execute.listed_names(x.root, src)
+        if names is not None:
+            rec["listed_at_seal"] = True
+        if inc and (left := unaccounted_names(names, inc, exc)):
+            errs.append(f"{cid}: the record {src[:80]} lists {len(left)} data file(s) this check neither requests nor excludes: "
+                        f"{left[:12]}{' ...' if len(left) > 12 else ''} — add them to `include`, or list them in `exclude` "
+                        "with the reason this claim does not need them")
         if cited == "discovery":
             did, named = str(s.get("discovery") or ""), str(s.get("named_in_paper") or "")
             hit = discover.returned(x.cfg, x.pid, did, src)
@@ -925,7 +1078,31 @@ _COMPUTE = re.compile(r"\d[\d.,]*\s*(?:[kKmMbB]\b|billion|million)?[\s-]*(?:x\s*
                       r"param(?:eter)?s?|flops?)", re.I)
 
 
-def _blocker(x: _Ctx, e: dict, errors: list[str], label: str) -> str:
+def _measured(x: _Ctx, e: dict, errors: list[str], label: str, b: str) -> tuple[list, list]:
+    """The checks an omission cites (`failed_checks`) as evidence of its blocker, sorted by what each one's record shows:
+    (cap evidence, measured evidence). A check is evidence only for an item it covered (a measured run of one experiment
+    says nothing about another); a fault of this run's network or host is evidence of nothing about the data or the host."""
+    by_id = {c["id"]: c for c in (x.plan() or {}).get("checks", [])}
+    caps, measured = [], []
+    for k in [str(k) for k in e.get("failed_checks") or []]:
+        o = state.read_json(x.root / "checks" / k / "outcome.json") or {}
+        if e.get("item") and k in by_id and flat(e["item"]) not in {flat(s) for s in by_id[k].get("covers") or []}:
+            errors.append(f"{label}: {k} did not run {e['item']!r} (its covers: {by_id[k].get('covers')}): what its run measured is "
+                          "evidence only for what it ran — link that check to this claim, or give this item its own check")
+            continue
+        if o.get("data_blocker"):
+            word = report.data_word(o["data_blocker"])
+            if word == "fault":
+                errors.append(f"{label}: {k} failed on a fault of this run's network, host or code "
+                              f"({', '.join(sorted({d.get('class', '') for d in o['data_blocker']}))}), which shows nothing about "
+                              "the data: acquire it again (a follow-up check), never give it up on that")
+            (caps if word == "cap" else measured).append((k, word))
+        elif str(o.get("reason", "")).startswith("RESOURCE BLOCKER"):
+            (caps if report.resource_word(o.get("resource")) == "cap" else measured).append((k, o.get("resource") or "compute"))
+    return caps, measured
+
+
+def _blocker(x: _Ctx, e: dict, errors: list[str], label: str, caps_hit: tuple = ()) -> str:
     """A requested experiment or dataset that is not run names WHAT stops it, and rests on what the harness
     holds wherever it can (returns the error, "" if the blocker stands):
     - `data`: a registry search it ran for the dataset (and, if that returned candidates, why none is the
@@ -947,13 +1124,23 @@ def _blocker(x: _Ctx, e: dict, errors: list[str], label: str) -> str:
                       "a failed search shows nothing about the dataset or model — search again")
     art_src = str(e.get("artifact") or "").strip()
     art = next((h for d in ids if (h := discover.returned(x.cfg, x.pid, d, art_src))), None) if art_src else None
-    outcome = lambda k: state.read_json(x.root / "checks" / str(k) / "outcome.json") or {}
+    capped, measured = _measured(x, e, errors, label, b) if b in ("data", "compute", "cap") else ([], [])
     if b not in BLOCKERS:
         errors.append(f"{label}: `blocker` is one of {list(BLOCKERS)} — what stops the requested experiment (data: no public "
                       "source could be found or read; credentials: a paid closed service or a gated record; compute: beyond "
-                      "this host, measured; protocol: a detail the paper omits that no declared deviation can supply; other)")
+                      "this host, measured; cap: a configured cap of this run that was reached (a time budget, the search or "
+                      "check budget, the data cap); protocol: a detail the paper omits that no declared deviation can supply; other)")
+    elif b == "cap":
+        if not capped and not caps_hit:
+            errors.append(f"{label}: a `cap` blocker rests on a configured cap this run reached — a check that ended at a time "
+                          "budget, the data cap or a denied source (`failed_checks`), or the search or check budget spent — and "
+                          "no configured cap was reached here: name the real blocker")
+        e["cap"] = "; ".join([f"{k}: {w}" for k, w in capped] + list(caps_hit))[:300]
+    elif b == "data" and capped and not measured:
+        errors.append(f"{label}: {', '.join(k for k, _ in capped)} stopped at a configured cap of this run (the data cap or a "
+                      "denied source), not at a fact about the data: its blocker is `cap`")
     elif b == "data" and searched:
-        failed = [k for k in e.get("failed_checks") or [] if outcome(k).get("data_blocker")]
+        failed = [k for k, w in measured if w == "data"]
         if not ids and not failed:
             errors.append(f"{label}: a dataset given up as unobtainable needs `discovery` — the ids of the registry searches you "
                           "ran for it (the discover command) — or `failed_checks`: checks that tried to acquire it")
@@ -970,8 +1157,12 @@ def _blocker(x: _Ctx, e: dict, errors: list[str], label: str) -> str:
         elif not (art.get("gated") or art.get("private")):
             errors.append(f"{label}: {art['source']} is public and not gated in its registry record: acquire it (cited_in "
                           "'discovery'); credentials stop only a paid service or a gated or private record")
+    elif b == "compute" and capped and not measured:
+        errors.append(f"{label}: {', '.join(f'{k} ({w})' for k, w in capped)} stopped at a configured limit of this run "
+                      "(SH_RUN_TIMEOUT_S, SH_CHECK_BUDGET_S, SH_MAX_DATA_GB), not at a measured limit of this host: its "
+                      "blocker is `cap`")
     elif b == "compute":
-        measured = [k for k in e.get("failed_checks") or [] if str(outcome(k).get("reason", "")).startswith("RESOURCE BLOCKER")]
+        measured = [k for k, w in measured if w != "data"]
         quote = str(e.get("paper_quote") or "")
         h = execute.host(x.cfg) if art and art.get("size_bytes") else {}
         known = [m for m in (h.get("ram_mb"), h.get("vram_mb")) if isinstance(m, (int, float))]
@@ -1012,7 +1203,17 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
             if (m := re.fullmatch(r"C(\d+)", str(c.get("id") or c.get("check") or "")))]
     cap, n0 = (x.cfg.max_followup_checks, max(used + [x.cfg.max_checks])) if base else (x.cfg.max_checks, 0)
     proposed = [c for c in obj.get("checks") or [] if isinstance(c, dict)]
-    claims_in = [cc for cc in obj.get("central_claims") or [] if isinstance(cc, dict)][:8]   # ponytail: 8 central claims
+    raw_claims = [cc for cc in obj.get("central_claims") or [] if isinstance(cc, dict)]
+    claims_in = raw_claims[:MAX_CLAIMS]
+    if len(raw_claims) > MAX_CLAIMS:                          # refused, never cut unseen; on the last attempt, recorded
+        errors.append(f"{len(raw_claims)} central claims: at most {MAX_CLAIMS} — keep the paper's most important ones and "
+                      "merge restatements of one claim; a claim past the cap is recorded as dropped, never checked")
+        dropped += [{"check": "central claim", "why": f"over the cap of {MAX_CLAIMS} central claims: {str(cc.get('quote'))[:160]!r}"}
+                    for cc in raw_claims[MAX_CLAIMS:]]
+    # A follow-up claim may rest on a check an earlier round ran (its harness id, C1..): its covers count for the claim
+    # (Oct-01 PPRM: "already run in round 1 as C3" could only be written as an omission).
+    proposed_ids = {c.get("id") for c in proposed}
+    earlier = {c["id"]: c for c in (base or {}).get("checks", []) if c["id"] not in proposed_ids}
     # Central claims get the budget first, and within them the checks that run the requested experiment: a
     # check no (re-found) central claim cites is incidental, is cut before any central one, and must say why
     # no central claim could use its slot; a supporting check is cut before a target one.
@@ -1020,6 +1221,12 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     proposed.sort(key=lambda c: (c.get("id") not in central_ids, c.get("role") != "target"))
     for c in proposed[cap:]:
         dropped.append({"check": c.get("id"), "why": f"over the budget of {cap} checks"})
+    # What a check cut by the check budget would have covered is uncovered because of a configured cap, said by the harness
+    # (Oct-02: it read `unstated`, the planner's); the caps this round reached are the facts a `cap` blocker may rest on.
+    cut = {flat(s): str(c.get("id")) for c in proposed[cap:] for s in c.get("covers") or []}
+    setting = "SH_MAX_FOLLOWUP_CHECKS" if base else "SH_MAX_CHECKS"
+    caps_hit = tuple(([f"SH_MAX_DISCOVERIES: {spent} of {x.cfg.max_discoveries} searches spent"] if spent >= x.cfg.max_discoveries
+                      else []) + ([f"{setting}: {len(proposed)} checks proposed for {cap} slots"] if len(proposed) >= cap else []))
     for i, c in enumerate(proposed[:cap], n0 + 1):
         cid, kind, errs = f"C{i}", c.get("kind"), []
         if kind not in KINDS:
@@ -1040,7 +1247,8 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
                "central": c.get("id") in central_ids, "incidental_why": str(c.get("incidental_why") or "")[:600],
                # a certificate checks the printed statement itself: there is no criterion to choose
                "role": role or "supporting", "criterion": "stated" if kind == "CERTIFICATE" else criterion or "supplied",
-               "covers": [str(s)[:120] for s in c.get("covers") or []][:12],
+               # ponytail: 24 covered items per check; an entry listing several is several (report.parts)
+               "covers": [p[:120] for s in c.get("covers") or [] for p in _parts(str(s))][:24],
                "acquire": _acquire(x, c, errs, cid) if kind in SCRIPT_KINDS else []}
         rec["basis"] = BASIS.get(kind, "")
         if kind == "RELEASED_DATA":
@@ -1110,7 +1318,11 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
             checks.append(rec)
     central = []
     by_pid = {k["proposed_id"]: k for k in checks}
-    prior = {flat(b["quote"]): b.get("claim_type", "") for b in (base or {}).get("central_claims", [])}
+    by_pid.update({k: c for k, c in earlier.items()})
+    # Every claim an earlier round sealed — the first plan's, and a withdrawn follow-up's — keeps its type; a quote inside
+    # one of them (or around it) is that claim.
+    prior = [(b["quote"], b.get("claim_type", "")) for p in [base or {}] + (report.withdrawn_plans(x.root) if base else [])
+             for b in p.get("central_claims", [])]
     for cc in claims_in:
         h = _find(x, str(cc.get("quote") or ""), errors, "central claim")
         if not h:
@@ -1120,14 +1332,21 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         label = f"central claim {h['quote'][:50]!r}"
         # A claim's type decides which rules guard it, so it is never left out and never changes between rounds.
         ctype = _enum(cc.get("claim_type"), CLAIM_TYPES)
+        was = next((t for q, t in prior if t and report.same_claim(q, h["quote"])), "")
         if not ctype:
             cerrs.append(f"{label}: `claim_type` is one of {list(CLAIM_TYPES)}")
-        elif prior.get(flat(h["quote"])) and prior[flat(h["quote"])] != ctype:
-            cerrs.append(f"{label}: the first plan typed it {prior[flat(h['quote'])]!r}; a follow-up round never retypes a claim")
-            ctype = prior[flat(h["quote"])]
+        elif was and was != ctype:
+            cerrs.append(f"{label}: an earlier round typed it {was!r} (the same claim, or a quote inside it); a follow-up "
+                         "round never retypes a claim")
+            ctype = was
         # Scope: every method, dataset or setting the claim names is covered by one of its TARGET checks or
         # omitted with a reason — a narrower test, or a supporting stand-in, never silently stands for the claim.
         scope = [str(s)[:120] for s in cc.get("scope") or [] if str(s).strip()][:16]
+        if listed := [(s, p) for s in scope if len(p := _parts(s)) > 1]:
+            cerrs.append(f"{label}: scope item(s) {[s for s, _ in listed][:4]} each name several items ({[p for _, p in listed][:2]}): "
+                         "give each dataset, model, method or setting its own scope item, covered by a check or omitted with "
+                         "its blocker (one entry for five benchmarks read as covered while one never arrived)")
+            scope = [q for s in scope for q in _parts(s)][:24]     # sealed on the last attempt: each its own item
         if not scope:
             cerrs.append(f"{label}: `scope` lists every method, dataset, setting and metric the claim names (the statement "
                          "itself, for a theorem)")
@@ -1138,44 +1357,52 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
                     "paper_quote": str(o.get("paper_quote") or "")[:400],
                     "not_the_dataset": str(o.get("not_the_dataset") or "")[:600]}
                    for o in cc.get("omitted") or [] if isinstance(o, dict)]
-        links = [k for k in cc.get("checks") or [] if k in {c.get("id") for c in proposed}]
+        links = [k for k in cc.get("checks") or [] if k in proposed_ids or k in earlier]
         # A check stands for this claim only if its kind can: an empirical claim's target runs the experiment
         # (never a certificate, nor the paper's own arithmetic except for a printed value); an engineering claim's
         # target is a compatibility test; a compatibility test speaks for nothing else.
-        for k in [by_pid[i] for i in links if i in by_pid]:
-            bad = ""
+        for key in [i for i in links if i in by_pid]:
+            k, bad = by_pid[key], ""
             if k["role"] == "target" and ctype != "theory" and (     # untyped: the strictest reading, an experiment
                     k["kind"] == "CERTIFICATE" or (k["kind"] == "ARITHMETIC" and ctype != "value")):
-                bad = (f"check {k['proposed_id']} is a {k['kind']} (exact instances / the paper's own numbers); it cannot stand "
+                bad = (f"check {key} is a {k['kind']} (exact instances / the paper's own numbers); it cannot stand "
                        f"for the {ctype or 'untyped (so: empirical)'} claim {h['quote'][:50]!r}, which is about an experiment: give "
                        "it role 'supporting', or link the check that runs the experiment")
             elif k["role"] == "target" and ctype == "engineering" and k.get("test") != "compatibility":
-                bad = (f"{label} is an engineering claim: its target check {k['proposed_id']} must be a RECONSTRUCTION "
+                bad = (f"{label} is an engineering claim: its target check {key} must be a RECONSTRUCTION "
                        "compatibility test (a performance comparison is a separate claim, with its own quote)")
             elif k.get("test") == "compatibility" and ctype != "engineering":
-                bad = (f"check {k['proposed_id']} is a compatibility test: it may speak only for a claim whose claim_type is "
+                bad = (f"check {key} is a compatibility test: it may speak only for a claim whose claim_type is "
                        "'engineering'")
             if bad:
                 cerrs.append(bad)
-                links.remove(k["proposed_id"])        # sealed on the last attempt: unlinked, never counted
+                links.remove(key)                     # sealed on the last attempt: unlinked, never counted
         have = set().union(*(set(map(flat, by_pid[k]["covers"])) for k in links if k in by_pid
                              and by_pid[k]["role"] == "target")) | {flat(o["item"]) for o in omitted if o["why"]}
         if links and (miss := [s for s in scope if flat(s) not in have]):
+            by_cut = {s: cut[flat(s)] for s in miss if flat(s) in cut}
             cerrs.append(f"{label}: scope item(s) {miss} are neither in a linked TARGET check's `covers` nor in `omitted` with "
-                         "a reason (a supporting check stands beside the claim and covers nothing of it)")
-            omitted += [{"item": s, "why": "neither covered by a target check nor omitted with a reason in the sealed plan",
-                         "blocker": "unstated", "discovery": [], "failed_checks": [], "artifact": "", "service": False,
+                         "a reason (a supporting check stands beside the claim and covers nothing of it)" + "".join(
+                             f"; {s!r} is covered only by {k}, which is past the check budget ({setting}={cap}): drop a "
+                             "lower-priority check, or omit the item with blocker `cap`" for s, k in by_cut.items()))
+            omitted += [{"item": s, "why": f"its check {by_cut[s]} was cut by the check budget ({setting}={cap}), a setting of "
+                                           "this run" if s in by_cut else "neither covered by a target check nor omitted with "
+                                                                         "a reason in the sealed plan",
+                         "blocker": "cap" if s in by_cut else "unstated", "basis": "harness" if s in by_cut else "",
+                         "discovery": [], "failed_checks": [], "artifact": "", "service": False,
                          "paper_quote": "", "not_the_dataset": ""} for s in miss]
         # What is not run says what stops it, for every claim type, checked against the harness's own records.
         claim_blocker = {k: cc.get(k) for k in ("blocker", "discovery", "failed_checks", "not_the_dataset", "artifact",
                                                 "service", "paper_quote")}
-        for o in [o for o in omitted if o["why"] and o["blocker"] != "unstated"]:
-            if (why := _blocker(x, o, cerrs, f"{label} omitted {o['item']!r}")):
+        for o in [o for o in omitted if o["why"] and o["blocker"] != "unstated" and o.get("basis") != "harness"]:
+            if (why := _blocker(x, o, cerrs, f"{label} omitted {o['item']!r}", caps_hit)):
                 o["unverified"] = why[:400]
             if o["blocker"] in ("other", "protocol") and spent >= x.cfg.max_discoveries:
                 o["budget_spent"] = f"{spent} of {x.cfg.max_discoveries}"   # a fact beside the planner's word (Oct-01)
-        if not links and (why := _blocker(x, claim_blocker, cerrs, f"{label} has no check; why_unchecked")):
+        if not links and (why := _blocker(x, claim_blocker, cerrs, f"{label} has no check; why_unchecked", caps_hit)):
             claim_blocker["unverified"] = why[:400]
+        if not links and claim_blocker["blocker"] in ("other", "protocol") and spent >= x.cfg.max_discoveries:
+            claim_blocker["budget_spent"] = f"{spent} of {x.cfg.max_discoveries}"   # a whole claim given up too (Oct-01)
         errors += cerrs
         central.append({"quote": h["quote"], "page": h["page"], "checks": links, "scope": scope, "omitted": omitted,
                         "claim_type": ctype, "why_unchecked": str(cc.get("why_unchecked") or "")[:600],
@@ -1184,13 +1411,15 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
                         "failed_checks": [str(d)[:12] for d in claim_blocker["failed_checks"] or []][:6],
                         "not_the_dataset": str(claim_blocker["not_the_dataset"] or "")[:600],
                         **({"unverified": claim_blocker["unverified"]} if claim_blocker.get("unverified") else {}),
+                        **({"budget_spent": claim_blocker["budget_spent"]} if claim_blocker.get("budget_spent") else {}),
+                        **({"cap": claim_blocker["cap"]} if claim_blocker.get("cap") else {}),
                         # sealed on the last attempt with these problems: each was resolved to its strictest reading
                         **({"sealed_with_errors": cerrs[:8]} if cerrs else {})})
     _fail_or_drop(errors, final)
     # The planner's own ids map onto the harness's C1..Cn; a check whose only claim link was removed is incidental.
     ids = {c["proposed_id"]: c["id"] for c in checks}
     for cc in central:
-        cc["checks"] = [ids[k] for k in cc["checks"] if k in ids]
+        cc["checks"] = [ids.get(k, k) for k in cc["checks"] if k in ids or k in earlier]
     linked = {k for cc in central for k in cc["checks"]}
     for c in checks:
         if c["central"] and c["id"] not in linked:
@@ -1397,13 +1626,9 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         deviations.append({"printed": h["quote"] if h else "", "page": h["page"] if h else None,
                            "used": str(d.get("used") or "")[:600], "why": str(d.get("why") or "")[:600],
                            "changes_claim": d.get("changes_claim") is True})
+    revisions = _revision(x, cid, int(r), runs, deviations, obj, errors, final)
     if c.get("criterion") == "supplied":   # a qualitative claim tested by a criterion the planner chose: its result is about that criterion
-        deviations.append({"printed": "", "page": None, "changes_claim": True,
-                           "used": "REFEREE's planner supplied the decision criterion "
-                                   f"({(c.get('target') or {}).get('relation') or c.get('metric') or 'the compared output'}) for a claim "
-                                   "whose sentence states no such comparison or number",
-                           "why": "the claim is qualitative; any threshold, rival or baseline is REFEREE's, so a result speaks for that "
-                                  "criterion and never for the claim as the paper states it"})
+        deviations.append(_supplied(c))
     if c["kind"] == "CERTIFICATE":   # a counterexample must satisfy every premise of the exact claim
         if not re.search(r"""["']premises_hold["']""", script):
             errors.append("each result line reports `premises_hold`: 1 if every premise of the claim being tested holds "
@@ -1420,11 +1645,44 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     return {"script_sha256": state.sha256(script), "runs": runs, "runs_quote": str(obj.get("runs_quote") or "")[:500],
             "metric": metric, "outputs": outputs, "deviations": deviations, "bindings": out,
             "stochastic": stochastic if isinstance(stochastic, bool) else None, "seed_flow": flow, "readings": readings,
+            **({"revisions": revisions} if revisions else {}),
             "checked_statement": "proof_step" if c.get("step") else str(obj.get("checked_statement") or "conclusion"),
             # A general argument (e.g. that a printed premise can never hold) is the author's reasoning:
             # shown to the verifier and the reader as such, never counted as an executed result.
             "premise_argument": str(obj.get("premise_argument") or "")[:2000] if c["kind"] == "CERTIFICATE" else "",
             "notes": str(obj.get("notes") or "")[:2000]}
+
+
+def _revision(x: _Ctx, cid: str, r: int, runs: int, deviations: list[dict], obj: dict, errors: list[str], final: bool) -> dict:
+    """Self-correction keeps the scope: a revised script that drops (or relabels) a claim-changing deviation the previous
+    round declared, or runs fewer instances or seeds, says in `revision_notes` what in the script changed — the verifier
+    sees it, and the ledger keeps it. Unexplained on the last attempt, the dropped deviation is carried forward (the
+    strictest reading), never lost (Oct-01 conformal C5: 1 claim-changing deviation in round 1, none by round 3)."""
+    prev = x.sealed(f"gen:{cid}.{r - 1}") if r > 1 else None
+    if not prev:
+        return {}
+    keep = [d for d in deviations if d["changes_claim"]]
+    same = lambda a, b: (a.get("printed") and flat(a["printed"]) == flat(b.get("printed") or "")) or flat(a["used"]) == flat(b["used"])
+    gone = [d for d in prev.get("deviations") or [] if d.get("changes_claim") and not d.get("changes_claim_by")
+            and "supplied the decision criterion" not in d.get("used", "") and not any(same(d, k) for k in keep)]
+    notes = [{"was": str(n.get("was") or "")[:300], "why": str(n.get("why") or "").strip()[:600]}
+             for n in obj.get("revision_notes") or [] if isinstance(n, dict)]
+    told = lambda d: any(len(n["why"]) >= 20 and len(flat(n["was"])) >= 10 and (flat(n["was"]) in flat(d["used"]) or flat(d["used"])
+                                                                                in flat(n["was"])) for n in notes)
+    open_ = [d for d in gone if not told(d)]
+    fewer = isinstance(prev.get("runs"), int) and runs < prev["runs"] and not any(flat(n["was"]) == "runs" and len(n["why"]) >= 20
+                                                                                for n in notes)
+    if (open_ or fewer) and not final:
+        errors.append(f"round {r} drops or relabels the claim-changing deviation(s) round {r - 1} declared "
+                      f"{[d['used'][:100] for d in open_]}" + (f" and runs {runs} instead of {prev['runs']}" if fewer else "")
+                      + ": if the script no longer departs from the paper there, say in `revision_notes` "
+                        "([{\"was\": the earlier deviation's `used` text (or \"runs\"), \"why\": what in the script changed}]) "
+                        "— the verifier checks it; a revision never weakens a claim-changing choice silently")
+    for d in open_ if final else []:                  # the last attempt: carried forward as it was, the strictest reading
+        deviations.append({k: d.get(k) for k in ("printed", "page", "used", "why")} | {
+            "changes_claim": True, "why": f"carried from round {r - 1}: dropped without a stated reason ({d.get('why', '')})"[:600]})
+    return {"from_round": r - 1, "dropped_claim_changing": [d["used"] for d in gone if told(d)], "notes": notes} if (
+        gone or notes or fewer) else {}
 
 
 def _seal_verify(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
@@ -1438,8 +1696,70 @@ def _seal_verify(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         _fail_or_drop(errors or ["APPROVE must cite the paper text relied on, verbatim"], final)
         verdict = "REVISE"          # an approval that cites nothing checkable is not an approval
     g = x.sealed(f"gen:{cid}.{r}") or {}
+    c = next((k for k in (x.plan() or {}).get("checks", []) if k["id"] == cid), {})
+    # Two keys on what decides which rule applies (invariant 7's pattern): the verifier states, independently of planner and
+    # author, whether the claim's sentence states the compared relation, and which deviations change what is compared. Either
+    # key alone moves the result to the changed claim; neither key ever moves it back (Oct-01 transformer C7, conformal C4/C6).
+    keys = {}
+    if verdict == "APPROVE":
+        n = len(g.get("deviations") or [])
+        crit = _enum(obj.get("criterion"), CRITERIA)
+        chg = obj.get("claim_changing")
+        two = c.get("kind") in ("RELEASED_DATA", "RECONSTRUCTION", "AUTHOR_CODE") and bool(c.get("target"))
+        errs = ([] if crit or not two else ["`criterion` is 'stated' (the claim's own sentence states the comparison or number "
+                                            "this check's target encodes) or 'supplied' (it states neither: a rival, threshold, "
+                                            "held-out test or grid someone chose)"])
+        if not isinstance(chg, list):
+            errs.append("`claim_changing` lists the indices (from 0) of every deviation that changes what is compared or what "
+                        "the claim says, whatever its author marked — [] when none does")
+        elif any(not isinstance(i, int) or isinstance(i, bool) or not 0 <= i < n for i in chg):
+            errs.append(f"`claim_changing` holds deviation indices from 0 to {n - 1}")
+        _fail_or_drop(errs, final)
+        keys = {"criterion": crit or ("supplied" if two else ""),                   # the last attempt: the strictest reading
+                "claim_changing": sorted({i for i in chg if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < n})
+                if isinstance(chg, list) and not errs else list(range(n))}
     return {"verdict": verdict, "required_changes": str(obj.get("required_changes") or "")[:3000],
-            "notes": str(obj.get("notes") or "")[:2000], "quotes": quotes, "script_sha256": g.get("script_sha256", "")}
+            "notes": str(obj.get("notes") or "")[:2000], "quotes": quotes, "script_sha256": g.get("script_sha256", ""), **keys}
+
+
+def _seal_audit(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
+    """An auditor's word stands only on the paper's own words: STANDS cites the text that fixes what the failure rests on;
+    DEPENDS names each open reading or supplied choice with the paper's words (or the declared deviation that supplied it)
+    and the reading under which the claim may hold. On the last attempt, an objection or an approval the paper does not
+    ground is no audit: UNRESOLVED, and the failure is not counted as one of the printed claim (fail closed)."""
+    verdict = obj.get("verdict") if obj.get("verdict") in ("STANDS", "DEPENDS") else None
+    if verdict is None:
+        raise SealError("verdict must be STANDS or DEPENDS")
+    errors: list[str] = []
+    quotes = [h["quote"] for q in obj.get("quotes") or [] if (h := _find(x, str(q), errors, "audit quote"))]
+    devs = (state.read_json(x.root / "checks" / tid.split(":", 1)[1] / "check.json") or {}).get("deviations") or []
+    items = []
+    for d in [d for d in obj.get("depends_on") or [] if isinstance(d, dict)][:8]:   # ponytail: 8 objections per failure
+        printed, dev = str(d.get("printed") or ""), d.get("deviation")
+        dev = dev if isinstance(dev, int) and not isinstance(dev, bool) and 0 <= dev < len(devs) else None
+        h = _find(x, printed, errors, "depends_on `printed`") if printed else None
+        if printed and not h:
+            continue
+        if not printed and dev is None:
+            errors.append("a `depends_on` item without the paper's words names `deviation`: the index of the script's declared "
+                          "deviation that supplied the choice")
+            continue
+        alt, was = str(d.get("alternative") or "").strip(), str(d.get("tested_as") or "").strip()
+        if len(alt) < 10 or len(was) < 5:
+            errors.append("each `depends_on` item says what the check assumed (`tested_as`) and the reading or choice under "
+                          "which the claim may hold (`alternative`)")
+            continue
+        items.append({"printed": h["quote"] if h else "", "page": h["page"] if h else None, "deviation": dev,
+                      "tested_as": was[:500], "alternative": alt[:500], "why": str(d.get("why") or "")[:800]})
+    if verdict == "STANDS" and not quotes:
+        errors.append("STANDS cites, in `quotes`, the paper text that fixes each premise and procedure the failure rests on")
+    if verdict == "DEPENDS" and not items:
+        errors.append("DEPENDS names at least one reading or choice the failure rests on, with the paper's words")
+    _fail_or_drop(errors, final)
+    if (verdict == "STANDS" and not quotes) or (verdict == "DEPENDS" and not items):
+        verdict = "UNRESOLVED"
+    return {"verdict": verdict, "depends_on": items if verdict == "DEPENDS" else [], "quotes": quotes,
+            "notes": str(obj.get("notes") or "")[:2000]}
 
 
 def _seal_vision(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
@@ -1452,7 +1772,8 @@ def _seal_report(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
 
 
 VALIDATORS = {"lens": _seal_lens, "critic": _seal_critic, "plan": _seal_plan, "bind": _seal_bind,
-              "gen": _seal_gen, "verify": _seal_verify, "report": _seal_report, "vision": _seal_vision}
+              "gen": _seal_gen, "verify": _seal_verify, "report": _seal_report, "vision": _seal_vision,
+              "audit": _seal_audit}
 _EMPTY = {"lens": {"concerns": [], "dropped": []}, "critic": {"reviews": []},
           "plan": {"checks": [], "central_claims": [], "dropped": [], "repo_is_authors": False, "repo_note": ""},
           "bind": {"identity": {"established": False, "reason": "malformed binding answer"}, "command": "",
@@ -1460,7 +1781,8 @@ _EMPTY = {"lens": {"concerns": [], "dropped": []}, "critic": {"reviews": []},
           "gen": {"refused": True, "notes": "malformed answer"},
           "verify": {"verdict": "UNCHECKABLE", "required_changes": "", "notes": "malformed verifier answer",
                      "quotes": [], "script_sha256": ""},
-          "report": {"summary_md": ""}, "vision": {"read": {}, "notes": "malformed answer"}}
+          "report": {"summary_md": ""}, "vision": {"read": {}, "notes": "malformed answer"},
+          "audit": {"verdict": "UNRESOLVED", "depends_on": [], "quotes": [], "notes": "malformed answer"}}
 
 
 def try_(cfg: state.Config, pid: str, tid: str, script_path: str) -> dict:

@@ -33,7 +33,10 @@ anything past 8000 characters):
      measured memory, a script error). A PARTIAL check measured some stages and not others:
      report the completed stages' results as limited to those stages, and what stopped the rest.
      A result under claim-changing deviations (READING_CHANGED) is about the changed claim, not
-     the printed one. A data-identity mismatch (the data used differ from the paper's own
+     the printed one, and so is a failure an independent audit found resting on a reading or a choice
+     the paper leaves open (say what it rests on). A `cap` blocker is a configured setting of this run
+     (a time budget, the search or check budget, the data cap), a `fault` is this run's network or host:
+     neither is a property of the experiment or the data. A data-identity mismatch (the data used differ from the paper's own
      description) is a finding to state plainly. Keep what the workflow completed apart from
      what it established; a concern stands only as far as its linked check established it.
   4. **Requested experiments** — from the Completion block of the status table, for each central

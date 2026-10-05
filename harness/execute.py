@@ -63,9 +63,47 @@ def gpu(cfg: state.Config) -> bool:
     return rc == 0 and "GPU " in out
 
 
+_GPU_LIBS = ("torch", "torchvision", "torchaudio", "tensorflow", "keras", "jax", "jaxlib", "flax", "cupy", "numba", "pycuda",
+             "triton", "transformers", "accelerate", "vllm", "lightning", "pytorch_lightning", "sentence_transformers",
+             "diffusers", "timm", "xformers", "bitsandbytes", "peft", "trl", "deepspeed", "onnxruntime", "mxnet", "paddle",
+             "tinygrad")
+_GPU_IMPORT = re.compile(rf"^\s*(?:import|from)\s+(?:{'|'.join(_GPU_LIBS)})\b", re.M)
+
+
+def wants_gpu(script: str, checkout: bool) -> bool:
+    """Can this approved script use the GPU? It imports, or declares, a library that can (a deep-learning or GPU array
+    stack), imports something only at run time, or may drive the authors' checkout (whose imports are not in it). Unknown
+    is yes. A script that cannot use the GPU never holds it, so it never waits behind another run's hold on it (Oct-01
+    PPRM: CPU-only simulations and their drafts queued behind a ResNet-1202 run)."""
+    if checkout or _GPU_IMPORT.search(script or "") or re.search(r"\b(?:importlib|__import__)\b", script or ""):
+        return True
+    try:
+        declared = packages(script or "")
+    except ValueError:
+        return True
+    return any(re.split(r"[\[=<>!~]", p, maxsplit=1)[0].lower().replace("-", "_") in _GPU_LIBS for p in declared)
+
+
 def gpu_run(cfg: state.Config, check: dict) -> bool:
-    """Is this check's run given the host's GPU? An experiment kind on a host that has one."""
-    return check.get("kind") in ("AUTHOR_CODE", "RECONSTRUCTION") and gpu(cfg)
+    """Is this check's run given the host's GPU? An experiment kind on a host that has one, unless its approved script
+    cannot use it (`gpu` False, set when the check starts: wants_gpu). The authors' own code is always offered it."""
+    return check.get("kind") in ("AUTHOR_CODE", "RECONSTRUCTION") and (
+        check.get("kind") == "AUTHOR_CODE" or check.get("gpu") is not False) and gpu(cfg)
+
+
+def evidence_slots(cfg: state.Config) -> int:
+    """Evidence runs that may start now across every review on this host: SH_PARALLEL minus the script runs in flight
+    (evidence runs and the harness's own drafts, which run the real script and share the host's CPU and memory). A data
+    fetch or an install takes no slot (Oct-01: two fetches held both slots for 46 minutes while approved second-long
+    checks waited); counting drafts keeps a memory limit measured as one run's, not several's. A daemon that cannot
+    answer leaves none."""
+    busy = 0
+    for mode in ("evidence", "try"):
+        rc, out = _docker(["docker", "ps", "-q", "--filter", f"label=referee.mode={mode}"], 60)
+        if rc != 0:
+            return 0
+        busy += len(out.split())
+    return max(0, cfg.parallel - busy)
 
 
 def gpu_busy() -> bool:
@@ -840,6 +878,35 @@ def data_gaps(data: dict) -> list[str]:
     return out
 
 
+def listed_names(root: Path, source: str) -> list[str] | None:
+    """The file names a `run.py discover --files` listing of this record returned (discovery.jsonl), else None."""
+    from .discover import canon
+    log = Path(root) / "discovery.jsonl"
+    rows = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines() if x.strip()] if log.exists() else []
+    f = next((r for r in reversed(rows) if r.get("files") and not r.get("error") and canon(r.get("files_of", "")) == canon(source)),
+             None)
+    return [x["name"] for x in f["files"]] if f else None
+
+
+def unaccounted(root: Path, data: dict, sources: list[dict]) -> list[str]:
+    """What a record's complete listing names that the plan neither requested nor excluded with a reason, one line per
+    source whose listing the planner was shown when it sealed the plan (`listed_at_seal`) — a gap of the acquisition: the
+    data the experiment ran on is what was requested only if nothing is left out unseen. A file excluded with a reason is
+    the plan's stated choice, reported with it; a listing only the fetcher saw is shown, never counted (a hub repository's
+    other configurations are not a gap of a plan that never saw them)."""
+    from .fetcher import _named
+    out = []
+    for k, u in unrequested(root, data).items():
+        src = sources[int(k)] if k.isdigit() and int(k) < len(sources) else {}
+        exc = [e.get("pattern", "") for e in src.get("exclude") or []]
+        if not src.get("listed_at_seal"):
+            continue
+        if left := [n for n in u["not_requested"] if not _named(n, exc)]:
+            out.append(f"{str(u['source'])[:120]}: its listing names {len(left)} data file(s) the plan neither requested nor "
+                       f"excluded with a reason: {', '.join(left[:8])}{' ...' if len(left) > 8 else ''}")
+    return out
+
+
 def unrequested(root: Path, data: dict) -> dict:
     """Per source of an acquisition: the data files its record's COMPLETE listing names that this plan did not take
     (the fetcher's records-API or hub listing, else a `run.py discover --files` listing of the same record; never a
@@ -1048,7 +1115,7 @@ def smoke(cfg: state.Config, root: Path, cid: str, r: int, kind: str, attributed
     em, env = env_mounts(env_dir, envinfo)
     mounts = [(sdir, f"{MOUNT}/check", True)] + em + [(scratch, f"{MOUNT}/ckpt", False)] + (
         [(Path(root) / "repo", f"{MOUNT}/repo", True)] if has_repo else []) + data_mount(root, cid)
-    gpus = kind == "RECONSTRUCTION" and gpu(cfg)
+    gpus = kind == "RECONSTRUCTION" and gpu(cfg) and wants_gpu(script, has_repo)
     if gpus and gpu_busy():                    # a draft never shares the GPU with a timed run: it waits its turn
         return None
     rec = start(_cname(cdir.resolve(), "smoke", r, state.sha256(script), st.get("starts", 0)),
@@ -1280,9 +1347,7 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
     if st["stage"] == "prepare" and not fly:
         todo = [-1]
     # The host is the limit, not the check: at most SH_PARALLEL evidence runs at once across every review.
-    rc, out = _docker(["docker", "ps", "-q", "--filter", "label=referee=1"], 60)
-    rc2, builds = _docker(["docker", "ps", "-q", "--filter", "label=referee.mode=install"], 60)
-    free = cfg.parallel - (len(out.split()) - len(builds.split())) if rc == rc2 == 0 else 0
+    free = evidence_slots(cfg)
     # ...and shared fairly: with several checks running, each holds at most an equal share of the slots.
     active = [e for e in cfg.projects.glob("*/checks/*/exec.json") if not (e.parent / "outcome.json").exists()]
     width = min(width, max(1, cfg.parallel // max(1, len(active))), st.get("width", width))
@@ -1447,8 +1512,11 @@ def _extension(cfg: state.Config, check: dict, st: dict, runs: int) -> int:
         return 0
     if not _wants(_reconciled(check, st, True, "", failure="")):
         return 0
-    need, limit, _, _ = _projected(cfg, check, st, SIGN_MIN, spent=_spent(st))
-    return SIGN_MIN if need <= limit else 0
+    need, limit, setting, _ = _projected(cfg, check, st, SIGN_MIN, spent=_spent(st))
+    if need > limit:              # recorded: a configured budget, not the evidence, left it undecided (Oct-01 PPRM C8)
+        st["extension_refused"] = {"to": SIGN_MIN, "need_s": round(need), "budget_s": limit, "setting": setting}
+        return 0
+    return SIGN_MIN
 
 
 def _reconciled(check: dict, st: dict, authorized: bool, why: str, failure: str | None = None) -> dict:
@@ -1602,6 +1670,9 @@ def protocol(check: dict, st: dict, rule: str) -> dict:
             **({"replicates_extended": f"from {planned} to {runs}: the {planned} independent replicates left the result "
                 f"inside their noise band (a repeated value awaiting the exact sign test, or a margin within t*SE), which "
                 f"only more replicates can narrow; extended once, to the {runs} the sign test needs"} if runs > planned else {}),
+            **({"extension_refused": f"only more replicates ({st['extension_refused']['to']}) could decide it; they need about "
+                f"{st['extension_refused']['need_s']} s of the {st['extension_refused']['budget_s']} s budget "
+                f"({st['extension_refused']['setting']}, a setting of this run, not a finding)"} if st.get("extension_refused") else {}),
             **({"pilot_seconds": st["pilot_s"]} if st.get("pilot_s") else {}),
             **({"admitted_under_check_budget_s": st["budget_s"]} if st.get("budget_s") else {}),
             **({"seeds_reused_from_checkpoints": st["reused"]} if st.get("reused") else {})}
@@ -1702,7 +1773,9 @@ def try_script(cfg: state.Config, pid: str, cid: str, script: str, c: dict) -> d
     ok, why = docker_status()
     if not ok:
         return {"error": why}
-    if c.get("kind") == "RECONSTRUCTION" and gpu(cfg) and gpu_busy():   # never beside a timed run on the one GPU
+    has_repo = (root / "repo" / ".git").is_dir()
+    gpus = c.get("kind") == "RECONSTRUCTION" and gpu(cfg) and wants_gpu(script, has_repo)
+    if gpus and gpu_busy():                                         # never beside a timed run on the one GPU
         return {"error": "the GPU is held by another run (a timed evidence run or a draft): this draft was not run and "
                          "does not count against your drafts; try again in a few minutes, or finish without one",
                 "retry": True}
@@ -1716,12 +1789,10 @@ def try_script(cfg: state.Config, pid: str, cid: str, script: str, c: dict) -> d
                          "minutes, or finish without one"}
     if not envinfo["ok"]:
         return {"error": envinfo["detail"]}
-    has_repo = (root / "repo" / ".git").is_dir()
     scratch = _cname("try-ckpt", tdir.resolve(), time.time())        # a throwaway /work/ckpt for the draft
     em, env = env_mounts(env_dir, envinfo)
     mounts = [(tdir, f"{MOUNT}/check", False)] + em + [(scratch, f"{MOUNT}/ckpt", False)] + (
         [(root / "repo", f"{MOUNT}/repo", True)] if has_repo else []) + data_mount(root, cid)
-    gpus = c.get("kind") == "RECONSTRUCTION" and gpu(cfg)
     rec = run(["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", "0"], mounts=mounts, env=env,
               workdir=f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check",
               image=run_image(envinfo.get("image", DEFAULT_IMAGE), gpus), network=False, timeout=cfg.try_timeout_s,

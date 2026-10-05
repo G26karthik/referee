@@ -21,6 +21,13 @@ instances in EXACT ARITHMETIC. Not a reproduction of experiments; a formal check
     instance, and (3) ALSO test the conclusion under the nearest coherent reading the paper
     evidently means, declared as ONE claim-changing deviation: then `premises_hold`/`violated`
     are for that reading and `"literal": "premise_not_met"` records the text as printed.
+  - AN OPEN DETAIL OF A PRINTED PROCEDURE (a stopping rule, a tie-break, an order, whether a walk may
+    revisit its end, which of several optima is "the" solution): a violation that holds under one reading
+    and not another is no counterexample to the printed text. Evaluate the instance under EVERY reading the
+    paper's words admit: the untagged line is the most literal reading of the printed text, and every other
+    admissible reading prints its own result line with `"reading": "<name>"` (each declared as a deviation).
+    An independent auditor reads every line of the failing instances before any counterexample counts: a
+    violation that disappears under an admissible reading is not counted against the printed claim.
   - SEARCH WHERE A VIOLATION WOULD BE: hypotheses at their edges (boundary points, degenerate
     or rank-deficient matrices, equality cases, parameters at their limits); a bound claimed
     for all t along a LONG horizon, every step, not a few early ones.
@@ -121,6 +128,9 @@ Load each dataset exactly as the paper and code specify and print its REFEREE_DA
      premise, the conclusion, an index range, a definition), and does `literal` separate
      `fails` (printed premises hold and the printed conclusion fails) from `undefined` (the
      printed text is not well-defined on the instance, e.g. an index out of range)?
+  7. Does the script settle a detail the printed procedure leaves open (a stopping rule, a tie-break,
+     revisits, which optimum) one way only, while the violation could depend on it? Every admissible reading
+     is computed on the same instance, each tagged `reading`; an untagged line is the text exactly as printed.
 
 ## verify RELEASED_DATA
   1. Does the script open the right released or acquired file(s) for THIS printed number, by

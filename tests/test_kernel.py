@@ -152,6 +152,16 @@ def _seal(cfg, pid, tid, obj, td) -> dict:
     return tasks.seal(cfg, pid, tid, str(f))
 
 
+def _audited(root: Path, cid: str, verdict: str = "STANDS", depends_on: list | None = None) -> None:
+    """A sealed independent audit of a check's failure, written as the seal would store it (2026-10-02: a failure about
+    the printed claim counts only once audited; tests that are not about the audit start from one)."""
+    rec = {"verdict": verdict, "depends_on": depends_on or [], "quotes": ["x"], "notes": ""}
+    state.write_json(root / "sealed" / f"audit__{cid}.json", rec)
+    seals = state.read_json(root / "seals.json", {}) or {}
+    seals[f"audit:{cid}"] = state.sha256((root / "sealed" / f"audit__{cid}.json").read_bytes())
+    state.write_json(root / "seals.json", seals)
+
+
 def test_seals_keep_only_harness_derived_fields_and_detect_tampering():
     with tempfile.TemporaryDirectory() as t:
         td = Path(t)
@@ -373,6 +383,8 @@ def test_status_is_about_central_claims_and_conflicting_readings_are_recorded():
         conf = report.conflicts(report._checks(root, plan))       # same reading, opposite results
         assert len(conf) == 1 and not conf[0]["explained"] and conf[0]["checks"] == ["C1", "C3"]
         plan["checks"] = plan["checks"][:2] + [{**plan["checks"][2], "statement": "Lemma 2", "step": "hence x < 1"}]
+        assert report._central(plan, report._checks(root, plan), [])[1]["claim_status"] == "PENDING"   # 2026-10-02: unaudited
+        _audited(root, "C3")
         claims = report._central(plan, report._checks(root, plan), [])   # a failed proof STEP is a gap, not a refutation
         assert claims[1]["claim_status"] == "PROOF_GAP_FOUND" and report._headline([], claims) == "CENTRAL_PROOF_GAP_FOUND"
         plan["central_claims"][1]["checks"] = []
@@ -1817,6 +1829,7 @@ def test_completion_is_reported_apart_from_the_workflow_finishing_and_from_the_f
         write("C4", {"status": "NO_VIOLATION_FOUND", "reason": "held", "values": [0], "execution": done})
         write("C3", {"status": "RELATION_HOLDS", "reason": "held", "values": [0.1, 0.2, 0.15], "execution": done},
               {"deviations": [{"printed": "", "used": "a simulated stand-in for the MMLU items", "changes_claim": True}]})
+        _audited(td / pid, "C1")                                            # 2026-10-02: the counterexample was audited
         led = report.ledger(tasks._Ctx(cfg, pid))
         pick = lambda prefix: next(r for r in led["completion"]["claims"] if r["claim"].startswith(prefix))
         assert led["scientific_status"] == "CENTRAL_FAILURE_FOUND"          # what was found about the theorem...
@@ -2925,6 +2938,11 @@ def test_the_extension_to_six_counts_the_time_already_spent():
         # the recorded seconds of the seeds count, not the pilot's alone
         assert execute._extension(cfg, check, st(1000, seed_seconds={"0": 1000, "1": 3000, "2": 3000}), 3) == 0
         assert execute._extension(cfg, check, st(1000, seed_seconds={"0": 1000, "1": 1000, "2": 1000}), 3) == 6
+        # 2026-10-02: a refused extension leaves a record — a setting, not the evidence, kept it undecided
+        s = st(2000)
+        assert execute._extension(cfg, check, s, 3) == 0 and s["extension_refused"]["setting"] == "SH_CHECK_BUDGET_S", s
+        pr = execute.protocol({**check, "runs_source": "referee_floor"}, s, "rule")
+        assert "SH_CHECK_BUDGET_S" in pr["extension_refused"] and "a setting of this run" in pr["extension_refused"], pr
 
 
 def test_independent_replicates_of_one_point_value_are_decided_by_an_exact_test():
@@ -3278,10 +3296,12 @@ def test_a_draft_never_shares_the_gpu_with_a_timed_run_and_a_skipped_one_costs_n
         with tempfile.TemporaryDirectory() as t:
             cfg, pid = _project(Path(t))
             cfg.allow_script_exec = True
-            res = execute.try_script(cfg, pid, "C1", "print(1)", {"kind": "RECONSTRUCTION"})
+            res = execute.try_script(cfg, pid, "C1", "import torch\nprint(1)", {"kind": "RECONSTRUCTION"})
             assert res["retry"] and "GPU" in res["error"], res
             cpu = execute.try_script(cfg, pid, "C1", "print(1)", {"kind": "CERTIFICATE"})   # not given the GPU: not held back
             assert not cpu.get("retry")
+            # 2026-10-02: a reconstruction that cannot use the GPU never waits for it either
+            assert not execute.try_script(cfg, pid, "C1", "import numpy\nprint(1)", {"kind": "RECONSTRUCTION"}).get("retry")
         def docker(a, timeout):                       # a sync draft holding the GPU is seen
             seen.append(a)
             if a[:2] == ["docker", "ps"]:
@@ -3750,6 +3770,485 @@ def test_record_src_from_a_container_is_written_only_inside_its_folder_and_only_
         kept = execute.record_src(cdir, line + "\n", listing)
         assert [x["path"] for x in kept] == ["0/a.py"], kept
         assert not (Path(t) / "evil.py").exists() and not (cdir / "record_src" / "0" / "b.py").exists()
+
+# --- 2026-10-02 diagnosis of the 10-01 run: claims and failures kept apart from what REFEREE chose ---------------------
+def _ready(td: Path, pages=None):
+    """A project past its lenses and critic (no concerns), on DATA_PAGES unless `pages` is given."""
+    cfg, pid = _project_pages(td, pages or DATA_PAGES)
+    state.write_json(td / ".gpu.json", False)
+    for lens in tasks.LENSES:
+        _seal(cfg, pid, f"lens:{lens}", {"concerns": []}, td)
+    _seal(cfg, pid, "critic", {"reviews": []}, td)
+    return cfg, pid, td / pid
+
+
+def _audit_ok(cfg, pid, td, cid):
+    """An independent audit that finds the failure stands (the quote it relies on re-found)."""
+    _seal(cfg, pid, f"audit:{cid}", {"verdict": "STANDS", "depends_on": [], "quotes": [THM]}, td)
+
+
+def test_a_violation_of_a_changed_claim_is_never_listed_as_a_failure_found():
+    """Oct-02 transformer review: '## Failures found' listed C2/C3/C8, whose relations REFEREE's planner supplied (each
+    claim READING_CHANGED), beside C6's counterexample to the printed exponent, with nothing telling them apart."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid, root = _ready(td)
+        sup = dict(_run("A"), kind="RELEASED_DATA", basis="predictions", criterion="supplied")
+        sup.pop("test")
+        cert = {"id": "B", "kind": "CERTIFICATE", "claim_quote": THM, "statement_quote": THM, "role": "target",
+                "covers": ["the bound"]}
+        _seal(cfg, pid, "plan", {"checks": [sup, cert], "central_claims": [
+            _claim(checks=["A"]), {"quote": THM, "claim_type": "theory", "checks": ["B"], "scope": ["the bound"]}]}, td)
+        dev = {"printed": "", "used": "REFEREE's planner supplied the decision criterion", "why": "", "changes_claim": True}
+        state.write_json(root / "checks" / "C1" / "check.json", {"deviations": [dev]})
+        state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "RELATION_VIOLATED", "values": [-1.0],
+                                                                   "reason": "acc_a > acc_b does not hold"})
+        state.write_json(root / "checks" / "C2" / "outcome.json", {"status": "COUNTEREXAMPLE_FOUND", "values": [1],
+                                                                   "reason": "8 admissible instances violate it"})
+        _audit_ok(cfg, pid, td, "C2")
+        x = tasks._Ctx(cfg, pid)
+        led = report.ledger(x)
+        md = report.render(x, led, None)
+        found = md.split("## Failures found", 1)[1].split("\n## ", 1)[0]
+        assert "**C2**" in found and "**C1**" not in found, found
+        changed = md.split("## Violations of a changed claim", 1)[1].split("\n## ", 1)[0]
+        assert "**C1**" in changed and "about the changed claim" in changed, changed
+
+
+def test_a_withdrawn_follow_up_plan_never_takes_its_claims_out_of_the_accounting():
+    """Oct-01 PPRM: the operator withdrew a follow-up plan made on failed searches; the re-planned round did not list two
+    central claims the withdrawn one had added ("PPRM can reduce the time to alarm by making use of the..."), and they were
+    in no final ledger or review — a claim once sealed vanished because its round was planned again."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid, root = _ready(td)
+        run = lambda cid, q=CIFAR, cov="CIFAR-10-C": {"id": cid, "kind": "RECONSTRUCTION", "claim_quote": q, "covers": [cov],
+                                                     **RUN, "target": {"quote": q, "relation": "acc_a > acc_b"}}
+        _seal(cfg, pid, "plan", {"checks": [run("R")], "central_claims": [_claim()]}, td)
+        state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "INCONCLUSIVE", "reason": "x"})
+        added = {"quote": MMLU, "claim_type": "performance", "checks": ["F1"], "scope": ["MMLU"]}
+        _seal(cfg, pid, "plan:2", {"checks": [run("F1", MMLU, "MMLU")], "central_claims": [added]}, td)
+        assert tasks.reopen(cfg, pid, "plan:2", "planned on failed searches")["withdrawn"] == "plan:2"
+        # Between the withdrawal and the new round, the claim is still accounted, and the new round is told of it.
+        led = report.ledger(tasks._Ctx(cfg, pid))
+        assert MMLU in [c["quote"] for c in led["central_claims"]], [c["quote"] for c in led["central_claims"]]
+        phase, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
+        assert phase == "plan" and owed[0]["id"] == "plan:2"
+        assert MMLU in Path(owed[0]["prompt"]).read_text(encoding="utf-8").split("Still undecided", 1)[1]
+        _seal(cfg, pid, "plan:2", {"checks": [run("F1")], "central_claims": [_claim(checks=["F1"])]}, td)   # it is not listed again
+        led = report.ledger(tasks._Ctx(cfg, pid))
+        cc = next(c for c in led["central_claims"] if c["quote"] == MMLU)
+        assert cc["claim_status"] == "NOT_CHECKED" and "withdrawn" in cc["why_unchecked"], cc
+        assert cc["completion"]["not_run"][0]["blocker"] == "withdrawn", cc["completion"]["not_run"]
+        md = report.render(tasks._Ctx(cfg, pid), led, None)
+        assert MMLU in md.split("## Not checked or not decided", 1)[1]
+        # a withdrawn plan whose bytes changed after it was set aside is not read as one
+        f = root / "sealed" / "plan__2.withdrawn.1.json"
+        f.write_text(f.read_text(encoding="utf-8").replace("MMLU", "MMLX"), encoding="utf-8")
+        assert MMLU not in [c["quote"] for c in report.ledger(tasks._Ctx(cfg, pid))["central_claims"]]
+
+
+def test_a_follow_up_quote_inside_a_first_round_claim_is_that_claim():
+    """Probe on the 10-01 PPRM plan: a follow-up quote that is a sub-span of a first-round claim sealed as a new `theory`
+    claim beside the `performance` original — a narrower duplicate that escaped the no-retype rule and counted twice."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid, root = _ready(td)
+        _seal(cfg, pid, "plan", {"checks": [_run()], "central_claims": [_claim()]}, td)
+        x = tasks._Ctx(cfg, pid)
+        part = "beats method B on CIFAR-10-C with ResNet-32"
+        assert "never retypes" in _refused(lambda: _plan(x, [_run("F1")], [_claim(quote=part, checks=["F1"],
+                                                                                  claim_type="theory")], tid="plan:2"))
+        state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "INCONCLUSIVE", "reason": "x"})
+        _seal(cfg, pid, "plan:2", {"checks": [_run("F1")], "central_claims": [_claim(quote=part, checks=["F1"])]}, td)
+        plan = tasks._Ctx(cfg, pid).plan()
+        assert len(plan["central_claims"]) == 1 and plan["central_claims"][0]["checks"] == ["C1", "C7"], plan["central_claims"]
+
+
+def test_central_claims_past_the_cap_are_refused_never_silently_cut():
+    """claims_in[:8] cut a 9th central claim on every attempt and recorded nothing (probe on HEAD da068d1)."""
+    with tempfile.TemporaryDirectory() as t:
+        lines = [f"Claim number {w} is shown by the experiments here." for w in
+                 ("one", "two", "three", "four", "five", "six", "seven", "eight", "nine")]
+        cfg, pid, x = _x(Path(t), ("\n".join(lines),))
+        claims = [{"quote": q, "claim_type": "theory", "checks": [], "scope": ["it"], "why_unchecked": "no check fits",
+                   "blocker": "other"} for q in lines]
+        assert "at most 8" in _refused(lambda: _plan(x, [], claims))
+        rec = _plan(x, [], claims, final=True)
+        assert len(rec["central_claims"]) == 8 and any(lines[8][:30] in d["why"] for d in rec["dropped"]), rec["dropped"]
+
+
+def test_a_follow_up_claim_may_rest_on_a_check_that_already_ran():
+    """Oct-01 PPRM: the follow-up claim "outperformed purely supervised or unsupervised baselines" omitted channel
+    equalization as `other` ("already run in round 1 as C3"): a follow-up claim could not link a first-round check, so a
+    scope item that ran read "not run"."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid, root = _ready(td)
+        _seal(cfg, pid, "plan", {"checks": [_run()], "central_claims": [_claim()]}, td)
+        x = tasks._Ctx(cfg, pid)
+        new = {"quote": GPT, "claim_type": "performance", "checks": ["C1", "F1"], "scope": ["CIFAR-10-C", "MMLU"]}
+        f1 = _run("F1", covers=("MMLU",), claim_quote=GPT, target={"quote": GPT, "relation": "acc_a > acc_b"})
+        rec = _plan(x, [f1], [new], tid="plan:2")
+        assert rec["central_claims"][0]["checks"] == ["C1", "C7"], rec["central_claims"]
+        state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "RELATION_HOLDS", "values": [1.0], "runs": 3})
+        _seal(cfg, pid, "plan:2", {"checks": [f1], "central_claims": [new]}, td)
+        state.write_json(root / "checks" / "C7" / "outcome.json", {"status": "RELATION_HOLDS", "values": [1.0], "runs": 3})
+        led = report.ledger(tasks._Ctx(cfg, pid))
+        row = next(c for c in led["central_claims"] if c["quote"] == GPT)["completion"]
+        assert row["scope_not_run"] == [] and row["ran"] == ["C1", "C7"], row
+
+
+def test_a_failure_counts_only_after_an_independent_audit_and_never_when_it_rests_on_an_open_reading():
+    """Oct-01 conformal: C9's sampler 'counterexample' held only when a walk may pass through t and come back — under first
+    arrival (the paper's "repeat this till u = t") every instance had zero discrepancy, an output the harness never read —
+    and C6's 'ratio not exactly 1' rested on a min-cut procedure substituted for the LP without the paper's trimming step,
+    marked not claim-changing. Both read FAILURE_FOUND: nobody looked at a failure once it was found."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid, root = _ready(td)
+        cert = {"id": "B", "kind": "CERTIFICATE", "claim_quote": THM, "statement_quote": THM, "role": "target",
+                "covers": ["the bound"]}
+        _seal(cfg, pid, "plan", {"checks": [cert], "central_claims": [
+            {"quote": THM, "claim_type": "theory", "checks": ["B"], "scope": ["the bound"]}]}, td)
+        dev = {"printed": "", "used": "walks may pass through the target and return", "why": "open", "changes_claim": False}
+        state.write_json(root / "checks" / "C1" / "check.json", {"deviations": [dev], "script_sha256": "s"})
+        state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "COUNTEREXAMPLE_FOUND", "values": [1, 1],
+                                                                   "reason": "8 admissible instances violate it"})
+        state.append_jsonl(root / "execution.jsonl", {"target": "C1", "mode": "evidence", "script_sha256": "s", "seed": 0,
+                                                      "stdout": 'REFEREE_RESULT {"premises_hold": 1, "violated": 1, '
+                                                                '"violated_first_arrival": 0}\n'})
+        x = tasks._Ctx(cfg, pid)
+        phase, owed, _ = tasks._plan(x)
+        assert [o["id"] for o in owed] == ["audit:C1"], owed                  # owed before any follow-up or report
+        brief = Path(owed[0]["prompt"]).read_text(encoding="utf-8")
+        assert '"violated_first_arrival": 0' in brief and "walks may pass through" in brief   # unmasked instances, deviations
+        led = report.ledger(x)
+        assert led["central_claims"][0]["claim_status"] == "PENDING" and led["scientific_status"] == "CHECKS_PENDING"
+        x = tasks._Ctx(cfg, pid)
+        assert "verdict" in _refused(lambda: tasks._seal_audit(x, "audit:C1", {"verdict": "maybe"}, final=False))
+        assert "`quotes`" in _refused(lambda: tasks._seal_audit(x, "audit:C1", {"verdict": "STANDS"}, final=False))
+        unfound = {"printed": "the walk stops at its first arrival", "tested_as": "revisits", "alternative": "first arrival only"}
+        assert "DEPENDS" in _refused(lambda: tasks._seal_audit(x, "audit:C1", {"verdict": "DEPENDS", "depends_on": [unfound]},
+                                                               final=False))                    # not the paper's words
+        nodev = {"printed": "", "deviation": 7, "tested_as": "revisits", "alternative": "first arrival only"}
+        assert "`deviation`" in _refused(lambda: tasks._seal_audit(x, "audit:C1", {"verdict": "DEPENDS", "depends_on": [nodev]},
+                                                                   final=False))
+        assert tasks._seal_audit(x, "audit:C1", {"verdict": "STANDS"}, final=True)["verdict"] == "UNRESOLVED"   # fail closed
+        dep = {"printed": "the bound holds for every n", "tested_as": "a walk may revisit the target",
+               "alternative": "walks stop at their first arrival; then no instance violates it"}
+        _seal(cfg, pid, "audit:C1", {"verdict": "DEPENDS", "depends_on": [dep, {**dep, "printed": "", "deviation": 0}]}, td)
+        x = tasks._Ctx(cfg, pid)
+        led = report.ledger(x)
+        assert led["central_claims"][0]["claim_status"] == "READING_CHANGED", led["central_claims"][0]["claim_status"]
+        assert led["scientific_status"] == "CENTRAL_READING_CHANGED"
+        md = report.render(x, led, None)
+        assert "## Failures found" not in md
+        rest = md.split("## Failures that rest on a reading or choice", 1)[1].split("\n## ", 1)[0]
+        assert "**C1**" in rest and "walks stop at their first arrival" in rest and "declared deviation 0" in rest, rest
+        assert report.unearned("C1 is a counterexample to Theorem 1.", led)          # a failure word it no longer earns
+        phase, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
+        assert phase == "plan" and "walks stop at their first arrival" in Path(owed[0]["prompt"]).read_text(encoding="utf-8")
+    with tempfile.TemporaryDirectory() as t:                  # the same failure, audited STANDS: it counts
+        td = Path(t)
+        cfg, pid, root = _ready(td)
+        _seal(cfg, pid, "plan", {"checks": [cert], "central_claims": [
+            {"quote": THM, "claim_type": "theory", "checks": ["B"], "scope": ["the bound"]}]}, td)
+        state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "COUNTEREXAMPLE_FOUND", "values": [1],
+                                                                   "reason": "8 admissible instances violate it"})
+        _audit_ok(cfg, pid, td, "C1")
+        led = report.ledger(tasks._Ctx(cfg, pid))
+        assert led["scientific_status"] == "CENTRAL_FAILURE_FOUND" and not report.unearned("C1 is a counterexample.", led)
+        state.write_json(root / "checks" / "C2" / "outcome.json", {"status": "RELATION_VIOLATED", "values": [-1]})
+        assert not report.needs_audit(root, {"id": "C2", "kind": "RECONSTRUCTION", "role": "supporting"})   # never counts
+
+
+def test_a_configured_cap_or_a_fault_of_this_run_is_never_reported_as_a_hardware_or_data_blocker():
+    """Oct-01 PPRM: C1 ended at the configured per-run limit (SH_RUN_TIMEOUT_S, a setting) and the review counted "compute 3"
+    — itself, and two follow-up omissions that cited it although it never ran their items. A transient fetch fault, the
+    data cap and a denied source all read `data`; a check cut by SH_MAX_CHECKS left its item `unstated` (the planner's)."""
+    rb = lambda cid, res: {"id": cid, "kind": "RECONSTRUCTION", "role": "target", "status": "BLOCKED", "resource": res,
+                           "reason": f"RESOURCE BLOCKER: {res}", "values": None, "covers": []}
+    db = lambda cid, cls, det="": {"id": cid, "kind": "RECONSTRUCTION", "role": "target", "status": "INCONCLUSIVE", "values": None,
+                                  "reason": "DATA ...", "covers": [], "data_blocker": [{"source": "s", "class": cls, "detail": det}]}
+    out = {b["item"]: b for b in report._blockers({"checks": ["C1"]}, [
+        rb("C1", "per_run_timeout"), rb("C2", "memory"), db("C3", "transient"), db("C4", "missing"),
+        db("C5", "storage", "passed the storage cap (SH_MAX_DATA_GB)"), db("C6", "denied")])}
+    assert out["C1"]["blocker"] == "cap" and out["C1"]["class"] == "per_run_timeout", out["C1"]
+    assert out["C2"]["blocker"] == "compute" and out["C3"]["blocker"] == "fault" and out["C4"]["blocker"] == "data"
+    assert out["C5"]["blocker"] == "cap" and out["C6"]["blocker"] == "cap", (out["C5"], out["C6"])
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid, root = _ready(td)
+        _seal(cfg, pid, "plan", {"checks": [_run(), _run("M", covers=("MMLU",), claim_quote=MMLU,
+                                                         target={"quote": MMLU, "relation": "acc_a > acc_b"})],
+                                 "central_claims": [_claim(), _claim(quote=MMLU, checks=["M"], scope=["MMLU"])]}, td)
+        state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "BLOCKED", "resource": "per_run_timeout",
+                                                                   "reason": "RESOURCE BLOCKER: a single run exceeded ..."})
+        state.write_json(root / "checks" / "C2" / "outcome.json", {"status": "INCONCLUSIVE", "reason": "DATA ACQUISITION FAILED",
+                                                                   "data_blocker": [{"source": "s", "class": "transient"}]})
+        x = tasks._Ctx(cfg, pid)
+        om = lambda item, b, **kw: {"item": item, "why": "it could not run here", "blocker": b, **kw}
+        new = lambda o, scope: {"quote": GPT, "claim_type": "performance", "checks": ["F1"], "scope": scope, "omitted": [o]}
+        f1 = _run("F1", covers=("GPT labeler",), claim_quote=GPT, target={"quote": GPT, "relation": "acc_a > acc_b"})
+        err = _refused(lambda: _plan(x, [f1], [new(om("CIFAR-10-C", "compute", failed_checks=["C1"]), ["GPT labeler", "CIFAR-10-C"])],
+                                     tid="plan:2"))
+        assert "`cap`" in err and "SH_RUN_TIMEOUT_S" in err, err                      # a setting, not this host's hardware
+        rec = _plan(x, [f1], [new(om("CIFAR-10-C", "cap", failed_checks=["C1"]), ["GPT labeler", "CIFAR-10-C"])], tid="plan:2")
+        assert not rec["central_claims"][0]["omitted"][0].get("unverified"), rec["central_claims"][0]["omitted"]
+        err = _refused(lambda: _plan(x, [f1], [new(om("Imagenet", "cap", failed_checks=["C1"]), ["GPT labeler", "Imagenet"])],
+                                     tid="plan:2"))
+        assert "did not run" in err, err                                              # evidence only for what it ran
+        err = _refused(lambda: _plan(x, [f1], [new(om("MMLU", "data", failed_checks=["C2"]), ["GPT labeler", "MMLU"])],
+                                     tid="plan:2"))
+        assert "fault of this run" in err, err                                        # a transient fault is no data fact
+        assert "no configured cap" in _refused(lambda: _plan(x, [f1], [new(om("GPT labeler 2", "cap"),
+                                                                           ["GPT labeler", "GPT labeler 2"])], tid="plan:2"))
+        # a plan sealed before this rule (the 10-01 PPRM follow-up) is flagged when its ledger is written
+        sealed = {"checks": [{"id": "C1", "covers": ["CIFAR-10-C"]}], "central_claims": [{"quote": GPT, "omitted": [
+            om("CIFAR-10-C", "compute", failed_checks=["C1"]), om("Imagenet", "compute", failed_checks=["C1"]),
+            om("MMLU", "data", failed_checks=["C2"])]}]}
+        report._failed_searches(root, sealed)
+        u = [o.get("unverified", "") for o in sealed["central_claims"][0]["omitted"]]
+        assert "configured cap" in u[0] and "not this item" in u[1] and "fault" in u[2], u
+    with tempfile.TemporaryDirectory() as t:                  # a check cut by SH_MAX_CHECKS: the harness says so
+        cfg, pid, x = _x(Path(t))
+        cfg.max_checks = 1
+        claims = [_claim(), _claim(quote=MMLU, checks=["M"], scope=["MMLU"])]
+        m = _run("M", covers=("MMLU",), claim_quote=MMLU, target={"quote": MMLU, "relation": "acc_a > acc_b"})
+        assert "SH_MAX_CHECKS" in _refused(lambda: _plan(x, [_run(), m], claims))
+        rec = _plan(x, [_run(), m], claims, final=True)
+        o = rec["central_claims"][1]["omitted"]
+        assert o and o[0]["blocker"] == "cap" and o[0]["basis"] == "harness" and "SH_MAX_CHECKS" in o[0]["why"], o
+        for i in range(cfg.max_discoveries):                 # the search budget spent: `cap` stands on that fact
+            state.append_jsonl(x.root / "discovery.jsonl", {"id": f"D{i + 1}", "query": f"q{i}", "results": {"zenodo": {"candidates": []}}})
+        cfg.max_checks = 6
+        rec = _plan(x, [_run()], [_claim(scope=["CIFAR-10-C", "Qwen 7B"], omitted=[om("Qwen 7B", "cap")])])
+        assert "SH_MAX_DISCOVERIES" in rec["central_claims"][0]["omitted"][0]["cap"], rec["central_claims"][0]["omitted"]
+        whole = {"quote": MMLU, "claim_type": "performance", "checks": [], "scope": ["MMLU"], "why_unchecked": "searches",
+                 "blocker": "other"}
+        assert _plan(x, [_run()], [_claim(), whole])["central_claims"][1]["budget_spent"]   # a whole claim too
+
+
+def test_a_data_fetch_or_a_draft_never_takes_an_evidence_slot():
+    """Oct-01 run: from 07:30 to 08:16Z two fetches were always running and no evidence run started in any of the three
+    papers — PPRM C5/C6 (6-15 s runs, approved by 07:37) waited 41 minutes — because the SH_PARALLEL pool counted every
+    REFEREE container except installs."""
+    real = execute._docker
+    running = {"label=referee.mode=evidence": "", "label=referee.mode=try": "", "label=referee=1": "f1 f2"}
+    execute._docker = lambda argv, timeout: (0, running.get(argv[-1], ""))
+    try:
+        cfg = state.Config()
+        cfg.parallel = 2
+        assert execute.evidence_slots(cfg) == 2, execute.evidence_slots(cfg)           # two fetches take no slot
+        running.update({"label=referee.mode=try": "t1"})
+        assert execute.evidence_slots(cfg) == 1      # a draft runs the real script on the host's CPU and memory: it does
+        running.update({"label=referee.mode=evidence": "e1"})
+        assert execute.evidence_slots(cfg) == 0
+        execute._docker = lambda argv, timeout: (1, "")
+        assert execute.evidence_slots(cfg) == 0                                         # a daemon that cannot answer: none
+    finally:
+        execute._docker = real
+
+
+def test_the_gpu_is_held_only_by_a_run_that_can_use_it():
+    """Oct-01 PPRM: every RECONSTRUCTION on a GPU host was given the GPU, so CPU-only simulations and their drafts queued
+    behind a ResNet-1202 run — one expensive experiment serialized every independent one."""
+    numpy = "import numpy as np\nprint('REFEREE_RESULT', {})\n"
+    assert not execute.wants_gpu(numpy, False)
+    assert execute.wants_gpu("import torch\n", False) and execute.wants_gpu("from transformers import AutoModel\n", False)
+    assert execute.wants_gpu("# REFEREE_PACKAGES: torch==2.3.0\nimport numpy\n", False)
+    assert execute.wants_gpu("m = __import__('tor' + 'ch')\n", False)                  # a dynamic import: unknown is yes
+    assert execute.wants_gpu(numpy, True)                                               # it may drive the authors' code
+    with tempfile.TemporaryDirectory() as t:
+        cfg = state.Config()
+        cfg.projects = Path(t)
+        state.write_json(Path(t) / ".gpu.json", True)
+        assert not execute.gpu_run(cfg, {"kind": "RECONSTRUCTION", "gpu": False})
+        assert execute.gpu_run(cfg, {"kind": "RECONSTRUCTION"})                         # an older record: yes, one at a time
+        assert execute.gpu_run(cfg, {"kind": "AUTHOR_CODE", "gpu": False})              # authors' code: always offered it
+        assert not execute.gpu_run(cfg, {"kind": "CERTIFICATE"})
+
+
+def test_a_task_no_worker_can_answer_ends_its_check_and_the_review_goes_on():
+    """Oct-01 PPRM: a permission block kept two workers from answering gen:C7.2; the workflow gave the task up and then
+    stopped — although C8's draft and C9's evidence run were in flight — because the harness reported executions running
+    only when no task was owed. The paper never reached its follow-up or report until the operator relaunched it."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid, root = _ready(td)
+        cert = {"id": "B", "kind": "CERTIFICATE", "claim_quote": THM, "statement_quote": THM, "role": "target",
+                "covers": ["the bound"]}
+        _seal(cfg, pid, "plan", {"checks": [cert], "central_claims": [
+            {"quote": THM, "claim_type": "theory", "checks": ["B"], "scope": ["the bound"]}]}, td)
+        real = execute.script_env
+        execute.script_env = lambda *a, **k: (td / ".script-env", {"ok": True, "detail": "baseline"})
+        try:
+            phase, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
+            assert [o["id"] for o in owed] == ["gen:C1.1"], owed
+            assert "not a pending task" in tasks.abandon(cfg, pid, "gen:C9.1", "x")["error"]
+            out = tasks.abandon(cfg, pid, "gen:C1.1", "two workers produced no sealable answer (a permission block)")
+            assert out["abandoned"] == "gen:C1.1", out
+            o = state.read_json(root / "checks" / "C1" / "outcome.json")
+            assert o["status"] == "INCONCLUSIVE" and "permission block" in o["reason"] and "nothing about the paper" in o["reason"], o
+            assert tasks._plan(tasks._Ctx(cfg, pid))[0] == "plan"                       # the review goes on: its follow-up
+            assert tasks.reopen(cfg, pid, "C1", "the permission block was lifted")["reopened"] == "C1"   # never a finding
+        finally:
+            execute.script_env = real
+    assert tasks.blocked_reason(["C8", "C9"]) .startswith("executions running")         # said whenever anything runs
+
+
+def test_a_record_file_the_plan_neither_requests_nor_excludes_is_a_gap_of_the_acquisition():
+    """Oct-01 transformer: Zenodo 18281512 lists 25 files; the plan took 20 although its own `why` said 24 task-by-model
+    CSVs. The acquisition read complete against that plan, and after the post-run fix the 5 were shown but counted for
+    nothing: a claim could still read RAN_AS_SPECIFIED on the 20."""
+    with tempfile.TemporaryDirectory() as t:
+        cfg, pid, x = _x(Path(t))
+        rec = "https://zenodo.org/records/18281512"
+        state.append_jsonl(x.root / "discovery.jsonl", {"id": "F1", "files_of": rec, "api": "x", "files": [
+            {"name": n, "bytes": 1, "md5": ""} for n in ("a.csv", "b.csv", "c.csv", "README.md")]})
+        acq = {"source": rec, "cited_in": "paper", "include": ["a.csv", "b.csv"]}
+        chk = lambda **a: dict(_run(), kind="RELEASED_DATA", basis="predictions", acquire=[{**acq, **a}])
+        err = _refused(lambda: _plan(x, [chk()], [_claim()]))
+        assert "c.csv" in err and "`exclude`" in err and "README" not in err, err          # code and docs are text, not data
+        assert "reason" in _refused(lambda: _plan(x, [chk(exclude=[{"pattern": "c.csv"}])], [_claim()]))
+        why = "the claim compares tasks a and b only"
+        sealed = _plan(x, [chk(exclude=[{"pattern": "c.csv", "why": why}])], [_claim()])
+        assert sealed["checks"][0]["acquire"][0]["exclude"] == [{"pattern": "c.csv", "why": why}]
+        assert sealed["checks"][0]["acquire"][0]["listed_at_seal"] is True               # the planner was shown the listing
+        root = x.root
+        data = {"sources": [{"source": rec, "dir": "0", "listing": ["a.csv", "b.csv", "c.csv", "README.md"], "admitted_files": 2,
+                             "admitted": [{"file": "a.csv"}, {"file": "b.csv"}]}], "n_files": 2, "fetched_at": "t"}
+        state.write_json(root / "checks" / "C1" / "data.json", data)
+        c = {"id": "C1", "kind": "RELEASED_DATA", "acquire": [{**acq, "listed_at_seal": True}],
+             "data_identity": {"a": {"matches": True}}, "values": [1]}
+        gaps = report._data_changed(c, root)                                             # sealed leniently, on its last attempt
+        assert any("c.csv" in g and "neither requested nor excluded" in g for g in gaps), gaps
+        c["acquire"] = [{**acq, "listed_at_seal": True, "exclude": [{"pattern": "c.csv", "why": why}]}]
+        assert report._data_changed(c, root) == []                                       # left out for a stated reason
+        lines = report._unrequested_lines({**c, "not_requested": execute.unrequested(root, data)})
+        assert any("excluded by the plan" in ln and why in ln for ln in lines), lines
+        c["acquire"] = [acq]       # a listing only the fetcher saw (a hub repo's other configurations): shown, never a gap
+        assert report._data_changed(c, root) == []
+
+
+def test_a_scope_entry_that_lists_several_datasets_is_several_items():
+    """Oct-01 PPRM: one scope item named five benchmarks, C7 covered it, and Social-IQA never arrived; only the script's
+    own deviation and its REFEREE_DATA line (`not_available: ['Social-IQA']`) showed the dropped dataset."""
+    assert tasks._parts("MMLU, CMExam, CommonsenseQA, Social-IQA and PubMedQA benchmark questions") == [
+        "MMLU", "CMExam", "CommonsenseQA", "Social-IQA", "PubMedQA benchmark questions"]
+    assert tasks._parts("Qwen predictors Q2.5-VL3B, Q2-VL7B and Q2.5-VL32B") == ["Qwen predictors Q2.5-VL3B", "Q2-VL7B", "Q2.5-VL32B"]
+    for one in ("Airport to Center trips (about 300, 40%/60% mixture, 100 train / 100 test)", "1,000 held-out samples",
+                "increasing psi_t and non-monotonic psi_t", "core density alpha in {0.2,0.4,0.6,0.8}"):
+        assert tasks._parts(one) == [one], (one, tasks._parts(one))
+    with tempfile.TemporaryDirectory() as t:
+        cfg, pid, x = _x(Path(t))
+        five = "MMLU, CMExam, CommonsenseQA, Social-IQA and PubMedQA"
+        m = _run("M", covers=(five,), claim_quote=MMLU, target={"quote": MMLU, "relation": "acc_a > acc_b"})
+        claim = _claim(quote=MMLU, checks=["M"], scope=[five])
+        assert "Social-IQA" in _refused(lambda: _plan(x, [m], [claim]))
+        rec = _plan(x, [m], [claim], final=True)
+        assert rec["central_claims"][0]["scope"] == ["MMLU", "CMExam", "CommonsenseQA", "Social-IQA", "PubMedQA"]
+        cc = {**rec["central_claims"][0], "checks": ["C1"]}
+        ran = {"id": "C1", "kind": "RECONSTRUCTION", "role": "target", "state": "COMPLETED", "status": "RELATION_HOLDS",
+               "values": [1.0], "deviations": [], "covers": [five], "data_changed": [], "reason": "",
+               "data_identity": {"question_pool": {"matches": True, "not_available": ["Social-IQA"]}}}
+        row = report._completion_row({**cc, "page": 1}, {"C1": ran})
+        assert row["scope_not_run"] == ["Social-IQA"] and row["experiment"] == "RAN_PARTIAL", row
+        b = next(b for b in row["not_run"] if b["item"] == "Social-IQA")
+        assert "REFEREE_DATA" in b["why"], b
+        # as the 10-01 C7 printed it: under `observed`; an old, unsplit scope entry naming it is not run either
+        ran["data_identity"] = {"question_pool": {"matches": False, "observed": {"not_available": ["Social-IQA"]}}}
+        row = report._completion_row({**cc, "scope": [five], "page": 1}, {"C1": ran})
+        assert row["scope_not_run"] == [five], row
+
+
+def test_the_criterion_and_what_changes_the_claim_need_the_verifiers_key_too():
+    """Oct-01: transformer C7 tested "Such a formula does not fit the empirical data well" by a planner relation labelled
+    `stated` (C1 had labelled the same relation `supplied`); conformal C4/C6 computed "the LP solution" by a substituted
+    min-cut procedure without the paper's trimming step, marked not claim-changing by its author, and C6 read
+    FAILURE_FOUND. Each label was one model's word; now the verifier states both independently, and either key moves the
+    result to the changed claim — never the other way."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid, root = _ready(td)
+        _seal(cfg, pid, "plan", {"checks": [_run("R")], "central_claims": [_claim()]}, td)
+        cdir = root / "checks" / "C1"
+        script = "import argparse\np = argparse.ArgumentParser(); p.add_argument('--seed', type=int); p.parse_args()\n"
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "script.1.py").write_text(script, encoding="utf-8")
+        sha = state.sha256(script)
+        devs = [{"printed": "", "used": "the LP solution is computed by a parametric min-cut", "why": "equivalent", "changes_claim": False},
+                {"printed": "", "used": "a grid of phi values", "why": "open", "changes_claim": False}]
+        seals = state.read_json(root / "seals.json", {})
+        p = root / "sealed" / "gen__C1.1.json"
+        state.write_json(p, {"script_sha256": sha, "runs": 3, "runs_quote": "", "metric": "", "outputs": ["acc_a", "acc_b"],
+                             "deviations": devs, "bindings": [], "stochastic": True, "seed_flow": True})
+        seals["gen:C1.1"] = state.sha256(p.read_bytes())
+        state.write_json(root / "seals.json", seals)
+        x = tasks._Ctx(cfg, pid)
+        ok = {"verdict": "APPROVE", "quotes": [CIFAR], "criterion": "stated", "claim_changing": []}
+        assert "`criterion`" in _refused(lambda: tasks._seal_verify(x, "verify:C1.1", {**ok, "criterion": ""}, final=False))
+        assert "`claim_changing`" in _refused(lambda: tasks._seal_verify(
+            x, "verify:C1.1", {k: v for k, v in ok.items() if k != "claim_changing"}, final=False))
+        assert "indices" in _refused(lambda: tasks._seal_verify(x, "verify:C1.1", {**ok, "claim_changing": [5]}, final=False))
+        strict = tasks._seal_verify(x, "verify:C1.1", {"verdict": "APPROVE", "quotes": [CIFAR]}, final=True)
+        assert strict["criterion"] == "supplied" and strict["claim_changing"] == [0, 1], strict   # the strictest reading
+        rec = tasks._seal_verify(x, "verify:C1.1", {**ok, "criterion": "supplied", "claim_changing": [0]}, final=False)
+        p = root / "sealed" / "verify__C1.1.json"
+        state.write_json(p, rec)
+        seals["verify:C1.1"] = state.sha256(p.read_bytes())
+        state.write_json(root / "seals.json", seals)
+        real = execute.poll
+        execute.poll = lambda *a, **k: False
+        try:
+            tasks._plan(tasks._Ctx(cfg, pid))
+        finally:
+            execute.poll = real
+        chk = state.read_json(cdir / "check.json")
+        assert chk["criterion"] == "supplied" and chk["deviations"][0]["changes_claim"] is True, chk
+        assert chk["deviations"][0]["changes_claim_by"] == "verifier" and chk["deviations"][1]["changes_claim"] is False
+        assert any("decision criterion" in d["used"] and d["changes_claim"] for d in chk["deviations"]), chk["deviations"]
+        assert "gpu" in chk
+
+
+def test_a_revision_never_drops_a_claim_changing_choice_without_saying_why():
+    """Oct-01 conformal C5: round 1 declared a claim-changing deviation; rounds 2 and 3 declared none and round 3 was
+    approved, with nothing recording why it went (the filter was fixed — or only its label was dropped). Self-correction
+    keeps the scope: a revision that drops or relabels a claim-changing choice says what in the script changed."""
+    with tempfile.TemporaryDirectory() as t:
+        cfg = state.Config()
+        plan = {"checks": [{"id": "C1", "kind": "CERTIFICATE", "metric": "", "statement": "Lemma 1", "step": ""}]}
+        dev = {"printed": "", "used": "trips are filtered by a 4 km radius around the airport", "why": "open", "changes_claim": True}
+        prev = {"deviations": [{**dev, "page": None}], "runs": 8}
+        x = type("X", (), {"root": Path(t), "paper": Paper(PAGES, ROWS), "cfg": cfg,
+                           "sealed": lambda self, tid: prev if tid == "gen:C1.1" else plan, "plan": lambda self: plan})()
+        script = "n = 1\nassert n\nok = n > 0\nprint('REFEREE_RESULT', {'violated': 0, 'premises_hold': 1, 'literal': 'holds'})\n"
+        b = [{"kind": k, "impl_quote": q, "paper_quote": "reaches 61.4 accuracy"} for k, q in
+             (("hypotheses", "assert n"), ("claimed_bound", "ok = n > 0"), ("instance", "n = 1"))]
+        g = {"script": script, "runs": 8, "outputs": ["violated"], "bindings": b, "deviations": []}
+        err = _refused(lambda: tasks._seal_gen(x, "gen:C1.2", g, final=False))
+        assert "revision_notes" in err and "4 km radius" in err, err
+        assert "revision_notes" in _refused(lambda: tasks._seal_gen(x, "gen:C1.2", {**g, "deviations": [{**dev, "changes_claim": False}]},
+                                                                    final=False))          # relabelled, not removed: the same
+        assert "runs" in _refused(lambda: tasks._seal_gen(x, "gen:C1.2", {**g, "runs": 3, "deviations": [dev]}, final=False))
+        note = {"was": "trips are filtered by a 4 km radius", "why": "the filter now reproduces the paper's 300 trips exactly"}
+        rec = tasks._seal_gen(x, "gen:C1.2", {**g, "revision_notes": [note]}, final=False)
+        assert rec["revisions"]["dropped_claim_changing"] == [dev["used"]] and rec["revisions"]["notes"][0]["why"] == note["why"]
+        strict = tasks._seal_gen(x, "gen:C1.2", g, final=True)                         # the last attempt: carried, strictest
+        assert strict.get("refused") or any(d["used"] == dev["used"] and d["changes_claim"] for d in strict["deviations"]), strict
+
+
+def test_a_follow_up_rounds_re_examined_omission_is_the_one_reported():
+    """Oct-01 PPRM: the follow-up round re-examined the Qwen omissions (first sealed `data` on searches that had failed);
+    `merged` kept the first round's entry, so the ledger still reported the blocker the re-plan was made to replace."""
+    first = {"checks": [], "dropped": [], "central_claims": [{"quote": "q", "checks": [], "why_unchecked": "",
+             "omitted": [{"item": "Qwen 7B", "why": "no record", "blocker": "data", "unverified": "searches failed"}]}]}
+    follow = {"checks": [], "dropped": [], "central_claims": [{"quote": "q", "checks": [], "why_unchecked": "",
+              "omitted": [{"item": "Qwen 7B", "why": "the search budget is spent", "blocker": "other"}]}]}
+    om = report.merged(first, follow)["central_claims"][0]["omitted"]
+    assert len(om) == 1 and om[0]["blocker"] == "other" and om[0]["earlier"]["blocker"] == "data", om
+
 
 if __name__ == "__main__":
     fns = [v for k, v in dict(globals()).items() if k.startswith("test_")]

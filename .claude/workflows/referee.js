@@ -34,6 +34,7 @@ const STATE = {
   properties: {
     paper_id: { type: 'string' }, phase: { type: 'string' }, status: { type: 'string' },
     blocked_reason: { type: 'string' }, scientific_status: { type: 'string' }, completion: { type: 'string' },
+    running: { type: 'array', items: { type: 'string' } },
     tasks: { type: 'array', items: { type: 'object', properties: {
       id: { type: 'string' }, role: { type: 'string' }, prompt: { type: 'string' },
       out: { type: 'string' }, effort: { type: 'string' },
@@ -57,11 +58,14 @@ async function run(kind, prompt, opts) {
   return agent(prompt, opts)
 }
 
-function controller(source, label) {
+function controller(source, label, abandon) {
+  // `abandon`: task ids two workers could not answer; the harness ends each first (an honest nothing; a check's is
+  // INCONCLUSIVE, a fault of this run) so one stuck task never stops the rest of the review.
+  const extra = abandon && abandon.length ? ` --abandon "${abandon.join(',')}" --why "two workers produced no sealable answer"` : ''
   return run('controller',
     `Run exactly this shell command (Bash, timeout 600000 ms) and return its JSON stdout fields ` +
-    `verbatim (paper_id, phase, status, blocked_reason, scientific_status, completion, tasks). Do nothing else:\n\n` +
-    sh(`run.py tasks "${source}" --json --wait 540`),
+    `verbatim (paper_id, phase, status, blocked_reason, running, scientific_status, completion, tasks). Do nothing else:\n\n` +
+    sh(`run.py tasks "${source}" --json --wait 540${extra}`),
     { label, phase: 'Review', model: CONTROLLER_MODEL, effort: 'low', schema: STATE })
 }
 
@@ -86,14 +90,24 @@ function worker(pid, t, prior) {
 }
 
 async function review(source) {
-  const rounds = [], fails = {}, why = {}
+  const rounds = [], fails = {}, why = {}, abandoned = {}
   let st = await controller(source, `tasks:${source}`)
   let waits = 0
   for (let round = 0; st && round < MAX_ROUNDS; round++) {
     const pid = st.paper_id
     const ready = st.tasks.filter(t => (fails[t.id] || 0) < 2)
     if (!ready.length) {
-      if (!String(st.blocked_reason || '').startsWith('executions running') || waits >= MAX_WAITS) break
+      // The harness says "executions running" whenever a run is in flight, tasks owed or not: keep polling them.
+      const busy = String(st.blocked_reason || '').startsWith('executions running')
+      const stuck = st.tasks.filter(t => (fails[t.id] || 0) >= 2 && !abandoned[t.id])
+      if (!busy && stuck.length) {
+        stuck.forEach(t => { abandoned[t.id] = true })
+        log(`${pid}: ending ${stuck.map(t => t.id).join(', ')} (two workers produced no sealable answer)`)
+        st = await controller(pid, `abandon:${pid}`, stuck.map(t => t.id))
+        round--
+        continue
+      }
+      if (!busy || waits >= MAX_WAITS) break
       log(`${pid}: ${st.blocked_reason}; waiting (${++waits}/${MAX_WAITS})`)
       st = await controller(pid, `wait:${pid}:${waits}`)
       round--
@@ -116,7 +130,7 @@ async function review(source) {
            // `workflow_status` says the workflow reached its end; `completion` says which requested experiments ran.
            completion: st.completion || 'NOT_ASSESSED',
            left: (st.tasks || []).map(t => t.id) },
-           rounds, waits, gave_up: Object.keys(fails).filter(k => fails[k] >= 2) }
+           rounds, waits, gave_up: Object.keys(fails).filter(k => fails[k] >= 2), abandoned: Object.keys(abandoned) }
 }
 
 phase('Review')

@@ -42,33 +42,125 @@ BASIS_WORDS = {"published_results": "audit of released result files", "predictio
                "fresh_run": "fresh run", "exact_instances": "exact instances", "paper_numbers": "the paper's own numbers"}
 
 
-def merged(plan: dict | None, follow: dict | None) -> dict | None:
+def parts(item: str) -> list[str]:
+    """The items of a scope entry that lists several ("A, B and C", "A; B"): split at commas and semicolons outside
+    brackets (never inside a number such as 1,000), and the last of them at a final and/or. One item returns itself
+    (Oct-01 PPRM: one entry naming five benchmarks read as covered while one of them never arrived)."""
+    s, out, depth, cur = str(item or ""), [], 0, ""
+    for i, ch in enumerate(s):
+        depth += ch in "([{"
+        depth -= ch in ")]}" and depth > 0
+        if ch in ",;" and depth == 0 and not (ch == "," and 0 < i < len(s) - 1 and s[i - 1].isdigit() and s[i + 1].isdigit()):
+            out.append(cur)
+            cur = ""
+            continue
+        cur += ch
+    out = [p.strip() for p in out + [cur] if p.strip()]
+    if len(out) < 2:
+        return [s.strip()]
+    if not re.search(r"[(\[{]", out[-1]):
+        out = out[:-1] + [p.strip() for p in re.split(r"\s+(?:and|or)\s+", out[-1]) if p.strip()]
+    return out
+
+
+def same_claim(a: str, b: str) -> bool:
+    """One printed claim: the same quote, or one quote inside the other (a later round quoting part of a sentence an
+    earlier plan listed restates that claim; it never opens a second, narrower one beside it)."""
+    fa, fb = flat(a), flat(b)
+    return fa == fb or (min(len(fa), len(fb)) >= 20 and (fa in fb or fb in fa))
+
+
+def withdrawn_plans(root: Path) -> list[dict]:
+    """Follow-up plans the operator withdrew (tasks._replan), each still sealed as plan:2.withdrawn.N: their checks were
+    set aside, never their claims. A file whose bytes no longer hash to its seal is not read as one."""
+    seals = state.read_json(Path(root) / "seals.json", {}) or {}
+    out = []
+    for f in sorted((Path(root) / "sealed").glob("plan__2.withdrawn.*.json"), key=lambda p: p.stem.rsplit(".", 1)[1].zfill(4)):
+        n = f.stem.rsplit(".", 1)[1]
+        if seals.get(f"plan:2.withdrawn.{n}") == state.sha256(f.read_bytes()):
+            out.append({**(state.read_json(f) or {}), "withdrawn": n})
+    return out
+
+
+def merged(plan: dict | None, follow: dict | None, withdrawn: list[dict] | tuple = ()) -> dict | None:
     """The first plan with its follow-up round: the follow-up's checks appended, its links and
-    reasons joined onto the same central claims (matched by quote)."""
-    if not plan or not follow:
+    reasons joined onto the same central claims (matched by quote, or one quote inside the other). A claim a
+    withdrawn follow-up plan listed stays accounted, unchecked, until a later round takes it up: re-planning a round
+    never removes a claim from the record (Oct-01 PPRM)."""
+    if not plan:
         return plan
     claims = [dict(cc) for cc in plan["central_claims"]]
-    for f in follow.get("central_claims", []):
-        cc = next((c for c in claims if flat(c["quote"]) == flat(f["quote"])), None)
+    for f in (follow or {}).get("central_claims", []):
+        cc = next((c for c in claims if same_claim(c["quote"], f["quote"])), None)
         if cc is None:
             claims.append(f)
             continue
         cc["checks"] = cc["checks"] + [k for k in f["checks"] if k not in cc["checks"]]
         cc["why_unchecked"] = f.get("why_unchecked") or cc.get("why_unchecked", "")
         # An omission stays on record until a check that covers it RAN (decided in _completion from what ran),
-        # never merely because a follow-up check was planned for it.
-        seen = {flat(o["item"]) for o in cc.get("omitted") or []}
-        cc["omitted"] = (cc.get("omitted") or []) + [o for o in f.get("omitted") or [] if flat(o["item"]) not in seen]
+        # never merely because a follow-up check was planned for it. The later round's word on an item it re-examined
+        # is the one reported; the earlier one stays beside it (Oct-01 PPRM: the re-plan's own blocker was dropped).
+        om = {flat(o["item"]): o for o in cc.get("omitted") or []}
+        for o in f.get("omitted") or []:
+            k = flat(o["item"])
+            om[k] = {**o, "earlier": {x: om[k][x] for x in ("blocker", "why", "unverified") if om[k].get(x)}} if k in om else o
+        cc["omitted"] = list(om.values())
         for k in ("blocker", "not_the_dataset"):
             cc[k] = f.get(k) or cc.get(k, "")
         for k in ("discovery", "failed_checks"):
             cc[k] = list(dict.fromkeys((cc.get(k) or []) + (f.get(k) or [])))
-    return {**plan, "checks": plan["checks"] + follow["checks"], "central_claims": claims,
-            "dropped": plan.get("dropped", []) + follow.get("dropped", [])}
+    for w in withdrawn:
+        for f in w.get("central_claims") or []:
+            if not any(same_claim(c["quote"], f["quote"]) for c in claims):
+                claims.append({**f, "checks": [], "withdrawn_plan": w["withdrawn"], "why_unchecked": (
+                    f"listed only by a follow-up plan the operator withdrew (sealed/plan__2.withdrawn.{w['withdrawn']}.json; "
+                    f"its checks are kept aside as checks/<id>.withdrawn.{w['withdrawn']}); no later round took it up")})
+    out = {**plan, "central_claims": claims}
+    return {**out, "checks": plan["checks"] + follow["checks"],
+            "dropped": plan.get("dropped", []) + follow.get("dropped", [])} if follow else out
+
+
+def plan_of(root: Path) -> dict | None:
+    """The plan of one review as sealed on disk: the first round, its follow-up, and the claims of any withdrawn one."""
+    return merged(state.read_json(Path(root) / "sealed" / "plan.json"), state.read_json(Path(root) / "sealed" / "plan__2.json"),
+                  withdrawn_plans(root))
 
 
 def _changed(c: dict) -> bool:
     return any(d.get("changes_claim") for d in c.get("deviations") or [])
+
+
+def _moved_before_audit(c: dict) -> bool:
+    """A result about a changed claim by what the check itself records: a claim-changing deviation (a REFEREE-supplied
+    criterion is one) or data other than it requested. A certificate separates its readings itself (COUNTEREXAMPLE_FOUND
+    is always about the text as printed), so only its audit can move it."""
+    return (_changed(c) or bool(c.get("data_changed"))) and c["kind"] != "CERTIFICATE"
+
+
+def _moved(c: dict) -> bool:
+    """Is a check's result about a changed claim rather than the printed one? As recorded by the check, or — for a
+    failure — as an independent audit found it: resting on a reading or a choice the paper's words leave open."""
+    return _moved_before_audit(c) or (c.get("status") in FAILURE
+                                      and (c.get("audit") or {}).get("verdict", "STANDS") != "STANDS")
+
+
+def sealed_record(root: Path, tid: str) -> dict | None:
+    """A sealed task record, only if its bytes still hash to what was sealed (as tasks._sealed)."""
+    f = Path(root) / "sealed" / f"{re.sub(r'[^\w.-]+', '__', tid)}.json"
+    seal = (state.read_json(Path(root) / "seals.json", {}) or {}).get(tid)
+    return state.read_json(f) if seal and f.is_file() and state.sha256(f.read_bytes()) == seal else None
+
+
+def needs_audit(root: Path, c: dict) -> bool:
+    """Does this check's failure stand on the printed claim, so that an independent audit must look at it before it counts?
+    A target check whose status is a failure (an arithmetic contradiction has its own page-image transcriber) and whose
+    result is not already about a changed claim."""
+    o = state.read_json(Path(root) / "checks" / c["id"] / "outcome.json") or {}
+    if o.get("status") not in FAILURE or c["kind"] == "ARITHMETIC" or c.get("role", "target") != "target":
+        return False
+    run = state.read_json(Path(root) / "checks" / c["id"] / "check.json", {}) or {}
+    chk = {**c, "deviations": run.get("deviations", []), "data_identity": o.get("data_identity"), "values": o.get("values")}
+    return not _moved_before_audit({**chk, "data_changed": _data_changed(chk, Path(root))})
 
 
 def _data_changed(c: dict, root: Path) -> list[str]:
@@ -78,8 +170,9 @@ def _data_changed(c: dict, root: Path) -> list[str]:
     acquired data — no identity line at all. Empty when nothing says the data changed."""
     if c["kind"] not in _EXPERIMENT:
         return []
-    from .execute import data_gaps
-    out = list(data_gaps(state.read_json(root / "checks" / c["id"] / "data.json") or {})) if c.get("acquire") else []
+    from .execute import data_gaps, unaccounted
+    d = state.read_json(root / "checks" / c["id"] / "data.json") or {}
+    out = list(data_gaps(d)) + unaccounted(root, d, c["acquire"]) if c.get("acquire") else []
     ident = c.get("data_identity") or {}
     out += [f"dataset {n}: identity not affirmed (matches: {i.get('matches') if isinstance(i, dict) else i!r})"
             for n, i in ident.items() if not (isinstance(i, dict) and i.get("matches") is True)]
@@ -115,18 +208,22 @@ def _claim_status(cs: list[dict], conflicted: bool = False, claim_type: str = ""
         return "CHECKS_DISAGREE"
     # A certificate separates its readings itself (COUNTEREXAMPLE_FOUND is always about the text as
     # printed); any other check's result under a claim-changing deviation, or on data other than the data
-    # it requested, is about the changed claim.
-    moved = lambda c: (_changed(c) or bool(c.get("data_changed"))) and c["kind"] != "CERTIFICATE"
-    st = _found(cs, moved)
+    # it requested, is about the changed claim — and so is a failure an independent audit found resting on a reading
+    # or choice the paper leaves open.
+    st = _found(cs, _moved)
     return "PARTIAL_EVIDENCE" if partial and st in ("SUPPORT_FOUND", "NO_VIOLATION_FOUND") else st
 
 
 def _found(cs: list[dict], moved) -> str:
     fails = [c for c in cs if c["status"] in FAILURE and not moved(c)]
+    held = [c for c in fails if c.get("audit_owed") and not c.get("audit")]   # awaiting its independent audit: not yet one
+    fails = [c for c in fails if c not in held]
     if any(c["evidence"] != "PROOF_AUDIT" for c in fails):
         return "FAILURE_FOUND"
     if fails:
         return "PROOF_GAP_FOUND"
+    if held:
+        return "PENDING"
     if any(c["status"] == READINGS_DIFFER for c in cs):
         return "READINGS_DISAGREE"
     if any(c["status"] in SUPPORT and not moved(c) for c in cs):
@@ -192,11 +289,16 @@ def _done(c: dict) -> str:
 def _unrequested_lines(c: dict) -> list[str]:
     """What the source's complete listing names that this plan did not request: said by the harness, beside the data
     identity lines, so a file left out by the plan never reads as missing from the release."""
+    from .fetcher import _named
     out, named = [], {f for u in (c.get("not_requested") or {}).values() for f in u["not_requested"]}
     for d, u in sorted((c.get("not_requested") or {}).items()):
+        acq = c.get("acquire") or []
+        exc = (acq[int(d)] if d.isdigit() and int(d) < len(acq) else {}).get("exclude") or []
         out.append(f"  - source `{u['source']}`: its record lists {u['listed']} data file(s); this plan did not request: "
                    + ", ".join(u["not_requested"][:12]) + (f" (+{len(u['not_requested']) - 12} more)" if len(u["not_requested"]) > 12 else "")
                    + " — not acquired by this check, not absent from the release")
+        out += [f"    - excluded by the plan: {', '.join(n for n in u['not_requested'] if _named(n, [e['pattern']]))[:200]} — "
+                f"{_cell(e['why'], 200)}" for e in exc if any(_named(n, [e["pattern"]]) for n in u["not_requested"])]
     for name, ident in (c.get("data_identity") or {}).items():
         src = str((ident or {}).get("source") or "") if isinstance(ident, dict) else ""
         if src.rsplit("/", 1)[-1] in {n.rsplit("/", 1)[-1] for n in named}:
@@ -258,6 +360,7 @@ def _checks(root: Path, plan: dict) -> list[dict]:
                     "execution": o.get("execution"), "stochastic": run.get("stochastic"),
                     "command": run.get("command", ""), "identity": run.get("identity"),
                     "script_sha256": run.get("script_sha256", ""), "deviations": run.get("deviations", []),
+                    "revisions": run.get("revisions") or [], "criterion": run.get("criterion", c.get("criterion", "")),
                     "premise_argument": run.get("premise_argument", ""),
                     "state": _state(root, c["id"], state.read_json(cdir / "outcome.json", {}) or {}),
                     # an outcome decided from checkpointed seeds before they counted as runs says so in its protocol
@@ -277,6 +380,10 @@ def _checks(root: Path, plan: dict) -> list[dict]:
                     "records": "execution.jsonl" if o.get("runs") or (o.get("protocol") or {}).get(
                         "seeds_reused_from_checkpoints") else ""})
         out[-1]["data_changed"] = _data_changed(out[-1], root)
+        # A failure about the printed claim counts once an independent auditor, shown the failing instances, found it
+        # does not rest on a reading or choice the paper's words leave open (tasks._audits; it can only lower).
+        out[-1]["audit_owed"] = needs_audit(root, c)
+        out[-1]["audit"] = sealed_record(root, f"audit:{c['id']}") if out[-1]["audit_owed"] else None
     return out
 
 
@@ -333,37 +440,67 @@ def _central(plan: dict, checks: list[dict], conf: list[dict]) -> list[dict]:
     return out
 
 
-def _blockers(cc: dict, cs: list[dict], unrun: list[str] = (), done: set = frozenset()) -> list[dict]:
+# What kept an experiment from running, in the harness's own words. A configured cap of this run (a time budget, the data
+# cap, a denied source, a closed gate) is no measurement of what the experiment needs (`cap`); a fault of this run's
+# network, host or code says nothing about the data (`fault`); only a measured limit of this host is `compute`, and only a
+# fact about the source (missing, inaccessible, invalid, empty) is `data` (Oct-01 PPRM: "compute 3" for one per-run limit).
+CAP_RESOURCES = ("time_budget", "per_run_timeout")
+DATA_FACTS = ("missing", "inaccessible", "content_invalid", "no_data", "protocol")
+RUN_FAULTS = ("transient", "infrastructure", "bug")
+
+
+def resource_word(resource: str | None) -> str:
+    return "cap" if resource in CAP_RESOURCES else "compute"
+
+
+def data_word(blk: list[dict]) -> str:
+    cls = {b.get("class") for b in blk}
+    if cls & set(DATA_FACTS):
+        return "data"
+    capped = [b for b in blk if b.get("class") in ("denied", "gate") or (b.get("class") == "storage" and "SH_MAX_DATA_GB" in str(
+        b.get("detail") or ""))]
+    if capped:
+        return "cap"
+    return "compute" if "storage" in cls else "fault"
+
+
+def _blockers(cc: dict, cs: list[dict], unrun: list[str] = (), done: set = frozenset(), said: set = frozenset()) -> list[dict]:
     """What kept a claim's requested experiment from running, each with who says so: the harness (a recorded
     data blocker, a measured resource limit, a refusal, a scope item whose check did not complete) or the planner
     (an omission's stated reason, with what the seal could not verify of it). An omission that a COMPLETED target
     check covers (`done`: a follow-up round ran it) is no reason anything did not run (Oct-02 PPRM review)."""
-    out = [{"item": o["item"], "blocker": o.get("blocker") or "unstated", "why": o["why"][:300], "basis": "planner",
+    out = [{"item": o["item"], "blocker": o.get("blocker") or "unstated", "why": o["why"][:300], "basis": o.get("basis") or "planner",
             **({"searched": o["discovery"]} if o.get("discovery") else {}),
             **({"unverified": o["unverified"]} if o.get("unverified") else {}),
-            **({"budget_spent": o["budget_spent"]} if o.get("budget_spent") else {})} for o in cc.get("omitted") or []
+            **({"budget_spent": o["budget_spent"]} if o.get("budget_spent") else {}),
+            **({"cap": o["cap"]} if o.get("cap") else {})} for o in cc.get("omitted") or []
            if o.get("why") and flat(o["item"]) not in done]
-    if not cc["checks"] and cc.get("why_unchecked"):
+    if not cc["checks"] and cc.get("withdrawn_plan"):
+        out.append({"item": "(the whole claim)", "blocker": "withdrawn", "why": cc["why_unchecked"][:300], "basis": "operator"})
+    elif not cc["checks"] and cc.get("why_unchecked"):
         out.append({"item": "(the whole claim)", "blocker": cc.get("blocker") or "unstated", "why": cc["why_unchecked"][:300],
                     "basis": "planner", **({"searched": cc["discovery"]} if cc.get("discovery") else {}),
-                    **({"unverified": cc["unverified"]} if cc.get("unverified") else {})})
+                    **({"unverified": cc["unverified"]} if cc.get("unverified") else {}),
+                    **({"budget_spent": cc["budget_spent"]} if cc.get("budget_spent") else {})})
     for c in cs:
         if c.get("role", "target") != "target":
             continue
         if c.get("data_blocker"):
-            out.append({"item": c["id"], "blocker": "data", "class": ", ".join(sorted({b["class"] for b in c["data_blocker"]})),
-                        "why": c["reason"][:300], "basis": "harness"})
+            out.append({"item": c["id"], "blocker": data_word(c["data_blocker"]),
+                        "class": ", ".join(sorted({b["class"] for b in c["data_blocker"]})), "why": c["reason"][:300],
+                        "basis": "harness"})
         elif c["status"] == "BLOCKED":
-            out.append({"item": c["id"], "blocker": "compute" if str(c["reason"]).startswith("RESOURCE BLOCKER") else "refused",
-                        "class": c.get("resource") or "", "why": c["reason"][:300], "basis": "harness"})
+            out.append({"item": c["id"], "blocker": resource_word(c.get("resource")) if str(c["reason"]).startswith(
+                "RESOURCE BLOCKER") else "refused", "class": c.get("resource") or "", "why": c["reason"][:300], "basis": "harness"})
         elif c["status"] == "NOT_CHECKABLE":
             out.append({"item": c["id"], "blocker": "protocol", "why": c["reason"][:300], "basis": "script author or verifier"})
         elif c["status"] in ("INCONCLUSIVE", "PENDING") and not c.get("values"):
             out.append({"item": c["id"], "blocker": "failed" if c["status"] == "INCONCLUSIVE" else "pending",
                         "why": c["reason"][:300], "basis": "harness"})
     named = {flat(b["item"]) for b in out}
-    out += [{"item": s, "blocker": "not run", "why": "no target check covering it ran to completion", "basis": "harness"}
-            for s in unrun if flat(s) not in named]
+    out += [{"item": s, "blocker": "not run", "basis": "harness",
+             "why": "its check's own REFEREE_DATA line names it missing: not loaded, so not run" if flat(s) in said
+             else "no target check covering it ran to completion"} for s in unrun if flat(s) not in named]
     return out
 
 
@@ -381,7 +518,13 @@ def _completion_row(cc: dict, by_id: dict) -> dict:
         f"{c['id']}: {g}" for c in ran for g in c.get("data_changed") or []]
     mismatch = [n for c in ran for n, i in (c.get("data_identity") or {}).items()
                 if not (isinstance(i, dict) and i.get("matches") is True)]
-    done = {flat(s) for c in ran if c["state"] == "COMPLETED" for s in c.get("covers") or []}
+    # A covered item the check's own REFEREE_DATA line names missing (`missing`, `not_available`) did not run, whatever
+    # `covers` says (Oct-01 PPRM: Social-IQA, never acquired, read as covered).
+    said = {flat(m) for c in ran for i in (c.get("data_identity") or {}).values() if isinstance(i, dict)
+            for box in (i, i.get("observed")) if isinstance(box, dict)                # the line itself, or what it observed
+            for k in ("missing", "not_available") for m in (box.get(k) or []) if isinstance(m, str) and len(flat(m)) >= 3}
+    entries = [s for c in ran if c["state"] == "COMPLETED" for s in c.get("covers") or []]
+    done = ({flat(p) for s in entries for p in parts(s)} | {flat(s) for s in entries if not {flat(p) for p in parts(s)} & said}) - said
     scope = cc.get("scope") or []
     unrun = [s for s in scope if flat(s) not in done] if scope else [o["item"] for o in cc.get("omitted") or [] if o.get("why")]
     unran = [c["id"] for c in target if c not in ran]
@@ -400,7 +543,7 @@ def _completion_row(cc: dict, by_id: dict) -> dict:
             "data_mismatch": mismatch, "scope_not_run": unrun, "targets_not_run": unran, "ran": [c["id"] for c in ran],
             "supporting": [{"check": c["id"], "kind": c["kind"], "status": c["status"], "state": c["state"]}
                            for c in cs if c.get("role") == "supporting" or (empirical and c["kind"] == "CERTIFICATE")],
-            "not_run": _blockers(cc, cs, unrun, done) if exp != "RAN_AS_SPECIFIED" else []}
+            "not_run": _blockers(cc, cs, unrun, done, said) if exp != "RAN_AS_SPECIFIED" else []}
 
 
 def _completion(checks: list[dict], claims: list[dict]) -> dict:
@@ -440,7 +583,7 @@ def _completion_line(comp: dict) -> str:
 
 
 def completion_line(root: Path) -> str:
-    plan = merged(state.read_json(root / "sealed" / "plan.json"), state.read_json(root / "sealed" / "plan__2.json"))
+    plan = plan_of(root)
     if plan is None:
         return "NOT_ASSESSED"
     checks = _checks(root, plan)
@@ -449,9 +592,9 @@ def completion_line(root: Path) -> str:
 
 def _headline(checks: list[dict], claims: list[dict]) -> str:
     """The paper-level status: about central claims only (incidental checks never lift it)."""
-    if any(c["status"] == "PENDING" for c in checks):
-        return "CHECKS_PENDING"
     st = [c["claim_status"] for c in claims]
+    if any(c["status"] == "PENDING" for c in checks) or "PENDING" in st:
+        return "CHECKS_PENDING"
     for found, head in (("FAILURE_FOUND", "CENTRAL_FAILURE_FOUND"), ("CHECKS_DISAGREE", "CENTRAL_CHECKS_DISAGREE"),
                         ("PROOF_GAP_FOUND", "CENTRAL_PROOF_GAP_FOUND"),
                         ("READINGS_DISAGREE", "CENTRAL_READINGS_DISAGREE")):
@@ -482,7 +625,7 @@ def progress(root: Path) -> str:
 
 def scientific_status(root: Path) -> str:
     """What the review CHECKED about the central claims — separate from workflow completion."""
-    plan = merged(state.read_json(root / "sealed" / "plan.json"), state.read_json(root / "sealed" / "plan__2.json"))
+    plan = plan_of(root)
     if plan is None:
         return "NOT_ASSESSED"
     checks = _checks(root, plan)
@@ -522,11 +665,14 @@ def _workflow(checks: list[dict]) -> dict:
 
 
 def _failed_searches(root: Path, plan: dict) -> None:
-    """A blocker sealed on searches that all failed (no registry answered) rests on nothing: flagged unverified,
-    whatever the seal accepted when it was sealed."""
+    """A blocker sealed on searches that all failed (no registry answered) rests on nothing, and a `data` or `compute`
+    blocker resting only on checks that stopped at a configured cap or on a fault of this run rests on no fact about the
+    data or the host: each is flagged unverified, whatever the seal accepted when it was sealed (a plan sealed before
+    the rule, or leniently on its last attempt; Oct-01 PPRM: "compute" citing a per-run timeout of another item)."""
     f = root / "discovery.jsonl"
     recs = {r["id"]: r for r in (json.loads(ln) for ln in f.read_text(encoding="utf-8").splitlines() if ln.strip())
             if "results" in r} if f.exists() else {}
+    covers = {c["id"]: {flat(p) for s in c.get("covers") or [] for p in parts(s)} for c in plan.get("checks") or []}
     for cc in plan.get("central_claims") or []:
         for o in [*(cc.get("omitted") or []), cc]:
             ids = [d for d in o.get("discovery") or [] if d in recs]
@@ -534,6 +680,19 @@ def _failed_searches(root: Path, plan: dict) -> None:
             if o.get("blocker") in ("data", "credentials", "compute") and bad:
                 o["unverified"] = (o.get("unverified") or f"search(es) it cites failed ({', '.join(bad[:6])}): a registry "
                                    "that did not answer shows nothing about the dataset or model")
+            cited = [str(k) for k in o.get("failed_checks") or []]
+            if o.get("blocker") not in ("data", "compute") or not cited or o.get("unverified"):
+                continue
+            words = {}
+            for k in cited:
+                out = state.read_json(root / "checks" / k / "outcome.json") or {}
+                ran_it = not o.get("item") or k not in covers or flat(o["item"]) in covers[k]
+                words[k] = ("not this item" if not ran_it else data_word(out["data_blocker"]) if out.get("data_blocker")
+                            else resource_word(out.get("resource")) if str(out.get("reason", "")).startswith("RESOURCE BLOCKER")
+                            else "nothing")
+            if not any(w == o["blocker"] for w in words.values()):
+                o["unverified"] = ("the check(s) it cites show no such fact: " + ", ".join(
+                    f"{k}: {w if w != 'cap' else 'a configured cap of this run'}" for k, w in words.items()))[:400]
 
 
 def ledger(x) -> dict:
@@ -612,6 +771,11 @@ def table(led: dict) -> str:
                        + (f"; the search budget was spent when this was planned ({b['budget_spent']} searches, "
                           "SH_MAX_DISCOVERIES): a setting of this run, not evidence that anything named is absent"
                           if b.get("budget_spent") else "")
+                       + (f"; a configured cap of this run, not a property of the experiment: {_cell(b['cap'], 160)}"
+                          if b.get("cap") else "; a configured cap of this run, not a property of the experiment"
+                          if b["blocker"] == "cap" else "")
+                       + ("; a fault of this run's network, host or code: nothing about the data" if b["blocker"] == "fault"
+                          else "")
                        + "]" for b in r["not_run"][:6])
              + "".join(f"; supporting only: {x['check']} {x['kind']} {x['status']}" for x in r["supporting"])
              for r in comp["claims"]]
@@ -652,10 +816,9 @@ def unearned(text: str, led: dict) -> list[str]:
     for cc in led.get("central_claims") or []:
         for k in cc.get("checks") or []:
             claims_of.setdefault(k, []).append(cc)
-    moved = lambda c: (_changed(c) or bool(c.get("data_changed"))) and c["kind"] != "CERTIFICATE"
     def earns(i: str, statuses: tuple) -> bool:
         c = by_id.get(i)
-        if not c or c["status"] not in statuses or moved(c):
+        if not c or c["status"] not in statuses or _moved(c) or (c.get("audit_owed") and not c.get("audit")):
             return False
         return statuses is FAILURE or (c.get("role", "target") == "target" and all(
             cc.get("claim_status") == "SUPPORT_FOUND"
@@ -707,7 +870,13 @@ def render(x, led: dict, rep: dict | None) -> str:
     summary = (rep or {}).get("summary_md", "")
     # A quote copied with the paper's line break escaped ("incompara-\nble") is the same quote.
     bad = unearned(summary, led) + [f"quote not in the paper: {q[:80]!r}" for q in unquoted(summary, x.paper)]
-    fails = [c for c in led["checks"] if c["status"] in FAILURE]
+    # Three kinds of failure status, never one list (Oct-02 transformer: C2/C3/C8, about REFEREE's own criterion, were
+    # listed as "Failures found" beside C6): of the printed claim (audited where owed); resting on a reading or choice the
+    # paper leaves open (its audit); and of a changed claim (a supplied criterion, a claim-changing deviation, other data).
+    allf = [c for c in led["checks"] if c["status"] in FAILURE]
+    fails = [c for c in allf if not _moved(c) and not (c.get("audit_owed") and not c.get("audit"))]
+    rests = [c for c in allf if not _moved_before_audit(c) and _moved(c)]
+    changed = [c for c in allf if _moved_before_audit(c)]
     lines = [f"# Review: {p['title']}", "",
              f"PDF sha256 `{p['sha256'][:16]}`" + (f", arXiv {p['arxiv_id']}{p['arxiv_version']}" if p["arxiv_id"] else "")
              + (f"; code {s['url']} @ `{s['commit'][:12]}` (attributed by {s['discovered_by']})" if s["url"] else
@@ -719,7 +888,25 @@ def render(x, led: dict, rep: dict | None) -> str:
         lines += ["## Failures found", ""] + [
             f"- **{c['id']}** {c['status']} ({c['evidence']}{', central' if c['central'] else ', incidental'}): "
             + ("a step of the printed proof fails; the statement itself is not refuted. " if c["evidence"] == "PROOF_AUDIT"
-               else "") + f"{c['reason']} — see `ledger.json`, `{c['records'] or 'outcome'}`" for c in fails] + [""]
+               else "") + f"{c['reason']} — see `ledger.json`, `{c['records'] or 'outcome'}`"
+            + (" (an independent audit found it stands on the paper's own words)" if c.get("audit") else "") for c in fails] + [""]
+    if rests:
+        lines += ["## Failures that rest on a reading or choice the paper leaves open (independent audit; for a human)", ""]
+        for c in rests:
+            a = c.get("audit") or {}
+            lines.append(f"- **{c['id']}** {c['status']} ({c['evidence']}): {_cell(c['reason'], 200)} — not counted as a "
+                         "failure of the printed claim: " + ("the independent audit could not be completed"
+                                                             if a.get("verdict") == "UNRESOLVED" else "it rests on:"))
+            lines += [f"  - " + (f"\"{_cell(d['printed'], 160)}\" (p{d['page']})" if d.get("printed") else
+                                 f"declared deviation {d.get('deviation')}") + f": tested as {_cell(d['tested_as'], 160)}; "
+                      f"the claim may hold under: {_cell(d['alternative'], 200)}" for d in a.get("depends_on") or []]
+        lines.append("")
+    if changed:
+        lines += ["## Violations of a changed claim (a REFEREE-supplied criterion, a claim-changing deviation, or other data)",
+                  ""] + [f"- **{c['id']}** {c['status']} ({c['evidence']}): {_cell(c['reason'], 200)} — about the changed "
+                         "claim, never a failure of the claim as printed: " + _cell("; ".join(
+                             [d["used"] for d in c["deviations"] if d.get("changes_claim")] + list(c.get("data_changed") or [])), 300)
+                         for c in changed] + [""]
     if led["conflicts"]:
         lines += ["## Conflicting readings of one printed object (recorded, not resolved)", ""]
         for cf in led["conflicts"]:
@@ -759,11 +946,16 @@ def render(x, led: dict, rep: dict | None) -> str:
         lines.append("")
     devs = [(c["id"], d) for c in led["checks"] for d in c["deviations"]]
     recs = led["workflow"]["environment_recoveries"]
-    if devs or recs:
-        lines += ["## Recorded deviations and environment recoveries", ""] + [
-            f"- {cid}{' **(changes the claim)**' if d.get('changes_claim') else ''}: "
+    revs = [(c["id"], rv) for c in led["checks"] for rv in c.get("revisions") or []]
+    if devs or recs or revs:
+        lines += ["## Recorded deviations, revisions and environment recoveries", ""] + [
+            f"- {cid}{' **(changes the claim)**' if d.get('changes_claim') else ''}"
+            + (" (so judged by the independent verifier)" if d.get("changes_claim_by") == "verifier" else "") + ": "
             + (f"printed \"{_cell(d['printed'], 120)}\" (p{d['page']})" if d["printed"] else "the paper is silent")
             + f" -> used: {_cell(d['used'], 200)}. Why: {_cell(d['why'], 200)}" for cid, d in devs] + [
+            f"- {cid} revision of round {rv['from_round']}: " + "; ".join(
+                f"\"{_cell(n['was'], 100)}\" — {_cell(n['why'], 200)}" for n in rv.get("notes") or [])
+            for cid, rv in revs if rv.get("notes")] + [
             f"- {cid} environment: {r['action']}" for cid, rs in recs.items() for r in rs] + [""]
     staged = [c for c in led["checks"] if c.get("stages") or c.get("failed_seeds") or c.get("completed_stages")]
     if staged:
@@ -820,7 +1012,8 @@ def render(x, led: dict, rep: dict | None) -> str:
     hist = [(c["id"], h) for c in led["checks"] for h in c.get("history") or []]
     wd = led.get("withdrawn_checks") or []
     if hist or wd:
-        lines += ["## Superseded results (withdrawn by a later run of the same check)", ""] + [
+        lines += ["## Superseded and withdrawn results (an earlier run of a check; a check of a withdrawn follow-up plan, "
+                  "whose id a later round may reuse for another check)", ""] + [
             f"- {cid} `{h['file']}`: {h['status']} — {_cell(h['reason'], 200)}" for cid, h in hist] + [
             f"- `{w['folder']}` (its follow-up plan `{w['plan']}` was withdrawn by the operator: "
             f"{_cell(w['withdrawn_because'], 240)}): {w['status']} — {_cell(w['reason'], 200)}{_measured_before(w)}"
@@ -833,7 +1026,8 @@ def render(x, led: dict, rep: dict | None) -> str:
             lines.append(f"- **{cid}**: runs {pr['runs']} ({pr['runs_from']}); seeds {pr['seeds']}; rule: "
                          f"{_cell(rule, 220)}" + (f"; relation {pr['relation']}" if pr.get("relation") else "")
                          + (f"; pilot {pr['pilot_seconds']:.0f}s" if pr.get("pilot_seconds") else "")
-                         + (f"; replicates extended {pr['replicates_extended']}" if pr.get("replicates_extended") else ""))
+                         + (f"; replicates extended {pr['replicates_extended']}" if pr.get("replicates_extended") else "")
+                         + (f"; replicate extension refused: {pr['extension_refused']}" if pr.get("extension_refused") else ""))
             lines += [f"  - REFEREE supplied: {_cell(u, 220)}" for u in pr.get("supplied_by_referee", [])
                       if u not in pr.get("claim_changes", [])]      # a claim-changing choice is listed once, below
             lines += [f"  - changes the claim: {_cell(u, 220)}" for u in pr.get("claim_changes", [])]
@@ -848,7 +1042,8 @@ def render(x, led: dict, rep: dict | None) -> str:
     lines += ["## Concerns (after the critic)", ""]
     for c in [c for c in led["concerns"] if not c.get("withdrawn")][:15]:   # ponytail: 15 shown, all in the ledger
         q = "; ".join(f"\"{_cell(e['quote'], 160)}\" (p{e['page']})" for e in c["evidence"][:2])
-        linked = ", ".join(f"{k['id']} {k['status']}" for k in led["checks"] if c["id"] in k["concerns"])
+        linked = ", ".join(f"{k['id']} {k['status']}" + (" (about a changed claim)" if k["status"] in FAILURE + SUPPORT and _moved(k)
+                                                         else "") for k in led["checks"] if c["id"] in k["concerns"])
         lines.append(f"- **{c['id']} {c['severity']}/{c['confidence']}** {_said(c['title'], led)} — "
                      f"{_said(_cell(c['statement'], 300), led)} Evidence: {q}"
                      + (f" _Page-image check: {_cell(c['image_check'], 240)}._" if c.get("image_check") else "")
