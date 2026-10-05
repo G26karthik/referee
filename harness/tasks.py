@@ -615,6 +615,10 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
                 spec=spec + extra + _data_text(x, cid), contract=_section("contracts", f"gen {kind}"), metric=metric,
                 environment=f"{env} (built: {env_now.get('detail', 'pending')[:300]})", host=execute.host_facts(x.cfg),
                 required=", ".join(REQUIRED[kind]), max_tries=x.cfg.max_tries, try_cmd=try_cmd, revision=revision))]
+        if g.get("refused") and g.get("by") == "harness":
+            return _terminal(cdir, c, "INCONCLUSIVE", f"the harness did not accept the script author's final answer for "
+                             f"gen:{cid}.{r} (these errors survived every seal attempt): {g['notes'][:400]}; a fault of "
+                             "this run, nothing about the paper; the check may be reopened")
         if g.get("refused"):
             return _terminal(cdir, c, "NOT_CHECKABLE", f"the script author refused: {g['notes'][:400]}",
                              by_model=True)
@@ -1517,6 +1521,10 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
                 errs.append(f"{cid}: RELEASED_DATA needs `basis`: 'published_results' (an audit of the released result "
                             "files the printed numbers were reported from) or 'predictions' (the metric recomputed from "
                             "released per-item predictions or scores)")
+            if not rec["acquire"] and not state.read_json(x.root / "released.json", []):
+                errs.append(f"{cid}: RELEASED_DATA recomputes from files the authors released, but the checkout releases no "
+                            "data files and this check acquires none: `acquire` the record the paper cites (or one a "
+                            "registry search returned), or run the experiment as a RECONSTRUCTION")
         if kind == "RECONSTRUCTION":
             rec["test"] = _enum(c.get("test"), ("performance", "compatibility"))
             if not rec["test"]:
@@ -1701,8 +1709,13 @@ def _readings(x: _Ctx, items, errs: list[str], cid: str, record: Path | None = N
     once the check's data is acquired — in a file of the released record kept as quote-only text
     (`record:<n>/<path>`: its code, notebook or README, never mounted and never run). Two readings with
     the same words are one definition."""
-    out = []
-    for r in [r for r in items or [] if isinstance(r, dict)][:3]:           # ponytail: 3 readings per check
+    out, given = [], [r for r in items or [] if isinstance(r, dict)]
+    if len(given) > 3:                                                      # refused by name, never cut unseen
+        errs.append(f"{cid}: {len(given)} readings: at most 3 (the paper's definition, the code's, a released record's). "
+                    "Put every printed choice in ONE reading with source 'paper' and every changed one in ONE other reading, "
+                    "and tie each such deviation to that reading; readings "
+                    f"{[str(r.get('name')) for r in given[3:]]} are not kept")
+    for r in given[:3]:                                                     # ponytail: 3 readings per check
         name, src, quote = str(r.get("name") or ""), str(r.get("source") or "").strip(), str(r.get("quote") or "")
         if not re.fullmatch(r"[a-z][a-z0-9_]{0,23}", name) or name in {o["name"] for o in out}:
             errs.append(f"{cid}: reading name {name!r} must be a distinct short lowercase identifier")
@@ -1838,7 +1851,7 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     cap = 200 if c["kind"] == "CERTIFICATE" else x.cfg.max_runs     # ponytail: 200 sandboxed runs per check
     if not 1 <= runs <= cap:
         if final or c["kind"] != "CERTIFICATE":         # a stated run count past the cap: refused, never shrunk
-            return {"refused": True, "notes": f"{runs} runs is outside 1..{cap}: refused rather than downscaled"}
+            return {"refused": True, "by": "harness", "notes": f"{runs} runs is outside 1..{cap}: refused rather than downscaled"}
         errors.append(f"`runs` is at most {cap}: each run is one sandboxed process. A certificate may check several "
                       "instances per run by printing one REFEREE_RESULT line per instance")
     stochastic = obj.get("stochastic")
@@ -1897,6 +1910,7 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
                            "used": str(d.get("used") or "")[:600], "why": str(d.get("why") or "")[:600],
                            "changes_claim": d.get("changes_claim") is True})
     names = {rd["name"] for rd in (c.get("readings") or []) + readings}
+    declared = {str(rd.get("name")) for rd in obj.get("readings") or [] if isinstance(rd, dict)}
     paper_names = {rd["name"] for rd in (c.get("readings") or []) + readings if rd.get("source") == "paper"}
     has_paper = bool(paper_names)
     for i, (d, dev) in enumerate(zip(given_devs[:MAX_DEVIATIONS], deviations)):
@@ -1906,7 +1920,10 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         # decided also computes the printed one, beside it, in the same run (Sep-29 label ranking C9: the paper's r/sum r
         # was replaced by a softmax and the printed estimator was never decided), or says why the printed text cannot run.
         if c["kind"] in ("RELEASED_DATA", "RECONSTRUCTION") and dev["changes_claim"] and dev["printed"]:
-            if rd and rd not in names:
+            if rd and rd not in names and rd in declared:
+                errors.append(f"deviation {i} names reading {rd!r}, which you declared but which was not kept (the "
+                              "`readings` error above says why)")
+            elif rd and rd not in names:
                 errors.append(f"deviation {i} names reading {rd!r}, which the check does not declare in `readings`")
             elif rd and rd in paper_names:
                 errors.append(f"deviation {i} names reading {rd!r}, the printed definition itself: a change holds in the OTHER "
@@ -1930,8 +1947,8 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         if any(d["changes_claim"] for d in deviations) and not re.search(r"""["']literal["']""", script):
             errors.append("a certificate that changes the claim's reading also reports `literal` (holds, fails, "
                           "undefined or premise_not_met) for the text exactly as printed")
-    if errors and final:
-        return {"refused": True, "notes": "; ".join(errors)[:2000]}
+    if errors and final:                  # the harness's refusal of the answer, never the author's refusal of the check
+        return {"refused": True, "by": "harness", "notes": "; ".join(errors)[:2000]}
     _fail_or_drop(errors, final)
     cdir = x.root / "checks" / cid
     cdir.mkdir(parents=True, exist_ok=True)
@@ -2139,7 +2156,7 @@ _EMPTY = {"lens": {"concerns": [], "dropped": []}, "critic": {"reviews": []}, "c
           "plan": {"checks": [], "central_claims": [], "dropped": [], "repo_is_authors": False, "repo_note": ""},
           "bind": {"identity": {"established": False, "reason": "malformed binding answer"}, "command": "",
                    "metric": "", "seed_flag": "", "runs": 1, "prepare": ""},
-          "gen": {"refused": True, "notes": "malformed answer"},
+          "gen": {"refused": True, "by": "harness", "notes": "malformed answer"},
           "verify": {"verdict": "UNCHECKABLE", "required_changes": "", "notes": "malformed verifier answer",
                      "quotes": [], "script_sha256": ""},
           "report": {"summary_md": "", "overview": "", "claims": [], "terms": [], "open_questions": []},

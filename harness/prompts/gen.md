@@ -73,7 +73,9 @@ THE SCRIPT CONTRACT
     of the items it was computed over]`. List a reading you found yourself in `readings`
     ({"name", "source": "paper" or the tracked file path, "quote": the paper's words verbatim or
     the literal code lines}). Never choose one; which reading matches the printed number is no
-    reason to prefer it.
+    reason to prefer it. At most 3 readings (the paper's, the code's, a released record's): with
+    several changes, ONE paper reading computes every printed choice together and ONE other reading
+    every changed one; a variant per factor is not a reading.
   - RESULT SCHEMA. The harness runs your final script once (seed 0) and returns it to you if a
     declared unit prints no result line with that exact `stage`, if a result line carries a stage
     name you did not declare (or none, when you declared units), if a declared reading is missing

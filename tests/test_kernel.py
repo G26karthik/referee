@@ -1005,6 +1005,7 @@ def test_a_paper_and_code_disagreement_is_computed_both_ways_never_chosen():
         cfg, pid = _project(td)
         code_line = "ece = abs(p_chosen.mean() - 1.0)  # the chosen response only"
         _checkout(td, pid, {"analyze.py": f"import numpy\n{code_line}\n"})
+        state.write_json(td / pid / "released.json", [{"path": "results/preds.csv"}])
         x = tasks._Ctx(cfg, pid)
         rd = {"id": "B", "kind": "RELEASED_DATA", "basis": "predictions", "claim_quote": "We report the mean over 5 random seeds",
               "target": {"quote": "reaches 61.4 accuracy", "value": "61.4"}, "role": "target", "criterion": "stated",
@@ -2472,6 +2473,7 @@ def test_a_supporting_check_covers_none_of_the_claim():
 def test_an_engineering_claim_is_never_decided_by_another_kind_of_check():
     with tempfile.TemporaryDirectory() as t:
         cfg, pid, x = _x(Path(t))
+        state.write_json(x.root / "released.json", [{"path": "results/preds.csv"}])
         rd = {"id": "R", "kind": "RELEASED_DATA", "basis": "predictions", "claim_quote": CIFAR, "role": "target",
               "criterion": "stated", "covers": ["CIFAR-10-C"], "target": {"quote": CIFAR, "relation": "acc_a > acc_b"}}
         assert "compatibility test" in _refused(lambda: _plan(x, [rd], [_claim(claim_type="engineering")]))
@@ -2504,6 +2506,93 @@ def test_deviations_past_the_cap_are_refused_never_cut_unseen():
         assert tasks._seal_gen(x, "gen:C1.1", {**g, "deviations": devs}, final=True)["refused"]
         ok = tasks._seal_gen(x, "gen:C1.1", {**g, "deviations": devs[:tasks.MAX_DEVIATIONS]}, final=False)
         assert len(ok["deviations"]) == tasks.MAX_DEVIATIONS
+
+
+def test_readings_past_the_cap_are_refused_by_name_and_a_harness_rejection_is_not_the_authors_refusal():
+    """Oct-05 changepoint C1: the script author declared 8 readings (a paper/code variant per factor); the seal kept the
+    first 3 silently and then refused each deviation for naming "a reading the check does not declare" — one the author had
+    declared. Three revisions could not find the fault, and the check ended NOT_CHECKABLE as "the script author refused",
+    words the harness wrote. Readings past the cap are refused by name, a reading that was declared but not kept is said
+    to be so, and a final answer the harness would not accept ends the check as a fault of this run, never as the
+    author's refusal."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid = _project(td)
+        lines = ["p = np.exp(r) / np.exp(r).sum()  # softmax of the chosen response",
+                 "q = r / r.sum(axis=0)  # pooled over every position"]
+        _checkout(td, pid, {"analyze.py": "import numpy as np\n" + "\n".join(lines) + "\n"})
+        state.write_json(td / pid / "released.json", [{"path": "results/a.csv"}])
+        plan = {"checks": [{"id": "C1", "kind": "RELEASED_DATA", "metric": "", "criterion": "stated",
+                            "target": {"quote": "reaches 61.4 accuracy", "value": "61.4"}}]}
+        x = tasks._Ctx(cfg, pid)
+        x.sealed = lambda tid: plan if tid == "plan" else None
+        x.plan = lambda: plan
+        script = 'd = open("results/a.csv").read()\nece = 1\nprint("REFEREE_RESULT", ece, "reading", "cohort")\n'
+        binds = [{"kind": k, "impl_quote": q, "paper_quote": "reaches 61.4 accuracy"} for k, q in
+                 (("dataset", 'open("results/a.csv")'), ("metric", "ece = 1"), ("comparison_target", "print("))]
+        readings = [{"name": "paper", "source": "paper", "quote": "We use generation of samples"},
+                    {"name": "code", "source": "analyze.py", "quote": lines[0]},
+                    {"name": "code_pooled", "source": "analyze.py", "quote": lines[1]},
+                    {"name": "paper_seeds", "source": "paper", "quote": "We report the mean over 5 random seeds"}]
+        dev = {"printed": "We use generation of samples", "used": "a softmax of the scores", "why": "positivity",
+               "changes_claim": True, "reading": "paper_seeds"}
+        g = {"script": script, "runs": 1, "metric": "ece", "outputs": ["ece"], "bindings": binds, "fidelity": FID,
+             "readings": readings, "deviations": [dev]}
+        err = _refused(lambda: tasks._seal_gen(x, "gen:C1.1", g, final=False))
+        assert "4 readings" in err and "at most 3" in err and "paper_seeds" in err, err
+        assert "does not declare" not in err, err                     # it was declared: the cap cut it, and says so
+        assert "not kept" in err, err
+        rec = tasks._seal_gen(x, "gen:C1.1", g, final=True)
+        assert rec["refused"] and rec.get("by") == "harness", rec
+        fine = tasks._seal_gen(x, "gen:C1.1", {**g, "readings": readings[:2], "deviations": [{**dev, "reading": "code"}]},
+                               final=False)
+        assert [r["name"] for r in fine["readings"]] == ["paper", "code"]
+        # A reading that fails to re-find is not "undeclared" either: the deviation says it was declared but not kept.
+        lost = [readings[0], readings[1], {**readings[2], "quote": "a line analyze.py never had"}]
+        err = _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {**g, "readings": lost,
+                                                               "deviations": [{**dev, "reading": "code_pooled"}]}, final=False))
+        assert "code_pooled" in err and "not kept" in err and "does not declare" not in err, err
+    # The step: a final answer the harness refused is a fault of this run (INCONCLUSIVE, reopenable), the harness's words.
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid = _project(td)
+        state.write_json(td / ".gpu.json", False)
+        for lens in tasks.LENSES:
+            _seal(cfg, pid, f"lens:{lens}", {"concerns": []}, td)
+        _seal(cfg, pid, "critic", {"reviews": []}, td)
+        c = {"id": "B", "kind": "CERTIFICATE", "claim_quote": "We report the mean over 5 random seeds",
+             "statement_quote": "The final loss is -0.52", "role": "target", "covers": ["the loss"]}
+        _seal(cfg, pid, "plan", {"checks": [c], "central_claims": [{"quote": c["claim_quote"], "checks": ["B"],
+                                                                    "claim_type": "theory", "scope": ["the loss"]}]}, td)
+        script = "n = 1\nassert n\nok = n > 0\nprint('REFEREE_RESULT', {'violated': 0, 'premises_hold': 1})\n"
+        b = [{"kind": k, "impl_quote": q, "paper_quote": "reaches 61.4 accuracy"} for k, q in
+             (("hypotheses", "assert n"), ("claimed_bound", "ok = n > 0"), ("instance", "n = 1"))]
+        bad = {"script": script, "runs": 1, "outputs": ["violated"], "bindings": b,
+               "readings": [{"name": "paper", "source": "paper", "quote": "The final loss is -0.52"}]}
+        for _ in range(2):
+            _refused(lambda: _seal(cfg, pid, "gen:C1.1", bad, td))
+        _seal(cfg, pid, "gen:C1.1", bad, td)                            # the third attempt seals the harness's refusal
+        tasks._plan(tasks._Ctx(cfg, pid))
+        out = state.read_json(td / pid / "checks" / "C1" / "outcome.json")
+        assert out["status"] == "INCONCLUSIVE" and "reason_by" not in out, out
+        assert "script author refused" not in out["reason"] and "harness" in out["reason"], out
+        assert "CERTIFICATE" in out["reason"], out                      # the errors it would not accept are shown
+
+
+def test_released_data_needs_released_or_acquired_files():
+    """Oct-05 GRACE follow-up: three RELEASED_DATA checks were planned for a checkout that releases no data files, with
+    nothing to acquire; each script author could only refuse, and the whole follow-up round was spent on them. The plan
+    seal refuses a RELEASED_DATA check with no released file and no acquisition."""
+    with tempfile.TemporaryDirectory() as t:
+        cfg, pid, x = _x(Path(t))
+        rd = {"id": "R", "kind": "RELEASED_DATA", "basis": "published_results", "claim_quote": CIFAR, "role": "target",
+              "criterion": "stated", "covers": ["CIFAR-10-C"], "target": {"quote": CIFAR, "relation": "acc_a > acc_b"}}
+        err = _refused(lambda: _plan(x, [rd], [_claim()]))
+        assert "releases no data" in err and "acquire" in err, err
+        rec = _plan(x, [rd], [_claim()], final=True)                    # last attempt: dropped, with the reason kept
+        assert not rec["checks"] and "releases no data" in str(rec["dropped"]), rec
+        state.write_json(x.root / "released.json", [{"path": "results/table2.csv"}])
+        assert [c["proposed_id"] for c in _plan(x, [rd], [_claim()])["checks"]] == ["R"]
 
 
 def test_a_released_record_file_can_be_a_reading_and_a_certificate_has_none():
@@ -3838,6 +3927,7 @@ def test_a_violation_of_a_changed_claim_is_never_listed_as_a_failure_found():
     with tempfile.TemporaryDirectory() as t:
         td = Path(t)
         cfg, pid, root = _ready(td)
+        state.write_json(root / "released.json", [{"path": "results/preds.csv"}])
         sup = dict(_run("A"), kind="RELEASED_DATA", basis="predictions", criterion="supplied")
         sup.pop("test")
         cert = {"id": "B", "kind": "CERTIFICATE", "claim_quote": THM, "statement_quote": THM, "role": "target",

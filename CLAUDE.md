@@ -62,7 +62,9 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
    makes it about a changed claim, shown beside what it rests on. Until audited the claim is PENDING.
 9. **Checks are independent**; a blocked check ends that check, not the paper. A task no worker can
    answer is ended (`run.py tasks --abandon`: an honest nothing; a check's is INCONCLUSIVE), never left
-   to stall the review; the harness says "executions running" whenever a run is in flight.
+   to stall the review — so is a script whose final answer the seal would not accept (the harness's refusal,
+   never reported as the author's); the harness says "executions running" whenever a run is in flight.
+   A RELEASED_DATA check needs a released file or an acquisition: the plan seal refuses one with neither.
 10. **Execution is auditable**: every process leaves an ExecutionRecord (argv, image,
     commit, script sha, times, exit code, stdout/stderr) in `execution.jsonl`.
 11. **No paper-specific logic**, names, thresholds or special cases.
