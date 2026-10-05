@@ -363,6 +363,8 @@ def _point(kind: str, printed: str, values: list[float], seeded: bool, determini
         return _r("INCONCLUSIVE", f"printed {claimed:g} vs produced {mean:g}: the produced value is the complement "
                   "(error vs accuracy), a metric-orientation mismatch, not a failed reproduction", **out)
     note = "" if kind == "AUTHOR_CODE" else " (not the authors' code: a finding about the paper's stated method or data)"
+    if _repeats(values):
+        std = out["std"] = 0.0                      # round-off is no spread
     if deterministic and kind == "RECONSTRUCTION" and n > 1 and std > 0:
         return _r("INCONCLUSIVE", f"declared deterministic, but its {n} runs differ (std {std:.4g}): the computation is "
                   "not deterministic as declared, so nothing is decided", rule="a declared deterministic pipeline must "
@@ -423,12 +425,12 @@ def _relation(kind: str, rel: str, margins: list[float], deterministic: bool = F
     return {**_over_margins(kind, rel, margins, deterministic, ind, shown, strict), **(prop or {})}
 
 
-def _repeats(values: list[float], ind: dict | None) -> bool:
-    """Do several runs give one value? Bit-identical, equal to 12 significant digits (the same sum in another order is
-    round-off), or result lines the independence record finds identical in every output (Sep-29 changepoint C7)."""
-    if len(values) < 2:
-        return False
-    return bool(ind and ind.get("state") in ("identical", "unproven")) or len({float(f"{v:.12g}") for v in values}) == 1
+def _repeats(values: list[float], ind: dict | None = None) -> bool:
+    """Do several runs give one compared value? Equal to 12 significant digits (the same sum taken in another order is
+    round-off, Sep-29 changepoint C7). Decided on the compared values themselves: whether the runs were independent is
+    the independence record's question (`ind`), never whether their values agree (it ignores time-like outputs, which
+    a timing comparison compares)."""
+    return len(values) > 1 and len({float(f"{v:.12g}") for v in values}) == 1
 
 
 def _over_margins(kind: str, rel: str, margins: list[float], deterministic: bool, ind: dict | None, shown: bool,

@@ -4411,8 +4411,8 @@ def test_seeded_runs_that_vary_nothing_go_back_to_their_author():
         state.write_json(td / pid / "checks" / "C1" / "outcome.json", {"status": "INCONCLUSIVE", "reason": "x",
                                                                          "revisable": "the seeds varied nothing"})
         _, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
-        assert [o["id"] for o in owed] == ["gen:C1.2"], owed
-        assert "the seeds varied nothing" in Path(owed[0]["prompt"]).read_text(encoding="utf-8")
+        gen = [o for o in owed if o["id"] == "gen:C1.2"]       # (a follow-up offered meanwhile stays owed beside it)
+        assert gen and "the seeds varied nothing" in Path(gen[0]["prompt"]).read_text(encoding="utf-8"), owed
         assert (td / pid / "checks" / "C1" / "outcome.setup.1.json").exists()   # the old outcome is kept beside it
 
 
@@ -4762,6 +4762,183 @@ def test_another_reproduction_record_is_compared_only_after_the_decisions_are_se
         assert "Other reproduction record (HF logbook)" in page and "Comparable: partly" in page
         after = report.ledger(tasks._Ctx(cfg, pid))["central_claims"]
         assert [c["decision"] for c in after] == [c["decision"] for c in before]                 # nothing moved
+        assert "In its words: \"RMSE 0.0471 for GRACE versus 0.0802\"" in page                    # its own words, shown
+        bad = td / "hf.pdf"
+        bad.write_bytes(b"%PDF-1.4 \xff\xfe\x00binary")
+        assert "not UTF-8" in tasks.register_reference(cfg, pid, str(bad), "HF")["error"]        # never stops the review
+
+
+# --- 2026-10-05 code review of the round's changes ------------------------------------------------------------------
+def test_a_failure_scoped_to_one_reading_is_still_audited_and_a_paper_tag_scopes_nothing():
+    """Review #1/#4: needs_audit read the plan check (`readings`, no `reading_defs`), so a reading-scoped deviation looked
+    claim-changing there and no audit was owed, while the ledger counted the failure: FAILURE_FOUND without its audit.
+    And a deviation tagged with the printed reading itself, or flagged by the verifier, cancelled itself."""
+    defs = [{"name": "paper", "source": "paper"}, {"name": "code", "source": "analyze.py"}]
+    dev = {"changes_claim": True, "used": "softmax", "reading": "code"}
+    with tempfile.TemporaryDirectory() as t:
+        root = Path(t)
+        state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "RELATION_VIOLATED"})
+        state.write_json(root / "checks" / "C1" / "check.json", {"deviations": [dev], "readings": defs})
+        plan_check = {"id": "C1", "kind": "RELEASED_DATA", "role": "target", "readings": defs}
+        assert report.needs_audit(root, plan_check)                              # the failure is about the printed claim
+    assert report._scoped(dev, {"reading_defs": defs}) and report._scoped(dev, {"readings": defs})
+    assert not report._scoped({**dev, "reading": "paper"}, {"reading_defs": defs})   # the printed one: nothing scoped
+    assert not report._scoped({**dev, "changes_claim_by": "verifier"}, {"reading_defs": defs})   # the second key stands
+    assert not report._scoped({**dev, "reading": "other"}, {"reading_defs": defs})   # an undeclared reading
+
+
+def test_an_extracted_claims_whole_scope_reaches_the_plan_and_the_ledger():
+    """Review #2 (live run): the plan seal cut the extracted scope to 16 items (GRACE K1 lost 8 baselines and datasets,
+    label ranking K6 lost 2 ECE variants), so a claim could read as run as specified on part of its scope."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid = _claims_project(td)
+        wide = {**_K[1], "scope": ["Ours", "Base"] + [f"dataset {i}" for i in range(28)]}
+        x0 = tasks._Ctx(cfg, pid)
+        rec = tasks._seal_claims(x0, "claims", {"claims": [wide]}, final=False)
+        assert len(rec["claims"][0]["scope"]) == 30 and "_raw" not in rec["claims"][0]
+        assert "at most" in _refused(lambda: tasks._seal_claims(x0, "claims", {"claims": [
+            {**wide, "scope": [f"d{i}" for i in range(45)]}]}, final=False))                    # refused, never cut
+        cut = tasks._seal_claims(x0, "claims", {"claims": [{**wide, "scope": [f"d{i}" for i in range(45)]}]}, final=True)
+        assert len(cut["claims"][0]["scope_cut"]) == 5                                           # recorded on the last attempt
+        _seal(cfg, pid, "claims", {"claims": [wide]}, td)
+        for lens in tasks.LENSES:
+            _seal(cfg, pid, f"lens:{lens}", {"concerns": []}, td)
+        _seal(cfg, pid, "critic", {"reviews": []}, td)
+        x = tasks._Ctx(cfg, pid)
+        sealed = tasks._seal_plan(x, "plan", {"checks": [], "central_claims": [
+            {"id": "K1", "why_unchecked": "no test fits", "blocker": "other"}]}, final=False)
+        assert len(sealed["central_claims"][0]["scope"]) == 30
+        old = {**sealed, "central_claims": [{**sealed["central_claims"][0], "scope": wide["scope"][:16]}]}   # a cut plan
+        m = report.merged(old, None, (), [{**rec["claims"][0], "scope_cut": ["d40"]}])
+        assert len(m["central_claims"][0]["scope"]) == 30                                        # the extraction restores it
+        assert any(o["item"] == "d40" and o["blocker"] == "cap" for o in m["central_claims"][0]["omitted"])
+
+
+def test_values_that_differ_are_never_one_measurement_and_round_off_never_fails_a_number():
+    """Review #3/#5: `_repeats` trusted the independence record, which ignores time-like outputs, so a timing comparison
+    whose margins differ (2.0, 0.7, 1.9) read as one deterministic measurement with a band of 0; and a printed-number check
+    whose seeds differed only by round-off got a prediction interval of ~1e-13 (FAILED_REPRODUCTION)."""
+    from harness.reconcile import _repeats
+    rel = "time_base - time_ours > 0"
+    outs = [{"time_base": 3.0, "time_ours": 1.0}, {"time_base": 2.0, "time_ours": 1.3}, {"time_base": 2.9, "time_ours": 1.0}]
+    margins = [o["time_base"] - o["time_ours"] for o in outs]
+    assert not _repeats(margins) and _repeats([1.0, 1.0 + 1e-15])
+    det = _rel(rel, _rows(outs), margins, det=True)
+    assert det["status"] == "INCONCLUSIVE" and "runs differ" in det["stages"]["a"]["reason"], det
+    st = {"staged": [["a", m] for m in margins], "detail": _rows(outs), "done_seeds": [0, 1, 2]}
+    assert not execute.varied_nothing({"kind": "RECONSTRUCTION", "stochastic": True}, st)   # a timing output varied
+    vals = [61.0 + k * 1e-13 for k in range(3)]
+    p = reconcile("RECONSTRUCTION", "61.4", vals, "", {}, True, True, "")
+    assert p["status"] != "FAILED_REPRODUCTION" and p["std"] == 0.0, p
+
+
+def test_a_place_in_the_line_lapses_when_its_review_stops_polling():
+    """Review #6: a review whose workflow stopped kept its queue entries forever; two stale CPU waiters left every later
+    check on the host with no free slot."""
+    with tempfile.TemporaryDirectory() as t:
+        cfg = state.Config()
+        cfg.projects = Path(t)
+        for c in ("A", "B"):
+            state.write_json(Path(t) / "p" / "checks" / c / "exec.json", {})
+        execute.wait_turn(cfg, "p/A", False)
+        q = state.read_json(Path(t) / ".queue.json")
+        q["p/A"]["seen"] = q["p/A"]["t"] = time.time() - execute.QUEUE_STALE_S - 5      # nobody polled it for an hour
+        state.write_json(Path(t) / ".queue.json", q)
+        assert execute.wait_turn(cfg, "p/B", False) == (0, 0)
+
+
+def test_an_offered_follow_up_stays_pending_until_it_is_sealed():
+    """Review #7: the early follow-up was recomputed at every call; once the long run had less than 20 minutes left (or
+    an audit appeared) the planner's answer was refused as 'not a pending task'."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid = _project(td)
+        state.write_json(td / ".gpu.json", False)
+        for lens in tasks.LENSES:
+            _seal(cfg, pid, f"lens:{lens}", {"concerns": []}, td)
+        _seal(cfg, pid, "critic", {"reviews": []}, td)
+        a = {"id": "A", "kind": "CERTIFICATE", "claim_quote": "We report the mean over 5 random seeds",
+             "statement_quote": "The final loss is -0.52", "role": "target", "covers": ["the loss"]}
+        _seal(cfg, pid, "plan", {"checks": [a], "central_claims": [
+            {"quote": a["claim_quote"], "checks": ["A"], "claim_type": "theory", "scope": ["the loss"]}]}, td)
+        state.write_json(td / pid / "checks" / "C1" / "check.json", {"id": "C1", "kind": "CERTIFICATE", "runs": 100})
+        state.write_json(td / pid / "checks" / "C1" / "exec.json", {"token": "t"})
+        real = execute.poll, execute.remaining_s
+        try:
+            execute.poll = lambda cfg, pid, cid: True
+            execute.remaining_s = lambda cfg, root, cid: 6 * 3600.0
+            assert "plan:2" in {o["id"] for o in tasks._plan(tasks._Ctx(cfg, pid))[1]}
+            execute.remaining_s = lambda cfg, root, cid: 60.0                     # the run is nearly done
+            assert "plan:2" in {o["id"] for o in tasks._plan(tasks._Ctx(cfg, pid))[1]}   # still pending: never refused
+            _seal(cfg, pid, "plan:2", {"checks": [], "central_claims": []}, td)
+            assert "plan:2" not in {o["id"] for o in tasks._plan(tasks._Ctx(cfg, pid))[1]}
+        finally:
+            execute.poll, execute.remaining_s = real
+
+
+def test_prose_cannot_slip_a_status_word_a_number_or_markup_past_the_checks():
+    """Review #8/#9: a quoted status word ("reproduced") was stripped as someone else's words; signed numbers and numbers
+    with a unit were not checked; the allowed numbers included every digit in the ledger's strings (sha256s, timestamps,
+    model text); inline HTML and entities rendered unchecked."""
+    from harness import reviewer
+    p = Paper(["The method reaches 61.4 accuracy on CIFAR with 5 random seeds and a batch of 128."])
+    led = {"checks": [{"id": "C1", "status": "INCONCLUSIVE"}], "concerns": [], "script_sha256": "9e300aa1"}
+    allowed = reviewer.allowed_numbers({"stages": {"thr=316.2": {"margin": 0.0973, "n": 100}}, "sha": "9e3"}, p.text)
+    ok = lambda s: reviewer.problems(s, led, p, allowed) == []
+    assert ok('The paper says "reaches 61.4 accuracy on CIFAR" and the margin was 0.0973 over 100 runs.')
+    assert not ok('The main result was "reproduced" here.')                     # a quoted status word is still REFEREE's
+    assert not ok("The gap was -0.4417 on average.") and not ok("It was 2.73x faster.") and not ok("It took 150ms.")
+    assert not ok("The count was 9000.")                                         # '9e3' in a string is no number held
+    assert ok("At threshold 316.2 the gap held.")                                # a stage name's number is held
+    assert not ok("The result was &#114;eproduced.") and not ok("<b>bold</b> claim")
+    assert ok("Two of five settings ran.")
+
+
+def test_follow_up_claims_keep_their_own_entries_and_never_reuse_an_id():
+    """Review #11/#12: new claims were paired with the unfiltered raw list (a dropped A shifted B onto A's checks), and
+    were numbered after the extracted ones only, so a re-plan reused the id of a withdrawn follow-up's claim and the
+    ledger dropped it."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid = _claims_project(td)
+        _seal(cfg, pid, "claims", {"claims": _K[:2]}, td)
+        for lens in tasks.LENSES:
+            _seal(cfg, pid, f"lens:{lens}", {"concerns": []}, td)
+        _seal(cfg, pid, "critic", {"reviews": []}, td)
+        _seal(cfg, pid, "plan", {"checks": [], "central_claims": [{"id": k, "why_unchecked": "no test", "blocker": "other"}
+                                                                  for k in ("K1", "K2")]}, td)
+        x = tasks._Ctx(cfg, pid)
+        withdrawn = {"checks": [], "central_claims": [{"id": "K3", "quote": "x", "checks": []}]}
+        state.write_json(td / pid / "sealed" / "plan__2.withdrawn.1.json", withdrawn)
+        seals = state.read_json(td / pid / "seals.json")
+        seals["plan:2.withdrawn.1"] = state.sha256((td / pid / "sealed" / "plan__2.withdrawn.1.json").read_bytes())
+        state.write_json(td / pid / "seals.json", seals)
+        bad = {"quote": "a sentence the paper never printed anywhere", "statement": "x" * 20, "claim_type": "theory",
+               "scope": ["x"], "required_evidence": "a proof of it", "why_unchecked": "BAD ONE"}
+        good = {**_K[2], "why_unchecked": "the good one's own reason", "blocker": "other"}
+        rec = tasks._seal_plan(x, "plan:2", {"checks": [], "central_claims": [], "new_claims": [bad, good]}, final=True)
+        new = [c for c in rec["central_claims"] if c.get("origin") == "plan:2"]
+        assert [c["id"] for c in new] == ["K4"], new                               # after the withdrawn K3
+        assert new[0]["why_unchecked"] == "the good one's own reason"              # its own entry, not BAD ONE's
+
+
+def test_counts_and_completion_read_unnamed_and_undefined_units_honestly():
+    """Review #14/#15: one declared unit printed without its name counted as missing (DOES NOT RECONCILE); and a script
+    could turn missing settings into 'undefined' ones at run time and still reach run as specified."""
+    one = {"kind": "RELEASED_DATA", "values": [1.0], "units": ["mean_ece_top10"], "stages": {},
+           "execution": {"runs_ended": 1}}
+    n = report.counts(one)
+    assert n["units_not_completed"] == 0 and n["reconciles"], n
+    c = {"id": "C1", "kind": "RECONSTRUCTION", "role": "target", "state": "COMPLETED", "status": "RELATION_HOLDS",
+         "values": [1.0], "covers": ["X"], "deviations": [], "data_identity": {}, "data_changed": [],
+         "stages": {"a": {"status": "RELATION_HOLDS"}, "b": {"status": "UNDEFINED", "reason": "no events"}}}
+    row = report._completion_row({"quote": "q", "page": 1, "claim_type": "performance", "checks": ["C1"], "scope": ["X"]},
+                                 {"C1": c})
+    assert row["experiment"] == "RAN_PARTIAL" and row["undefined_settings"] == ["C1: b"], row
+    from harness.reviewer import decision
+    mixed = _claim_row("SUPPORT_FOUND", exp="RAN_WITH_CHANGES")
+    assert decision(mixed, {})["reason"] == "changed_protocol"                     # never "no test was run"
 
 
 if __name__ == "__main__":

@@ -99,7 +99,7 @@ def read_ranges(path: Path, chunk: int) -> list[list]:
     one turn of parallel Reads, each under the Read tool's cap."""
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return []
     out, start, size = [], 0, 0
     for i, line in enumerate(lines):
@@ -272,8 +272,12 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
     # The follow-up round does not wait on a long run: once only executions remain and each has at least
     # FOLLOWUP_AFTER_S left (measured from its pilot), the follow-up plans for what has ended, beside them; what they
     # find is reported when they end. A costly training run never holds back a proof check or a cheap experiment.
-    early = (executing and not tasks and not x.waiting and x.cfg.max_followup_checks > 0 and x.sealed("plan:2") is None
-             and all((execute.remaining_s(x.cfg, x.root, k) or 0) >= FOLLOWUP_AFTER_S for k in executing))
+    # Once offered, the follow-up stays pending until it is sealed (its planner may take longer than a run has left).
+    offered = (x.cfg.max_followup_checks > 0 and x.sealed("plan:2") is None
+               and (x.root / "tasks" / f"{_safe('plan:2')}.md").exists())
+    early = offered or (executing and not tasks and not x.waiting and x.cfg.max_followup_checks > 0
+                        and x.sealed("plan:2") is None
+                        and all((execute.remaining_s(x.cfg, x.root, k) or 0) >= FOLLOWUP_AFTER_S for k in executing))
     if (tasks or running) and not early:
         return "verify", tasks, running
     ledger = report.ledger(x)
@@ -287,7 +291,7 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
                  cc["claim_status"] in ("NOT_CHECKED", "NOTHING_DECIDED", "PARTIAL_EVIDENCE")
                  or (cc.get("claim_type") != "theory" and ran.get(cc["quote"]) not in (None, "RAN_AS_SPECIFIED")))]
     if x.cfg.max_followup_checks > 0 and x.sealed("plan:2") is None:
-        return "plan", [_plan_task(x, "plan:2", _followup_text(ledger, undecided, executing))], running
+        return "plan", tasks + [_plan_task(x, "plan:2", _followup_text(ledger, undecided, executing))], running
     if running:
         return "verify", [], running
     if x.sealed("report") is None:
@@ -335,6 +339,10 @@ def register_reference(cfg: state.Config, pid: str, path: str, source: str) -> d
             return {"error": "the review is not sealed yet: a reference record is compared only after REFEREE's own decisions"}
         src = Path(path)
         data = src.read_bytes()
+        try:
+            data.decode("utf-8")
+        except UnicodeDecodeError:
+            return {"error": f"{src.name} is not UTF-8 text: register the record's text (markdown, JSON, plain text)"}
         reg = state.read_json(root / "reference" / "index.json", []) or []
         name = f"{len(reg) + 1}_{re.sub(r'[^A-Za-z0-9_.-]+', '_', src.name)[:80]}"
         (root / "reference").mkdir(parents=True, exist_ok=True)
@@ -343,9 +351,8 @@ def register_reference(cfg: state.Config, pid: str, path: str, source: str) -> d
                     "original": str(src)[:300]})
         state.write_json(root / "reference" / "index.json", reg)
         seals = state.read_json(root / "seals.json", {}) or {}
-        if "compare" in seals:                    # a new record: the comparison is made again over all of them
-            seals.pop("compare")
-            state.write_json(root / "seals.json", seals)
+        seals.pop("compare", None)                # a new record: the comparison is made again over all of them
+        state.write_json(root / "seals.json", seals)   # (and the review reads IN PROGRESS until it is rendered again)
         state.append_jsonl(root / "log.jsonl", {"event": "reference", "file": name, "source": source[:80]})
         return {"registered": name, "sha256": state.sha256(data)}
 
@@ -1091,6 +1098,9 @@ def _seal_lens(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
 # ponytail: 30 main claims is a safety ceiling against a runaway list, not a target: the extractor is told to list every
 # main claim and no more; past it the answer is refused (merge restatements and scope items), never cut unseen.
 MAX_EXTRACTED = 30
+# ponytail: 40 scope items per claim (methods, baselines, datasets, settings of one conclusion); more is refused, and on the
+# last attempt the items past it are recorded with the claim (`scope_cut`) and reported as not tested — never cut unseen.
+MAX_SCOPE = 40
 
 
 def _seal_claims(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
@@ -1099,6 +1109,8 @@ def _seal_claims(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     evidence the paper offers and what would decide it — every quote re-found. Ids K1..Kn are the harness's."""
     raw = [c for c in obj.get("claims") or [] if isinstance(c, dict)]
     out, dropped, errors = _validate_claims(x, raw, [], 1)
+    for o in out:
+        o.pop("_raw", None)
     if len(raw) > MAX_EXTRACTED:
         errors.append(f"{len(raw)} claims: at most {MAX_EXTRACTED} — a dataset, baseline, seed or case of one conclusion is its "
                       "scope, and a restatement is `also_stated`, never another claim")
@@ -1122,7 +1134,10 @@ def _validate_claims(x: _Ctx, raw: list[dict], known: list[dict], first: int) ->
         statement = re.sub(r"\s+", " ", str(c.get("statement") or "")).strip()
         if not 10 <= len(statement) <= 400:
             errs.append(f"{label}: `statement` is the claim in one plain sentence (10-400 characters)")
-        scope = [p[:120] for s in c.get("scope") or [] if str(s).strip() for p in _parts(str(s))][:24]
+        scope = [p[:120] for s in c.get("scope") or [] if str(s).strip() for p in _parts(str(s))]
+        if len(scope) > MAX_SCOPE:              # refused, never cut unseen; on the last attempt the cut is recorded
+            errs.append(f"{label}: {len(scope)} scope items: at most {MAX_SCOPE} — list each method, dataset and setting once")
+        scope, cut = scope[:MAX_SCOPE], scope[MAX_SCOPE:]
         if not scope:
             errs.append(f"{label}: `scope` lists every method, dataset, setting and metric the claim names (a theorem: itself)")
         req = str(c.get("required_evidence") or "").strip()
@@ -1150,7 +1165,10 @@ def _validate_claims(x: _Ctx, raw: list[dict], known: list[dict], first: int) ->
         out.append({"id": f"K{first + len(out)}", "quote": h["quote"], "page": h["page"], "also_stated": also,
                     "statement": statement[:400], "claim_type": ctype, "scope": scope, "assumptions": assumptions,
                     "evidence_in_paper": evidence, "required_evidence": req[:600], "interpretations": interp,
+                    "_raw": raw.index(c), **({"scope_cut": cut} if cut else {}),
                     **({"sealed_with_errors": errs[:6]} if errs else {})})
+    dropped += [{"claim": str(c.get("quote") or "")[:200], "why": [f"past the ceiling of {MAX_EXTRACTED} claims"]}
+                for c in raw[MAX_EXTRACTED:]]
     return out, dropped, errors
 
 
@@ -1434,14 +1452,16 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
             errors.append(f"main claim(s) {missing} have no entry: link the checks that test each, or give `why_unchecked` "
                           "and `blocker`")
         if base:
-            known = ks + [c for c in base.get("central_claims", []) if c.get("id") and c["id"] not in extracted]
-            new, ndrop, nerr = _validate_claims(x, [c for c in obj.get("new_claims") or [] if isinstance(c, dict)][:6],
-                                                known, len(known) + 1)            # ponytail: 6 new claims per follow-up
+            known = ks + [c for p in [base] + report.withdrawn_plans(x.root) for c in p.get("central_claims", [])
+                          if c.get("id") and c["id"] not in extracted]
+            top = max([int(m.group(1)) for c in known if (m := re.fullmatch(r"K(\d+)", str(c.get("id") or "")))] + [0])
+            raw_new = [c for c in obj.get("new_claims") or [] if isinstance(c, dict)][:6]   # ponytail: 6 new claims per follow-up
+            new, ndrop, nerr = _validate_claims(x, raw_new, known, top + 1)
             errors += nerr
             dropped += [{"check": "new claim", "why": d["why"]} for d in ndrop]
-            for n, raw in zip(new, [c for c in obj.get("new_claims") or [] if isinstance(c, dict)]):
-                extracted[n["id"]] = {**n, "origin": "plan:2"}
-                given[n["id"]] = raw
+            for n in new:
+                extracted[n["id"]] = {**{k: v for k, v in n.items() if k != "_raw"}, "origin": "plan:2"}
+                given[n["id"]] = raw_new[n["_raw"]]
                 want.append(n["id"])
         claims_in = [{**given.get(i, {"checks": [], "why_unchecked": "the plan gave no entry for this claim"}),
                       **{k: extracted[i][k] for k in ("quote", "claim_type", "scope")}, "id": i} for i in want]
@@ -1581,12 +1601,15 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
             ctype = was
         # Scope: every method, dataset or setting the claim names is covered by one of its TARGET checks or
         # omitted with a reason — a narrower test, or a supporting stand-in, never silently stands for the claim.
-        scope = [str(s)[:120] for s in cc.get("scope") or [] if str(s).strip()][:16]
+        scope = [str(s)[:120] for s in cc.get("scope") or [] if str(s).strip()]
+        if len(scope) > MAX_SCOPE:              # refused, never cut unseen (an extracted claim is already within it)
+            cerrs.append(f"{label}: {len(scope)} scope items: at most {MAX_SCOPE}")
+        scope = scope[:MAX_SCOPE]
         if listed := [(s, p) for s in scope if len(p := _parts(s)) > 1]:
             cerrs.append(f"{label}: scope item(s) {[s for s, _ in listed][:4]} each name several items ({[p for _, p in listed][:2]}): "
                          "give each dataset, model, method or setting its own scope item, covered by a check or omitted with "
                          "its blocker (one entry for five benchmarks read as covered while one never arrived)")
-            scope = [q for s in scope for q in _parts(s)][:24]     # sealed on the last attempt: each its own item
+            scope = [q for s in scope for q in _parts(s)][:MAX_SCOPE]     # sealed on the last attempt: each its own item
         if not scope:
             cerrs.append(f"{label}: `scope` lists every method, dataset, setting and metric the claim names (the statement "
                          "itself, for a theorem)")
@@ -1874,7 +1897,8 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
                            "used": str(d.get("used") or "")[:600], "why": str(d.get("why") or "")[:600],
                            "changes_claim": d.get("changes_claim") is True})
     names = {rd["name"] for rd in (c.get("readings") or []) + readings}
-    has_paper = any(rd.get("source") == "paper" for rd in (c.get("readings") or []) + readings)
+    paper_names = {rd["name"] for rd in (c.get("readings") or []) + readings if rd.get("source") == "paper"}
+    has_paper = bool(paper_names)
     for i, (d, dev) in enumerate(zip(given_devs[:MAX_DEVIATIONS], deviations)):
         rd, why_not = str(d.get("reading") or "").strip()[:24], str(d.get("printed_infeasible") or "").strip()[:400]
         dev.update(**({"reading": rd} if rd else {}), **({"printed_infeasible": why_not} if why_not else {}))
@@ -1884,6 +1908,9 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         if c["kind"] in ("RELEASED_DATA", "RECONSTRUCTION") and dev["changes_claim"] and dev["printed"]:
             if rd and rd not in names:
                 errors.append(f"deviation {i} names reading {rd!r}, which the check does not declare in `readings`")
+            elif rd and rd in paper_names:
+                errors.append(f"deviation {i} names reading {rd!r}, the printed definition itself: a change holds in the OTHER "
+                              "reading (name that one); the paper's reading computes the printed text unchanged")
             elif rd and not has_paper:
                 errors.append(f"deviation {i} is tied to reading {rd!r}: the printed definition is computed beside it, as a "
                               "reading with source 'paper' (its words verbatim), in the same run and cohort")

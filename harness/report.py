@@ -133,6 +133,16 @@ def merged(plan: dict | None, follow: dict | None, withdrawn: list[dict] | tuple
                            "checks": [], "omitted": [], "blocker": "", "discovery": [], "failed_checks": [],
                            "not_the_dataset": "", "why_unchecked": "no plan round took this extracted main claim up "
                                                                    "(the sealed plan has no entry for it)"})
+    by_k = {k["id"]: k for k in extracted if k.get("id")}
+    for cc in claims:
+        k = by_k.get(cc.get("id"))
+        if k:
+            cc.update({f: k[f] for f in ("quote", "page", "claim_type", "scope") if f in k})
+            have = {flat(o["item"]) for o in cc.get("omitted") or []}
+            cc["omitted"] = list(cc.get("omitted") or []) + [
+                {"item": s, "why": f"past the {len(k['scope'])}-item scope the claim record holds (MAX_SCOPE)", "blocker": "cap",
+                 "basis": "harness", "discovery": [], "failed_checks": [], "artifact": "", "service": False, "paper_quote": "",
+                 "not_the_dataset": ""} for s in k.get("scope_cut") or [] if flat(s) not in have]
     out = {**plan, "central_claims": claims}
     return {**out, "checks": plan["checks"] + follow["checks"],
             "dropped": plan.get("dropped", []) + follow.get("dropped", [])} if follow else out
@@ -147,9 +157,14 @@ def plan_of(root: Path) -> dict | None:
 def _scoped(d: dict, c: dict) -> bool:
     """A claim-changing deviation that holds in one named reading only, while the printed definition is computed beside it
     in the same run (a reading with source 'paper'): it changes that reading, never the check (the readings are decided
-    each on its own, and differing ones read READINGS_DIFFER)."""
-    return bool(d.get("reading")) and any(r.get("source") == "paper" for r in c.get("reading_defs") or c.get("readings_declared")
-                                          or [] if isinstance(r, dict))
+    each on its own, and differing ones read READINGS_DIFFER). The reading it names is another one than the printed
+    definition, and a deviation the independent verifier called claim-changing is never scoped away (its key stands).
+    The definitions are read from the ledger's `reading_defs` or the plan's `readings`, whichever the caller holds."""
+    defs = [r for r in (c.get("reading_defs") or (c.get("readings") if isinstance(c.get("readings"), list) else None) or [])
+            if isinstance(r, dict)]
+    paper = {r.get("name") for r in defs if r.get("source") == "paper"}
+    return (bool(d.get("reading")) and bool(paper) and d["reading"] not in paper
+            and d["reading"] in {r.get("name") for r in defs} and d.get("changes_claim_by") != "verifier")
 
 
 def _changed(c: dict) -> bool:
@@ -185,7 +200,8 @@ def needs_audit(root: Path, c: dict) -> bool:
     if o.get("status") not in FAILURE or c["kind"] == "ARITHMETIC" or c.get("role", "target") != "target":
         return False
     run = state.read_json(Path(root) / "checks" / c["id"] / "check.json", {}) or {}
-    chk = {**c, "deviations": run.get("deviations", []), "data_identity": o.get("data_identity"), "values": o.get("values")}
+    chk = {**c, "deviations": run.get("deviations", []), "data_identity": o.get("data_identity"), "values": o.get("values"),
+           "reading_defs": run.get("readings") or c.get("readings") or []}
     return not _moved_before_audit({**chk, "data_changed": _data_changed(chk, Path(root))})
 
 
@@ -373,6 +389,8 @@ def counts(c: dict) -> dict:
     with_result = len(st) - undef - missing if st else int(bool(c.get("values")))
     declared = set(c.get("units") or [])
     unit_names = set(st) or ({""} if c.get("values") else set())
+    if len(declared) == 1 and unit_names <= {"", "(unnamed)"} and c.get("values"):
+        unit_names = set(declared)                  # one declared unit printed without its name is that unit
     lost = sorted(declared - {("" if s == "(unnamed)" else s) for s in unit_names})
     ind = [p.get("n_independent", p.get("n")) for p in st.values() if p["status"] not in ("UNDEFINED", "NOT_COMPLETED")
            and isinstance(p.get("n_independent", p.get("n")), int)]
@@ -622,7 +640,10 @@ def _completion_row(cc: dict, by_id: dict) -> dict:
     scope = cc.get("scope") or []
     unrun = [s for s in scope if flat(s) not in done] if scope else [o["item"] for o in cc.get("omitted") or [] if o.get("why")]
     unran = [c["id"] for c in target if c not in ran]
-    partial = bool(unrun or unran) or any(c["state"] == "PARTIALLY_COMPLETED" or c["status"] == PARTIAL for c in ran)
+    # A setting the run reported undefined was not measured: support from that check covers only the defined settings
+    # (the script decides at run time what it calls undefined, unseen by its verifier), so the claim's scope is partial.
+    undefined = [f"{c['id']}: {s}" for c in ran for s, p in (c.get("stages") or {}).items() if p.get("status") == "UNDEFINED"]
+    partial = bool(unrun or unran or undefined) or any(c["state"] == "PARTIALLY_COMPLETED" or c["status"] == PARTIAL for c in ran)
     if not ran:
         exp, matched = "NOT_RUN", None
     elif changes:
@@ -635,6 +656,7 @@ def _completion_row(cc: dict, by_id: dict) -> dict:
             "requested": "a mathematical statement on exact instances" if not empirical else "an experiment",
             "experiment": exp, "protocol_matched": matched, "partial": partial, "changes": changes[:6],
             "data_mismatch": mismatch, "scope_not_run": unrun, "targets_not_run": unran, "ran": [c["id"] for c in ran],
+            "undefined_settings": undefined[:40],
             "supporting": [{"check": c["id"], "kind": c["kind"], "status": c["status"], "state": c["state"]}
                            for c in cs if c.get("role") == "supporting" or (empirical and c["kind"] == "CERTIFICATE")],
             "not_run": _blockers(cc, cs, unrun, done, said) if exp != "RAN_AS_SPECIFIED" else []}

@@ -106,6 +106,10 @@ def evidence_slots(cfg: state.Config) -> int:
     return max(0, cfg.parallel - busy)
 
 
+# ponytail: a waiting check not polled for an hour (its workflow stopped) gives up its place; polls come every few minutes.
+QUEUE_STALE_S = 3600
+
+
 def wait_turn(cfg: state.Config, key: str, wants_gpu: bool) -> tuple[int, int]:
     """(checks that want only a slot, checks that want the GPU) waiting longer than `key` for their next run, across every
     review on this host; `key` (pid/cid) joins the line if it is not in it. A check takes its next run only when no check
@@ -114,9 +118,14 @@ def wait_turn(cfg: state.Config, key: str, wants_gpu: bool) -> tuple[int, int]:
     waits (Sep-29 GRACE: the first-polled check restarted at every free slot)."""
     with state.lock(cfg.projects / ".queue.lock"):
         q = state.read_json(cfg.projects / ".queue.json", {}) or {}
+        now = time.time()
+        # An entry lives while its check runs AND its review is still being polled: a review whose workflow stopped (a
+        # killed session, a reboot nobody resumed) stops refreshing `seen`, and its place lapses after QUEUE_STALE_S.
         q = {k: v for k, v in q.items() if (cfg.projects / k.split("/", 1)[0] / "checks" / k.split("/", 1)[-1] / "exec.json").exists()
-             and not (cfg.projects / k.split("/", 1)[0] / "checks" / k.split("/", 1)[-1] / "outcome.json").exists()}
-        q.setdefault(key, {"t": time.time(), "gpu": wants_gpu})
+             and not (cfg.projects / k.split("/", 1)[0] / "checks" / k.split("/", 1)[-1] / "outcome.json").exists()
+             and now - v.get("seen", v.get("t", 0)) <= QUEUE_STALE_S}
+        q.setdefault(key, {"t": now, "gpu": wants_gpu})
+        q[key]["seen"] = now
         state.write_json(cfg.projects / ".queue.json", q)
     mine = q[key]["t"]
     ahead = [v for k, v in q.items() if k != key and v["t"] < mine]
@@ -1403,6 +1412,7 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
     width = min(width, max(1, cfg.parallel // max(1, len(active))), st.get("width", width))
     if "pilot_s" not in st:
         width = 1                                          # a bounded pilot: one run first, timed, then the rest
+    slots = free
     if gpu_run(cfg, check):
         # ponytail: one GPU, one run on it. Two runs of different checks on one 8 GB GPU slowed each other until both
         # passed the per-run limit (Oct-01 PPRM C7/C8: 7446 of 8188 MiB used, no progress for 35 min), a blocker that
@@ -1417,7 +1427,7 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
     if st["stage"] == "run" and len(fly) < width and (st.get("redo") or st["next"] < runs):
         # Fair turns across checks: a slot (or the GPU) that a check waiting longer could take is left to it.
         ahead_cpu, ahead_gpu = wait_turn(cfg, turn, gpu_run(cfg, check))
-        free = (0 if ahead_gpu else max(0, free - ahead_cpu)) if gpu_run(cfg, check) else \
+        free = (0 if ahead_gpu or not free else min(1, max(0, slots - ahead_cpu))) if gpu_run(cfg, check) else \
             max(0, free - ahead_cpu - (min(1, ahead_gpu) if ahead_gpu and not gpu_busy() else 0))
     while st["stage"] == "run" and len(fly) + len(todo) < width and len(todo) < free and (
             st.get("redo") or st["next"] < runs):
@@ -1624,6 +1634,12 @@ def varied_nothing(check: dict, st: dict) -> str:
         return ""
     states = [independence.assess(detail, s, rd, check.get("seed_flow"))["state"] for s, rd in keys]
     if not all(x in ("identical", "unproven") for x in states):
+        return ""
+    from .reconcile import _repeats                 # ...and the compared values themselves repeat (a timing output does not)
+    by: dict = {}
+    for e in st.get("staged") or []:
+        by.setdefault((e[0], e[2] if len(e) > 2 else ""), []).append(e[1])
+    if by and not all(_repeats(v) for v in by.values() if len(v) > 1):
         return ""
     return (f"the approved script declared `stochastic`: true, but its {len(set(st['done_seeds']))} seeded runs printed "
             f"identical result lines in all {len(keys)} stage(s), with nothing showing the seed varied them: they are one run "

@@ -23,8 +23,7 @@ VERIFIED, NOT_VERIFIED = "VERIFIED", "NOT_VERIFIED"
 # Each reason is one sentence of plain English; the decision's own facts follow it in `because`.
 REASONS = {
     "supported": "The requested test ran as specified and its result supports the claim within the tested scope.",
-    "contradicted": "The evidence contradicts the claim as printed; an independent audit found the failure rests on the "
-                    "paper's own words.",
+    "contradicted": "The evidence contradicts the claim as printed.",
     "false_as_printed": "A case that meets every printed assumption violates the printed statement.",
     "proof_step_invalid": "A step of the printed proof fails on cases that meet its assumptions. This does not show "
                           "that the statement itself is false.",
@@ -69,6 +68,10 @@ def decision(cc: dict, by_id: dict) -> dict:
         reason = "supported"
     elif st in ("SUPPORT_FOUND", "NO_VIOLATION_FOUND") and theory:
         reason = "finite_cases_only"
+    elif st == "SUPPORT_FOUND" and comp.get("experiment") == "RAN_WITH_CHANGES":
+        reason = "changed_protocol"                 # one test as specified, another under a change: not the printed scope
+    elif st == "SUPPORT_FOUND":
+        reason = "incomplete_coverage"
     elif st == "FAILURE_FOUND":
         reason = "false_as_printed" if theory else "contradicted"
     elif st == "PROOF_GAP_FOUND":
@@ -105,6 +108,13 @@ def _because(cc: dict, tgt: list[dict], reason: str, comp: dict) -> list[str]:
     out = []
     for c in tgt:
         out.append(f"{_what(c)}: {_status_words(c)}")
+        if c["status"] in FAILURE and (c.get("audit") or {}).get("verdict") == "STANDS":
+            out.append(f"{c['id']}: an independent audit, shown the failing cases, found the failure rests on the paper's own words")
+        if c["status"] in FAILURE and (c.get("image_check") or {}).get("agrees"):
+            out.append(f"{c['id']}: every number was read off the page image and agrees with the extracted text")
+    if comp.get("undefined_settings"):
+        out.append("undefined (not measured): " + ", ".join(comp["undefined_settings"][:6])
+                   + (" …" if len(comp["undefined_settings"]) > 6 else ""))
     if comp.get("changes"):
         out.append("changed from the paper: " + "; ".join(_short(x, 140) for x in comp["changes"][:3]))
     if reason in ("incomplete_coverage", "blocked", "not_checked", "undecided", "changed_protocol") and comp.get("scope_not_run"):
@@ -277,23 +287,25 @@ def evidence_line(c: dict, led: dict) -> str:
 
 
 # --- prose validation ---------------------------------------------------------------------------------------------
+_NUMTOK = re.compile(r"(?<![A-Za-z_\d.])(-?)(\d+(?:\.(\d+))?)(?:[eE]([-+]?\d+))?(%?)")
+
+
 def numbers_of(text: str) -> list[float]:
-    return [float(m) for m in re.findall(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", re.sub(r"(?<=\d),(?=\d{3})", "", text or ""))]
+    t = re.sub(r"(?<=\d),(?=\d{3})", "", text or "")
+    return [float(f"{m.group(1)}{m.group(2)}" + (f"e{m.group(4)}" if m.group(4) else "")) for m in _NUMTOK.finditer(t)]
 
 
 def unknown_numbers(text: str, allowed: list[float]) -> list[str]:
-    """Numbers in model prose that neither the record nor the paper holds (to the digits written). Small whole numbers
-    (counts up to 12) are free; an id such as K3 or C7 is not a number."""
+    """Numbers in model prose (signed, with a unit or a percent attached) that neither the record nor the paper holds to
+    the digits written. Small whole counts (up to 12) are free; an id such as K3 or C7 is not a number."""
     bad, t = [], re.sub(r"(?<=\d),(?=\d{3})", "", text or "")
-    for m in re.finditer(r"(?<![\w.\-])(\d+(?:\.(\d+))?)(%?)(?![\w])", t):
-        if t[max(0, m.start() - 1):m.start()].isalpha():
+    for m in _NUMTOK.finditer(t):
+        sign, body, dec, exp, pct = m.group(1), m.group(2), m.group(3) or "", m.group(4), m.group(5)
+        v = float(f"{sign}{body}" + (f"e{exp}" if exp else ""))
+        if not dec and not exp and not sign and v <= 12:
             continue
-        v, dec, pct = float(m.group(1)), len(m.group(2) or ""), m.group(3)
-        if not dec and v <= 12:
-            continue
-        tol = 0.5 * 10 ** -dec + 1e-12
-        cands = [v] + ([v / 100] if pct else [])
-        if not any(_near(allowed, x, tol if x == v else tol / 100) for x in cands):
+        tol = (0.5 * 10 ** -len(dec)) * (10 ** int(exp) if exp else 1) + 1e-12
+        if not (_near(allowed, v, tol) or (pct and _near(allowed, v / 100, tol / 100))):
             bad.append(m.group(0))
     return bad
 
@@ -304,28 +316,58 @@ def _near(allowed: list[float], x: float, tol: float) -> bool:
     return i < len(allowed) and allowed[i] <= x + tol
 
 
-def allowed_numbers(*texts: str) -> list[float]:
-    vals = set()
+def numeric_leaves(obj, out: set | None = None) -> set:
+    """The numbers a record HOLDS as numbers (and the numbers in its keys, such as stage names): never the digits inside
+    its strings — a sha256, a timestamp, a model-written reason are not measurements."""
+    out = set() if out is None else out
+    if isinstance(obj, bool):
+        return out
+    if isinstance(obj, (int, float)):
+        out.update((float(obj), -float(obj), abs(float(obj))))
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(k, str):
+                out.update(numbers_of(k))
+            numeric_leaves(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            numeric_leaves(v, out)
+    return out
+
+
+def allowed_numbers(record, *texts: str) -> list[float]:
+    vals = numeric_leaves(record)
     for t in texts:
         for v in numbers_of(t):
             vals.update((v, -v, abs(v)))
     return sorted(vals)
 
 
-def problems(text: str, led: dict, paper, allowed: list[float]) -> list[str]:
-    """Why a model-written passage cannot be published: a status word no cited check earns, a quote not in the paper, a
-    number the record and the paper do not hold."""
+_MARKUP = re.compile(r"<[A-Za-z/!]|&#?\w+;")
+
+
+def problems(text: str, led: dict, paper, allowed: list[float], refs_flat: str = "") -> list[str]:
+    """Why a model-written passage cannot be published: markup or an entity (it would render as something the checks never
+    saw), a status word no cited check earns, a quote not in the paper (or the registered record), a number the record
+    and the paper do not hold."""
     if not text:
         return []
-    return ([f"status language: {s[:120]!r}" for s in report.unearned(_unquote(text), led)][:2]
-            + [f"quote not in the paper: {q[:80]!r}" for q in report.unquoted(text, paper)][:2]
+    if _MARKUP.search(text):
+        return ["markup or a character entity in the text"]
+    quotes = [q for q in re.findall(r'"([^"\n]*)"', text) if len(q) >= 20 and not paper.occurs(q.replace("\\n", "\n"))
+              and report.flat(q) not in refs_flat]
+    return ([f"status language: {s[:120]!r}" for s in report.unearned(_unquote(text, paper, refs_flat), led)][:2]
+            + [f"quote not in the paper or the record: {q[:80]!r}" for q in quotes][:2]
             + [f"number not in the record or the paper: {n}" for n in unknown_numbers(text, allowed)][:3])
 
 
-def _unquote(text: str) -> str:
-    """Text with its quoted spans removed: words inside quotation marks are someone else's (the paper's, a reference
-    record's), not REFEREE's assertion."""
-    return re.sub(r'"[^"\n]*"', " ", text or "")
+def _unquote(text: str, paper, refs_flat: str = "") -> str:
+    """Text with the quoted spans removed that are someone else's words — the paper's, or a registered reference
+    record's, re-found there — so a status word inside them is not REFEREE's assertion. Any other quoted word stays."""
+    def keep(m):
+        q = m.group(1)
+        return " " if len(q) >= 8 and (paper.occurs(q) or report.flat(q) in refs_flat) else m.group(0)
+    return re.sub(r'"([^"\n]*)"', keep, text or "")
 
 
 # --- the page ------------------------------------------------------------------------------------------------------
@@ -334,13 +376,13 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
     rep, cmp = rep or {}, cmp or {}
     by_id = {c["id"]: c for c in led["checks"]}
     claims = led["central_claims"]
-    det = json.dumps(led, ensure_ascii=False, default=str)
-    allowed = allowed_numbers(det, "\n".join(x.paper.pages) if hasattr(x.paper, "pages") else "",
-                              json.dumps(cmp, ensure_ascii=False))
+    refs = _reference_text(x.root)
+    allowed = allowed_numbers(led, "\n".join(x.paper.pages) if hasattr(x.paper, "pages") else "", refs)
+    refs_flat = report.flat(refs)
     held: list[str] = []
 
     def prose(text: str, where: str) -> str:
-        bad = problems(text, led, x.paper, allowed)
+        bad = problems(text, led, x.paper, allowed, refs_flat)
         if bad:
             held.append(f"{where}: " + "; ".join(bad))
             return ("_(Model-written text withheld here: it used a number, a quotation or a status word that the record "
@@ -357,9 +399,13 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
              "were checked against the record._", ""]
     lines += ["## What the paper does", "", prose(rep.get("overview", ""), "overview") or "_(no overview)_", ""]
     verified = [cc for cc in claims if (cc.get("decision") or {}).get("decision") == VERIFIED]
+    first = sum(1 for cc in claims if cc.get("id") and cc.get("origin") != "plan:2")
+    added = sum(1 for cc in claims if cc.get("origin") == "plan:2")
+    how = (f"{first} main claims were extracted from the paper before any test was planned"
+           + (f"; {added} more were added by the follow-up round" if added else "") if first else
+           f"{len(claims)} main claims were listed by the planner (no extraction is on record)")
     lines += ["## Decisions on the main claims", "",
-              f"{len(claims)} main claims were extracted from the paper before any test was planned. "
-              f"{len(verified)} verified; {len(claims) - len(verified)} not verified.", "",
+              f"{how}. {len(verified)} verified; {len(claims) - len(verified)} not verified.", "",
               "| Claim | Decision | Reason |", "|---|---|---|"]
     for cc in claims:
         d = cc.get("decision") or {}
@@ -402,8 +448,11 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
             lines.append(f"- **No test ran.** The planner's reason: {_short(cc['why_unchecked'], 300)}")
         o = other.get(k)
         if o:
-            lines.append(f"- **Other reproduction record ({o.get('source', 'reference')}):** {_short(o.get('reference_finding'), 300)} "
-                         f"Comparable: {o.get('comparable', '?')} — {prose(o.get('why', ''), k + ' reference')} "
+            said = "; ".join(f"\"{_short(q, 160)}\"" for q in o.get("quotes") or [])
+            lines.append(f"- **Other reproduction record ({_short(o.get('source', 'reference'), 60)}):** "
+                         f"{prose(_short(o.get('reference_finding'), 300), k + ' reference finding')}"
+                         + (f" In its words: {said}." if said else "")
+                         + f" Comparable: {o.get('comparable', '?')} — {prose(o.get('why', ''), k + ' reference')} "
                          f"Agreement: {str(o.get('agreement', '')).replace('_', ' ')}.")
         ev = [evidence_line(c, led) for c in tgt + sup]
         if ev:
@@ -426,6 +475,17 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
     (x.root / "reviewer.md").write_text(text, encoding="utf-8")
     state.write_json(x.root / "reviewer.withheld.json", held)
     return text
+
+
+def _reference_text(root: Path) -> str:
+    """The registered reference records' text (for re-finding their quotes and numbers); empty when none."""
+    out = []
+    for r in state.read_json(Path(root) / "reference" / "index.json", []) or []:
+        try:
+            out.append((Path(root) / "reference" / r["file"]).read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+    return "\n".join(out)
 
 
 def _harness_commit() -> str:

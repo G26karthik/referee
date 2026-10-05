@@ -1,2 +1,4 @@
 # REFEREE runtime: PDF parsing only. Everything a check runs is installed inside its container.
 pymupdf>=1.24
+# tools/reviewer_pdf.py only (a delivery convenience): Markdown -> HTML
+markdown>=3.5
