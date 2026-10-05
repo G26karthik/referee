@@ -27,11 +27,14 @@ THE SCRIPT CONTRACT
     stage even if a later one fails.
   - At the start, declare the units that will each print a result line, once:
     `REFEREE_PROGRESS {"units": ["<unit>", ...]}` — a declared unit that prints no result counts as
-    NOT COMPLETED. Before each step, print `REFEREE_PROGRESS {"stage": "<step>", "t": <seconds so
+    NOT COMPLETED. A unit whose compared quantity is mathematically UNDEFINED on the data (an estimator with no event
+    to estimate from, a ratio over a zero count) prints `REFEREE_RESULT {"stage": "<unit>", "undefined": "<why>"}`
+    instead: it is counted as completed and undefined, apart from missing units. Never print a placeholder number. Before each step, print `REFEREE_PROGRESS {"stage": "<step>", "t": <seconds so
     far>}` (either stream): it shows how far a failed run got and times the pilot.
   - DATA IDENTITY: for each dataset you load, print `REFEREE_DATA {"dataset": "<name>", "source":
     "<file path>", "observed": {...counts, shape, distinct labels...}, "expected": {...what the
-    paper prints, with its quote...}, "matches": true|false}`. `matches` is true when what you loaded
+    paper prints, with its quote...}, "covers": ["<the scope items this dataset is the data for>"], "matches": true|false}`.
+    Every scope item an acquired source `serves` (see the manifest) is named in some line's `covers`, or in `missing`. `matches` is true when what you loaded
     is the dataset the paper describes within what the paper itself states: a count inside its own
     stated tolerance or hedge ("about 300", "occasionally larger or smaller", "~1% discarded") matches;
     observed and expected are recorded either way. It is false when the data differ from that
@@ -114,6 +117,11 @@ paper tuned them, a baseline rebuilt differently, a different aggregation) and f
 fixes a detail the claim leaves open (a distribution, a threshold, a seed) — those are protocol
 choices REFEREE supplied and are reported as such. An unlisted departure gets the check rejected;
 a result obtained under claim-changing deviations is reported as being about the changed claim.
+A PRINTED DEFINITION IS COMPUTED BESIDE ANY CHANGE OF IT (RELEASED_DATA, RECONSTRUCTION): a claim-changing
+deviation with `printed` words also computes the printed version in the same run — declare `readings` with one of
+source "paper" (those words verbatim) and give the deviation `"reading": "<the other reading's name>"` — or, only
+where the printed text cannot be computed (a detail it never states: the tuning grid, the unreleased split), say why
+in `"printed_infeasible"`. A result under a changed definition alone never stands for the printed claim.
 For a CERTIFICATE with a claim-changing deviation, ALSO evaluate the text exactly as printed on
 the same instance and add `"literal": "holds" | "fails" | "undefined" | "premise_not_met"` to the
 result line (fails = its printed premises hold and its printed conclusion fails; undefined = the
@@ -147,6 +155,19 @@ test keeps the planner's condition and output definitions exactly: one stated co
 the component swapped in, no baselines to beat, no tuning sweep, no grid of settings; the
 harness sets its run count and its 30-minute budget.
 
+FIDELITY (RELEASED_DATA, RECONSTRUCTION). State, for each aspect, what the paper says, what the authors' code or the
+released record does, and what your script uses: `"fidelity": [{"aspect": "data|model|metric|baselines|preprocessing|
+sample_size|statistics", "paper": "<the paper's words, verbatim, or empty if silent>", "code": {"file": "<tracked
+checkout path, or record:<n>/<path>>", "quote": "<its literal lines>"} or null, "used": "<what the script does>",
+"agrees": true|false (paper vs code, when both are given), "reading": "<a declared reading's name, when the script
+computes the code's version as a reading>", "explained": "<when they disagree and both are not computed: what differs,
+which one the script follows, why>"}]` — every aspect once (or `{"aspect": ..., "not_applicable": "<why>"}`: no
+baselines in a certificate-like computation). `data` = dataset identity, version, split; `model` = architecture, size,
+checkpoint; `metric` = the compared quantity's estimator, pooling and selection; `baselines` = which ones and how
+obtained; `preprocessing`; `sample_size` = items, seeds, runs; `statistics` = the paper's decision or aggregation rule.
+Where paper and code define the METRIC differently, both are computed as `readings`; never choose one. A silent paper
+with no code is your choice: declare it as a deviation with empty `printed`.
+
 TESTING. You may run a draft (at most {{max_tries}} times; result lines are masked; drafts never
 count as evidence): write the script to a file, then run
     {{try_cmd}} <path-to-your-script.py>
@@ -159,6 +180,7 @@ Write ONLY this JSON to the output path you were given:
  "metric": "the compared output's name (not for CERTIFICATE or a relation target)",
  "outputs": ["every name the result line carries"],
  "deviations": [],
+ "fidelity": [],
  "revision_notes": [],
  "bindings": [{"kind": "...", "paper_quote": "...", "impl_quote": "..."}],
  "checked_statement": "conclusion|proof_step (CERTIFICATE only)",

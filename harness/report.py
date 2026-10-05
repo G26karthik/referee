@@ -144,8 +144,16 @@ def plan_of(root: Path) -> dict | None:
                   withdrawn_plans(root), claims_of(root))
 
 
+def _scoped(d: dict, c: dict) -> bool:
+    """A claim-changing deviation that holds in one named reading only, while the printed definition is computed beside it
+    in the same run (a reading with source 'paper'): it changes that reading, never the check (the readings are decided
+    each on its own, and differing ones read READINGS_DIFFER)."""
+    return bool(d.get("reading")) and any(r.get("source") == "paper" for r in c.get("reading_defs") or c.get("readings_declared")
+                                          or [] if isinstance(r, dict))
+
+
 def _changed(c: dict) -> bool:
-    return any(d.get("changes_claim") for d in c.get("deviations") or [])
+    return any(d.get("changes_claim") and not _scoped(d, c) for d in c.get("deviations") or [])
 
 
 def _moved_before_audit(c: dict) -> bool:
@@ -196,6 +204,10 @@ def _data_changed(c: dict, root: Path) -> list[str]:
             for n, i in ident.items() if not (isinstance(i, dict) and i.get("matches") is True)]
     if c.get("acquire") and not ident and c.get("values"):
         out.append("no REFEREE_DATA identity line: the data the run read was never compared with the paper's description")
+    elif c.get("acquire") and ident and c.get("values"):
+        from .execute import unshown_items
+        out += [f"{s}: no REFEREE_DATA line shows the data loaded for it" for s in unshown_items(
+            c, [i for i in ident.values() if isinstance(i, dict)])]
     return out
 
 
@@ -562,7 +574,7 @@ def _completion_row(cc: dict, by_id: dict) -> dict:
     target = [c for c in cs if c.get("role", "target") == "target"]
     ran = [c for c in target if c["state"] in ("COMPLETED", "PARTIALLY_COMPLETED")
            and (c["kind"] in _EXPERIMENT if empirical else True) and (c.get("values") or c["kind"] == "ARITHMETIC")]
-    changes = [d["used"] for c in ran for d in c["deviations"] if d.get("changes_claim")] + [
+    changes = [d["used"] for c in ran for d in c["deviations"] if d.get("changes_claim") and not _scoped(d, c)] + [
         f"{c['id']}: {g}" for c in ran for g in c.get("data_changed") or []]
     mismatch = [n for c in ran for n, i in (c.get("data_identity") or {}).items()
                 if not (isinstance(i, dict) and i.get("matches") is True)]

@@ -491,7 +491,19 @@ def _data_identity(rec: dict, check: dict) -> list[str]:
     if any(not isinstance(d.get("matches"), bool) for d in ids):
         return ["a REFEREE_DATA line carries no boolean `matches` (true or false: does the data read match the paper's "
                 "own description)"]
+    if (unshown := unshown_items(check, ids)):
+        return [f"acquired data serves {unshown[:6]}, but no REFEREE_DATA line names them in `covers` (the data loaded for "
+                "them) or `missing` (could not be loaded)"]
     return []
+
+
+def unshown_items(check: dict, ids: list[dict]) -> list[str]:
+    """The scope items an acquired source serves (the plan's `serves`) that no REFEREE_DATA line names in `covers` or
+    `missing`: the run never showed it loaded their data."""
+    from .evidence import flat
+    named = {flat(str(v)) for d in ids if isinstance(d, dict) for k in ("covers", "missing") for v in (d.get(k) or [])
+             if isinstance(d.get(k), list)}
+    return [s for a in check.get("acquire") or [] for s in a.get("serves") or [] if flat(s) not in named]
 
 
 def result_schema(rec: dict, check: dict) -> list[str]:

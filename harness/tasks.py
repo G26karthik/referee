@@ -484,8 +484,8 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
             prev = x.sealed(f"verify:{cid}.{r - 1}") if r > 1 else None
             setup = cdir / f"setup.{r - 1}.txt"
             revision = (
-                f"\n=== REVISION {r}: the previous script FAILED in the harness's run of it ===\nFix what "
-                f"stopped it (a module missing from the environment: declare it on a `# REFEREE_PACKAGES:` line; "
+                f"\n=== REVISION {r}: the harness's run of the previous script returned it to you ===\nFix what "
+                f"it names (a module missing from the environment: declare it on a `# REFEREE_PACKAGES:` line; "
                 f"a path, argument or code error; a data file named differently than you assumed — look at the "
                 f"acquired-data manifest). Never fix it by weakening the claim. The error (result lines masked):\n"
                 f"{setup.read_text(encoding='utf-8')[-2500:]}\n"
@@ -559,7 +559,7 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
                      "runs_source": source, "stochastic": g.get("stochastic"), "seed_flow": g.get("seed_flow"),
                      "readings": _merge_readings(c.get("readings"), g.get("readings")),
                      "script_sha256": g["script_sha256"], "metric": g.get("metric", c["metric"]), "criterion": crit,
-                     "deviations": devs, "premise_argument": g.get("premise_argument", ""),
+                     "deviations": devs, "premise_argument": g.get("premise_argument", ""), "fidelity": g.get("fidelity") or [],
                      "revisions": [x.sealed(f"gen:{cid}.{k}").get("revisions") for k in range(2, r + 1)
                                    if (x.sealed(f"gen:{cid}.{k}") or {}).get("revisions")],
                      "approval": {"approved": True, "script_sha256": v["script_sha256"],
@@ -1142,6 +1142,15 @@ def _acquire(x: _Ctx, c: dict, errs: list[str], cid: str) -> list[dict]:
             errs.append(f"{cid}: each `exclude` entry gives the reason this claim does not need those files: {bad[:5]}")
         rec = {"source": src, "include": inc, "cited_in": cited, "why": str(s.get("why") or "")[:400],
                "required": s.get("required") is not False, **({"exclude": exc} if exc else {})}
+        # Which of the check's scope items this source holds the data for: the run must then show, per item, that what it
+        # loaded is that data (a REFEREE_DATA line naming it in `covers`), or say it is missing — so a download plan that
+        # left a required file out reads as an item not run, never as covered (validated against the experiment).
+        covers = {flat(p) for x_ in c.get("covers") or [] for p in _parts(str(x_))}
+        serves = [str(v)[:120] for v in s.get("serves") or [] if str(v).strip()][:12]
+        if (stray := [v for v in serves if flat(v) not in covers]):
+            errs.append(f"{cid}: acquire source {src[:80]} `serves` {stray[:4]}, which are not in this check's `covers`")
+        if serves:
+            rec["serves"] = serves
         # Every data file the record's listing names is requested or excluded with a reason: a file left out unseen made
         # an acquisition read complete (Oct-01 transformer: 20 of 25, the plan's own `why` said 24). Only a listing the
         # planner was shown (`discover --files`) binds it; a listing the fetcher alone saw stays informational.
@@ -1588,29 +1597,32 @@ def _readings(x: _Ctx, items, errs: list[str], cid: str, record: Path | None = N
             if h:
                 out.append({"name": name, "source": "paper", "quote": h["quote"], "page": h["page"]})
             continue
-        if src.startswith("record:"):
-            rel = src[len("record:"):].strip().replace("\\", "/").removeprefix("./")
-            listed = {r.get("path"): r.get("sha256") for r in (state.read_json(record.parent / "data.json") or {}).get(
-                "record_src") or []} if record is not None else {}
-            f = record / rel if record is not None and rel in listed and ".." not in rel.split("/") else None
-            if f and f.is_file() and state.sha256(f.read_bytes()) != listed[rel]:
-                f = None                                     # changed since the acquisition kept it
-            if not (f and f.is_file() and len(flat(quote)) >= 20 and flat(quote) in flat(
-                    f.read_text(encoding="utf-8", errors="replace"))):
-                errs.append(f"{cid}: reading {name}: the quote is not literal text (20+ chars) of the released record's file "
-                            f"{src!r} (the files listed under record_src in the acquired-data manifest)")
-                continue
-            out.append({"name": name, "source": src, "quote": quote[:1500]})
-            continue
-        f = _repo_file(x, src)
-        if not (f and f.is_file() and len(flat(quote)) >= 20 and flat(quote) in flat(
-                f.read_text(encoding="utf-8", errors="replace"))):
-            errs.append(f"{cid}: reading {name}: the quote is not literal code (20+ chars) of tracked file {src!r}")
+        if not _code_quote(x, src, quote, record):
+            errs.append(f"{cid}: reading {name}: the quote is not literal text (20+ chars) of the released record's file "
+                        f"{src!r} (the files listed under record_src in the acquired-data manifest)" if src.startswith("record:")
+                        else f"{cid}: reading {name}: the quote is not literal code (20+ chars) of tracked file {src!r}")
             continue
         out.append({"name": name, "source": src, "quote": quote[:1500]})
     if items and len(out) < 2:
         errs.append(f"{cid}: `readings` needs at least two definitions that re-find (the paper's and the code's)")
     return out
+
+
+def _code_quote(x: _Ctx, src: str, quote: str, record: Path | None = None) -> bool:
+    """Is `quote` literal text (20+ characters) of a file git tracks in the pinned checkout, or of a released record's
+    file kept as quote-only text (`record:<path>`, unchanged since it was acquired)?"""
+    src = str(src or "").strip()
+    if src.startswith("record:"):
+        rel = src[len("record:"):].strip().replace("\\", "/").removeprefix("./")
+        listed = {r.get("path"): r.get("sha256") for r in (state.read_json(record.parent / "data.json") or {}).get(
+            "record_src") or []} if record is not None else {}
+        f = record / rel if record is not None and rel in listed and ".." not in rel.split("/") else None
+        if f and f.is_file() and state.sha256(f.read_bytes()) != listed[rel]:
+            f = None                                     # changed since the acquisition kept it
+    else:
+        f = _repo_file(x, src)
+    return bool(f and f.is_file() and len(flat(quote)) >= 20 and flat(quote) in flat(f.read_text(encoding="utf-8",
+                                                                                                    errors="replace")))
 
 
 def _repo_file(x: _Ctx, rel) -> Path | None:
@@ -1766,6 +1778,26 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         deviations.append({"printed": h["quote"] if h else "", "page": h["page"] if h else None,
                            "used": str(d.get("used") or "")[:600], "why": str(d.get("why") or "")[:600],
                            "changes_claim": d.get("changes_claim") is True})
+    names = {rd["name"] for rd in (c.get("readings") or []) + readings}
+    has_paper = any(rd.get("source") == "paper" for rd in (c.get("readings") or []) + readings)
+    for i, (d, dev) in enumerate(zip(given_devs[:MAX_DEVIATIONS], deviations)):
+        rd, why_not = str(d.get("reading") or "").strip()[:24], str(d.get("printed_infeasible") or "").strip()[:400]
+        dev.update(**({"reading": rd} if rd else {}), **({"printed_infeasible": why_not} if why_not else {}))
+        # Readings are never chosen (invariant 15): a script that departs from a printed definition where the claim is
+        # decided also computes the printed one, beside it, in the same run (Sep-29 label ranking C9: the paper's r/sum r
+        # was replaced by a softmax and the printed estimator was never decided), or says why the printed text cannot run.
+        if c["kind"] in ("RELEASED_DATA", "RECONSTRUCTION") and dev["changes_claim"] and dev["printed"]:
+            if rd and rd not in names:
+                errors.append(f"deviation {i} names reading {rd!r}, which the check does not declare in `readings`")
+            elif rd and not has_paper:
+                errors.append(f"deviation {i} is tied to reading {rd!r}: the printed definition is computed beside it, as a "
+                              "reading with source 'paper' (its words verbatim), in the same run and cohort")
+            elif not rd and len(why_not) < 20:
+                errors.append(f"deviation {i} changes the printed text ({dev['printed'][:80]!r}): compute the printed version "
+                              "too — a reading with source 'paper', and this deviation's `reading` naming the other one — or "
+                              "say in `printed_infeasible` why the printed text cannot be computed (a detail it never states)")
+    fidelity = _fidelity(x, c, obj.get("fidelity"), names, deviations, errors) if c["kind"] in (
+        "RELEASED_DATA", "RECONSTRUCTION") else []
     revisions = _revision(x, cid, int(r), runs, deviations, obj, errors, final)
     if c.get("criterion") == "supplied":   # a qualitative claim tested by a criterion the planner chose: its result is about that criterion
         deviations.append(_supplied(c))
@@ -1785,12 +1817,68 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     return {"script_sha256": state.sha256(script), "runs": runs, "runs_quote": str(obj.get("runs_quote") or "")[:500],
             "metric": metric, "outputs": outputs, "deviations": deviations, "bindings": out,
             "stochastic": stochastic if isinstance(stochastic, bool) else None, "seed_flow": flow, "readings": readings,
-            **({"revisions": revisions} if revisions else {}),
+            **({"revisions": revisions} if revisions else {}), **({"fidelity": fidelity} if fidelity else {}),
             "checked_statement": "proof_step" if c.get("step") else str(obj.get("checked_statement") or "conclusion"),
             # A general argument (e.g. that a printed premise can never hold) is the author's reasoning:
             # shown to the verifier and the reader as such, never counted as an executed result.
             "premise_argument": str(obj.get("premise_argument") or "")[:2000] if c["kind"] == "CERTIFICATE" else "",
             "notes": str(obj.get("notes") or "")[:2000]}
+
+
+FIDELITY = ("data", "model", "metric", "baselines", "preprocessing", "sample_size", "statistics")
+
+
+def _fidelity(x: _Ctx, c: dict, items, names: set, deviations: list[dict], errors: list[str]) -> list[dict]:
+    """The script author's account of each aspect of the experiment against the paper and, where they ship it, the
+    authors' code or the released record: the dataset, the model, the metric, the baselines, the preprocessing, the
+    sample sizes and the statistical rule — what the paper says (verbatim), what the code does (its literal lines), what
+    the script uses. Every aspect is stated (or `not_applicable` with why). Where paper and code disagree the script never
+    picks one silently: on the compared quantity (`metric`) both are computed as readings; on any other aspect it
+    computes both (a reading) or explains the disagreement, and the report shows it beside the result."""
+    out, seen = [], set()
+    record = x.root / "checks" / c["id"] / "record_src"
+    for f in [f for f in items or [] if isinstance(f, dict)][:14]:
+        a = str(f.get("aspect") or "")
+        if a not in FIDELITY or a in seen:
+            errors.append(f"fidelity: aspect {a!r} is one of {list(FIDELITY)}, each once")
+            continue
+        seen.add(a)
+        if len(na := str(f.get("not_applicable") or "").strip()) >= 10:
+            out.append({"aspect": a, "not_applicable": na[:300]})
+            continue
+        pq = str(f.get("paper") or "").strip()
+        h = _find(x, pq, errors, f"fidelity {a}: `paper`") if pq else None
+        code = f.get("code") if isinstance(f.get("code"), dict) else {}
+        src, cq = str(code.get("file") or "").strip(), str(code.get("quote") or "")
+        if src and not _code_quote(x, src, cq, record):
+            errors.append(f"fidelity {a}: `code` quote is not literal text (20+ chars) of {src!r} (a tracked checkout file, or "
+                          "record:<path> of the released record)")
+            src = ""
+        used = str(f.get("used") or "").strip()
+        if len(used) < 5:
+            errors.append(f"fidelity {a}: `used` says what the script does")
+        agrees = f.get("agrees")
+        rd, expl = str(f.get("reading") or "").strip()[:24], str(f.get("explained") or "").strip()[:600]
+        if pq and src and not isinstance(agrees, bool):
+            errors.append(f"fidelity {a}: with the paper's words and the code's lines both given, `agrees` is true or false")
+        if agrees is False:
+            if a == "metric" and not (rd and rd in names):
+                errors.append("fidelity metric: the paper and the code define the compared quantity differently — compute both "
+                              "as `readings` (same data, same cohort) and name the code's reading in `reading`; never choose one")
+            elif a != "metric" and not (rd and rd in names) and len(expl) < 20:
+                errors.append(f"fidelity {a}: the paper and the code disagree — compute both (a reading), or say in "
+                              "`explained` what differs, which one the script follows and why")
+        if not pq and not src and not any(not d["printed"] for d in deviations):
+            errors.append(f"fidelity {a}: neither the paper's words nor the code's lines are given — if the paper is silent "
+                          "here, the script's choice is a deviation with an empty `printed`")
+        out.append({"aspect": a, "paper": h["quote"] if h else "", **({"page": h["page"]} if h else {}),
+                    "code": {"file": src, "quote": cq[:600]} if src else None, "used": used[:600],
+                    "agrees": agrees if isinstance(agrees, bool) else None, **({"reading": rd} if rd else {}),
+                    **({"explained": expl} if expl else {})})
+    if (miss := [a for a in FIDELITY if a not in seen]):
+        errors.append(f"fidelity: state every aspect {miss} against the paper and the released code (or `not_applicable` "
+                      "with why)")
+    return out
 
 
 def _revision(x: _Ctx, cid: str, r: int, runs: int, deviations: list[dict], obj: dict, errors: list[str], final: bool) -> dict:

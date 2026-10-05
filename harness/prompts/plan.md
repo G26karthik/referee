@@ -131,7 +131,10 @@ concerns about the same number share one check.
 
 DATA NOT IN THE CHECKOUT. Missing from the checkout is not unavailable, and a dataset the paper only
 NAMES is not "uncited": it has to be found. List what a script check needs in its `acquire`:
-[{"source": ..., "cited_in": ..., "include": ["filename patterns"], "why": "...", "required": true}].
+[{"source": ..., "cited_in": ..., "include": ["filename patterns"], "serves": ["the check's covered scope items this
+source holds the data for"], "why": "...", "required": true}]. Check the include list against the EXPERIMENT, not
+against a convenient subset: every dataset, split and file the claim's experiment reads is included; a served item whose
+data the run cannot show it loaded reads as not run.
 The harness downloads them once (network on only for this), validates every file (an HTML page, an
 empty or corrupt file, a bad checksum and source code are not admitted), records each file's sha256 and
 mounts the rest read-only at /work/data/<n>/. Name the dataset's documented size or identity (instances,

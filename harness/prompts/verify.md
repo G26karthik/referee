@@ -23,7 +23,12 @@ the compared output (`metric`, or the relation's names) carry the computed quant
 about — never a flag computed against the printed number? Does a `# REFEREE_PACKAGES:` line
 declare only what the script imports beyond its environment? Does the script print a
 REFEREE_DATA identity line for each dataset it loads, and keep going (not exit) on a mismatch?
-Does it stay the test the spec names (a compatibility test is not a benchmark; an audit of
+Is the FIDELITY table true — the paper's words for each aspect really about that aspect, the code lines really the
+code that computes it, and `agrees` honest? A disagreement of paper and code on the compared quantity that is not
+computed both ways is REVISE; on another aspect, an unexplained one is REVISE. A claim-changing deviation from printed
+words whose printed version is computable but not computed beside it (a reading with source "paper") is REVISE; check a
+`printed_infeasible` reason against the paper. Does every unit whose quantity can be undefined print an `undefined`
+line rather than a placeholder number or nothing? Does it stay the test the spec names (a compatibility test is not a benchmark; an audit of
 released results is not a recomputation)? Where the checkout's code and the paper define the
 compared quantity differently, does it compute every reading on the same data and cohort?
 

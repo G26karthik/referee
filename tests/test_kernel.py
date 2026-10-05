@@ -25,6 +25,8 @@ PAGES = ["Our method reaches 61.4 accuracy on CIFAR.\nThe baseline reaches 59.3 
          "We use gener-\nation of samples. The ﬁnal loss is −0.52.",
          "Table 2: Results\nMethod Acc F1\nOurs 61.4 0.72\nBase 59.3 0.70"]
 ROWS = [[], ["Table 2: Results", "Method Acc F1", "Ours 61.4 0.72", "Base 59.3 0.70"]]
+# A script author's fidelity table (tasks._fidelity) for fixtures that are not about it.
+FID = [{"aspect": a, "not_applicable": "not part of this synthetic fixture"} for a in tasks.FIDELITY]
 
 
 def test_quotes_resolve_uniquely_or_not_at_all():
@@ -302,7 +304,7 @@ def test_the_compared_output_is_bound_by_name_by_the_script_author():
         script = 'rows = open("results/a.csv").read().split()\nn = len(rows)\nprint("REFEREE_RESULT", n)\n'
         binds = [{"kind": k, "impl_quote": q, "paper_quote": "reaches 61.4 accuracy"} for k, q in
                  (("dataset", 'open("results/a.csv")'), ("metric", "n = len(rows)"), ("comparison_target", "print("))]
-        g = {"script": script, "runs": 1, "outputs": ["n_no_cp", "violated"], "bindings": binds}
+        g = {"fidelity": FID, "script": script, "runs": 1, "outputs": ["n_no_cp", "violated"], "bindings": binds}
         for metric in ("", "violated", "n_other"):
             assert "`metric`" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {**g, "metric": metric}, final=False))
         bad_dev = {"printed": "a sentence the paper never printed", "used": "x", "changes_claim": False}
@@ -1054,7 +1056,7 @@ def test_a_paper_and_code_disagreement_is_computed_both_ways_never_chosen():
         script = 'rows = open("results/a.csv").read().split()\nece = len(rows)\nprint("REFEREE_RESULT", ece)\n'
         binds = [{"kind": k, "impl_quote": q, "paper_quote": "reaches 61.4 accuracy"} for k, q in
                  (("dataset", 'open("results/a.csv")'), ("metric", "ece = len(rows)"), ("comparison_target", "print("))]
-        g = {"script": script, "runs": 1, "metric": "ece", "outputs": ["ece"], "bindings": binds}
+        g = {"fidelity": FID, "script": script, "runs": 1, "metric": "ece", "outputs": ["ece"], "bindings": binds}
         assert "`reading`" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", g, final=False))
         ok = {**g, "script": script.replace("ece)", "ece, 'reading', 'cohort')")}
         assert tasks._seal_gen(x, "gen:C1.1", ok, final=False)["metric"] == "ece"
@@ -1143,7 +1145,7 @@ def test_identical_reruns_are_one_measurement_never_replicates():
         binds = [{"kind": k, "impl_quote": q, "paper_quote": "reaches 61.4 accuracy"} for k, q in
                  (("method", "fit()"), ("training", "fit()"), ("dataset", "load()"), ("metric", "acc = 61.0"),
                   ("comparison_target", "print("))]
-        g = {"script": script, "runs": 1, "metric": "acc", "outputs": ["acc"], "bindings": binds}
+        g = {"fidelity": FID, "script": script, "runs": 1, "metric": "acc", "outputs": ["acc"], "bindings": binds}
         assert "`stochastic`" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", g, final=False))
         assert tasks._seal_gen(x, "gen:C1.1", {**g, "stochastic": False}, final=False)["stochastic"] is False
     led = {"checks": [], "concerns": []}
@@ -1681,7 +1683,7 @@ def test_the_seed_must_reach_a_random_generator_for_a_stochastic_script():
         binds = [{"kind": k, "impl_quote": q, "paper_quote": "reaches 61.4 accuracy"} for k, q in
                  (("method", "fit()"), ("training", "fit()"), ("dataset", "load()"), ("metric", "acc = 61.0"),
                   ("comparison_target", "print("))]
-        g = {"runs": 1, "metric": "acc", "outputs": ["acc"], "bindings": binds, "stochastic": True}
+        g = {"fidelity": FID, "runs": 1, "metric": "acc", "outputs": ["acc"], "bindings": binds, "stochastic": True}
         ignores = ("acc = 61.0\nfit()\nload()\nrng = np.random.default_rng(7)\n"
                    "print('REFEREE_RESULT', {'acc': acc, 'data_fingerprint': fp})\n")
         assert "never reaches a random generator" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {**g, "script": ignores}, final=False))
@@ -1735,7 +1737,7 @@ def test_a_check_whose_data_was_not_acquired_ends_as_a_blocker_and_no_surrogate_
         binds = [{"kind": k, "impl_quote": q, "paper_quote": claim} for k, q in
                  (("method", "fit()"), ("training", "fit()"), ("dataset", "load()"), ("metric", "acc_a = 1"),
                   ("comparison_target", "print("))]
-        g = {"runs": 1, "outputs": ["acc_a", "acc_b"], "bindings": binds, "stochastic": True}
+        g = {"fidelity": FID, "runs": 1, "outputs": ["acc_a", "acc_b"], "bindings": binds, "stochastic": True}
         sim = ("acc_a = 1\nfit()\nload()\nrng = np.random.default_rng(args.seed)\n"
                "print('REFEREE_RESULT', {'acc_a': acc_a, 'data_fingerprint': fp})\n")
         assert "never reads /work/data" in _refused(lambda: tasks._seal_gen(x2, "gen:C1.1", {**g, "script": sim}, final=False))
@@ -2089,7 +2091,7 @@ def test_a_criterion_the_planner_supplied_makes_the_result_about_that_criterion(
         binds = [{"kind": k, "impl_quote": q, "paper_quote": claim} for k, q in
                  (("method", "fit()"), ("training", "fit()"), ("dataset", "load()"), ("metric", "a = 1"), ("comparison_target", "print("))]
         script = "a = 1\nfit()\nload()\nrng = np.random.default_rng(args.seed)\nprint('REFEREE_RESULT', a, 'data_fingerprint')\n"
-        g = {"script": script, "runs": 1, "outputs": ["chi2_formula", "chi2_rival"], "bindings": binds, "stochastic": True}
+        g = {"fidelity": FID, "script": script, "runs": 1, "outputs": ["chi2_formula", "chi2_rival"], "bindings": binds, "stochastic": True}
         sealed = tasks._seal_gen(x2, "gen:C1.1", g, final=False)
         dev = [d for d in sealed["deviations"] if "supplied the decision criterion" in d["used"]]
         assert len(dev) == 1 and dev[0]["changes_claim"] is True                                # recorded by the harness, not chosen by the script
@@ -2110,7 +2112,7 @@ def test_an_experiment_that_trains_nothing_declares_training_not_applicable_inst
         binds = [{"kind": k, "impl_quote": q, "paper_quote": pq} for k, q in
                  (("method", "run()"), ("dataset", "load()"), ("metric", "acc = 61.0"), ("comparison_target", "print("))]
         script = "acc = 61.0\nrun()\nload()\nrng = np.random.default_rng(args.seed)\nprint('REFEREE_RESULT', acc, 'data_fingerprint')\n"
-        g = {"script": script, "runs": 1, "metric": "acc", "outputs": ["acc"], "stochastic": True}
+        g = {"fidelity": FID, "script": script, "runs": 1, "metric": "acc", "outputs": ["acc"], "stochastic": True}
         why = "nothing is trained: the stream is simulated and the test is a closed-form bound"
         assert tasks._seal_gen(x, "gen:C1.1", {**g, "bindings": binds}, final=False)["refused"]           # no training binding at all
         ok = tasks._seal_gen(x, "gen:C1.1", {**g, "bindings": binds + [{"kind": "training", "not_applicable": why}]}, final=False)
@@ -2496,7 +2498,7 @@ def test_deviations_past_the_cap_are_refused_never_cut_unseen():
                "target": {"quote": CIFAR, "relation": "acc_a > acc_b", "names": ["acc_a", "acc_b"]}}
         x = _gen_x(Path(t), chk)
         devs = [{"printed": "", "used": f"choice {i}", "why": "open", "changes_claim": False} for i in range(tasks.MAX_DEVIATIONS + 1)]
-        g = {"script": SCRIPT, "runs": 1, "outputs": ["acc_a", "acc_b"], "bindings": BINDS, "stochastic": True}
+        g = {"fidelity": FID, "script": SCRIPT, "runs": 1, "outputs": ["acc_a", "acc_b"], "bindings": BINDS, "stochastic": True}
         assert "merge choices of one kind" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {**g, "deviations": devs}, final=False))
         assert tasks._seal_gen(x, "gen:C1.1", {**g, "deviations": devs}, final=True)["refused"]
         ok = tasks._seal_gen(x, "gen:C1.1", {**g, "deviations": devs[:tasks.MAX_DEVIATIONS]}, final=False)
@@ -2521,7 +2523,7 @@ def test_a_released_record_file_can_be_a_reading_and_a_certificate_has_none():
         b = [{"kind": k, "impl_quote": q, "paper_quote": MMLU} for k, q in
              (("dataset", "open('/work/data/0/a.csv')"), ("metric", "acc = 0.6"), ("comparison_target", "print("))]
         paper = {"name": "paper", "source": "paper", "quote": "Our LLM monitor reaches 61.4 accuracy on MMLU"}
-        g = {"script": script, "runs": 1, "metric": "acc", "outputs": ["acc"], "bindings": b}
+        g = {"fidelity": FID, "script": script, "runs": 1, "metric": "acc", "outputs": ["acc"], "bindings": b}
         rec = tasks._seal_gen(x, "gen:C1.1", {**g, "readings": [paper, {"name": "record", "source": "record:0/analysis.py",
                                                                          "quote": line}]}, final=False)
         assert [r["source"] for r in rec["readings"]] == ["paper", "record:0/analysis.py"]
@@ -4372,6 +4374,78 @@ def test_seeded_runs_that_vary_nothing_go_back_to_their_author():
         assert [o["id"] for o in owed] == ["gen:C1.2"], owed
         assert "the seeds varied nothing" in Path(owed[0]["prompt"]).read_text(encoding="utf-8")
         assert (td / pid / "checks" / "C1" / "outcome.setup.1.json").exists()   # the old outcome is kept beside it
+
+
+def test_a_printed_definition_is_computed_beside_any_change_and_paper_and_code_are_stated():
+    """Sep-29 label ranking C9: the script replaced the paper's top-1 probability r/sum r by a softmax (declared
+    claim-changing), relegated the printed ratio to a secondary output nobody decided, and pooled four positions where the
+    released analysis scores the chosen response only — so the result matched neither the paper nor the code. Now a
+    claim-changing departure from printed words computes the printed version too (or says why it cannot), and the
+    script states data, model, metric, baselines, preprocessing, sample size and statistics against paper and code."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid = _project(td)
+        code_line = "p = np.exp(r) / np.exp(r).sum()  # softmax of the chosen response"
+        _checkout(td, pid, {"analyze.py": f"import numpy as np\n{code_line}\n"})
+        state.write_json(td / pid / "released.json", [{"path": "results/a.csv"}])
+        plan = {"checks": [{"id": "C1", "kind": "RELEASED_DATA", "metric": "", "criterion": "stated",
+                            "target": {"quote": "reaches 61.4 accuracy", "value": "61.4"}}]}
+        x = tasks._Ctx(cfg, pid)
+        x.sealed = lambda tid: plan if tid == "plan" else None
+        x.plan = lambda: plan
+        script = ('d = open("results/a.csv").read()\nece = 1\nprint("REFEREE_RESULT", ece, "reading", "cohort")\n')
+        binds = [{"kind": k, "impl_quote": q, "paper_quote": "reaches 61.4 accuracy"} for k, q in
+                 (("dataset", 'open("results/a.csv")'), ("metric", "ece = 1"), ("comparison_target", "print("))]
+        fid = [f for f in FID if f["aspect"] != "metric"]
+        dev = {"printed": "We use generation of samples", "used": "a softmax of the scores", "why": "positivity",
+               "changes_claim": True}
+        g = {"script": script, "runs": 1, "metric": "ece", "outputs": ["ece"], "bindings": binds, "deviations": [dev]}
+        metric_disagrees = {"aspect": "metric", "paper": "We use generation of samples",
+                            "code": {"file": "analyze.py", "quote": code_line}, "used": "the paper's ratio", "agrees": False}
+        err = _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {**g, "fidelity": fid + [metric_disagrees]}, final=False))
+        assert "compute the printed version" in err and "fidelity metric" in err, err
+        readings = [{"name": "paper", "source": "paper", "quote": "We use generation of samples"},
+                    {"name": "code", "source": "analyze.py", "quote": code_line}]
+        ok = {**g, "readings": readings, "deviations": [{**dev, "reading": "code"}],
+              "fidelity": fid + [{**metric_disagrees, "reading": "code"}]}
+        rec = tasks._seal_gen(x, "gen:C1.1", ok, final=False)
+        assert rec["deviations"][0]["reading"] == "code" and rec["fidelity"][-1]["agrees"] is False
+        assert "printed_infeasible" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {
+            **ok, "readings": [], "deviations": [{**dev, "printed_infeasible": "short"}]}, final=False))
+        fine = tasks._seal_gen(x, "gen:C1.1", {**g, "fidelity": FID, "deviations": [
+            {**dev, "printed_infeasible": "the paper never states the grid it tuned the baselines over"}]}, final=False)
+        assert fine["deviations"][0]["printed_infeasible"].startswith("the paper never")
+        bad_code = {**metric_disagrees, "code": {"file": "analyze.py", "quote": "a line the code never had in it"}}
+        assert "not literal text" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {**ok, "fidelity": fid + [bad_code]},
+                                                                      final=False))
+    # A change scoped to one reading, with the printed definition computed beside it, does not move the whole check.
+    c = {"id": "C1", "kind": "RELEASED_DATA", "evidence": "x", "status": "RELATION_HOLDS", "role": "target",
+         "deviations": [{"changes_claim": True, "used": "softmax", "reading": "code"}],
+         "reading_defs": [{"name": "paper", "source": "paper"}, {"name": "code", "source": "analyze.py"}]}
+    assert report._claim_status([c]) == "SUPPORT_FOUND"
+    assert report._claim_status([{**c, "reading_defs": []}]) == "READING_CHANGED"   # no printed reading beside it
+
+
+def test_acquired_data_is_checked_against_the_items_the_experiment_needs():
+    """Oct-01 transformer and Oct-05 review: a download plan can leave out data the experiment needs, and a dataset the
+    check `covers` read as run though no line showed it was loaded. A source names the scope items it `serves`; the run
+    shows, per item, the data it loaded (`covers`) or that it is `missing`, else the item reads as changed data."""
+    with tempfile.TemporaryDirectory() as t:
+        cfg, pid = _project(Path(t))
+        x = tasks._Ctx(cfg, pid)
+        errs: list = []
+        tasks._acquire(x, {"covers": ["political", "movies"], "acquire": [
+            {"source": "https://example.org/d.zip", "cited_in": "paper", "serves": ["political", "glass"]}]}, errs, "C1")
+        assert any("glass" in e and "covers" in e for e in errs), errs
+    chk = {"kind": "RELEASED_DATA", "acquire": [{"source": "s", "serves": ["political", "movies"]}], "metric": "ece"}
+    assert execute.unshown_items(chk, [{"dataset": "a", "covers": ["political"], "matches": True}]) == ["movies"]
+    assert execute.unshown_items(chk, [{"covers": ["political"]}, {"missing": ["movies"]}]) == []
+    rec = {"stdout": 'REFEREE_DATA {"dataset": "pol", "covers": ["political"], "matches": true}\nREFEREE_RESULT {"ece": 1}',
+           "stderr": ""}
+    assert any("movies" in d for d in execute.result_schema(rec, chk))      # the draft goes back to its author
+    c = {"id": "C1", "kind": "RELEASED_DATA", "acquire": chk["acquire"], "values": [1.0],
+         "data_identity": {"pol": {"covers": ["political"], "matches": True}}}
+    assert report._data_changed(c, Path(t)) and "movies" in report._data_changed(c, Path(t))[-1]
 
 
 CLAIM_PAGES = ["Abstract. Our layer can replace a dense layer in any network. Our method is more accurate than the "

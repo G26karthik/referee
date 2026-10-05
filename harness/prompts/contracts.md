@@ -68,7 +68,8 @@ differently, compute both readings in this run (see PAPER VS CODE).
   - With readings: each reading is decided on its own; the same finding under every reading
     stands; otherwise READINGS_DIFFER, with both, for a human.
   - Per `stage`: each stage is decided on its own; a relation must hold in every stage; a stage
-    that started and printed no result makes the check PARTIAL (its finished stages are kept).
+    that started and printed no result makes the check PARTIAL (its finished stages are kept); a stage
+    that printed `undefined` is UNDEFINED (completed; it decides nothing and is counted apart).
 
 ## gen RECONSTRUCTION
 WHAT YOU ARE DOING: a PAPER-DERIVED EVALUATION of one experiment the paper specifies, where no
@@ -106,7 +107,10 @@ Load each dataset exactly as the paper and code specify and print its REFEREE_DA
   - A printed number: RESOLVED inside the 95% CI of the seed mean, FAILED outside the prediction
     interval, else INCONCLUSIVE.
   - A stage that started and printed no result, or a seed that failed after measuring, makes the
-    check PARTIAL: what finished is kept and reported, and decides only its own stages.
+    check PARTIAL: what finished is kept and reported, and decides only its own stages. A stage that
+    printed `undefined` is UNDEFINED: completed, deciding nothing, counted apart.
+  - Seeded runs whose result lines are identical in every stage (nothing showing the seed varied them)
+    return the approved script to its author: declare `stochastic` false, or seed the randomness.
   - Any claim-changing deviation makes the result about the changed claim (READING_CHANGED), never
     support or failure of the printed claim.
 
