@@ -48,7 +48,7 @@ KIND_WORDS = {"RECONSTRUCTION": "a fresh run of the experiment", "RELEASED_DATA"
               "ARITHMETIC": "the paper's own printed numbers, recomputed"}
 BASIS_WORDS = {"published_results": "an audit of the authors' released result files (nothing re-run)",
                "predictions": "a recomputation of the metric from released predictions or scores"}
-_ROWS = 8          # ponytail: result rows shown per check (the rest are counted, and all are in ledger.json)
+_ROWS = 12         # ponytail: result rows shown per check (the rest are counted, and all are in ledger.json)
 
 
 def _failure_audit(cs: list[dict], verdict: str) -> bool:
@@ -81,9 +81,14 @@ def decision(cc: dict, by_id: dict) -> dict:
     elif _failure_audit(tgt, "DEPENDS") or st == "READINGS_DISAGREE":
         reason = "interpretation_uncertain"
     elif st == "READING_CHANGED":
-        undefined = any(c["kind"] == "CERTIFICATE" and ((c.get("literal") or {}).get("undefined") or 0) > 0
-                        and c["status"] in ("NO_VIOLATION_FOUND", "VIOLATION_UNDER_CHANGED_READING") for c in tgt)
-        reason = "notation_defect" if theory and undefined else "changed_protocol"
+        certs = [c for c in tgt if c["kind"] == "CERTIFICATE" and c["status"] in ("NO_VIOLATION_FOUND",
+                                                                                  "VIOLATION_UNDER_CHANGED_READING")]
+        lit = lambda k: sum((c.get("literal") or {}).get(k) or 0 for c in certs)
+        # The printed text evaluated on every case and held in all of them: the claim is untested only in the sense
+        # that finite cases never prove it — a changed reading's violation is about the changed statement.
+        printed_held = lit("holds") > 0 and not (lit("fails") or lit("undefined") or lit("premise_not_met"))
+        reason = ("notation_defect" if theory and lit("undefined") else "finite_cases_only" if theory and printed_held
+                  else "changed_protocol")
     elif st == "CHECKS_DISAGREE":
         reason = "checks_disagree"
     elif st == "PARTIAL_EVIDENCE":
@@ -99,8 +104,16 @@ def decision(cc: dict, by_id: dict) -> dict:
         reason = "blocked"
     else:
         reason = "not_checked"
+    text = REASONS[reason]
+    if any(c["status"] == "VIOLATION_UNDER_CHANGED_READING" for c in tgt):
+        if reason == "notation_defect":
+            text = ("The statement is not defined as printed (for example, an index out of range). Under the changed "
+                    "reading tested instead, cases violate it; that is about the changed statement, not the printed one.")
+        elif reason == "finite_cases_only":
+            text += (" Cases do violate a changed reading of it; that is about the changed statement, not the printed "
+                     "one.")
     return {"decision": VERIFIED if reason == "supported" else NOT_VERIFIED, "reason": reason,
-            "reason_text": REASONS[reason], "because": _because(cc, tgt, reason, comp)}
+            "reason_text": text, "because": _because(cc, tgt, reason, comp)}
 
 
 def _because(cc: dict, tgt: list[dict], reason: str, comp: dict) -> list[str]:
@@ -198,28 +211,36 @@ def result_rows(c: dict) -> list[str]:
             lines.append(f"- {n} exact cases; {c.get('admissible', 0)} met every assumption of the tested reading"
                          + (f"; as printed: " + ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in lit.items()) if lit else ""))
         return lines
-    if c.get("readings") and isinstance(c["readings"], dict):
+    by_reading = {f"{s} [{r}]": p for r, rp in (c.get("readings") or {}).items() if isinstance(rp, dict)
+                  for s, p in (rp.get("stages") or {}).items()} if isinstance(c.get("readings"), dict) else {}
+    if isinstance(c.get("readings"), dict) and not by_reading:          # a record with one status per reading only
         for r, p in c["readings"].items():
             lines.append(f"- reading **{r}**: {p.get('status', '').lower().replace('_', ' ')}" + (
                 f", value {fmt(p['reproduced'])}" if isinstance(p.get("reproduced"), (int, float)) else
                 f", margin {fmt(p['margin'])}" if isinstance(p.get("margin"), (int, float)) else ""))
+    # Each reading is its own row beside the outputs it printed: a status alone hides the magnitudes and their signs.
+    if by_reading:
+        st = by_reading
     decided = {s: p for s, p in st.items() if p.get("status") not in ("UNDEFINED", "NOT_COMPLETED")}
     rel = t.get("relation")
     if st and len(decided) <= _ROWS:
-        head = list(dict.fromkeys(n for s in decided for n in (outs.get(s) or {})))[:4]
-        lines.append("| Setting | " + " | ".join(head) + (" | margin ± 95% band" if rel else " | value") + " | runs (independent) | result |")
-        lines.append("|---" * (len(head) + 4) + "|")
+        head = list(dict.fromkeys([n for n in t.get("names") or [] if any(n in (outs.get(s) or {}) for s in decided)]
+                                  + [n for s in decided for n in (outs.get(s) or {})]))[:4]
+        cols = ["Setting", *head, "margin ± 95% band" if rel else "value", "runs (independent)", "result"]
+        lines.append("| " + " | ".join(cols) + " |")
+        lines.append("|---" * len(cols) + "|")
         for s, p in decided.items():
             o = outs.get(s) or {}
             val = (f"{fmt(p.get('margin'))} ± {fmt(p.get('band', 0))}" if rel and "margin" in p else
                    fmt(p.get("reproduced")) if "reproduced" in p else "")
-            lines.append(f"| {s or '(all)'} | " + " | ".join(fmt(o.get(h)) if h in o else "" for h in head)
-                         + f" | {val} | {p.get('n', '')} ({p.get('n_independent', p.get('n', ''))}) | "
-                           f"{p['status'].lower().replace('_', ' ')} |")
+            runs = f"{p['n']} ({p.get('n_independent', p['n'])})" if "n" in p else ""
+            lines.append("| " + " | ".join([s.strip() or "(all)", *(fmt(o[h]) if h in o else "" for h in head), val, runs,
+                                             p["status"].lower().replace("_", " ")]) + " |")
     elif st:
         groups: dict = {}
         for s, p in decided.items():
-            groups.setdefault(_group(s), []).append(p)
+            r = s[s.rfind(" ["):] if by_reading else ""             # a reading is never pooled with another
+            groups.setdefault((_group(s) + r).strip(), []).append(p)
         for g, ps in sorted(groups.items()):
             ms = sorted(p["margin"] for p in ps if isinstance(p.get("margin"), (int, float)))
             by: dict = {}
@@ -260,8 +281,32 @@ def ran_line(c: dict, root: Path) -> str:
         parts.append("scope: " + ", ".join(c["covers"][:10]))
     n = c.get("counts") or {}
     if n.get("launches"):
-        parts.append(f"{n['launches']} run(s)" + (" (" + c["runs_source"].replace("_", " ") + ")" if c.get("runs_source") else ""))
+        parts.append(f"{n['launches']} run(s)" + (f" ({RUNS_WORDS.get(c['runs_source'], c['runs_source'])})"
+                                                  if c.get("runs_source") else ""))
     return "; ".join(parts)
+
+
+RUNS_WORDS = {"paper": "the run count the paper states", "referee": "count chosen by REFEREE; the paper states none",
+              "referee_floor": "REFEREE's minimum for a noise band; the paper states fewer or none",
+              "deterministic": "a deterministic computation", "compatibility": "the compatibility runs"}
+
+
+def audit_notes(c: dict, prose) -> list[str]:
+    """What the independent audit of a failure found, with the printed words a DEPENDS verdict rests on and what the
+    other reading gives (the auditor's words, published only through the prose checks)."""
+    a = c.get("audit") or {}
+    if c["status"] not in FAILURE or not a.get("verdict"):
+        return []
+    if a["verdict"] == "STANDS":
+        return ["Independent audit (shown the failing cases): the failure rests on the paper's own words."]
+    if a["verdict"] != "DEPENDS":
+        return ["Independent audit: unresolved, so the failure is not counted against the printed claim."]
+    out = ["Independent audit (shown the failing cases): the failure depends on how these printed words are read:"]
+    for d in (a.get("depends_on") or [])[:3]:
+        if isinstance(d, dict) and d.get("printed"):
+            alt = prose(_short(d.get("alternative"), 260), f"{c['id']} audit")
+            out.append(f"  \"{_short(d['printed'], 160)}\" (p{d.get('page')})" + (f" — other reading: {alt}" if alt else ""))
+    return out
 
 
 def fidelity_notes(c: dict) -> list[str]:
@@ -436,6 +481,7 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
             table = [r for r in rows if r.startswith("|")]
             lines += (["", *table, ""] if table else []) + ["  " + r for r in rows if not r.startswith("|")]
             lines += [f"  - {n}" for n in fidelity_notes(c)]
+            lines += [f"  {n}" if n.startswith("  ") else f"  - {n}" for n in audit_notes(c, prose)]
         for c in sup:
             lines.append(f"- Supporting test (does not decide the claim): {_what(c)} — {_status_words(c)}.")
         if comp.get("scope_not_run"):

@@ -4813,6 +4813,77 @@ def test_the_reviewer_page_is_built_from_the_record_and_publishes_only_checked_p
         assert len(page.split()) < 1100                                                          # about two pages
 
 
+def test_each_reading_shows_its_numbers_and_an_audit_says_what_a_failure_depends_on():
+    """Oct-06 draft review of label ranking K7: the readings check printed a table whose header had five columns and
+    its separator four, with no number in it, and "reading paper_raw_sum: relation holds" hid that its correlations
+    were negative (-0.314 vs -0.328) where the code's were positive (0.726 vs 0.595). Every reading shows its outputs and
+    margin per setting. K1/K2: an independent audit found each counterexample DEPENDS on how a symbol is read; the page
+    said only "interpretation uncertain" and never which words, nor that the claim holds under the other reading."""
+    from harness import reviewer
+    rd = lambda m, st: {"status": st, "stages": {"RB2": {"status": st, "margin": m, "band": 0.0, "n": 1}}}
+    c6 = {"id": "C6", "kind": "RELEASED_DATA", "role": "target", "status": "READINGS_DIFFER", "values": [0.013152, 0.130513, -0.179659],
+          "target": {"relation": "tau_fs_min > tau_mp_max", "names": ["tau_fs_min", "tau_mp_max"]},
+          "stages": {"RB2": {"status": "READINGS_DIFFER", "readings": {"paper": "RELATION_HOLDS", "code": "RELATION_HOLDS",
+                                                                       "pooled": "RELATION_VIOLATED"}}},
+          "readings": {"paper": rd(0.013152, "RELATION_HOLDS"), "code": rd(0.130513, "RELATION_HOLDS"),
+                       "pooled": rd(-0.179659, "RELATION_VIOLATED")},
+          "outputs": {"RB2 [paper]": {"tau_fs_min": -0.314388, "tau_mp_max": -0.32754, "tau_lb": -0.326241},
+                      "RB2 [code]": {"tau_fs_min": 0.725983, "tau_mp_max": 0.59547, "tau_lb": 0.771277},
+                      "RB2 [pooled]": {"tau_fs_min": 0.286479, "tau_mp_max": 0.466137, "tau_lb": 0.35461}},
+          "counts": {"units_declared": 1, "launches": 1}}
+    rows = reviewer.result_rows(c6)
+    table = [r for r in rows if r.startswith("|")]
+    assert table and len({r.count("|") for r in table}) == 1, table                 # header, separator, rows: one width
+    assert table[0].split("|")[2].strip() == "tau_fs_min", table[0]                  # the compared outputs come first
+    text = "\n".join(rows)
+    for v in ("-0.31439", "-0.32754", "0.72598", "0.59547", "0.013152", "-0.17966"):
+        assert v in text, (v, text)
+    assert "RB2 [paper]" in text and "relation violated" in text
+    bare = {**c6, "readings": {}, "outputs": {}, "stages": {"a": {"status": "RELATION_HOLDS", "margin": 0.5, "band": 0.1, "n": 3}}}
+    t2 = [r for r in reviewer.result_rows(bare) if r.startswith("|")]
+    assert len({r.count("|") for r in t2}) == 1 and "0.5 ± 0.1" in t2[-1], t2         # no outputs: still one width
+    with tempfile.TemporaryDirectory() as t:
+        cert = {"id": "C1", "kind": "CERTIFICATE", "role": "target", "status": "COUNTEREXAMPLE_FOUND", "values": [1.0] * 8,
+                "admissible": 8, "literal": {"fails": 8}, "counts": {}, "step": "Proof of Theorem 2", "deviations": [],
+                "audit": {"verdict": "DEPENDS", "depends_on": [
+                    {"printed": "where P denotes the projection onto B", "page": 5, "tested_as": "the projection event",
+                     "alternative": "the symbol denotes the top-k prefix event; under it every tested case holds",
+                     "why": "the definition is stated only once"}]}}
+        cc = {"id": "K1", "statement": "Full calibration implies top-k calibration.", "quote": "full calibration implies",
+              "page": 6, "claim_type": "theory", "checks": ["C1"], "claim_status": "READING_CHANGED",
+              "completion": {"experiment": "RAN", "changes": [], "scope_not_run": [], "not_run": []}}
+        cc["decision"] = reviewer.decision(cc, {"C1": cert})
+        led = {"paper": {"title": "LR", "sha256": "ab" * 32, "arxiv_id": "", "source": "x"}, "source": {},
+               "checks": [cert], "central_claims": [cc], "workflow": {"finished": 1, "checks_planned": 1}, "concerns": []}
+        x = types.SimpleNamespace(root=Path(t), paper=Paper(["Thus full calibration implies top-k calibration, "
+                                                             "where P denotes the projection onto B."]))
+        page = reviewer.render(x, led, None)
+        assert cc["decision"]["reason"] == "interpretation_uncertain"
+        assert "independent audit" in page.lower() and '"where P denotes the projection onto B" (p5)' in page, page
+        assert "top-k prefix event" in page                                              # what the other reading gives
+        assert "of one proof step" in page and "8 exact cases" in page
+
+
+def test_a_decision_never_says_a_changed_reading_held_when_it_failed_or_that_the_printed_text_was_not_tested():
+    """Oct-06 draft review of changepoint: K6 read "Under a corrected reading it held on the tested cases" while its
+    check found cases that violate the corrected reading; K2/K3 read "The test ran only under a changed protocol" while
+    the same certificate evaluated the printed statement too and all 324 cases held as printed."""
+    from harness.reviewer import decision
+    cert = lambda st, lit: {"id": "C1", "kind": "CERTIFICATE", "role": "target", "status": st, "values": [0] * 24,
+                            "literal": lit, "counts": {}}
+    d = lambda c: decision(_claim_row("READING_CHANGED", "theory", "RAN", checks=["C1"]), {"C1": c})
+    undefined_violated = d(cert("VIOLATION_UNDER_CHANGED_READING", {"undefined": 12}))
+    assert undefined_violated["reason"] == "notation_defect"
+    assert "held" not in undefined_violated["reason_text"] and "violate" in undefined_violated["reason_text"]
+    undefined_held = d(cert("NO_VIOLATION_FOUND", {"undefined": 16}))
+    assert undefined_held["reason"] == "notation_defect" and "held" in undefined_held["reason_text"]
+    printed_held = d(cert("VIOLATION_UNDER_CHANGED_READING", {"holds": 324}))
+    assert printed_held["reason"] == "finite_cases_only", printed_held                # the printed text was tested
+    assert "changed reading" in printed_held["reason_text"] and "only under" not in printed_held["reason_text"]
+    assert d(cert("VIOLATION_UNDER_CHANGED_READING", {}))["reason"] == "changed_protocol"   # nothing as printed
+    assert d(cert("VIOLATION_UNDER_CHANGED_READING", {"holds": 3, "fails": 1}))["reason"] != "finite_cases_only"
+
+
 def test_another_reproduction_record_is_compared_only_after_the_decisions_are_sealed():
     """Oct-05 review: HF verdicts are another reproduction record, not ground truth. One is registered only after
     REFEREE's own decisions are sealed, its findings are quoted verbatim from the registered file with whether the two
