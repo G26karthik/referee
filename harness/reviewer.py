@@ -386,7 +386,9 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
         sup = [by_id[i] for i in cc.get("checks") or [] if i in by_id and by_id[i].get("role") == "supporting"]
         for c in tgt:
             lines.append(f"- **What ran:** {ran_line(c, x.root)}. Result: {_status_words(c)}.")
-            lines += ["  " + r if not r.startswith("|") else r for r in result_rows(c)]
+            rows = result_rows(c)
+            table = [r for r in rows if r.startswith("|")]
+            lines += (["", *table, ""] if table else []) + ["  " + r for r in rows if not r.startswith("|")]
             lines += [f"  - {n}" for n in fidelity_notes(c)]
         for c in sup:
             lines.append(f"- Supporting test (does not decide the claim): {_what(c)} — {_status_words(c)}.")
