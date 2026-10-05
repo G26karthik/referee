@@ -4937,6 +4937,8 @@ def test_the_reviewer_page_states_each_test_once_and_stays_near_two_pages():
         assert "1 of 100 planned runs" in page and "DOES NOT RECONCILE" not in page, page
         assert "No tuning is run." in page and "(100 trees, depth 4)" not in page        # a whole first sentence, no cut
         assert claims[0]["decision"]["reason"] == "blocked"                             # its one test was blocked
+        main = page.split("## Test details")[0]
+        assert "config.yaml values" not in main and "on toy k=5; 1 of 100 planned runs" in main, main   # the gist up top
 
 
 def test_a_decision_never_says_a_changed_reading_held_when_it_failed_or_that_the_printed_text_was_not_tested():

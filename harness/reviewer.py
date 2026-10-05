@@ -199,7 +199,7 @@ def _group(stage: str) -> str:
     return m.group(1) if m else ""
 
 
-def result_rows(c: dict) -> list[str]:
+def result_rows(c: dict, limit: int = _ROWS) -> list[str]:
     """Markdown lines with the numbers a check produced: per stage (or per group of stages when there are many) the
     compared outputs' means, the margin of the stated comparison with its 95% band, the runs and how many of them were
     independent; for exact cases the counts; for a printed number the value produced beside it."""
@@ -225,7 +225,7 @@ def result_rows(c: dict) -> list[str]:
         st = by_reading
     decided = {s: p for s, p in st.items() if p.get("status") not in ("UNDEFINED", "NOT_COMPLETED")}
     rel = t.get("relation")
-    if st and len(decided) <= _ROWS:
+    if st and len(decided) <= limit:
         head = list(dict.fromkeys([n for n in t.get("names") or [] if any(n in (outs.get(s) or {}) for s in decided)]
                                   + [n for s in decided for n in (outs.get(s) or {})]))[:4]
         cols = ["Setting", *head, "margin ± 95% band" if rel else "value", "runs (independent)", "result"]
@@ -288,6 +288,28 @@ def ran_line(c: dict, root: Path) -> str:
                       f"{n['launches']} run(s)") + (f" ({RUNS_WORDS.get(c['runs_source'], c['runs_source'])})"
                                                     if c.get("runs_source") else ""))
     return "; ".join(parts)
+
+
+def brief(c: dict) -> str:
+    """One line for the main text: the kind of test, the datasets it read (by name), and its runs."""
+    n, data = c.get("counts") or {}, list(c.get("data_identity") or {})[:3]
+    planned = n.get("launches_planned")
+    runs = (f"{n['launches']} of {planned} planned runs" if n.get("launches") and planned and planned != n["launches"]
+            else f"{n['launches']} run(s)" if n.get("launches") else "")
+    return _what(c) + (f" on {', '.join(data)}" if data else "") + (f"; {runs}" if runs else "")
+
+
+def _details(c: dict, root: Path, prose, bears_on: list[str], led: dict) -> list[str]:
+    """A test in full, once: what it ran on, its numbers and counts, paper/code differences and declared changes, the
+    independent audit, and its records (the only place a check code leads a line)."""
+    rows = result_rows(c)
+    table = [r for r in rows if r.startswith("|")]
+    out = [f"**{c['id']}** · {_what(c).rsplit(' (', 1)[0]} · bears on {', '.join(bears_on) or 'no main claim'}", "",
+           f"- What ran: {ran_line(c, root)}.", f"- Result: {_status_words(c)}."]
+    out += (["", *table, ""] if len(table) > 8 else []) + [f"  {r}" for r in rows if not r.startswith("|")]
+    out += [f"  - {n}" for n in fidelity_notes(c)]
+    out += [f"  {n}" if n.startswith("  ") else f"  - {n}" for n in audit_notes(c, prose)]
+    return out + [f"- Evidence: {evidence_line(c, led)}", ""]
 
 
 def _observed(obs) -> str:
@@ -485,6 +507,11 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
     expl = {str(e.get("id")): e.get("explanation", "") for e in rep.get("claims") or [] if isinstance(e, dict)}
     other = {str(e.get("id")): e for e in cmp.get("claims") or [] if isinstance(e, dict)}
     shown: dict = {}
+    details: list[str] = []          # each test once, in full, after the claims: the main text stays near two pages
+    cites = {}
+    for cc in claims:
+        for i in cc.get("checks") or []:
+            cites.setdefault(i, []).append(cc.get("id", ""))
     for cc in claims:
         d, comp, k = cc.get("decision") or {}, cc.get("completion") or {}, cc.get("id", "")
         lines += [f"### {k}. {_short(cc.get('statement') or cc['quote'], 200)}", "",
@@ -502,14 +529,20 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
                 lines.append(f"- **What ran:** {_what(c)}, the same test as under {shown[c['id']]}. Result: {_status_words(c)}.")
                 continue
             shown[c["id"]] = k
-            lines.append(f"- **What ran:** {ran_line(c, x.root)}. Result: {_status_words(c)}.")
-            rows = result_rows(c)
+            lines.append(f"- **What ran:** {brief(c)}. Result: {_status_words(c)}.")
+            rows = [r for r in result_rows(c, limit=6) if not r.startswith("- counts:")]
             table = [r for r in rows if r.startswith("|")]
             lines += (["", *table, ""] if table else []) + ["  " + r for r in rows if not r.startswith("|")]
-            lines += [f"  - {n}" for n in fidelity_notes(c)]
-            lines += [f"  {n}" if n.startswith("  ") else f"  - {n}" for n in audit_notes(c, prose)]
+            if d.get("reason") == "changed_protocol":
+                lines += [f"  - changed from the paper: {_sentence(u, 160)}" for u in (comp.get("changes") or [])[:2]]
+            audit = audit_notes(c, prose)
+            lines += [f"  {n}" if n.startswith("  ") else f"  - {n}" for n in audit[:2]]
+            details += _details(c, x.root, prose, cites.get(c["id"], []), led)
         for c in sup:
             lines.append(f"- Supporting test (does not decide the claim): {_what(c)} — {_status_words(c)}.")
+            if c["id"] not in shown:
+                shown[c["id"]] = k
+                details += _details(c, x.root, prose, cites.get(c["id"], []), led)
         if comp.get("scope_not_run"):
             lines.append("- **Not tested:** " + ", ".join(comp["scope_not_run"][:12])
                          + (" …" if len(comp["scope_not_run"]) > 12 else "") + ".")
@@ -531,11 +564,13 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
                          + (f" In its words: {said}." if said else "")
                          + f" Comparable: {o.get('comparable', '?')} — {prose(o.get('why', ''), k + ' reference')} "
                          f"Agreement: {str(o.get('agreement', '')).replace('_', ' ')}.")
-        ev = [evidence_line(c, led) for c in tgt + sup]
-        if ev:
-            lines.append("- Evidence: " + "; ".join(ev))
+        if tgt + sup:
+            lines.append("- Evidence: " + ", ".join(c["id"] for c in tgt + sup) + " (under Test details)")
         lines.append("")
-    terms = [t for t in rep.get("terms") or [] if isinstance(t, dict) and t.get("term") and t.get("definition")][:12]
+    if details:
+        lines += ["## Test details", "", "_Each test once: what it ran on, the paper/code differences and changes its "
+                  "script declared, the full result counts, the independent audit, and its records._", "", *details]
+    terms =[t for t in rep.get("terms") or [] if isinstance(t, dict) and t.get("term") and t.get("definition")][:12]
     if terms:
         lines += ["## Terms", ""] + [f"- **{_short(t['term'], 60)}**: {prose(_short(t['definition'], 300), 'term ' + str(t['term'])[:20])}"
                                      for t in terms] + [""]
