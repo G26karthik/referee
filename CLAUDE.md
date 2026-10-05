@@ -14,7 +14,7 @@ reconciling numbers, and computing every status.
 
 ## Pipeline
 
-`ingest -> 4 lenses -> critic -> planner -> per check: bind | gen -> verify (1 revision) -> execute + reconcile -> audit (a failure) -> follow-up plan -> report writer -> done`
+`ingest -> 4 lenses + claim extractor -> critic -> planner -> per check: bind | gen -> verify (1 revision) -> execute + reconcile -> audit (a failure) -> follow-up plan -> report writer -> done (-> compare, once another record is registered)`
 
 | File | Responsibility |
 |---|---|
@@ -28,9 +28,10 @@ reconciling numbers, and computing every status.
 | `harness/discover.py` | registry search (Zenodo, DataCite, HF datasets) for datasets a paper names; the log a plan's `acquire` is checked against |
 | `harness/independence.py` | are seeded replicates different runs? (result-line outputs, data fingerprints, the seed's flow into a generator) |
 | `harness/reconcile.py` | executed value vs printed value; statuses |
-| `harness/report.py` | ledger, deterministic status table, earned-language check, `review.md` |
+| `harness/report.py` | ledger, deterministic status table, earned-language check, `review.md` (the trace) |
+| `harness/reviewer.py` | per-claim decision (Verified / Not verified + reason), `reviewer.md` (two-page reviewer page), prose checks |
 | `harness/state.py` | config/gates, atomic JSON, project lock |
-| `harness/prompts/*.md` | every model instruction (lenses, critic, planner, bind, gen, verify, report) |
+| `harness/prompts/*.md` | every model instruction (lenses, claims, critic, planner, bind, gen, verify, audit, report, compare) |
 | `tests/test_kernel.py` | the trust kernel only |
 | `.claude/workflows/referee.js` | the autonomous loop (Haiku controller, Sonnet workers) |
 
@@ -225,6 +226,45 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     verifier, kept in the ledger); unexplained on the last attempt, the deviation is carried forward. A
     revision fixes what was named; it never weakens the experiment to pass.
 
+27. **Claims are the paper's, extracted before any plan.** A `claims` task reads the paper alone (beside the lenses)
+    and seals every main claim with its words, a plain statement, `claim_type`, scope (one item per entry), the
+    assumptions under which it is claimed, the evidence the paper offers, what would decide it, and its alternative
+    readings; ids K1..Kn are the harness's. A plan tests claims BY ID and can never add, drop, requote or retype one; a
+    criterion a planner supplies is a diagnostic (a deviation), never a claim. Seeds, datasets, baselines and cases of one
+    claim are its scope, not new claims. No claim count is imposed (a safety ceiling of 30 refuses a runaway list). Every
+    extracted claim stays in the ledger, its completion and the report whatever the plans did (a malformed plan, a
+    withdrawn follow-up); a follow-up round may add a missed headline claim only through `new_claims`, validated alike.
+28. **One decision per main claim, computed.** `reviewer.decision`: VERIFIED only when the requested test ran as
+    specified and supports the claim within the tested scope — a theorem is never verified by finite cases. Otherwise
+    NOT_VERIFIED with one reason: contradicted, false as printed, proof step invalid (never "false"), premise impossible,
+    notation defect, changed protocol, interpretation uncertain (readings differ, or an audit found the failure DEPENDS),
+    checks disagree, incomplete coverage, finite cases only, undecided, blocked (a harness-recorded blocker), not checked,
+    pending. Missing evidence is never read as falsity.
+29. **Expected, completed, undefined and missing reconcile.** A unit whose compared quantity is undefined prints
+    `undefined` with why: UNDEFINED (completed, deciding nothing), never NOT_COMPLETED. `report.counts` gives settings
+    declared = with a result + undefined + missing, readings, launches, independent replicates and result lines apart,
+    and says when they do not reconcile. Replicates equal to round-off (12 significant digits) are one measurement.
+    An approved stochastic script whose seeds varied nothing in every stage goes back to its author (`revisable`).
+30. **What the comparison computes follows the paper and the code, never a convenient third.** A claim-changing
+    deviation from printed words computes the printed version beside it (a reading with source "paper") or says why it
+    cannot (`printed_infeasible`); a change scoped to one reading does not move the check. Script authors state a
+    `fidelity` table (data, model, metric, baselines, preprocessing, sample size, statistics: the paper's words, the
+    code's literal lines, what the script uses); a paper/code disagreement on the metric is computed both ways, on any
+    other aspect computed or explained, and is shown on the reviewer page. An acquired source names the scope items it
+    `serves`; the run shows each one's data (`covers`) or `missing`, else the item reads as changed data.
+31. **Independent work never waits on a long run.** Slots and the GPU are taken in turn across every check on the host
+    (`execute.wait_turn`): a check that just ran waits behind the ones that waited. Once only executions remain and
+    each has at least FOLLOWUP_AFTER_S (20 min) left, the follow-up round is planned beside them; a claim a running check
+    decides is listed as running, never re-planned.
+32. **The reviewer page is the record, in plain words.** `reviewer.md` (about two pages) gives the decisions table and
+    the unresolved claims first, then per claim the decision before its limits, what ran on what (data identity,
+    method, metric, scope, runs), the per-setting numbers with their 95% band and reconciled counts, paper/code
+    disagreements, what was not tested and who says so, and evidence references (check ids only there). Model prose
+    (overview, explanations, terms, questions) is published only if every number is in the record or the paper, every
+    quote in the paper and every status word earned; otherwise it is withheld (`reviewer.withheld.json`). Another
+    reproduction record (an HF logbook) is registered only after the review is sealed (`run.py reference`), quoted
+    verbatim beside each claim with whether the tests are comparable, and never moves a decision.
+
 ## Dependency recovery (documented, isolated, recorded)
 
 An environment is built from what the checkout declares: `uv.lock` -> `uv sync --frozen`
@@ -256,6 +296,7 @@ python run.py discover <paper-id> --files <record url>     # the files of a cite
 python run.py reopen <paper-id> <check> <why>              # redo a check that ended WITHOUT a finding, after a harness fix
                                                            # (a RESOURCE BLOCKER reruns the same approved script; plan:2 re-plans; report rewrites it)
 python run.py env <paper-id>                               # authors' env (the harness starts it)
+python run.py reference <paper-id> <file> [--source NAME]   # another reproduction record, only after the review is sealed
 python run.py status [<paper-id>]                          # read-only, recomputed: FINISHED only if review.md is newest
 python run.py pack <out.zip> [<paper-id> ...] --clean      # zip artifacts, then delete clones/venvs
 python tests/test_kernel.py
