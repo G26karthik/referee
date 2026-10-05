@@ -167,6 +167,16 @@ def _scoped(d: dict, c: dict) -> bool:
             and d["reading"] in {r.get("name") for r in defs} and d.get("changes_claim_by") != "verifier")
 
 
+def recorded_deviations(run: dict) -> list[dict]:
+    """A check's recorded deviations as the ledger reads them. On a compatibility test, a supplied-criterion entry recorded
+    before 2026-10-06 (claim-changing) reads as what it is: the harness's own compatibility condition (tasks._supplied)."""
+    devs = [d for d in run.get("deviations") or [] if isinstance(d, dict)]
+    if run.get("test") != "compatibility":
+        return devs
+    return [{**d, "changes_claim": False, "changes_claim_by": None} if d.get("supplied_criterion")
+            or (not d.get("printed") and "supplied the decision criterion" in str(d.get("used", ""))) else d for d in devs]
+
+
 def _changed(c: dict) -> bool:
     return any(d.get("changes_claim") and not _scoped(d, c) for d in c.get("deviations") or [])
 
@@ -200,7 +210,7 @@ def needs_audit(root: Path, c: dict) -> bool:
     if o.get("status") not in FAILURE or c["kind"] == "ARITHMETIC" or c.get("role", "target") != "target":
         return False
     run = state.read_json(Path(root) / "checks" / c["id"] / "check.json", {}) or {}
-    chk = {**c, "deviations": run.get("deviations", []), "data_identity": o.get("data_identity"), "values": o.get("values"),
+    chk = {**c, "deviations": recorded_deviations(run), "data_identity": o.get("data_identity"), "values": o.get("values"),
            "reading_defs": run.get("readings") or c.get("readings") or []}
     return not _moved_before_audit({**chk, "data_changed": _data_changed(chk, Path(root))})
 
@@ -403,7 +413,9 @@ def counts(c: dict) -> dict:
             "comparisons": with_result * max(1, len(readings)), "launches": ex.get("runs_ended", c.get("runs") or 0),
             "launches_planned": ex.get("runs_planned"), "result_lines": len(c.get("values") or []),
             "independent_replicates": min(ind) if ind else None,
-            "reconciles": units == with_result + undef + missing + len(lost) and not lost}
+            # a unit missing beside units that reported is unaccounted; a check that reported none (blocked, failed before
+            # any result) has every declared unit missing, which adds up
+            "reconciles": units == with_result + undef + missing + len(lost) and not (lost and st)}
 
 
 _OUTPUTS_SHOWN = 4    # ponytail: compared outputs averaged per stage for the reader; every output is in seeds.jsonl
@@ -466,7 +478,7 @@ def _checks(root: Path, plan: dict) -> list[dict]:
                     "reading_defs": run.get("readings") or c.get("readings") or [], "readings": o.get("readings"),
                     "execution": o.get("execution"), "stochastic": run.get("stochastic"),
                     "command": run.get("command", ""), "identity": run.get("identity"),
-                    "script_sha256": run.get("script_sha256", ""), "deviations": run.get("deviations", []),
+                    "script_sha256": run.get("script_sha256", ""), "deviations": recorded_deviations(run),
                     "revisions": run.get("revisions") or [], "criterion": run.get("criterion", c.get("criterion", "")),
                     "premise_argument": run.get("premise_argument", ""),
                     "state": _state(root, c["id"], state.read_json(cdir / "outcome.json", {}) or {}),

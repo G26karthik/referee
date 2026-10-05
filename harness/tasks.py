@@ -686,8 +686,15 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
 
 def _supplied(c: dict, by: str = "planner") -> dict:
     """The deviation a REFEREE-chosen decision criterion is: a qualitative claim tested by a relation, rival, baseline or
-    threshold someone chose speaks for that criterion, never for the claim as printed."""
-    return {"printed": "", "page": None, "changes_claim": True, **({"changes_claim_by": by} if by != "planner" else {}),
+    threshold someone chose speaks for that criterion, never for the claim as printed. A compatibility test's per-run
+    condition is the harness's own protocol for an engineering claim (invariant 23), recorded as such: it changes nothing
+    of that claim and speaks for compatibility only (the plan seal never lets it stand for a performance claim)."""
+    if c.get("test") == "compatibility":
+        return {"printed": "", "page": None, "changes_claim": False, "supplied_criterion": True,
+                "used": f"REFEREE's compatibility condition ({(c.get('target') or {}).get('relation') or 'per run'}) in "
+                        "every run: the component integrates, runs and trains; it speaks for compatibility only",
+                "why": "an engineering claim is tested by a compatibility test whose per-run condition the harness defines"}
+    return {"printed": "", "page": None, "changes_claim": True, "supplied_criterion": True, **({"changes_claim_by": by} if by != "planner" else {}),
             "used": f"REFEREE's {by} supplied the decision criterion "
                     f"({(c.get('target') or {}).get('relation') or c.get('metric') or 'the compared output'}) for a claim "
                     "whose sentence states no such comparison or number",

@@ -3950,6 +3950,39 @@ def test_a_violation_of_a_changed_claim_is_never_listed_as_a_failure_found():
         assert "**C1**" in changed and "about the changed claim" in changed, changed
 
 
+def test_a_compatibility_condition_is_the_harness_protocol_never_a_change_of_the_engineering_claim():
+    """Oct-06 GRACE K2: "the GRACE layer can be substituted for an FCNN layer and trained end-to-end" was tested by the
+    compatibility test invariant 23 prescribes (swapped into two architectures, the loss fell in 3 of 3 runs each), but
+    its per-run condition was recorded as "REFEREE's planner supplied the decision criterion" (claim-changing), so the
+    claim read READING_CHANGED — no engineering claim could ever be verified. The condition is the harness's own
+    protocol for an engineering claim; it speaks for compatibility only (a performance claim never takes it)."""
+    rel = "loss_first - loss_last > 0"
+    compat = {"kind": "RECONSTRUCTION", "test": "compatibility", "target": {"relation": rel}}
+    d = tasks._supplied(compat)
+    assert d["changes_claim"] is False and "compatibility" in d["used"] and rel in d["used"], d
+    assert tasks._supplied({**compat, "test": "performance"})["changes_claim"] is True        # a performance criterion
+    devs, crit = tasks._two_keys({**compat, "criterion": "stated"}, {"deviations": []}, {"criterion": "supplied"})
+    assert not any(x["changes_claim"] for x in devs), devs
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid, root = _ready(td)
+        chk = {"id": "A", "kind": "RECONSTRUCTION", "test": "compatibility", "role": "target", "criterion": "supplied",
+               "claim_quote": CIFAR, "covers": ["CIFAR-10-C"], "target": {"quote": CIFAR, "relation": rel},
+               "define": {"loss_first": "first logged loss", "loss_last": "last logged loss"}}
+        _seal(cfg, pid, "plan", {"checks": [chk], "central_claims": [_claim(checks=["A"], claim_type="engineering")]}, td)
+        old = {"printed": "", "used": f"REFEREE's planner supplied the decision criterion ({rel}) for a claim whose "
+               "sentence states no such comparison or number", "why": "", "changes_claim": True}   # recorded before the fix
+        state.write_json(root / "checks" / "C1" / "check.json", {"test": "compatibility", "deviations": [old]})
+        state.write_json(root / "checks" / "C1" / "outcome.json", {
+            "status": "RELATION_HOLDS", "values": [0.83, 0.84, 0.82], "evidence": "PAPER_DERIVED_IMPLEMENTATION",
+            "reason": "the condition held in every run", "runs": 3, "execution": {"runs_planned": 3, "runs_ended": 3,
+                                                                                  "runs_exited_ok": True}})
+        led = report.ledger(tasks._Ctx(cfg, pid))
+        cc = led["central_claims"][0]
+        assert cc["claim_status"] == "SUPPORT_FOUND", cc["claim_status"]
+        assert cc["decision"]["decision"] == "VERIFIED", cc["decision"]
+
+
 def test_a_withdrawn_follow_up_plan_never_takes_its_claims_out_of_the_accounting():
     """Oct-01 PPRM: the operator withdrew a follow-up plan made on failed searches; the re-planned round did not list two
     central claims the withdrawn one had added ("PPRM can reduce the time to alarm by making use of the..."), and they were
@@ -4862,6 +4895,48 @@ def test_each_reading_shows_its_numbers_and_an_audit_says_what_a_failure_depends
         assert "independent audit" in page.lower() and '"where P denotes the projection onto B" (p5)' in page, page
         assert "top-k prefix event" in page                                              # what the other reading gives
         assert "of one proof step" in page and "8 exact cases" in page
+
+
+def test_the_reviewer_page_states_each_test_once_and_stays_near_two_pages():
+    """Oct-06 draft review: the GRACE page ran to 4,900 words because a test's data, model, metric, baselines and changes
+    were repeated under every claim citing it (C1 under K1 and K8, C5 under K1 and K9), each unrun scope item had its own
+    "not run — no target check covering it ran to completion" line, and data identity was printed as raw JSON. A
+    blocked check's six declared settings (0 + 0 + 6 missing) also read "DOES NOT RECONCILE"."""
+    from harness import reviewer
+    blocked = {"id": "C1", "kind": "RECONSTRUCTION", "role": "target", "status": "BLOCKED", "units": [f"u{i}" for i in range(6)],
+               "reason": "RESOURCE BLOCKER: the 100 runs need about 25.2 h more", "values": [], "stages": {},
+               "execution": {"runs_planned": 100, "runs_ended": 1}}
+    n = report.counts(blocked)
+    assert n["units_not_completed"] == 6 and n["reconciles"], n                   # 6 = 0 + 0 + 6: nothing unaccounted
+    partly = {**blocked, "status": "PARTIAL", "values": [1.0], "stages": {"u0": {"status": "RELATION_HOLDS", "n": 3}}}
+    assert not report.counts(partly)["reconciles"]                                # five units vanished beside a result
+    with tempfile.TemporaryDirectory() as t:
+        c1 = {**blocked, "counts": report.counts(blocked), "covers": ["GRACE", "TARNet"], "runs_source": "paper",
+              "data_identity": {"toy k=5": {"observed": {"n_train": 5000, "n_test": 10000, "treated_fraction": 0.5020666666666667,
+                                                         "x_min": 2.8245575196539363e-07}, "matches": True}},
+              "fidelity": [{"aspect": "model", "used": "The authors' GRACE class with config.yaml values. Every other value "
+                                                       "is taken from config.yaml as shipped."}],
+              "deviations": [{"changes_claim": True, "used": "No tuning is run. GRACE uses the released configuration "
+                                                             "(100 trees, depth 4) for every dataset and every size."}]}
+        mk = lambda k, scope: {"id": k, "statement": f"claim {k}", "quote": "GRACE outperformed the baselines", "page": 6,
+                               "claim_type": "performance", "checks": ["C1"], "claim_status": "NOT_CHECKED",
+                               "completion": {"experiment": "NOT_RUN", "changes": [], "scope_not_run": scope, "not_run": [
+                                   {"item": s, "blocker": "not run", "basis": "harness",
+                                    "why": "no target check covering it ran to completion"} for s in scope] + [
+                                   {"item": "BART", "blocker": "cap", "basis": "planner", "why": "no slot left"}]}}
+        claims = [mk("K1", ["GRACE", "TARNet", "BART"]), mk("K8", ["GRACE", "TARNet"])]
+        for cc in claims:
+            cc["decision"] = reviewer.decision(cc, {"C1": c1})
+        led = {"paper": {"title": "GRACE", "sha256": "ab" * 32, "arxiv_id": "", "source": "x"}, "source": {},
+               "checks": [c1], "central_claims": claims, "workflow": {"finished": 1, "checks_planned": 1}, "concerns": []}
+        page = reviewer.render(types.SimpleNamespace(root=Path(t), paper=Paper(["GRACE outperformed the baselines."])), led, None)
+        k8 = page.split("### K8.")[1]
+        assert page.count("config.yaml values") == 1 and "same test as under K1" in k8, page
+        assert '{"n_train"' not in page and "n_train 5000" in page and "treated_fraction 0.50207" in page, page
+        assert "no target check covering it ran to completion" not in page and "BART: cap" in page, page
+        assert "1 of 100 planned runs" in page and "DOES NOT RECONCILE" not in page, page
+        assert "No tuning is run." in page and "(100 trees, depth 4)" not in page        # a whole first sentence, no cut
+        assert claims[0]["decision"]["reason"] == "blocked"                             # its one test was blocked
 
 
 def test_a_decision_never_says_a_changed_reading_held_when_it_failed_or_that_the_printed_text_was_not_tested():

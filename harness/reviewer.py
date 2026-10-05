@@ -99,8 +99,8 @@ def decision(cc: dict, by_id: dict) -> dict:
         reason = "undecided"
     elif st == "NOTHING_DECIDED" and any(c.get("values") for c in tgt):
         reason = "undecided"
-    elif any(b.get("basis") == "harness" and b.get("blocker") not in ("not run", "pending")
-             for b in comp.get("not_run") or []):
+    elif any(c["status"] == "BLOCKED" for c in tgt) or any(
+            b.get("basis") == "harness" and b.get("blocker") not in ("not run", "pending") for b in comp.get("not_run") or []):
         reason = "blocked"
     else:
         reason = "not_checked"
@@ -268,22 +268,40 @@ def ran_line(c: dict, root: Path) -> str:
     script author's fidelity table), and its runs."""
     parts = [_what(c)]
     fid = {f["aspect"]: f for f in c.get("fidelity") or [] if not f.get("not_applicable")}
-    ident = [f"{n} ({_short(json.dumps((i.get('observed') or {}), ensure_ascii=False)[:120], 120)})"
+    ident = [f"{n} ({_observed(i.get('observed'))})" if i.get("observed") else n
              for n, i in (c.get("data_identity") or {}).items() if isinstance(i, dict)][:3]
     if ident:
         parts.append("data: " + "; ".join(ident))
     elif fid.get("data"):
-        parts.append("data: " + _short(fid["data"]["used"], 160))
+        parts.append("data: " + _sentence(fid["data"]["used"], 160))
     for a in ("model", "metric", "baselines"):
         if fid.get(a):
-            parts.append(f"{a}: {_short(fid[a]['used'], 160)}")
+            parts.append(f"{a}: {_sentence(fid[a]['used'], 160)}")
     if c.get("covers"):
-        parts.append("scope: " + ", ".join(c["covers"][:10]))
+        parts.append("scope: " + ", ".join(c["covers"][:10]) + (" …" if len(c["covers"]) > 10 else ""))
     n = c.get("counts") or {}
     if n.get("launches"):
-        parts.append(f"{n['launches']} run(s)" + (f" ({RUNS_WORDS.get(c['runs_source'], c['runs_source'])})"
-                                                  if c.get("runs_source") else ""))
+        planned = n.get("launches_planned")
+        parts.append((f"{n['launches']} of {planned} planned runs" if planned and planned != n["launches"] else
+                      f"{n['launches']} run(s)") + (f" ({RUNS_WORDS.get(c['runs_source'], c['runs_source'])})"
+                                                    if c.get("runs_source") else ""))
     return "; ".join(parts)
+
+
+def _observed(obs) -> str:
+    """A dataset's identity line as words: its scalar facts, numbers to five significant digits."""
+    if not isinstance(obs, dict):
+        return _short(obs, 100)
+    items = [(k, v) for k, v in obs.items() if isinstance(v, (int, float, str)) and not isinstance(v, bool)][:5]
+    return ", ".join(f"{k} {fmt(v) if isinstance(v, (int, float)) else _short(v, 40)}" for k, v in items)
+
+
+def _sentence(s, n: int) -> str:
+    """The first whole sentence (or clause before a semicolon) of a model-written description, so a note is never cut
+    mid-word; past `n` characters it is shortened as a last resort."""
+    s = re.sub(r"\s+", " ", str(s or "")).strip()
+    m = re.match(r"(.{12,}?)(?:\.(?=\s+[A-Z(\"'])|;(?=\s))", s)
+    return _short(m.group(1) + "." if m else s, n)
 
 
 RUNS_WORDS = {"paper": "the run count the paper states", "referee": "count chosen by REFEREE; the paper states none",
@@ -316,12 +334,12 @@ def fidelity_notes(c: dict) -> list[str]:
         if f.get("agrees") is False:
             out.append(f"{f['aspect']}: paper and code differ — paper \"{_short(f.get('paper'), 120)}\"; code "
                        f"`{(f.get('code') or {}).get('file', '')}`; " + (f"both computed (reading {f['reading']})"
-                                                                         if f.get("reading") else _short(f.get("explained"), 200)))
+                                                                         if f.get("reading") else _sentence(f.get("explained"), 200)))
     for d in c.get("deviations") or []:
         if d.get("changes_claim"):
-            out.append("changed from the paper: " + _short(d.get("used"), 200) + (f" (only in reading {d['reading']})"
-                                                                                if d.get("reading") else ""))
-    return out[:6]
+            out.append("changed from the paper: " + _sentence(d.get("used"), 200) + (f" (only in reading {d['reading']})"
+                                                                                   if d.get("reading") else ""))
+    return out[:5]
 
 
 def evidence_line(c: dict, led: dict) -> str:
@@ -463,6 +481,7 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
     lines.append("")
     expl = {str(e.get("id")): e.get("explanation", "") for e in rep.get("claims") or [] if isinstance(e, dict)}
     other = {str(e.get("id")): e for e in cmp.get("claims") or [] if isinstance(e, dict)}
+    shown: dict = {}
     for cc in claims:
         d, comp, k = cc.get("decision") or {}, cc.get("completion") or {}, cc.get("id", "")
         lines += [f"### {k}. {_short(cc.get('statement') or cc['quote'], 200)}", "",
@@ -476,6 +495,10 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
         tgt = [by_id[i] for i in cc.get("checks") or [] if i in by_id and by_id[i].get("role", "target") == "target"]
         sup = [by_id[i] for i in cc.get("checks") or [] if i in by_id and by_id[i].get("role") == "supporting"]
         for c in tgt:
+            if c["id"] in shown:            # a test is described once; a later claim it bears on points back to it
+                lines.append(f"- **What ran:** {_what(c)}, the same test as under {shown[c['id']]}. Result: {_status_words(c)}.")
+                continue
+            shown[c["id"]] = k
             lines.append(f"- **What ran:** {ran_line(c, x.root)}. Result: {_status_words(c)}.")
             rows = result_rows(c)
             table = [r for r in rows if r.startswith("|")]
@@ -485,11 +508,16 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
         for c in sup:
             lines.append(f"- Supporting test (does not decide the claim): {_what(c)} — {_status_words(c)}.")
         if comp.get("scope_not_run"):
-            lines.append("- **Not tested:** " + ", ".join(comp["scope_not_run"][:12]) + ".")
-        for b in (comp.get("not_run") or [])[:5]:
-            if not (b.get("item", "").startswith("C") and b["item"][1:].isdigit()):
-                lines.append(f"  - {b['item']}: {b['blocker']} — {_short(b.get('why'), 200)} "
-                             f"({'harness record' if b.get('basis') == 'harness' else (b.get('basis') or 'planner') + ' says'})")
+            lines.append("- **Not tested:** " + ", ".join(comp["scope_not_run"][:12])
+                         + (" …" if len(comp["scope_not_run"]) > 12 else "") + ".")
+        # Only a reason of its own is listed: an item whose test did not finish says so under "What ran" already.
+        why_not = [b for b in comp.get("not_run") or [] if not (b.get("item", "").startswith("C") and b["item"][1:].isdigit())
+                   and b.get("blocker") not in ("not run", "pending")]
+        for b in why_not[:4]:
+            lines.append(f"  - {b['item']}: {b['blocker']} — {_sentence(b.get('why'), 200)} "
+                         f"({'harness record' if b.get('basis') == 'harness' else (b.get('basis') or 'planner') + ' says'})")
+        if len(why_not) > 4:
+            lines.append(f"  - {len(why_not) - 4} more items with a stated reason are in `ledger.json`.")
         if not tgt and cc.get("why_unchecked"):
             lines.append(f"- **No test ran.** The planner's reason: {_short(cc['why_unchecked'], 300)}")
         o = other.get(k)
