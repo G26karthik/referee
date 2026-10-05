@@ -4895,6 +4895,7 @@ def test_each_reading_shows_its_numbers_and_an_audit_says_what_a_failure_depends
         assert "independent audit" in page.lower() and '"where P denotes the projection onto B" (p5)' in page, page
         assert "top-k prefix event" in page                                              # what the other reading gives
         assert "of one proof step" in page and "8 exact cases" in page
+        assert "proof step as printed fails" in page and "a counterexample was found" not in page   # a step, not the theorem
 
 
 def test_the_reviewer_page_states_each_test_once_and_stays_near_two_pages():

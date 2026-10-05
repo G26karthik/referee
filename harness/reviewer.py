@@ -170,6 +170,8 @@ def _status_words(c: dict) -> str:
              "INCONCLUSIVE": "not decided", "BLOCKED": "not run", "NOT_CHECKABLE": "no approved test",
              "ARITHMETIC_CONSISTENT": "the paper's numbers agree", "ARITHMETIC_CONTRADICTION": "the paper's numbers disagree",
              "PENDING": "not finished"}.get(st, str(st))
+    if c["kind"] == "CERTIFICATE" and c.get("step") and st == "COUNTEREXAMPLE_FOUND":
+        words = "the proof step as printed fails on cases that meet its assumptions (the theorem itself is not refuted)"
     if c.get("status_on_completed"):
         words += f" (on what completed: {c['status_on_completed'].lower().replace('_', ' ')})"
     if n.get("units_declared", 0) > 1:
