@@ -210,10 +210,14 @@ def result_rows(c: dict, limit: int = _ROWS) -> list[str]:
     lines = []
     if c["kind"] == "CERTIFICATE":
         lit = {k: v for k, v in (c.get("literal") or {}).items() if v}
+        words = {"holds": "hold", "fails": "fail", "undefined": "undefined", "premise_not_met": "premise not met"}
         n = len(c.get("values") or [])
+        cases = c.get("instances") or n                     # older records: one line per case
+        k = c.get("readings_per_instance") or 1
         if n:
-            lines.append(f"- {n} exact cases; {c.get('admissible', 0)} met every assumption of the tested reading"
-                         + (f"; as printed: " + ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in lit.items()) if lit else ""))
+            lines.append(f"- {cases} cases" + (f" ({n} result lines: each case under {k} readings)" if k > 1 else "")
+                         + f"; {c.get('admissible_instances', c.get('admissible', 0))} met every assumption of the tested reading"
+                         + ("; as printed: " + ", ".join(f"{v} {words.get(x, x)}" for x, v in lit.items()) if lit else ""))
         return lines
     by_reading = {f"{s} [{r}]": p for r, rp in (c.get("readings") or {}).items() if isinstance(rp, dict)
                   for s, p in (rp.get("stages") or {}).items()} if isinstance(c.get("readings"), dict) else {}

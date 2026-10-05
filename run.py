@@ -7,6 +7,7 @@ workers writing a check script use `try`; `exec` and `env` poll to completion by
   python run.py discover <paper-id> "<dataset name>" [--registry zenodo|datacite|huggingface|huggingface-models]
   python run.py discover <paper-id> --files <record url>   # the files of a cited repository record
   python run.py reopen <paper-id> <check> <why>             # a check that ended without a finding, after a harness fix
+  python run.py redecide <paper-id> <check> <why>           # a finished certificate re-decided from its recorded runs
   python run.py env <paper-id>          # build the authors' environment (started by the harness)
   python run.py stop <paper-id> <check> <why>   # the operator ends a running check
   python run.py reference <paper-id> <file> [--source NAME]   # another reproduction record, after the review is sealed
@@ -49,6 +50,8 @@ def main(argv: list[str]) -> int:
     dv.add_argument("--files", default="", help="list the files of a cited repository record (names, sizes, checksums)")
     ro = sub.add_parser("reopen")
     ro.add_argument("pid"), ro.add_argument("check"), ro.add_argument("why")
+    rd = sub.add_parser("redecide")
+    rd.add_argument("pid"), rd.add_argument("check"), rd.add_argument("why")
     e = sub.add_parser("exec")
     e.add_argument("pid"), e.add_argument("check")
     sub.add_parser("env").add_argument("pid")
@@ -82,6 +85,8 @@ def main(argv: list[str]) -> int:
         print(json.dumps(tasks.register_reference(cfg, a.pid, a.file, a.source)))
     elif a.cmd == "reopen":           # a check that ended without a finding, after its cause was fixed
         print(json.dumps(tasks.reopen(cfg, a.pid, a.check, a.why)))
+    elif a.cmd == "redecide":         # a finished certificate decided again from its recorded runs (decision code fixed)
+        print(json.dumps(execute.redecide(cfg, a.pid, a.check, a.why)))
     elif a.cmd == "exec":             # poll one started check to its end (the harness polls it anyway)
         while execute.poll(cfg, a.pid, a.check):
             time.sleep(10)

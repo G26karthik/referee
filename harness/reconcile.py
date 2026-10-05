@@ -84,8 +84,17 @@ def certificate(results: list[dict], changed: bool, step: bool, crashed: int = 0
     lit_fails = [r for r in results if r.get("literal") == "fails" and not r.get("reading")]
     lit_moved = [r for r in results if r.get("literal") == "fails" and r.get("reading")]
     tagged = sum(1 for r in results if r.get("reading"))
-    lit = {k: sum(1 for r in results if r.get("literal") == k) for k in ("holds", "fails", "undefined", "premise_not_met")}
+    # An instance may print one line per reading, each repeating `literal` (the text as printed on that instance): the
+    # instances are the printed reading's lines (untagged), else one named reading's — never every line counted again.
+    groups: dict = {}
+    for r in results:
+        groups.setdefault(r.get("reading") or "", []).append(r)
+    base = groups.get("") or next((groups[g] for g in sorted(groups) if any(r.get("literal") for r in groups[g])),
+                                  None) or results
+    lit = {k: sum(1 for r in base if r.get("literal") == k) for k in ("holds", "fails", "undefined", "premise_not_met")}
     out = {"rule": "exact arithmetic; a counterexample must satisfy every premise of the exact claim", "n": n,
+           "instances": len(base), "admissible_instances": sum(1 for r in base if r.get("premises") == 1),
+           **({"readings_per_instance": len(groups)} if len(groups) > 1 else {}),
            "admissible": len(adm), "violated_admissible": len(bad) + len(bad_moved),
            "reading": "changed (see deviations)" if changed else "as printed",
            **({"literal": lit} if any(lit.values()) else {}), **({"premises_unsaid": len(unsaid)} if unsaid else {}),

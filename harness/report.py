@@ -486,6 +486,7 @@ def _checks(root: Path, plan: dict) -> list[dict]:
                     "runs": o.get("runs") or (o.get("protocol") or {}).get("seeds_reused_from_checkpoints"),
                     "values": o.get("values"), "literal": o.get("literal"),
                     "admissible": o.get("admissible"), "protocol": o.get("protocol"),
+                    **{k: o[k] for k in ("instances", "admissible_instances", "readings_per_instance", "redecided") if k in o},
                     "image_check": o.get("image_check"), "pilot_values": o.get("pilot_values"), "pilot_stages": o.get("pilot_stages"),
                     "status": o.get("status"), "reason": o.get("reason", ""), "reason_by": o.get("reason_by", "harness"),
                     "rule": o.get("rule") or next((p["rule"] for p in (o.get("stages") or {}).values() if p.get("rule")), ""),

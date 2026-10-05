@@ -2863,6 +2863,53 @@ def test_a_certificate_reading_tag_never_makes_a_counterexample():
     assert certificate(plain, False, False)["status"] == "COUNTEREXAMPLE_FOUND"     # an untagged instance still decides
 
 
+def test_certificate_counts_are_instances_and_a_finished_one_is_redecided_from_its_records():
+    """Oct-06 label ranking C2: 20 instances, each printed three result lines (the printed reading and two named
+    readings), and every line carried `literal`; the page said "60 exact cases ... as printed: 24 holds, 36 fails" where
+    12 of 20 instances fail as printed. Counts are of instances (the printed reading's lines), with the result lines and
+    readings beside them. A finished certificate is re-decided from its recorded run outputs under the current kernel
+    (no model, no container), the earlier outcome kept beside it."""
+    inst = lambda fails, rd="": {"violated": int(bool(fails)) if not rd else 1, "premises": 1, "exact": False,
+                                 "literal": "fails" if fails else "holds", **({"reading": rd} if rd else {})}
+    rows = [x for i in range(20) for x in (inst(i < 12), inst(i < 12, "fixed"), inst(i < 12, "def5"))]
+    r = certificate(rows, True, False)
+    assert r["status"] == "COUNTEREXAMPLE_FOUND" and r["n"] == 60, r
+    assert r["instances"] == 20 and r["literal"] == {"holds": 8, "fails": 12, "undefined": 0, "premise_not_met": 0}, r
+    assert r["readings_per_instance"] == 3 and r["admissible_instances"] == 20, r
+    tagged = [x for i in range(8) for x in ({"violated": 0, "premises": 1, "literal": "undefined", "reading": "zero_based"},
+                                            {"violated": 0, "premises": 1, "literal": "undefined", "reading": "sigmoid"})]
+    t = certificate(tagged, True, False)                     # every line tagged: one reading's lines are the instances
+    assert t["instances"] == 8 and t["literal"]["undefined"] == 8, t
+    from harness import reviewer
+    page = "\n".join(reviewer.result_rows({"kind": "CERTIFICATE", **r, "values": [0] * 60}))
+    assert "20 cases" in page and "60 result lines" in page and "12 fail" in page and "36" not in page, page
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, pid, root = _ready(Path(tmp))
+        cdir = root / "checks" / "C1"
+        cdir.mkdir(parents=True, exist_ok=True)
+        state.write_json(cdir / "check.json", {"id": "C1", "kind": "CERTIFICATE", "script_sha256": "s1", "deviations": [
+            {"changes_claim": True, "used": "x"}], "step": ""})
+        old = {"check": "C1", "kind": "CERTIFICATE", "status": "COUNTEREXAMPLE_FOUND", "n": 60, "literal": {"holds": 24, "fails": 36},
+               "values": [0] * 60, "runs": 20, "authorized": True, "execution": {"runs_planned": 20, "runs_ended": 20}}
+        state.write_json(cdir / "outcome.json", old)
+        line = lambda d: "REFEREE_RESULT " + json.dumps(d)
+        for seed in range(20):
+            out = "\n".join(line({"violated": v, "premises_hold": 1, "literal": lit, **({"reading": rd} if rd else {})})
+                            for v, lit, rd in ((int(seed < 12), "fails" if seed < 12 else "holds", ""),
+                                               (1, "fails" if seed < 12 else "holds", "fixed")))
+            state.append_jsonl(root / "execution.jsonl", {"target": "C1", "mode": "evidence", "seed": seed, "script_sha256": "s1",
+                                                          "returncode": 0, "stdout": out, "stderr": "", "timed_out": False})
+        state.append_jsonl(root / "execution.jsonl", {"target": "C1", "mode": "try", "seed": 0, "script_sha256": "s1",
+                                                      "returncode": 0, "stdout": line({"violated": 1, "premises_hold": 1}),
+                                                      "stderr": ""})                       # a draft run decides nothing
+        res = execute.redecide(cfg, pid, "C1", "certificate counts are of instances (test)")
+        new = state.read_json(cdir / "outcome.json")
+        assert res["status"] == new["status"] == "COUNTEREXAMPLE_FOUND" and new["instances"] == 20, (res, new)
+        assert new["literal"]["fails"] == 12 and new["redecided"]["was"]["literal"] == {"holds": 24, "fails": 36}, new
+        assert (cdir / "outcome.redecided.1.json").exists() and new["runs"] == 20 and new["execution"]["runs_ended"] == 20
+        assert "error" in execute.redecide(cfg, pid, "C9", "no such check")
+
+
 def _replay():
     spec = importlib.util.spec_from_file_location("replay", Path(__file__).resolve().parent.parent / "tools" / "replay.py")
     mod = importlib.util.module_from_spec(spec)
@@ -4894,7 +4941,7 @@ def test_each_reading_shows_its_numbers_and_an_audit_says_what_a_failure_depends
         assert cc["decision"]["reason"] == "interpretation_uncertain"
         assert "independent audit" in page.lower() and '"where P denotes the projection onto B" (p5)' in page, page
         assert "top-k prefix event" in page                                              # what the other reading gives
-        assert "of one proof step" in page and "8 exact cases" in page
+        assert "of one proof step" in page and "8 cases" in page
         assert "proof step as printed fails" in page and "a counterexample was found" not in page   # a step, not the theorem
 
 
