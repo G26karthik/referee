@@ -296,7 +296,9 @@ python run.py try <paper-id> <gen-task-id> <script.py>      # draft run, masked,
 python run.py discover <paper-id> "<dataset name>" [--registry zenodo|datacite|huggingface]   # public data only
 python run.py discover <paper-id> --files <record url>     # the files of a cited repository record (names, sizes, md5)
 python run.py reopen <paper-id> <check> <why>              # redo a check that ended WITHOUT a finding, after a harness fix
-                                                           # (a RESOURCE BLOCKER reruns the same approved script; plan:2 re-plans; report rewrites it)
+                                                           # (a RESOURCE BLOCKER reruns the same approved script; plan:2 re-plans; report rewrites it;
+                                                           #  a partial check whose lost seeds died of GPU memory reruns only those seeds)
+python run.py redecide <paper-id> <check> <why>            # a finished certificate decided again from its recorded runs (decision code fixed)
 python run.py env <paper-id>                               # authors' env (the harness starts it)
 python run.py reference <paper-id> <file> [--source NAME]   # another reproduction record, only after the review is sealed
 python run.py status [<paper-id>]                          # read-only, recomputed: FINISHED only if review.md is newest
