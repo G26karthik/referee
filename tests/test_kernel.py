@@ -5180,6 +5180,27 @@ def test_a_place_in_the_line_lapses_when_its_review_stops_polling():
         assert execute.wait_turn(cfg, "p/B", False) == (0, 0)
 
 
+def test_a_waiter_nobody_is_polling_never_blocks_the_line():
+    """Oct-06 run: changepoint C7/C8 headed the GPU line while their review's controller sat for 54 minutes on a script
+    review (no `tasks` call, so nobody polled them); seven GPU checks of all three reviews waited behind them with the GPU
+    idle. A waiter can take its turn only when polled: one not polled for QUEUE_IDLE_S keeps its place but blocks no one,
+    and takes its turn back when it is polled again."""
+    with tempfile.TemporaryDirectory() as t:
+        cfg = state.Config()
+        cfg.projects = Path(t)
+        for c in ("A", "B", "C"):
+            state.write_json(Path(t) / "p" / "checks" / c / "exec.json", {})
+        execute.wait_turn(cfg, "p/A", True)
+        execute.wait_turn(cfg, "p/B", True)
+        q = state.read_json(Path(t) / ".queue.json")
+        q["p/A"]["seen"] = time.time() - execute.QUEUE_IDLE_S - 60                     # its review is busy elsewhere
+        state.write_json(Path(t) / ".queue.json", q)
+        assert execute.wait_turn(cfg, "p/B", True) == (0, 0)                            # B runs instead of idling
+        assert execute.wait_turn(cfg, "p/C", False) == (0, 1)                           # C still waits behind B
+        assert execute.wait_turn(cfg, "p/A", True) == (0, 0)                            # A polled again: its place stands
+        assert execute.wait_turn(cfg, "p/B", True) == (0, 1)
+
+
 def test_an_offered_follow_up_stays_pending_until_it_is_sealed():
     """Review #7: the early follow-up was recomputed at every call; once the long run had less than 20 minutes left (or
     an audit appeared) the planner's answer was refused as 'not a pending task'."""

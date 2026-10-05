@@ -108,6 +108,9 @@ def evidence_slots(cfg: state.Config) -> int:
 
 # ponytail: a waiting check not polled for an hour (its workflow stopped) gives up its place; polls come every few minutes.
 QUEUE_STALE_S = 3600
+# ponytail: one not polled for 15 min (its review's controller busy on a long task) keeps its place but blocks no one:
+# it can take a turn only when polled (Oct-06: seven GPU checks waited 54 min behind two unpolled ones, GPU idle).
+QUEUE_IDLE_S = 900
 
 
 def wait_turn(cfg: state.Config, key: str, wants_gpu: bool) -> tuple[int, int]:
@@ -128,7 +131,7 @@ def wait_turn(cfg: state.Config, key: str, wants_gpu: bool) -> tuple[int, int]:
         q[key]["seen"] = now
         state.write_json(cfg.projects / ".queue.json", q)
     mine = q[key]["t"]
-    ahead = [v for k, v in q.items() if k != key and v["t"] < mine]
+    ahead = [v for k, v in q.items() if k != key and v["t"] < mine and now - v.get("seen", v["t"]) <= QUEUE_IDLE_S]
     return sum(1 for v in ahead if not v["gpu"]), sum(1 for v in ahead if v["gpu"])
 
 
