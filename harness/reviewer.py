@@ -314,11 +314,12 @@ def brief(c: dict) -> str:
 def _details(c: dict, root: Path, prose, bears_on: list[str], led: dict) -> list[str]:
     """A test in full, once: what it ran on, its numbers and counts, paper/code differences and declared changes, the
     independent audit, and its records (the only place a check code leads a line)."""
-    rows = result_rows(c)
+    rows, shown = result_rows(c), set(result_rows(c, limit=6))     # what the main text printed is not printed again
     table = [r for r in rows if r.startswith("|")]
     out = [f"**{c['id']}** · {_what(c).rsplit(' (', 1)[0]} · bears on {', '.join(bears_on) or 'no main claim'}", "",
            f"- What ran: {ran_line(c, root)}.", f"- Result: {_status_words(c)}."]
-    out += (["", *table, ""] if len(table) > 8 else []) + [f"  {r}" for r in rows if not r.startswith("|")]
+    out += (["", *table, ""] if len(table) > 8 else []) + [f"  {r}" for r in rows if not r.startswith("|")
+                                                           and (r not in shown or r.startswith("- counts:"))]
     out += [f"  - {n}" for n in fidelity_notes(c)]
     out += [f"  {n}" if n.startswith("  ") else f"  - {n}" for n in audit_notes(c, prose)]
     return out + [f"- Evidence: {evidence_line(c, led)}", ""]
@@ -542,6 +543,10 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
                 continue
             shown[c["id"]] = k
             lines.append(f"- **What ran:** {brief(c)}. Result: {_status_words(c)}.")
+            if (rel := (c.get("target") or {}).get("relation")):
+                lines.append(f"  - compared: `{rel}` (margin = left side minus right side; "
+                             + ("the paper's own comparison)" if c.get("criterion") == "stated" else
+                                "a criterion chosen by REFEREE, which the paper's sentence does not state)"))
             rows = [r for r in result_rows(c, limit=6) if not r.startswith("- counts:")]
             table = [r for r in rows if r.startswith("|")]
             lines += (["", *table, ""] if table else []) + ["  " + r for r in rows if not r.startswith("|")]

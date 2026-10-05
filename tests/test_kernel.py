@@ -4919,6 +4919,18 @@ def test_each_reading_shows_its_numbers_and_an_audit_says_what_a_failure_depends
     for v in ("-0.31439", "-0.32754", "0.72598", "0.59547", "0.013152", "-0.17966"):
         assert v in text, (v, text)
     assert "RB2 [paper]" in text and "relation violated" in text
+    with tempfile.TemporaryDirectory() as t:                  # what "margin" compares, and whose criterion it is, once
+        cc = {"id": "K7", "statement": "s", "quote": "correlates strongly", "page": 9, "claim_type": "performance",
+              "checks": ["C6"], "claim_status": "READINGS_DISAGREE",
+              "completion": {"experiment": "RAN", "changes": [], "scope_not_run": [], "not_run": []}}
+        many = {**c6, "criterion": "supplied", "stages": {f"s{i}": {"status": "RELATION_HOLDS", "margin": 0.1 * i, "n": 3}
+                                                          for i in range(9)}, "readings": {}, "outputs": {}}
+        cc["decision"] = reviewer.decision(cc, {"C6": many})
+        led = {"paper": {"title": "LR", "sha256": "ab" * 32, "arxiv_id": "", "source": "x"}, "source": {},
+               "checks": [many], "central_claims": [cc], "workflow": {"finished": 1, "checks_planned": 1}, "concerns": []}
+        page = reviewer.render(types.SimpleNamespace(root=Path(t), paper=Paper(["It correlates strongly."])), led, None)
+        assert page.count("compared: `tau_fs_min > tau_mp_max`") == 1 and "chosen by REFEREE" in page, page
+        assert page.count("settings: 9 decided") == 1, page                          # the summary is not printed twice
     bare = {**c6, "readings": {}, "outputs": {}, "stages": {"a": {"status": "RELATION_HOLDS", "margin": 0.5, "band": 0.1, "n": 3}}}
     t2 = [r for r in reviewer.result_rows(bare) if r.startswith("|")]
     assert len({r.count("|") for r in t2}) == 1 and "0.5 ± 0.1" in t2[-1], t2         # no outputs: still one width
