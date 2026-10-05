@@ -3586,6 +3586,45 @@ def _with_hub(mod, fn):
             sys.modules["huggingface_hub"] = saved
 
 
+def test_a_transient_hub_failure_is_retried_and_the_retry_resumes():
+    """Oct-05 label ranking C6: the hub client lost one `.incomplete` file 13 minutes into a 3 GB snapshot
+    (FileNotFoundError, classified transient) and the acquisition ended there: the hf:// path had no retry, while every
+    http(s) download had bounded retries. A transient hub failure is retried (bounded), in the same local folder so the
+    files that arrived are not fetched again, and the retry is recorded; a non-transient one is not retried."""
+    from harness import fetcher
+    repos = {"o/set": {"eval/a.json": b'{"x": 1}', "eval/b.json": b'{"x": 2}'}}
+    calls = []
+
+    def flaky(n_fail, exc):
+        mod = _fake_hub(repos)
+        real = mod.snapshot_download
+
+        def snap(repo, **kw):
+            calls.append(kw["local_dir"])
+            if len(calls) <= n_fail:
+                Path(kw["local_dir"], "eval").mkdir(parents=True, exist_ok=True)
+                Path(kw["local_dir"], "eval", "a.json").write_bytes(b'{"x": 1}')       # one file arrived before the cut
+                raise exc
+            return real(repo, **kw)
+        mod.snapshot_download = snap
+        return mod
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        go = lambda d: lambda: fetcher.acquire(fetcher.Fetcher(str(td / "cache"), 10 ** 6, [], sleep=lambda s: None, tries=3,
+                                                               timeout=5), {"source": "hf://datasets/o/set", "include": ["eval/*"]},
+                                               str(td / d / "0"), str(td / "tmp"), "0")
+        rec = _with_hub(flaky(2, FileNotFoundError(2, "No such file or directory", "x.incomplete")), go("d1"))
+        assert len(rec["admitted"]) == 2 and not rec["failure_class"], rec
+        assert len(set(calls)) == 1 and len(calls) == 3                     # the same folder: a resume, not a fresh start
+        assert sum("retried" in r for r in rec["recovery"]) == 2, rec["recovery"]
+        calls.clear()
+        rec = _with_hub(flaky(5, FileNotFoundError(2, "No such file or directory", "x.incomplete")), go("d2"))
+        assert rec["failure_class"] == "transient" and len(calls) == 3       # bounded
+        calls.clear()
+        rec = _with_hub(flaky(1, type("GatedRepoError", (Exception,), {})("gated repo")), go("d3"))
+        assert len(calls) == 1 and rec["failure_class"] != "transient"      # not transient: never retried
+
+
 def test_hub_snapshot_files_are_validated_and_the_storage_cap_is_cumulative():
     """R2 PPRM C3: the hub's `.cache/huggingface/*` metadata and 0-byte `.lock` files were admitted as data; and the cap
     test compared each repository alone with the cap (`need > cap`), never the running total."""

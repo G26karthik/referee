@@ -602,8 +602,20 @@ def _hf(f: Fetcher, s: dict, dest: str, tmp: str, rec: dict) -> None:
     os.makedirs(tmp, exist_ok=True)
     local = tempfile.mkdtemp(prefix="hub-", dir=tmp)       # the client's own metadata stays here, never in `dest`
     try:
-        snapshot_download(repo, repo_type=kind.rstrip("s"), revision=info.sha, allow_patterns=sorted({**text, **data}),
-                          local_dir=local)
+        # A transient failure (a timeout, a 5xx, a partial file the client lost) is retried like any download, bounded by
+        # the fetcher's tries, in the SAME folder so what arrived is kept (the client resumes it); anything else is not
+        # retried (Oct-05 label ranking C6: one lost `.incomplete` file ended a 3 GB snapshot after one attempt).
+        for i in range(f.tries):
+            try:
+                snapshot_download(repo, repo_type=kind.rstrip("s"), revision=info.sha,
+                                  allow_patterns=sorted({**text, **data}), local_dir=local)
+                break
+            except Exception as e:                        # noqa: BLE001
+                klass, msg = classify(e)
+                if klass != "transient" or i == f.tries - 1:
+                    raise
+                rec["recovery"].append(f"hub snapshot retried after a transient failure ({msg[:160]}), resuming in place")
+                f.sleep(min(60, 5 * 2 ** i))
         rec.update(revision=info.sha, files_matched=len(data))
         for name in [*data, *[t for t in text if t not in data]]:
             p = os.path.join(local, name)
