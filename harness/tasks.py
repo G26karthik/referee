@@ -14,7 +14,8 @@ import time
 from pathlib import Path
 
 from . import discover, execute, independence, paper, reconcile, report, state
-from .evidence import Paper, clean_source, command, documented, flat, has_word, interval, mask, printed_form, relation, value_in
+from .evidence import (Paper, clean_source, command, count_in, documented, flat, has_word, interval, mask, printed_form,
+                       relation, value_in)
 from .repo import listing, released
 
 LENSES = ("overclaim", "protocol", "confound", "contradiction")
@@ -1776,7 +1777,7 @@ def _runs(x: _Ctx, runs, quote, why: list[str]) -> int | None:
     """A paper-stated run count, only if its sentence is re-found printing that number."""
     if not isinstance(runs, int) or isinstance(runs, bool) or runs < 1:
         return None
-    if runs > 1 and not ((h := x.paper.find(str(quote or ""))[0]) and value_in(h["quote"], str(runs))):
+    if runs > 1 and not ((h := x.paper.find(str(quote or ""))[0]) and count_in(h["quote"], runs)):
         return None
     if runs > x.cfg.max_runs:
         why.append(f"the paper's {runs} runs exceed SH_MAX_RUNS={x.cfg.max_runs}: refused rather than downscaled")
@@ -1866,8 +1867,11 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         errors.append("`stochastic` must be true (the seed drives randomness: training, sampling, simulation) or false "
                       "(the computation is deterministic: the harness runs it twice and requires identical results)")
     if runs > 1 and c["kind"] == "RECONSTRUCTION" and stochastic is True and c.get("test") != "compatibility" and not (
-            (h := x.paper.find(str(obj.get("runs_quote") or ""))[0]) and value_in(h["quote"], str(runs))):
-        errors.append("runs > 1 needs runs_quote: the paper's sentence printing that number, verbatim")
+            (h := x.paper.find(str(obj.get("runs_quote") or ""))[0]) and count_in(h["quote"], runs)):
+        errors.append("runs > 1 needs runs_quote: the paper's sentence printing that number, verbatim ("
+                      + (f"the quoted sentence does not print {runs}, as a number or in words" if h else
+                         "the quote was not found in the paper" if obj.get("runs_quote") else "none given")
+                      + "); with no printed count, give runs 1 and the harness sets the replicates")
     flow = independence.seed_flow(script) if c["kind"] == "RECONSTRUCTION" else None
     if c["kind"] == "RECONSTRUCTION" and c.get("test") != "compatibility" and stochastic is True and flow is False:
         errors.append("`stochastic` is true, but `--seed` never reaches a random generator in the script (no default_rng, "

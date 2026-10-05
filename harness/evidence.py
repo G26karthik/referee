@@ -241,6 +241,31 @@ def value_in(text: str, value: str) -> bool:
     return bool(v) and any(_canon(m.group()) == v for m in _NUMBER.finditer(text or ""))
 
 
+_UNITS = ("zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen "
+          "seventeen eighteen nineteen").split()
+_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90}
+
+
+def _word(n: int) -> str:
+    """The English words for a whole count below 1000 ("three", "twenty-five", "one hundred"), or ""."""
+    if n < 20:
+        return _UNITS[n] if n >= 0 else ""
+    if n < 100:
+        t = next(k for k, v in _TENS.items() if v == n // 10 * 10)
+        return t + (f"-{_UNITS[n % 10]}" if n % 10 else "")
+    if n < 1000 and n % 100 == 0:
+        return f"{_UNITS[n // 100]} hundred"
+    return ""
+
+
+def count_in(text: str, n: int) -> bool:
+    """Is the whole count `n` printed in `text`, as a number ("5") or in words ("five", "one hundred")?"""
+    w = _word(int(n))
+    words = [w] + ([w.replace("-", " ")] if "-" in w else []) + (["a hundred", "hundred"] if n == 100 else [])
+    return value_in(text, str(n)) or any(re.search(rf"(?<![\w-]){re.escape(x)}(?![\w-])", text or "", re.I)
+                                         for x in words if x)
+
+
 def parse_value(raw: str) -> float | None:
     try:
         return float(_canon((raw or "").strip().rstrip("%")))

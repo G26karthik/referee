@@ -2508,6 +2508,31 @@ def test_deviations_past_the_cap_are_refused_never_cut_unseen():
         assert len(ok["deviations"]) == tasks.MAX_DEVIATIONS
 
 
+def test_a_run_count_printed_as_a_word_is_the_papers_count():
+    """Oct-06 GRACE C9: the paper prints "we run three independent simulation runs"; the seal required the digit 3 in the
+    quoted sentence, so three attempts were refused ("runs > 1 needs runs_quote") and the check ended INCONCLUSIVE. A
+    count written as a word is the same printed count; the refusal says which part failed."""
+    from harness.evidence import count_in
+    assert count_in("we run three independent simulation runs", 3) and count_in("over 5 random seeds", 5)
+    assert count_in("averaged over one hundred runs", 100) and count_in("Twenty runs", 20)
+    assert not count_in("we run three independent runs", 5) and not count_in("threefold", 3) and not count_in("3.5 runs", 3)
+    with tempfile.TemporaryDirectory() as t:
+        chk = {"id": "C1", "kind": "RECONSTRUCTION", "metric": "", "test": "performance",
+               "target": {"quote": CIFAR, "relation": "acc_a > acc_b", "names": ["acc_a", "acc_b"]}}
+        x = _gen_x(Path(t), chk)
+        x.paper = Paper(DATA_PAGES + ["For each setting we run three independent simulation runs and report the mean."])
+        g = {"fidelity": FID, "script": SCRIPT, "outputs": ["acc_a", "acc_b"], "bindings": BINDS, "stochastic": True}
+        ok = tasks._seal_gen(x, "gen:C1.1", {**g, "runs": 3, "runs_quote": "we run three independent simulation runs"},
+                             final=False)
+        assert ok["runs"] == 3 and ok["runs_quote"].startswith("we run three"), ok
+        err = _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {**g, "runs": 4, "runs_quote":
+                                                               "we run three independent simulation runs"}, final=False))
+        assert "does not print 4" in err, err
+        err = _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {**g, "runs": 3, "runs_quote": "a sentence not in the paper"},
+                                               final=False))
+        assert "not found" in err or "re-found" in err, err
+
+
 def test_readings_past_the_cap_are_refused_by_name_and_a_harness_rejection_is_not_the_authors_refusal():
     """Oct-05 changepoint C1: the script author declared 8 readings (a paper/code variant per factor); the seal kept the
     first 3 silently and then refused each deviation for naming "a reading the check does not declare" — one the author had
