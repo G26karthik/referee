@@ -82,16 +82,27 @@ def withdrawn_plans(root: Path) -> list[dict]:
     return out
 
 
-def merged(plan: dict | None, follow: dict | None, withdrawn: list[dict] | tuple = ()) -> dict | None:
+def _one(a: dict, b: dict) -> bool:
+    """One claim: the same extracted id, or (without ids) the same quote or one inside the other."""
+    return a["id"] == b["id"] if a.get("id") and b.get("id") else same_claim(a["quote"], b["quote"])
+
+
+def claims_of(root: Path) -> list[dict]:
+    """The main claims extracted before any plan (sealed/claims.json, only if it still hashes to its seal)."""
+    return (sealed_record(root, "claims") or {}).get("claims") or []
+
+
+def merged(plan: dict | None, follow: dict | None, withdrawn: list[dict] | tuple = (), extracted: list | tuple = ()) -> dict | None:
     """The first plan with its follow-up round: the follow-up's checks appended, its links and
-    reasons joined onto the same central claims (matched by quote, or one quote inside the other). A claim a
-    withdrawn follow-up plan listed stays accounted, unchecked, until a later round takes it up: re-planning a round
-    never removes a claim from the record (Oct-01 PPRM)."""
+    reasons joined onto the same central claims (matched by extracted id, else by quote, or one quote inside the
+    other). A claim a withdrawn follow-up plan listed stays accounted, unchecked, until a later round takes it up, and so
+    does every EXTRACTED main claim no plan round took up (a malformed or partial plan never removes one): re-planning a
+    round never removes a claim from the record (Oct-01 PPRM)."""
     if not plan:
         return plan
     claims = [dict(cc) for cc in plan["central_claims"]]
     for f in (follow or {}).get("central_claims", []):
-        cc = next((c for c in claims if same_claim(c["quote"], f["quote"])), None)
+        cc = next((c for c in claims if _one(c, f)), None)
         if cc is None:
             claims.append(f)
             continue
@@ -111,10 +122,17 @@ def merged(plan: dict | None, follow: dict | None, withdrawn: list[dict] | tuple
             cc[k] = list(dict.fromkeys((cc.get(k) or []) + (f.get(k) or [])))
     for w in withdrawn:
         for f in w.get("central_claims") or []:
-            if not any(same_claim(c["quote"], f["quote"]) for c in claims):
+            if not any(_one(c, f) for c in claims):
                 claims.append({**f, "checks": [], "withdrawn_plan": w["withdrawn"], "why_unchecked": (
                     f"listed only by a follow-up plan the operator withdrew (sealed/plan__2.withdrawn.{w['withdrawn']}.json; "
                     f"its checks are kept aside as checks/<id>.withdrawn.{w['withdrawn']}); no later round took it up")})
+    for k in extracted:
+        if not any(_one(c, k) for c in claims):
+            claims.append({**{f: k.get(f) for f in ("id", "quote", "page", "claim_type", "scope", "statement", "assumptions",
+                                                    "required_evidence", "interpretations") if k.get(f) is not None},
+                           "checks": [], "omitted": [], "blocker": "", "discovery": [], "failed_checks": [],
+                           "not_the_dataset": "", "why_unchecked": "no plan round took this extracted main claim up "
+                                                                   "(the sealed plan has no entry for it)"})
     out = {**plan, "central_claims": claims}
     return {**out, "checks": plan["checks"] + follow["checks"],
             "dropped": plan.get("dropped", []) + follow.get("dropped", [])} if follow else out
@@ -123,7 +141,7 @@ def merged(plan: dict | None, follow: dict | None, withdrawn: list[dict] | tuple
 def plan_of(root: Path) -> dict | None:
     """The plan of one review as sealed on disk: the first round, its follow-up, and the claims of any withdrawn one."""
     return merged(state.read_json(Path(root) / "sealed" / "plan.json"), state.read_json(Path(root) / "sealed" / "plan__2.json"),
-                  withdrawn_plans(root))
+                  withdrawn_plans(root), claims_of(root))
 
 
 def _changed(c: dict) -> bool:
@@ -326,6 +344,36 @@ def _withdrawn(root: Path) -> list[dict]:
                     "status": o.get("status") or "NOT_FINISHED", "reason": str(o.get("reason", ""))[:300],
                     "pilot_stages": o.get("pilot_stages") or {}, "withdrawn_because": why.get(n, "")[:500]})
     return out
+
+
+def counts(c: dict) -> dict:
+    """What one check was expected to produce and what it produced, reconciled from its own record: result units
+    declared; units with a decided result, undefined (the quantity has no value there) and not completed (no result
+    line); the readings each unit was computed under; the processes launched; the result lines; and how many of the
+    launches were independent replicates (identical reruns are one). Settings, readings, launches and lines are four
+    different numbers and are never added into one (Sep-29 changepoint C7: 124 settings x 2 readings x 3 identical
+    launches = 660 lines, 220 distinct comparisons)."""
+    st, ex = c.get("stages") or {}, c.get("execution") or {}
+    by: dict = {}
+    for p in st.values():
+        by[p["status"]] = by.get(p["status"], 0) + 1
+    undef, missing = by.get("UNDEFINED", 0), by.get("NOT_COMPLETED", 0)
+    with_result = len(st) - undef - missing if st else int(bool(c.get("values")))
+    declared = set(c.get("units") or [])
+    unit_names = set(st) or ({""} if c.get("values") else set())
+    lost = sorted(declared - {("" if s == "(unnamed)" else s) for s in unit_names})
+    ind = [p.get("n_independent", p.get("n")) for p in st.values() if p["status"] not in ("UNDEFINED", "NOT_COMPLETED")
+           and isinstance(p.get("n_independent", p.get("n")), int)]
+    if not st and isinstance(c.get("n_independent", c.get("n")), int):
+        ind = [c.get("n_independent", c.get("n"))]
+    readings = sorted(c.get("readings") or {}) if isinstance(c.get("readings"), dict) else []
+    units = len(declared) if declared else len(unit_names)
+    return {"units_declared": units, "units_with_result": with_result, "units_undefined": undef,
+            "units_not_completed": missing + len(lost), "units_unaccounted": lost[:20], "readings": readings,
+            "comparisons": with_result * max(1, len(readings)), "launches": ex.get("runs_ended", c.get("runs") or 0),
+            "launches_planned": ex.get("runs_planned"), "result_lines": len(c.get("values") or []),
+            "independent_replicates": min(ind) if ind else None,
+            "reconciles": units == with_result + undef + missing + len(lost) and not lost}
 
 
 def _counts(stages: dict) -> str:

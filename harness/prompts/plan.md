@@ -11,19 +11,17 @@ Authors' repository: {{repo}}
 Checkout (you may Read any file in it): {{checkout}}
 Host (measured): {{host}}
 
+=== MAIN CLAIMS (extracted from the paper before this plan; fixed) ===
+{{claims}}
+
 === CONCERNS (after the critic; id, severity, central, checkable, statement) ===
 {{concerns}}
 
 === REPOSITORY LISTING ===
 {{listing}}
 
-STEP 1 — CENTRAL CLAIMS. List every distinct claim the abstract, the contribution list and the
-conclusion say the paper shows (at most 8, most important first; more is refused), each as a verbatim quote: its
-headline experiments, its theorems, and its engineering claims (e.g. "can replace a layer of an
-existing model" is exercised by swapping it in and training — it is NOT a qualitative claim). For
-each give `scope`: every method, dataset, setting and metric the claim names or compares, ONE per
-entry (e.g. ["RPC", "PL", "Mallows", "political", "movies"] — never "MMLU, CMExam and PubMedQA" in one
-entry: the harness refuses a listing entry). Every scope item is either in the `covers` of a
+{{claims_step}}
+Every scope item is either in the `covers` of a
 check linked to the claim, or listed in the claim's `omitted` with a concrete reason AND a `blocker`
 (data | credentials | compute | cap | protocol | other). A claim with no check gets a concrete
 `why_unchecked` and a `blocker` naming what NO kind below overcomes, with what the harness can check
@@ -195,8 +193,8 @@ its mean paired margin beyond Student-t standard errors over the seeds). AUTHOR_
 Write ONLY this JSON to the output path you were given:
 {"repo_is_authors": true,
  "repo_note": "why the repository is (not) the authors' own code for these experiments",
- "central_claims": [{"quote": "verbatim", "claim_type": "engineering|performance|value|theory",
-                     "scope": ["every method/dataset/setting it names"],
+ "central_claims": [{"id": "K1 (an extracted claim's id; without extracted claims: quote, claim_type and scope instead)",
+                     "quote": "", "claim_type": "", "scope": [],
                      "checks": ["C1"], "omitted": [{"item": "a scope item", "why": "concrete reason",
                        "blocker": "data|credentials|compute|cap|protocol|other", "discovery": [],
                        "not_the_dataset": "", "failed_checks": [], "artifact": "", "service": false,

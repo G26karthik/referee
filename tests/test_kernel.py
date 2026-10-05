@@ -147,6 +147,9 @@ def _project(td: Path) -> tuple[state.Config, str]:
 
 
 def _seal(cfg, pid, tid, obj, td) -> dict:
+    if tid == "plan" and tasks._sealed(td / pid, "claims") is None and "claims" in {
+            t["id"] for t in tasks._plan(tasks._Ctx(cfg, pid))[1]}:
+        tasks.abandon(cfg, pid, "claims", "a test of the planner's own claim list (no extraction)")
     f = td / "answer.json"
     f.write_text(json.dumps(obj), encoding="utf-8")
     return tasks.seal(cfg, pid, tid, str(f))
@@ -4248,6 +4251,269 @@ def test_a_follow_up_rounds_re_examined_omission_is_the_one_reported():
               "omitted": [{"item": "Qwen 7B", "why": "the search budget is spent", "blocker": "other"}]}]}
     om = report.merged(first, follow)["central_claims"][0]["omitted"]
     assert len(om) == 1 and om[0]["blocker"] == "other" and om[0]["earlier"]["blocker"] == "data", om
+
+
+# --- 2026-10-05 review: replicates, undefined units, counts ------------------------------------------
+def test_replicates_equal_up_to_round_off_are_one_measurement():
+    """Sep-29 changepoint C7: three seeds of a deterministic pipeline printed the same variances; a sum taken in another
+    order makes them differ in the last bits. Equal-to-round-off lines are one run repeated, never three replicates
+    whose standard error is ~1e-16 (that read RELATION_HOLDS with t(2)=4.3 and a band of 0)."""
+    rel = "var_lb - var_km > 0"
+    outs = [{"var_km": 829.023247152567 + k * 1.1e-13, "var_lb": 1205.235555555558} for k in range(3)]
+    margins = [o["var_lb"] - o["var_km"] for o in outs]
+    assert len(set(margins)) > 1                                          # not bit-identical
+    ind = independence.assess(_rows(outs), "a", "", True)
+    assert ind["state"] != "different" and not ind["independent"], ind
+    r = _rel(rel, _rows(outs), margins, rng=True)
+    assert r["status"] == "INCONCLUSIVE" and r["stages"]["a"]["n_independent"] == 1, r
+    det = _rel(rel, _rows(outs), margins, det=True)                       # declared deterministic: one measurement
+    assert det["status"] == "RELATION_HOLDS" and det["stages"]["a"]["n_independent"] == 1, det
+    real = [{"var_km": 829.0 + k, "var_lb": 1205.2} for k in range(3)]    # runs that really differ stay replicates
+    assert independence.assess(_rows(real), "a", "", True)["independent"]
+
+
+def test_an_undefined_unit_is_counted_apart_from_a_missing_one():
+    """Sep-29 changepoint C7: 14 settings where KM's estimate is undefined (no alarm in any sequence) printed no result
+    line and read NOT_COMPLETED beside 14 genuinely missing ones, so the check read PARTIAL and the ledger could not say
+    how many settings were expected, measured, undefined or lost. A unit that says why its quantity is undefined is
+    completed and decides nothing; a unit with no line is not completed."""
+    from harness.reconcile import PARTIAL
+    rel = "var_lb - var_km > 0"
+    out = "\n".join(['REFEREE_PROGRESS {"units": ["a", "b", "c", "d"]}',
+                     'REFEREE_RESULT {"stage": "a", "var_km": 1, "var_lb": 2, "data_fingerprint": "x"}',
+                     'REFEREE_RESULT {"stage": "b", "var_km": 1, "var_lb": 3, "data_fingerprint": "x"}',
+                     'REFEREE_RESULT {"stage": "c", "undefined": "no alarm in any sequence: KM is undefined"}'])
+    assert execute.undefined_units(out) == {"c": "no alarm in any sequence: KM is undefined"}
+    staged = execute.staged_values(out, rel, "")
+    errs, _ = execute.split_units(execute.units({"stdout": out}), staged, False, "no line", execute.undefined_units(out))
+    assert errs == {"d": "no line"}, errs                                  # c is undefined, d is missing
+    dec = lambda st, undef, errs: reconcile("RELEASED_DATA", "", [e[1] for e in st], "", {}, False, True, "", rel,
+                                           staged=st, stage_errors=errs, deterministic=True, undefined=undef)
+    full = dec(staged, {"c": "no alarm"}, {})
+    assert full["status"] == "RELATION_HOLDS" and full["stages"]["c"]["status"] == "UNDEFINED", full
+    assert full["undefined_stages"] == ["c"] and "undefined" in full["reason"]
+    part = dec(staged, {"c": "no alarm"}, {"d": "no line"})
+    assert part["status"] == PARTIAL and part["stages"]["d"]["status"] == "NOT_COMPLETED"
+    assert dec([], {"c": "x"}, {})["status"] == "INCONCLUSIVE"            # undefined everywhere decides nothing
+    # The counts reconcile: units declared = with a result + undefined + not completed; launches and independent runs apart.
+    o = {**part, "values": [1, 2] * 3, "runs": 3, "execution": {"runs_planned": 3, "runs_ended": 3, "runs_exited_ok": 3},
+         "units": ["a", "b", "c", "d"]}
+    n = report.counts({"kind": "RELEASED_DATA", **o})
+    assert (n["units_declared"], n["units_with_result"], n["units_undefined"], n["units_not_completed"]) == (4, 2, 1, 1), n
+    assert n["launches"] == 3 and n["result_lines"] == 6 and n["reconciles"], n
+
+
+def test_every_declared_unit_is_accounted_for_however_many():
+    """Sep-29 changepoint C7 declared 248 units and printed 220; the outcome named 22 incomplete and lost 6 without a
+    trace (a cap on the units kept per seed). Every declared unit ends in exactly one of: decided, undefined, not completed."""
+    with tempfile.TemporaryDirectory() as t:
+        root = Path(t)
+        cdir = root / "checks" / "C1"
+        cdir.mkdir(parents=True)
+        units = [f"u{i:03d}" for i in range(248)]
+        printed, undef = units[:220], units[220:234]
+        check = {"id": "C1", "kind": "RECONSTRUCTION", "runs": 2, "stochastic": False, "script_sha256": "s",
+                 "target": {"relation": "b - a > 0"}}
+        for seed in range(2):
+            out = "\n".join([f'REFEREE_PROGRESS {{"units": {json.dumps(units)}}}'] +
+                            [f'REFEREE_RESULT {{"stage": "{u}", "a": 1, "b": 2}}' for u in printed] +
+                            [f'REFEREE_RESULT {{"stage": "{u}", "undefined": "no events"}}' for u in undef])
+            staged = execute.staged_values(out, "b - a > 0", "")
+            declared, un = execute.units({"stdout": out}), execute.undefined_units(out)
+            errs, _ = execute.split_units(declared, staged, False, "a declared unit printed no result line", un)
+            state.append_jsonl(cdir / "seeds.jsonl", {"key": "s", "seed": seed, "values": [e[1] for e in staged],
+                                                       "cert": [], "staged": staged, "seconds": 1, "error": "",
+                                                       "stage_errors": errs, "units": sorted(declared), "undefined": un,
+                                                       "schema": [], "cohort_mismatch": [],
+                                                       "detail": execute.result_detail(out, seed)})
+        st: dict = {}
+        execute.reuse_checkpoints(root, cdir, check, st)
+        res = execute._reconciled(check, st, True, "", failure="")
+        sts = [p["status"] for p in res["stages"].values()]
+        assert len(sts) == 248, len(sts)
+        assert sts.count("UNDEFINED") == 14 and sts.count("NOT_COMPLETED") == 14 and sts.count("RELATION_HOLDS") == 220
+
+
+def test_seeded_runs_that_vary_nothing_go_back_to_their_author():
+    """Sep-29 changepoint C7: a deterministic pipeline (fixed WISDM data, deterministic detectors) declared `stochastic`;
+    its three seeds printed identical lines, so no stage could be decided (no replicates, no noise band). That is a defect
+    of the script's declaration, not a finding: the approved script goes back to its author once, with the reason."""
+    rows = _rows([{"v": 1.0}, {"v": 1.0}, {"v": 1.0}]) + _rows([{"v": 2.0}] * 3, stage="b")
+    chk = {"kind": "RECONSTRUCTION", "stochastic": True, "test": "performance"}
+    why = execute.varied_nothing(chk, {"detail": rows, "done_seeds": [0, 1, 2]})
+    assert why and "stochastic" in why, why
+    assert not execute.varied_nothing({**chk, "stochastic": False}, {"detail": rows, "done_seeds": [0, 1, 2]})
+    assert not execute.varied_nothing(chk, {"detail": rows + _rows([{"v": 3.0}, {"v": 4.0}], stage="c"),
+                                            "done_seeds": [0, 1, 2]})        # one stage the seed did vary: replicates there
+    assert not execute.varied_nothing(chk, {"detail": rows[:1], "done_seeds": [0]})
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid = _project(td)
+        state.write_json(td / ".gpu.json", False)
+        for lens in tasks.LENSES:
+            _seal(cfg, pid, f"lens:{lens}", {"concerns": []}, td)
+        _seal(cfg, pid, "critic", {"reviews": []}, td)
+        c = {"id": "B", "kind": "CERTIFICATE", "claim_quote": "We report the mean over 5 random seeds",
+             "statement_quote": "The final loss is -0.52", "role": "target", "covers": ["the loss"]}
+        _seal(cfg, pid, "plan", {"checks": [c], "central_claims": [{"quote": c["claim_quote"], "checks": ["B"],
+                                                                    "claim_type": "theory", "scope": ["the loss"]}]}, td)
+        script = "n = 1\nassert n\nok = n > 0\nprint('REFEREE_RESULT', {'violated': 0, 'premises_hold': 1})\n"
+        b = [{"kind": k, "impl_quote": q, "paper_quote": "reaches 61.4 accuracy"} for k, q in
+             (("hypotheses", "assert n"), ("claimed_bound", "ok = n > 0"), ("instance", "n = 1"))]
+        _seal(cfg, pid, "gen:C1.1", {"script": script, "runs": 1, "outputs": ["violated"], "bindings": b}, td)
+        state.write_json(td / pid / "checks" / "C1" / "smoke.1.json", {"returncode": 0, "failed": False, "reached": True,
+                                                                        "stdout": "", "stderr": ""})
+        _seal(cfg, pid, "verify:C1.1", {"verdict": "APPROVE", "quotes": ["reaches 61.4 accuracy"], "claim_changing": []}, td)
+        tasks._plan(tasks._Ctx(cfg, pid))                                    # approved: started
+        assert (td / pid / "checks" / "C1" / "exec.json").exists()
+        state.write_json(td / pid / "checks" / "C1" / "outcome.json", {"status": "INCONCLUSIVE", "reason": "x",
+                                                                         "revisable": "the seeds varied nothing"})
+        _, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
+        assert [o["id"] for o in owed] == ["gen:C1.2"], owed
+        assert "the seeds varied nothing" in Path(owed[0]["prompt"]).read_text(encoding="utf-8")
+        assert (td / pid / "checks" / "C1" / "outcome.setup.1.json").exists()   # the old outcome is kept beside it
+
+
+CLAIM_PAGES = ["Abstract. Our layer can replace a dense layer in any network. Our method is more accurate than the "
+               "baseline on CIFAR and SVHN.\nTheorem 1. If the step size is below one half, the error decays.\n"
+               "We report the mean over 5 random seeds.",
+               "Table 2: Results\nMethod CIFAR SVHN\nOurs 61.4 70.2\nBase 59.3 68.0\nIn conclusion, our method is more "
+               "accurate than the baseline on both datasets."]
+
+
+def _claims_project(td: Path) -> tuple[state.Config, str]:
+    cfg, pid = _project(td)
+    state.write_json(td / pid / "paper" / "doc.json", {"pid": pid, "title": "T", "sha256": "0", "pages": CLAIM_PAGES,
+                                                       "rows": [[], CLAIM_PAGES[1].splitlines()[:4]], "arxiv_id": "",
+                                                       "arxiv_version": "", "source": ""})
+    (td / pid / "paper" / "paper.md").write_text("\n".join(CLAIM_PAGES), encoding="utf-8")
+    state.write_json(td / ".gpu.json", False)
+    return cfg, pid
+
+
+_K = [{"quote": "Our layer can replace a dense layer in any network", "statement": "The layer can be swapped in for a dense layer.",
+       "claim_type": "engineering", "scope": ["our layer", "dense layer"], "required_evidence": "swap the layer in and train it"},
+      {"quote": "Our method is more accurate than the baseline on CIFAR and SVHN",
+       "also_stated": ["our method is more accurate than the baseline on both datasets"],
+       "statement": "The method has higher accuracy than the baseline.", "claim_type": "performance",
+       "scope": ["Ours", "Base", "CIFAR, SVHN"], "required_evidence": "the Table 2 experiment over 5 seeds",
+       "evidence_in_paper": [{"quote": "Table 2: Results", "what": "two datasets"}],
+       "interpretations": [{"name": "top1", "reading": "top-1 accuracy on the test split",
+                            "quote": "more accurate than the baseline on CIFAR"}]},
+      {"quote": "If the step size is below one half, the error decays", "statement": "The error decays for small steps.",
+       "claim_type": "theory", "scope": ["Theorem 1"], "required_evidence": "a proof; exact cases can only refute it",
+       "assumptions": [{"quote": "the step size is below one half", "what": "step size < 1/2"}]}]
+
+
+def test_main_claims_are_extracted_before_any_plan_and_kept_through_every_round():
+    """Oct-05 review: the planner both listed the claims and chose the tests, so a planner's criterion could become a
+    claim, fragments ('the truncation bias is smaller than that of') stood for claims, and a follow-up plan's list
+    replaced the first one's. Claims are now extracted from the paper alone, with their words, scope, assumptions and
+    required evidence; a plan tests them by id and can neither drop, requote nor retype one."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid = _claims_project(td)
+        owed = {o["id"] for o in tasks._plan(tasks._Ctx(cfg, pid))[1]}
+        assert "claims" in owed and "lens:overclaim" in owed                 # extracted beside the lenses, from the paper
+        dup = {**_K[1], "quote": "more accurate than the baseline on CIFAR and SVHN"}
+        x0 = tasks._Ctx(cfg, pid)
+        assert "same claim" in _refused(lambda: tasks._seal_claims(x0, "claims", {"claims": _K + [dup]}, final=False))
+        assert "claim_type" in _refused(lambda: tasks._seal_claims(x0, "claims", {"claims": [{**_K[0], "claim_type": "big"}]},
+                                                                     final=False))
+        assert "more accurate" in _refused(lambda: tasks._seal_claims(x0, "claims", {"claims": [{**_K[1], "interpretations": [
+            {"name": "a", "reading": "an ambiguous reading", "quote": "more accurate"}]}]}, final=False))   # not unique
+        _seal(cfg, pid, "claims", {"claims": _K}, td)
+        ks = tasks._sealed(td / pid, "claims")["claims"]
+        assert [k["id"] for k in ks] == ["K1", "K2", "K3"] and ks[1]["scope"] == ["Ours", "Base", "CIFAR", "SVHN"]
+        assert ks[2]["assumptions"][0]["page"] == 1 and ks[1]["interpretations"][0]["name"] == "top1"
+        for lens in tasks.LENSES:
+            _seal(cfg, pid, f"lens:{lens}", {"concerns": []}, td)
+        _seal(cfg, pid, "critic", {"reviews": []}, td)
+        phase, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
+        assert phase == "plan" and "K2" in Path(owed[0]["prompt"]).read_text(encoding="utf-8")
+        cert = {"id": "A", "kind": "CERTIFICATE", "claim_quote": "If the step size is below one half, the error decays",
+                "statement_quote": "If the step size is below one half, the error decays", "role": "target",
+                "covers": ["Theorem 1"]}
+        x = tasks._Ctx(cfg, pid)
+        part = {"checks": [cert], "central_claims": [{"id": "K3", "checks": ["A"]}]}
+        err = _refused(lambda: tasks._seal_plan(x, "plan", part, final=False))
+        assert "K1" in err and "K2" in err                                    # every extracted claim needs an entry
+        forged = {"checks": [cert], "central_claims": [{"id": "K9", "checks": ["A"]}]}
+        assert "not extracted" in _refused(lambda: tasks._seal_plan(x, "plan", forged, final=False))
+        retyped = {"checks": [cert], "central_claims": [
+            {"id": "K3", "checks": ["A"], "claim_type": "performance", "quote": "We report the mean over 5 random seeds"},
+            {"id": "K1", "why_unchecked": "no network code", "blocker": "other"},
+            {"id": "K2", "why_unchecked": "no data", "blocker": "other"}]}
+        rec = tasks._seal_plan(x, "plan", retyped, final=False)               # quote and type come from the extraction
+        k3 = next(c for c in rec["central_claims"] if c["id"] == "K3")
+        assert k3["claim_type"] == "theory" and k3["quote"].startswith("If the step") and k3["checks"] == ["C1"]
+        assert k3["statement"] == "The error decays for small steps." and k3["assumptions"]
+        # A malformed plan (sealed empty on its last attempt) still leaves every extracted claim in the ledger.
+        state.write_json(td / pid / "sealed" / "plan.json", tasks._EMPTY["plan"])
+        seals = state.read_json(td / pid / "seals.json")
+        seals["plan"] = state.sha256((td / pid / "sealed" / "plan.json").read_bytes())
+        state.write_json(td / pid / "seals.json", seals)
+        led = report.ledger(tasks._Ctx(cfg, pid))
+        assert [c["id"] for c in led["central_claims"]] == ["K1", "K2", "K3"]
+        assert all(c["claim_status"] == "NOT_CHECKED" and c["why_unchecked"] for c in led["central_claims"])
+        assert len(led["completion"]["claims"]) == 3                         # every claim has a completion entry
+
+
+def test_a_long_check_yields_its_turn_to_one_that_waited():
+    """Sep-29 GRACE: the first-polled check took every freed slot (and the GPU) for all of its 100 seeds while the
+    integration test waited behind it. A check that just ran waits behind every check that waited meanwhile."""
+    with tempfile.TemporaryDirectory() as t:
+        cfg = state.Config()
+        cfg.projects = Path(t)
+        for c in ("A", "B", "C"):
+            state.write_json(Path(t) / "p" / "checks" / c / "exec.json", {})
+        assert execute.wait_turn(cfg, "p/A", True) == (0, 0)
+        assert execute.wait_turn(cfg, "p/B", True) == (0, 1)                # A waited longer
+        time.sleep(0.01)
+        assert execute.wait_turn(cfg, "p/C", False) == (0, 2)
+        execute.leave_turn(cfg, "p/A")                                       # A started its run
+        assert execute.wait_turn(cfg, "p/B", True) == (0, 0)
+        time.sleep(0.01)
+        assert execute.wait_turn(cfg, "p/A", True) == (1, 1)                 # its next run waits behind B and C
+        state.write_json(Path(t) / "p" / "checks" / "B" / "outcome.json", {})
+        assert execute.wait_turn(cfg, "p/A", True) == (1, 0)                 # an ended check leaves no ghost in the line
+
+
+def test_the_follow_up_round_does_not_wait_on_a_long_run():
+    """Sep-29 GRACE: the follow-up plan (and so the layer-replacement test it would have planned) waited for a 100-seed
+    training check of another claim. Once only long executions remain, the follow-up is planned beside them; a
+    claim whose check still runs is not 'undecided' and is listed as still running."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid = _project(td)
+        state.write_json(td / ".gpu.json", False)
+        for lens in tasks.LENSES:
+            _seal(cfg, pid, f"lens:{lens}", {"concerns": []}, td)
+        _seal(cfg, pid, "critic", {"reviews": []}, td)
+        a = {"id": "A", "kind": "CERTIFICATE", "claim_quote": "We report the mean over 5 random seeds",
+             "statement_quote": "The final loss is -0.52", "role": "target", "covers": ["the loss"]}
+        b = {**a, "id": "B", "claim_quote": "We use generation of samples", "covers": ["samples"]}
+        _seal(cfg, pid, "plan", {"checks": [a, b], "central_claims": [
+            {"quote": a["claim_quote"], "checks": ["A"], "claim_type": "theory", "scope": ["the loss"]},
+            {"quote": b["claim_quote"], "checks": ["B"], "claim_type": "theory", "scope": ["samples"]}]}, td)
+        state.write_json(td / pid / "checks" / "C1" / "outcome.json", {"status": "NOT_CHECKABLE", "reason": "x"})
+        state.write_json(td / pid / "checks" / "C2" / "check.json", {"id": "C2", "kind": "CERTIFICATE", "runs": 100})
+        state.write_json(td / pid / "checks" / "C2" / "exec.json", {"token": "t"})          # approved and started
+        real = execute.poll, execute.remaining_s
+        try:
+            execute.poll = lambda cfg, pid, cid: cid == "C2"                 # C2 executes
+            execute.remaining_s = lambda cfg, root, cid: 600.0                # a short run: the follow-up waits for it
+            phase, owed, running = tasks._plan(tasks._Ctx(cfg, pid))
+            assert phase == "verify" and owed == [] and running == ["C2"]
+            execute.remaining_s = lambda cfg, root, cid: 6 * 3600.0           # a long one: planned beside it
+            phase, owed, running = tasks._plan(tasks._Ctx(cfg, pid))
+            assert phase == "plan" and [o["id"] for o in owed] == ["plan:2"] and running == ["C2"]
+            text = Path(owed[0]["prompt"]).read_text(encoding="utf-8")
+            assert "STILL RUNNING" in text and "- C2 " in text
+            undecided = text.split("Still undecided:")[1].split("===")[0]
+            assert "generation of samples" not in undecided and "mean over 5" in undecided
+        finally:
+            execute.poll, execute.remaining_s = real
 
 
 if __name__ == "__main__":

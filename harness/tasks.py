@@ -58,7 +58,7 @@ MAX_CLAIMS = 8
 SEVERITY = ("NOTE", "MINOR", "MAJOR", "FATAL")
 CLASSES = ("CONFIRMED_FINDING", "PLAUSIBLE_CONCERN", "OPEN_QUESTION", "DISMISSED")
 PROMPTS = Path(__file__).parent / "prompts"
-_EFFORT = {"lens": "high", "critic": "high", "plan": "high", "bind": "high", "gen": "high", "vision": "medium",
+_EFFORT = {"lens": "high", "critic": "high", "claims": "high", "plan": "high", "bind": "high", "gen": "high", "vision": "medium",
            "verify": "high", "report": "medium", "audit": "high"}
 
 
@@ -126,7 +126,8 @@ class _Ctx:
     def plan(self) -> dict | None:
         """The plan with its follow-up round merged in (checks C1..Cn, then the follow-up's), and the claims of any
         follow-up plan the operator withdrew."""
-        return report.merged(self.sealed("plan"), self.sealed("plan:2"), report.withdrawn_plans(self.root))
+        return report.merged(self.sealed("plan"), self.sealed("plan:2"), report.withdrawn_plans(self.root),
+                             (self.sealed("claims") or {}).get("claims") or [])
 
     def tracked(self) -> set[str]:
         if not hasattr(self, "_tracked"):
@@ -233,13 +234,19 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
     """(phase, tasks, executions to start)."""
     missing = [lens for lens in LENSES if x.sealed(f"lens:{lens}") is None]
     title = x.meta["title"]
+    # The main claims are extracted from the paper alone, beside the lenses and before any plan: a planner tests claims,
+    # it never makes them (a criterion it supplies is a deviation, never a claim of the paper).
+    claims = [] if x.sealed("claims") is not None or x.sealed("plan") is not None else [x.task(
+        "claims", "claims", _template("claims", title=title, pages_dir=x.pages_dir))]
     if missing:
         return "read", [x.task(f"lens:{lens}", "lens", _template(
             "lens", lens=lens, focus=_section("lenses", lens), title=title, pages_dir=x.pages_dir))
-            for lens in missing], []
+            for lens in missing] + claims, []
     if x.sealed("critic") is None:
         return "critic", [x.task("critic", "critic", _template(
-            "critic", title=title, pages_dir=x.pages_dir, concerns=_concern_lines(x.concerns())))], []
+            "critic", title=title, pages_dir=x.pages_dir, concerns=_concern_lines(x.concerns())))] + claims, []
+    if claims:
+        return "claims", claims + _concern_vision(x), []
     plan = x.plan()
     rows = (x.root / "paper" / "rows.md",)
     if plan is None:
@@ -260,8 +267,14 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
     for c in plan["checks"]:
         tasks += _step(x, c)
     tasks += _audits(x, plan)
-    running = [c["id"] for c in plan["checks"] if execute.poll(x.cfg, x.pid, c["id"])] + sorted(x.waiting)
-    if tasks or running:
+    executing = [c["id"] for c in plan["checks"] if execute.poll(x.cfg, x.pid, c["id"])]
+    running = executing + sorted(x.waiting)
+    # The follow-up round does not wait on a long run: once only executions remain and each has at least
+    # FOLLOWUP_AFTER_S left (measured from its pilot), the follow-up plans for what has ended, beside them; what they
+    # find is reported when they end. A costly training run never holds back a proof check or a cheap experiment.
+    early = (executing and not tasks and not x.waiting and x.cfg.max_followup_checks > 0 and x.sealed("plan:2") is None
+             and all((execute.remaining_s(x.cfg, x.root, k) or 0) >= FOLLOWUP_AFTER_S for k in executing))
+    if (tasks or running) and not early:
         return "verify", tasks, running
     ledger = report.ledger(x)
     # Coverage: once every check ended, one follow-up plan sees what each check found and why; it
@@ -270,11 +283,13 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
     # ...and an empirical claim whose requested experiment did not run as specified (blocked, partial, or
     # run only on a substitute) is undecided however its supporting checks came out.
     ran = {r["claim"]: r["experiment"] for r in ledger["completion"]["claims"]}
-    undecided = [cc for cc in ledger["central_claims"]
-                 if cc["claim_status"] in ("NOT_CHECKED", "NOTHING_DECIDED", "PARTIAL_EVIDENCE")
-                 or (cc.get("claim_type") != "theory" and ran.get(cc["quote"]) not in (None, "RAN_AS_SPECIFIED"))]
+    undecided = [cc for cc in ledger["central_claims"] if not set(cc["checks"]) & set(executing) and (
+                 cc["claim_status"] in ("NOT_CHECKED", "NOTHING_DECIDED", "PARTIAL_EVIDENCE")
+                 or (cc.get("claim_type") != "theory" and ran.get(cc["quote"]) not in (None, "RAN_AS_SPECIFIED")))]
     if x.cfg.max_followup_checks > 0 and x.sealed("plan:2") is None:
-        return "plan", [_plan_task(x, "plan:2", _followup_text(ledger, undecided))], []
+        return "plan", [_plan_task(x, "plan:2", _followup_text(ledger, undecided, executing))], running
+    if running:
+        return "verify", [], running
     if x.sealed("report") is None:
         return "report", [x.task("report", "report", _template(
             "report", title=title, table=report.table(ledger), concerns=_concern_lines(ledger["concerns"]),
@@ -298,8 +313,10 @@ def _plan_task(x: _Ctx, tid: str, followup: str) -> dict:
             f'SH_ALLOW_NETWORK={int(x.cfg.allow_network)} SH_ALLOW_DATA_SEARCH={int(x.cfg.allow_data_search)} '
             f'SH_MAX_DISCOVERIES={x.cfg.max_discoveries} SH_DENY_SOURCES="{",".join(x.cfg.deny_sources)}" '
             f'"{Path(x.cfg.python).as_posix()}" run.py discover {x.pid}')
+    extracted = bool((x.sealed("claims") or {}).get("claims"))
     return x.task(tid, "plan", _template(
         "plan", title=x.meta["title"], pages_dir=x.pages_dir, repo=repo_line, checkout=x.checkout.as_posix(),
+        claims=_claims_text(x), claims_step=_section("plan_steps", "extracted" if extracted else "legacy"),
         host=execute.host_facts(x.cfg), concerns=_concern_lines(x.concerns()), listing=lst,
         max_checks=x.cfg.max_followup_checks if followup else x.cfg.max_checks, followup=followup,
         discover_cmd=find, discover_files_cmd=f"{find} --files", discoveries=_discovery_text(x), max_discoveries=x.cfg.max_discoveries,
@@ -307,12 +324,22 @@ def _plan_task(x: _Ctx, tid: str, followup: str) -> dict:
         (x.root / "paper" / "rows.md",))
 
 
-def _followup_text(ledger: dict, undecided: list[dict]) -> str:
+# ponytail: a follow-up round waits for a run with less than 20 min left (what it finds informs the follow-up); a longer
+# one runs beside the follow-up, and what it finds is reported when it ends.
+FOLLOWUP_AFTER_S = 1200
+
+
+def _followup_text(ledger: dict, undecided: list[dict], executing: list[str] = ()) -> str:
     done = [{k: c.get(k) for k in ("id", "kind", "claim", "role", "covers", "status", "state", "reason", "stages",
                                    "data_identity", "data_blocker", "not_requested", "pilot_stages")
-             if c.get(k) not in (None, {}, [])} for c in ledger["checks"]]
+             if c.get(k) not in (None, {}, [])} for c in ledger["checks"] if c["id"] not in executing]
     ran = {r["claim"]: r for r in ledger["completion"]["claims"]}
-    listed = "\n".join(f"- {cc['quote']!r} ({cc.get('claim_type') or 'untyped'}): {cc['claim_status']}; the requested "
+    busy = ("\n=== STILL RUNNING (long executions; each ends on its own and is reported then — never plan a duplicate of "
+            "one, and never plan for a claim only a running check decides) ===\n"
+            + "\n".join(f"- {c['id']} {c['kind']} for: {c['claim'][:120]!r}; covers {c.get('covers')}" for c in ledger["checks"]
+                        if c["id"] in executing) + "\n") if executing else ""
+    listed = "\n".join(f"- {cc['id'] + ' ' if cc.get('id') else ''}{cc.get('statement') or cc['quote']!r} ({cc.get('claim_type') or 'untyped'}): "
+                       f"{cc['claim_status']}; the requested "
                        f"experiment: {ran[cc['quote']]['experiment']}" + "".join(
                            f" [{b['item']}: {b['blocker']}{' ' + b['class'] if b.get('class') else ''}, asserted by the "
                            f"{b['basis']}{'; NOT verified: ' + b['unverified'][:160] if b.get('unverified') else ''}"
@@ -325,10 +352,10 @@ def _followup_text(ledger: dict, undecided: list[dict]) -> str:
     choices = "\n".join(f"- {d['printed'][:160]!r} (p{d['page']}): " + "; ".join(
         f"{u['checks']}: {u['used'][:120]!r}{' (changes the claim)' if u['changes_claim'] else ''}" for u in d["choices"])
         for d in ledger.get("definition_choices") or [])
-    return ("\n=== FOLLOW-UP ROUND (every planned check has ended) ===\nCentral claims the first plan listed, and what "
-            f"was found:\n{listed}\nStill undecided:\n"
-            + ("\n".join(f"- {cc['quote']!r}: {cc['claim_status']} (checks {', '.join(cc['checks']) or 'none'}; "
-                         f"why unchecked: {cc.get('why_unchecked') or '-'})" for cc in undecided) or "- none")
+    return ("\n=== FOLLOW-UP ROUND (every planned check has ended, or is a long run still going: see STILL RUNNING) ===\n"
+            f"Main claims, and what was found:\n{listed}\nStill undecided:\n"
+            + ("\n".join(f"- {cc['id'] + ' ' if cc.get('id') else ''}{cc['quote']!r}: {cc['claim_status']} (checks {', '.join(cc['checks']) or 'none'}; "
+                         f"why unchecked: {cc.get('why_unchecked') or '-'})" for cc in undecided) or "- none") + busy
             + "\n=== WHAT EACH CHECK FOUND (harness statuses and reasons) ===\n"
             + json.dumps(done, ensure_ascii=False, indent=1)[:20_000]
             + "\nA check with a `data_blocker` could not acquire its data: its class says whether the source is missing, "
@@ -347,8 +374,11 @@ def _followup_text(ledger: dict, undecided: list[dict]) -> str:
               "different route, a cited public artifact to acquire, or a narrower but still paper-faithful test can decide "
               "what the first round could not, and (b) any headline claim of the abstract, the contribution list or the "
               "conclusion that the list above does not contain (re-read them). Repeat nothing that already ran. "
-              "`central_claims` lists ONLY those claims (the same quote for (a); a new verbatim quote with its scope for "
-              "(b)), each with the new check ids or a concrete `why_unchecked` naming the blocker. A claim may also list the id "
+              "`central_claims` lists ONLY those claims: for (a) by their id (K1, ...) when the list gives one, else by the "
+              "same quote; for (b) as `new_claims` (each written as the claim extractor writes one: quote, statement, "
+              "claim_type, scope, assumptions, required_evidence — plus its checks) when the claims above carry ids, else as a "
+              "new verbatim quote with its scope in `central_claims`; each with the new check ids or a concrete "
+              "`why_unchecked` naming the blocker. A claim may also list the id "
               "of a check above (C1, ...) that already ran the experiment it names: that check's `covers` count for the claim, "
               "so a scope item it ran is never written as an omission. Proposing nothing is correct when nothing more can be "
               "decided.\n")
@@ -386,11 +416,14 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
     cdir = x.root / "checks" / cid
     rounds = 1 + x.cfg.max_revisions
     o = state.read_json(cdir / "outcome.json")
-    if o and o.get("setup_error") and kind in SCRIPT_KINDS:   # an approved script that could not start goes
-        r0 = max((r for r in range(1, rounds + 1)                # back to its author with the error, not a verdict
+    # An approved script that could not start, or whose seeded runs varied nothing (execute.varied_nothing), goes back
+    # to its author with the reason, not a verdict; its outcome is kept beside the next round's.
+    if o and (o.get("setup_error") or o.get("revisable")) and kind in SCRIPT_KINDS:
+        r0 = max((r for r in range(1, rounds + 1)
                   if (x.sealed(f"verify:{cid}.{r}") or {}).get("verdict") == "APPROVE"), default=0)
         if 0 < r0 < rounds:
-            (cdir / f"setup.{r0}.txt").write_text(o.get("setup_log") or o.get("reason", ""), encoding="utf-8")
+            (cdir / f"setup.{r0}.txt").write_text(o.get("setup_log") or o.get("revisable") or o.get("reason", ""),
+                                                  encoding="utf-8")
             (cdir / "outcome.json").replace(cdir / f"outcome.setup.{r0}.json")
             (cdir / "exec.json").unlink(missing_ok=True)
             o = None
@@ -960,6 +993,81 @@ def _seal_lens(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
             "unasked_question": str(obj.get("unasked_question") or "")[:2000], "notes": str(obj.get("notes") or "")[:2000]}
 
 
+# ponytail: 30 main claims is a safety ceiling against a runaway list, not a target: the extractor is told to list every
+# main claim and no more; past it the answer is refused (merge restatements and scope items), never cut unseen.
+MAX_EXTRACTED = 30
+
+
+def _seal_claims(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
+    """The paper's main claims, extracted before any plan (a planner tests claims; it never makes them). Each keeps the
+    words it is stated in, its type, its scope (one item per entry), the assumptions under which the paper claims it, the
+    evidence the paper offers and what would decide it — every quote re-found. Ids K1..Kn are the harness's."""
+    raw = [c for c in obj.get("claims") or [] if isinstance(c, dict)]
+    out, dropped, errors = _validate_claims(x, raw, [], 1)
+    if len(raw) > MAX_EXTRACTED:
+        errors.append(f"{len(raw)} claims: at most {MAX_EXTRACTED} — a dataset, baseline, seed or case of one conclusion is its "
+                      "scope, and a restatement is `also_stated`, never another claim")
+    if not out:
+        errors.append("no main claim was extracted: every paper states at least one result")
+    _fail_or_drop(errors, final)
+    return {"claims": out, "dropped": dropped, "notes": str(obj.get("notes") or "")[:2000]}
+
+
+def _validate_claims(x: _Ctx, raw: list[dict], known: list[dict], first: int) -> tuple[list, list, list]:
+    """(claims, dropped, errors): each claim re-found and typed, numbered K<first>.. after the `known` ones (a claim that
+    restates a known one is refused)."""
+    errors, out, dropped = [], [], []
+    for c in raw[:MAX_EXTRACTED]:
+        errs: list[str] = []
+        h = _find(x, str(c.get("quote") or ""), errs, "claim quote")
+        label = f"claim {str(c.get('quote') or '')[:50]!r}"
+        ctype = _enum(c.get("claim_type"), CLAIM_TYPES)
+        if not ctype:
+            errs.append(f"{label}: `claim_type` is one of {list(CLAIM_TYPES)}")
+        statement = re.sub(r"\s+", " ", str(c.get("statement") or "")).strip()
+        if not 10 <= len(statement) <= 400:
+            errs.append(f"{label}: `statement` is the claim in one plain sentence (10-400 characters)")
+        scope = [p[:120] for s in c.get("scope") or [] if str(s).strip() for p in _parts(str(s))][:24]
+        if not scope:
+            errs.append(f"{label}: `scope` lists every method, dataset, setting and metric the claim names (a theorem: itself)")
+        req = str(c.get("required_evidence") or "").strip()
+        if len(req) < 15:
+            errs.append(f"{label}: `required_evidence` says what would decide the claim within its stated scope")
+        quoted = lambda items, what: [
+            {"quote": hit["quote"], "page": hit["page"], **{k: str(i.get(k) or "")[:300] for k in ("what", "name", "reading")
+                                                          if i.get(k)}}
+            for i in items if isinstance(i, dict) and (hit := _find(x, str(i.get("quote") or ""), errs, f"{label} {what}"))]
+        also = [hit["quote"] for q in c.get("also_stated") or [] if (hit := _find(x, str(q), errs, f"{label} also_stated"))]
+        assumptions = quoted(c.get("assumptions") or [], "assumption")
+        evidence = quoted(c.get("evidence_in_paper") or [], "evidence_in_paper")
+        interp = quoted(c.get("interpretations") or [], "interpretation")
+        if any(not re.fullmatch(r"[a-z][a-z0-9_]{0,23}", i.get("name", "")) or len(i.get("reading", "")) < 10 for i in interp):
+            errs.append(f"{label}: each interpretation has a short lowercase `name` and its `reading`")
+        dup = h and next((o for o in known + out if report.same_claim(h["quote"], o["quote"])), None)
+        if dup:
+            errs.append(f"{label}: the same claim as {dup['id']} (one quote inside the other): list it once, the other "
+                        "words in `also_stated`")
+        if errs and (not h or not ctype or not scope or dup):
+            dropped.append({"claim": str(c.get("quote") or "")[:200], "why": errs})
+            errors += errs
+            continue
+        errors += errs
+        out.append({"id": f"K{first + len(out)}", "quote": h["quote"], "page": h["page"], "also_stated": also,
+                    "statement": statement[:400], "claim_type": ctype, "scope": scope, "assumptions": assumptions,
+                    "evidence_in_paper": evidence, "required_evidence": req[:600], "interpretations": interp,
+                    **({"sealed_with_errors": errs[:6]} if errs else {})})
+    return out, dropped, errors
+
+
+def _claims_text(x: _Ctx) -> str:
+    """The sealed main claims, as the planner and the follow-up round see them (fixed: never added to, dropped or retyped
+    by a plan)."""
+    ks = (x.sealed("claims") or {}).get("claims") or []
+    return "\n".join(json.dumps({k: c.get(k) for k in ("id", "statement", "claim_type", "quote", "page", "scope",
+                                                       "assumptions", "required_evidence", "interpretations") if c.get(k)},
+                                ensure_ascii=False) for c in ks) or "(no claims were extracted)"
+
+
 def _seal_critic(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     known = {c["id"] for c in x.concerns()}
     return {"reviews": [{"id": r["id"], "severity": r.get("severity"), "withdraw": r.get("withdraw") is True,
@@ -1205,7 +1313,35 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     proposed = [c for c in obj.get("checks") or [] if isinstance(c, dict)]
     raw_claims = [cc for cc in obj.get("central_claims") or [] if isinstance(cc, dict)]
     claims_in = raw_claims[:MAX_CLAIMS]
-    if len(raw_claims) > MAX_CLAIMS:                          # refused, never cut unseen; on the last attempt, recorded
+    ks = (x.sealed("claims") or {}).get("claims") or []
+    extracted: dict = {}
+    if ks:
+        # The main claims were extracted before this plan: the plan says how each is tested, by id, and cannot add, drop,
+        # requote or retype one. Every claim has an entry in the first round; a follow-up round lists only those it takes
+        # up, and may add a headline claim the extraction missed (`new_claims`, validated as the extractor's are).
+        extracted = {k["id"]: k for k in ks}
+        given = {str(cc.get("id") or ""): cc for cc in raw_claims}
+        if (unknown := [i for i in given if i not in extracted]):
+            errors.append(f"central_claims ids {unknown[:6]} are not extracted claims ({', '.join(extracted)}): a plan tests the "
+                          "extracted claims by id; it never adds, requotes or retypes one"
+                          + (" (a headline claim the extraction missed goes in `new_claims`)" if base else ""))
+        want = [i for i in extracted if i in given] if base else list(extracted)
+        if not base and (missing := [i for i in want if i not in given]):
+            errors.append(f"main claim(s) {missing} have no entry: link the checks that test each, or give `why_unchecked` "
+                          "and `blocker`")
+        if base:
+            known = ks + [c for c in base.get("central_claims", []) if c.get("id") and c["id"] not in extracted]
+            new, ndrop, nerr = _validate_claims(x, [c for c in obj.get("new_claims") or [] if isinstance(c, dict)][:6],
+                                                known, len(known) + 1)            # ponytail: 6 new claims per follow-up
+            errors += nerr
+            dropped += [{"check": "new claim", "why": d["why"]} for d in ndrop]
+            for n, raw in zip(new, [c for c in obj.get("new_claims") or [] if isinstance(c, dict)]):
+                extracted[n["id"]] = {**n, "origin": "plan:2"}
+                given[n["id"]] = raw
+                want.append(n["id"])
+        claims_in = [{**given.get(i, {"checks": [], "why_unchecked": "the plan gave no entry for this claim"}),
+                      **{k: extracted[i][k] for k in ("quote", "claim_type", "scope")}, "id": i} for i in want]
+    elif len(raw_claims) > MAX_CLAIMS:                        # refused, never cut unseen; on the last attempt, recorded
         errors.append(f"{len(raw_claims)} central claims: at most {MAX_CLAIMS} — keep the paper's most important ones and "
                       "merge restatements of one claim; a claim past the cap is recorded as dropped, never checked")
         dropped += [{"check": "central claim", "why": f"over the cap of {MAX_CLAIMS} central claims: {str(cc.get('quote'))[:160]!r}"}
@@ -1413,6 +1549,10 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
                         **({"unverified": claim_blocker["unverified"]} if claim_blocker.get("unverified") else {}),
                         **({"budget_spent": claim_blocker["budget_spent"]} if claim_blocker.get("budget_spent") else {}),
                         **({"cap": claim_blocker["cap"]} if claim_blocker.get("cap") else {}),
+                        # the extracted claim's own record: its id, plain statement, assumptions, what would decide it
+                        **({k: extracted[cc["id"]][k] for k in ("id", "statement", "assumptions", "required_evidence",
+                                                                "interpretations", "also_stated", "evidence_in_paper", "origin")
+                            if k in extracted[cc["id"]]} if cc.get("id") in extracted else {}),
                         # sealed on the last attempt with these problems: each was resolved to its strictest reading
                         **({"sealed_with_errors": cerrs[:8]} if cerrs else {})})
     _fail_or_drop(errors, final)
@@ -1771,10 +1911,10 @@ def _seal_report(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     return {"summary_md": str(obj.get("summary_md") or "")[:8000]}
 
 
-VALIDATORS = {"lens": _seal_lens, "critic": _seal_critic, "plan": _seal_plan, "bind": _seal_bind,
+VALIDATORS = {"lens": _seal_lens, "critic": _seal_critic, "claims": _seal_claims, "plan": _seal_plan, "bind": _seal_bind,
               "gen": _seal_gen, "verify": _seal_verify, "report": _seal_report, "vision": _seal_vision,
               "audit": _seal_audit}
-_EMPTY = {"lens": {"concerns": [], "dropped": []}, "critic": {"reviews": []},
+_EMPTY = {"lens": {"concerns": [], "dropped": []}, "critic": {"reviews": []}, "claims": {"claims": [], "dropped": []},
           "plan": {"checks": [], "central_claims": [], "dropped": [], "repo_is_authors": False, "repo_note": ""},
           "bind": {"identity": {"established": False, "reason": "malformed binding answer"}, "command": "",
                    "metric": "", "seed_flag": "", "runs": 1, "prepare": ""},

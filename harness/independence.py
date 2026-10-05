@@ -95,9 +95,15 @@ def seed_flow(script: str) -> bool | None:
     return False
 
 
+def _round(v):
+    """A float to 12 significant digits: the same sum taken in another order differs in its last bits, which is
+    round-off, never a different run (Sep-29 changepoint C7 read such seeds as replicates with a band of ~1e-16)."""
+    return float(f"{v:.12g}") if isinstance(v, float) else v
+
+
 def _fp(rows: list[dict]) -> str:
-    """The outputs of one seed's result lines for a stage, less anything time-like."""
-    body = [{k: v for k, v in sorted(r.get("out", {}).items()) if not _timey(k)} for r in rows]
+    """The outputs of one seed's result lines for a stage, less anything time-like, compared up to round-off."""
+    body = [{k: _round(v) for k, v in sorted(r.get("out", {}).items()) if not _timey(k)} for r in rows]
     return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()[:16]
 
 

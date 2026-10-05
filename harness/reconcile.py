@@ -141,7 +141,7 @@ def reconcile(kind: str, printed: str, values: list[float], failure: str, ev: di
               changed: bool = False, step: bool = False, staged: list | None = None,
               failed: dict | None = None, stage_errors: dict | None = None, readings: list | None = None,
               cohort_mismatch: list | None = None, deterministic: bool = False, test: str = "",
-              detail: list | None = None, rng: bool | None = None, metric: str = "") -> dict:
+              detail: list | None = None, rng: bool | None = None, metric: str = "", undefined: dict | None = None) -> dict:
     """`failure` ends a check that measured nothing; `failed` (seed -> error) records seeds that
     failed after the check had measured something, whose completed measurements are kept.
     `staged` entries are [stage, value] or [stage, value, reading]; `readings` names the
@@ -150,7 +150,8 @@ def reconcile(kind: str, printed: str, values: list[float], failure: str, ev: di
     "compatibility": an engineering condition each run must meet. `detail` (per run and stage: every numeric
     output, counted trials, a data fingerprint) says whether replicates that repeat a value were different
     runs; `rng` (does --seed reach a generator anywhere in the script?) is recorded context only. `metric`
-    names the compared output of a point check (its counted trials, when it declares them)."""
+    names the compared output of a point check (its counted trials, when it declares them). `undefined` (stage -> why)
+    names units whose compared quantity the run says is undefined: completed, deciding nothing, never NOT_COMPLETED."""
     if not authorized:
         return _r("BLOCKED", f"not run: {why}. A refusal by this harness is not evidence about the paper.")
     if not admits(kind):
@@ -191,15 +192,21 @@ def reconcile(kind: str, printed: str, values: list[float], failure: str, ev: di
                   f"{' (it declares ' + str(list(readings)) + ')' if readings else ' (it declares none)'}: values "
                   "computed under different definitions are never pooled into one sample, so nothing is decided",
                   undeclared_readings=tags[:20])
+    undefined = {s: w for s, w in (undefined or {}).items() if s not in {e[0] for e in staged or []}}
     if readings:
-        return _by_reading(readings, staged or [], failed, stage_errors, decide, cohort_mismatch or [], printed)
-    return _decide(values, [e[:2] for e in staged or []], failed, stage_errors, decide)
+        return _by_reading(readings, staged or [], failed, stage_errors, decide, cohort_mismatch or [], printed, undefined)
+    return _decide(values, [e[:2] for e in staged or []], failed, stage_errors, decide, undefined=undefined)
 
 
-def _decide(values: list[float], staged: list, failed: dict, stage_errors: dict, decide, reading: str = "") -> dict:
-    stages = sorted({s for s, _ in staged} | set(stage_errors), key=lambda s: (s == "", s))
+def _decide(values: list[float], staged: list, failed: dict, stage_errors: dict, decide, reading: str = "",
+            undefined: dict | None = None) -> dict:
+    undefined = undefined or {}
+    stages = sorted({s for s, _ in staged} | set(stage_errors) | set(undefined), key=lambda s: (s == "", s))
     if stages and stages != [""]:
-        return _staged(staged, stages, failed, stage_errors, lambda vals, s="": decide(vals, s, reading))
+        return _staged(staged, stages, failed, stage_errors, lambda vals, s="": decide(vals, s, reading), undefined)
+    if not values and "" in undefined:
+        return _r("INCONCLUSIVE", f"the compared quantity is undefined on what this check ran: {undefined['']}",
+                  undefined_stages=[""])
     res = decide(values, "", reading)
     return _partial(res, failed) if failed else res
 
@@ -213,7 +220,7 @@ def _show(p: dict) -> str:
 
 
 def _by_reading(names: list, staged: list, failed: dict, stage_errors: dict, decide, mismatch: list,
-                printed: str) -> dict:
+                printed: str, undefined: dict | None = None) -> dict:
     """Each reading decided on its own results of the same runs, then compared STAGE BY STAGE over the
     union of their stages. A stage where one reading printed a result and another did not is not
     comparable (INCONCLUSIVE, the stages named). A stage whose readings differ in status, or for a
@@ -224,8 +231,8 @@ def _by_reading(names: list, staged: list, failed: dict, stage_errors: dict, dec
     per, printed_in = {}, {}
     for r in names:
         sub = [[e[0], e[1]] for e in staged if len(e) > 2 and e[2] == r]
-        per[r] = _decide([v for _, v in sub], sub, failed, stage_errors, decide, r)
-        printed_in[r] = {s for s, _ in sub}
+        per[r] = _decide([v for _, v in sub], sub, failed, stage_errors, decide, r, undefined)
+        printed_in[r] = {s for s, _ in sub} | set(undefined or {})
     base = {"readings": per, "rule": "each reading decided on the same runs, data and cohort, stage by stage; none "
                                      "is chosen"}
     name = lambda s: s or "(no stage)"
@@ -289,33 +296,48 @@ def _partial(res: dict, failed: dict, stages: dict | None = None, extra: str = "
             "failed_seeds": failed, **({"stages": stages} if stages else {})}
 
 
-def _staged(staged, stages, failed, stage_errors, decide) -> dict:
+UNDEFINED = "UNDEFINED"   # a unit whose compared quantity the run says is undefined there: completed, deciding nothing
+
+
+def _staged(staged, stages, failed, stage_errors, decide, undefined: dict | None = None) -> dict:
     """Each stage (a dataset, a setting) is decided over its own seeds; a stated relation must
-    hold in every stage. A stage that started and printed no result is not completed. A failure
-    found in a completed stage stands; otherwise any incomplete stage or failed seed is PARTIAL."""
-    per = {}
+    hold in every stage. A stage that started and printed no result is not completed; a stage whose
+    run said why its quantity is undefined there is UNDEFINED (completed, deciding nothing, listed in
+    `undefined_stages`). A failure found in a completed stage stands; otherwise any incomplete stage or
+    failed seed is PARTIAL. The rest is decided over the stages where the quantity is defined."""
+    per, undefined = {}, undefined or {}
     for s in stages:
         vals = [v for t, v in staged if t == s]
-        per[s or "(unnamed)"] = ({"status": "NOT_COMPLETED", "reason": stage_errors.get(s, "no result line")[:400]}
-                                 if not vals else decide(vals, s))
-    sts = [p["status"] for p in per.values()]
-    brief = "; ".join(f"{s}: {p['status']}" + (f" (n={p['n']})" if p.get("n") else "") for s, p in per.items())
-    fail = next((s for s, p in per.items() if p["status"] in FAILURE), None)
+        per[s or "(unnamed)"] = (decide(vals, s) if vals else
+                                 {"status": UNDEFINED, "reason": undefined[s][:400]} if s in undefined else
+                                 {"status": "NOT_COMPLETED", "reason": stage_errors.get(s, "no result line")[:400]})
+    und = [s for s, p in per.items() if p["status"] == UNDEFINED]
+    note = (f"; {len(und)} stage(s) undefined (the compared quantity has no value there; they decide nothing)"
+            if und else "")
+    extra = {"undefined_stages": und} if und else {}
+    defined = {s: p for s, p in per.items() if p["status"] != UNDEFINED}
+    sts = [p["status"] for p in defined.values()]
+    brief = "; ".join(f"{s}: {p['status']}" + (f" (n={p['n']})" if p.get("n") else "") for s, p in defined.items())
+    if not defined:
+        return _r("INCONCLUSIVE", f"the compared quantity is undefined in every stage{note}", stages=per, **extra)
+    fail = next((s for s, p in defined.items() if p["status"] in FAILURE), None)
     if "NOT_COMPLETED" in sts or failed:     # the protocol did not complete: what completed is kept, decides nothing
-        done = [p["status"] for p in per.values() if p["status"] != "NOT_COMPLETED"]
+        done = [p["status"] for p in defined.values() if p["status"] != "NOT_COMPLETED"]
         best = per[fail]["status"] if fail else next((x for x in done if x not in SUPPORT), done[0] if done else
                                                      "INCONCLUSIVE")
-        return _partial(_r(best, brief, stages=per), failed, per,
-                        extra=f"; stages not completed: {', '.join(s for s, p in per.items() if p['status'] == 'NOT_COMPLETED') or 'none'}")
+        return {**_partial(_r(best, brief + note, stages=per), failed, per,
+                           extra=f"; stages not completed: {', '.join(s for s, p in per.items() if p['status'] == 'NOT_COMPLETED') or 'none'}"),
+                **extra}
     if fail:
-        return _r(per[fail]["status"], f"stage {fail}: {per[fail]['reason']} [{brief}]", rule=per[fail].get("rule", ""),
-                  stages=per)
+        return _r(per[fail]["status"], f"stage {fail}: {per[fail]['reason']} [{brief}]{note}", rule=per[fail].get("rule", ""),
+                  stages=per, **extra)
     if all(x in SUPPORT + ("NO_VIOLATION_FOUND",) for x in sts):
         weakest = "NO_VIOLATION_FOUND" if "NO_VIOLATION_FOUND" in sts else sts[0]
         return _r(weakest, ("no stage was violated (tested replicates only, never a proof) " if weakest == "NO_VIOLATION_FOUND"
-                            else "every stage holds ") + f"[{brief}]", rule=next(iter(per.values())).get("rule", ""), stages=per)
-    return _r("INCONCLUSIVE", f"not every stage is decided [{brief}]", stages=per,
-              rule=next((p["rule"] for p in per.values() if p.get("rule")), ""))
+                            else "every stage holds ") + f"[{brief}]{note}", rule=next(iter(defined.values())).get("rule", ""),
+                  stages=per, **extra)
+    return _r("INCONCLUSIVE", f"not every stage is decided [{brief}]{note}", stages=per, **extra,
+              rule=next((p["rule"] for p in defined.values() if p.get("rule")), ""))
 
 
 def _point(kind: str, printed: str, values: list[float], seeded: bool, deterministic: bool = False,
@@ -401,11 +423,19 @@ def _relation(kind: str, rel: str, margins: list[float], deterministic: bool = F
     return {**_over_margins(kind, rel, margins, deterministic, ind, shown, strict), **(prop or {})}
 
 
+def _repeats(values: list[float], ind: dict | None) -> bool:
+    """Do several runs give one value? Bit-identical, equal to 12 significant digits (the same sum in another order is
+    round-off), or result lines the independence record finds identical in every output (Sep-29 changepoint C7)."""
+    if len(values) < 2:
+        return False
+    return bool(ind and ind.get("state") in ("identical", "unproven")) or len({float(f"{v:.12g}") for v in values}) == 1
+
+
 def _over_margins(kind: str, rel: str, margins: list[float], deterministic: bool, ind: dict | None, shown: bool,
                   strict: bool) -> dict:
     n = len(margins)
-    same = n > 1 and len(set(margins)) == 1
-    if deterministic and kind == "RECONSTRUCTION" and n > 1 and (len(set(margins)) > 1 or (
+    same = _repeats(margins, ind)
+    if deterministic and kind == "RECONSTRUCTION" and n > 1 and (not _repeats(margins, ind) or (
             ind and ind["state"] == "different")):
         return _r("INCONCLUSIVE", f"declared deterministic, but its {n} runs differ: the computation is not deterministic "
                   "as declared, so its runs are neither one measurement nor replicates", relation=rel, n=n,
@@ -425,7 +455,7 @@ def _over_margins(kind: str, rel: str, margins: list[float], deterministic: bool
                       + (f" ({ind['basis']})" if ind else ""),
                       relation=rel, margin=round(margins[0], 6), n=n, n_independent=1,
                       rule="identical results of seeded runs are one measurement, not replicates")
-        m = margins[0]
+        m = statistics.fmean(margins)
         out = {"relation": rel, "margin": round(m, 6), "band": 0.0, "n": n, "n_independent": 1,
                "rule": f"deterministic computation: identical in all {n} runs, one measurement (not {n} replicates), "
                        "decided on the sign of its margin"}

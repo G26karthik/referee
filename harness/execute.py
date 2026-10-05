@@ -106,6 +106,31 @@ def evidence_slots(cfg: state.Config) -> int:
     return max(0, cfg.parallel - busy)
 
 
+def wait_turn(cfg: state.Config, key: str, wants_gpu: bool) -> tuple[int, int]:
+    """(checks that want only a slot, checks that want the GPU) waiting longer than `key` for their next run, across every
+    review on this host; `key` (pid/cid) joins the line if it is not in it. A check takes its next run only when no check
+    waiting longer could take it: one that just finished a run waits behind those that waited while it ran, so a long
+    check of 100 seeds never holds the GPU or the slots for all of them while an integration test or a cheap experiment
+    waits (Sep-29 GRACE: the first-polled check restarted at every free slot)."""
+    with state.lock(cfg.projects / ".queue.lock"):
+        q = state.read_json(cfg.projects / ".queue.json", {}) or {}
+        q = {k: v for k, v in q.items() if (cfg.projects / k.split("/", 1)[0] / "checks" / k.split("/", 1)[-1] / "exec.json").exists()
+             and not (cfg.projects / k.split("/", 1)[0] / "checks" / k.split("/", 1)[-1] / "outcome.json").exists()}
+        q.setdefault(key, {"t": time.time(), "gpu": wants_gpu})
+        state.write_json(cfg.projects / ".queue.json", q)
+    mine = q[key]["t"]
+    ahead = [v for k, v in q.items() if k != key and v["t"] < mine]
+    return sum(1 for v in ahead if not v["gpu"]), sum(1 for v in ahead if v["gpu"])
+
+
+def leave_turn(cfg: state.Config, key: str) -> None:
+    """`key` started its run: it leaves the line (its next run queues behind whoever waits then)."""
+    with state.lock(cfg.projects / ".queue.lock"):
+        q = state.read_json(cfg.projects / ".queue.json", {}) or {}
+        if q.pop(key, None) is not None:
+            state.write_json(cfg.projects / ".queue.json", q)
+
+
 def gpu_busy() -> bool:
     """Does a running REFEREE container hold the GPU (Docker's own record of the device request)? A daemon that cannot
     answer is busy: never a second run on a GPU nobody can see."""
@@ -504,7 +529,8 @@ def result_schema(rec: dict, check: dict) -> list[str]:
         out.append(f"result line(s) carry a `reading` {tags[:10]} but the check declares no readings: they are never "
                    "pooled, and nothing is decided on them")
     if check.get("kind") in ("RECONSTRUCTION", "RELEASED_DATA") and lines:
-        declared, printed = units(rec), {str(d.get("stage") or "")[:80] for d in lines}
+        declared = units(rec)
+        printed = {str(d.get("stage") or "")[:80] for d in lines} | set(undefined_units(rec.get("stdout") or ""))
         if declared and (miss := sorted(declared - printed)):
             out.append(f"declared unit(s) {miss[:10]} printed no result line")
         if declared and (extra := sorted(printed - declared)):
@@ -527,14 +553,24 @@ def result_schema(rec: dict, check: dict) -> list[str]:
     return out[:20]                                             # ponytail: 20 defects per run
 
 
-def split_units(declared: set, staged: list, run_failed: bool, why: str) -> tuple[dict, list[str]]:
+def undefined_units(stdout: str) -> dict[str, str]:
+    """{stage: why} for the units a run says its compared quantity is undefined on (`REFEREE_RESULT {"stage": ...,
+    "undefined": "<why>"}`: an estimator with no event to estimate from, a ratio over zero). Such a unit completed and
+    decides nothing; it is never counted with a unit that printed no line (Sep-29 changepoint C7: 14 undefined
+    settings read NOT_COMPLETED beside 14 missing ones)."""
+    return {str(d.get("stage") or "")[:80]: str(d["undefined"])[:300] for d in json_lines(stdout, "REFEREE_RESULT")
+            if isinstance(d.get("undefined"), str) and d["undefined"].strip()}
+
+
+def split_units(declared: set, staged: list, run_failed: bool, why: str,
+                undefined: dict | None = None) -> tuple[dict, list[str]]:
     """(incomplete stages, schema defects) of one run. A declared unit without a result is not
-    completed, except in the one case where the results are unambiguous: a completed run that
-    declared ONE unit and printed its results without a stage name. That is a labeling defect
-    (recorded; the results are the check's only unit), never a measurement that did not happen.
-    Several declared units are never matched to results by guessing."""
+    completed, unless the run said why its quantity is undefined there (`undefined`), or in the one case
+    where the results are unambiguous: a completed run that declared ONE unit and printed its results
+    without a stage name. That is a labeling defect (recorded; the results are the check's only unit),
+    never a measurement that did not happen. Several declared units are never matched to results by guessing."""
     printed = {e[0] for e in staged}
-    miss = declared - printed
+    miss = declared - printed - set(undefined or {})
     if not run_failed and len(declared) == 1 and miss == declared and printed == {""}:
         return {}, [f"the run completed and declared one unit {sorted(declared)}, but printed its result line(s) "
                     "without that `stage` name"]
@@ -1290,11 +1326,13 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             vs = [e[1] for e in staged]
         # A declared result unit that printed no result is not completed, whether or not the run failed.
         declared = units(done) if kind in ("RECONSTRUCTION", "RELEASED_DATA") else set()
+        undef = undefined_units(done.get("stdout") or "") if kind in ("RECONSTRUCTION", "RELEASED_DATA") else {}
         st["units"] = sorted(set(st.get("units") or []) | declared)
+        st.setdefault("undefined", {}).update(undef)
         last = next((s for s in reversed([str(d.get("stage")) for d in json_lines(
             (done.get("stdout") or "") + "\n" + (done.get("stderr") or ""), "REFEREE_PROGRESS") if d.get("stage")])), "")
         failed_stages, defects = split_units(declared, staged, ev["failed"], failure_text(done) if ev["failed"]
-                                             else "a declared unit printed no result line")
+                                             else "a declared unit printed no result line", undef)
         for s, e in failed_stages.items():
             st.setdefault("stage_errors", {}).setdefault(s, e)
         # Execution and the result contract are recorded apart from what the results say.
@@ -1327,7 +1365,7 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
                                                    "cert": rows, "staged": staged, "seconds": done.get("seconds"),
                                                    "error": st.get("failed_seeds", {}).get(key, ""),
                                                    "stage_errors": failed_stages, "units": sorted(declared),
-                                                   "schema": defects, "cohort_mismatch": mism, "detail": detail})
+                                                   "undefined": undef, "schema": defects, "cohort_mismatch": mism, "detail": detail})
         if "pilot_s" not in st:                           # the first completed run is the pilot
             st["pilot_s"] = done.get("seconds") or 0
             if (why := _over_budget(cfg, check, st, runs)):
@@ -1363,6 +1401,12 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
     done_set = set(st.get("done_seeds", []))
     while st["next"] in done_set:
         st["next"] += 1
+    turn = f"{pid}/{cid}"
+    if st["stage"] == "run" and len(fly) < width and (st.get("redo") or st["next"] < runs):
+        # Fair turns across checks: a slot (or the GPU) that a check waiting longer could take is left to it.
+        ahead_cpu, ahead_gpu = wait_turn(cfg, turn, gpu_run(cfg, check))
+        free = (0 if ahead_gpu else max(0, free - ahead_cpu)) if gpu_run(cfg, check) else \
+            max(0, free - ahead_cpu - (min(1, ahead_gpu) if ahead_gpu and not gpu_busy() else 0))
     while st["stage"] == "run" and len(fly) + len(todo) < width and len(todo) < free and (
             st.get("redo") or st["next"] < runs):
         if st.get("redo"):
@@ -1398,6 +1442,8 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
                                workdir=workdir, image=image, network=network, env=env,
                                gpus=gpu_run(cfg, check),   # an experiment may use it
                                mode=mode, target=cid, meta=meta)
+    if any(s >= 0 for s in todo):
+        leave_turn(cfg, turn)
     state.write_json(cdir / "exec.json", st)
     return True
 
@@ -1471,6 +1517,21 @@ def _projected(cfg: state.Config, check: dict, st: dict, runs: int, spent: float
     return spent + per * (runs - st["seed"]) / w, limit, setting, w
 
 
+def remaining_s(cfg: state.Config, root: Path, cid: str) -> float | None:
+    """About how long a running check still needs: its remaining runs at its completed seeds' median time (the pilot's
+    before two completed), or — while its first run is still going — how long that run has gone already (a lower
+    bound). None when nothing has started. Scheduling information only; it decides nothing."""
+    cdir = Path(root) / "checks" / cid
+    st, check = state.read_json(cdir / "exec.json") or {}, state.read_json(cdir / "check.json") or {}
+    if "env" not in st or (cdir / "outcome.json").exists():
+        return None
+    runs = max(int(check.get("runs") or 1), int(st.get("runs_extended") or 0))
+    if st.get("pilot_s"):
+        return _projected(cfg, check, st, runs)[0]
+    starts = [_secs(r.get("started_at", "")) for r in (st.get("fly") or {}).values() if r.get("started_at")]
+    return max(0.0, time.time() - min(starts)) if starts else None
+
+
 def _spent(st: dict) -> float:
     """The seconds the check's completed seeds took (each seed's own run time; the pilot's where unrecorded)."""
     secs, pilot = st.get("seed_seconds") or {}, st.get("pilot_s", 0)
@@ -1533,7 +1594,30 @@ def _reconciled(check: dict, st: dict, authorized: bool, why: str, failure: str 
                      cohort_mismatch=st.get("cohort_mismatch"),
                      deterministic=kind == "RELEASED_DATA" or check.get("stochastic") is False,
                      test=check.get("test", ""), detail=st.get("detail"), rng=check.get("seed_flow"),
-                     metric=check.get("metric", ""))
+                     metric=check.get("metric", ""), undefined=st.get("undefined"))
+
+
+def varied_nothing(check: dict, st: dict) -> str:
+    """Why an approved stochastic reconstruction must go back to its author, or "": two or more seeds ran and, in every
+    stage and reading, their result lines are identical (up to round-off) with nothing showing the seed varied them. The
+    replicates are one run repeated, so nothing can be decided; the declaration (`stochastic`) or the seeding is the
+    script's defect, not a finding (Sep-29 changepoint C7: a deterministic pipeline declared stochastic, 220 stages
+    undecidable)."""
+    from . import independence
+    if check.get("kind") != "RECONSTRUCTION" or check.get("stochastic") is not True or check.get("test") == "compatibility":
+        return ""
+    detail = st.get("detail") or []
+    keys = sorted({(r.get("stage", ""), r.get("reading", "")) for r in detail})
+    if len(set(st.get("done_seeds") or [])) < 2 or not keys:
+        return ""
+    states = [independence.assess(detail, s, rd, check.get("seed_flow"))["state"] for s, rd in keys]
+    if not all(x in ("identical", "unproven") for x in states):
+        return ""
+    return (f"the approved script declared `stochastic`: true, but its {len(set(st['done_seeds']))} seeded runs printed "
+            f"identical result lines in all {len(keys)} stage(s), with nothing showing the seed varied them: they are one run "
+            "repeated, so no replicate decides anything. If the experiment has no randomness (fixed data through a fixed "
+            "pipeline), declare `stochastic`: false (it then runs twice and must repeat exactly). If it does, draw every "
+            "random choice (sampling, splits, initialisation, simulation) from --seed and print `data_fingerprint`.")
 
 
 def _stage_summary(staged: list) -> dict:
@@ -1595,9 +1679,11 @@ def reuse_checkpoints(root: Path, cdir: Path, check: dict, st: dict, fresh: bool
             st["failed_seeds"][str(row["seed"])] = row["error"]
         st["ok_runs"] = st.get("ok_runs", 0) + (not row.get("error"))
         st["units"] = sorted(set(st.get("units") or []) | set(row.get("units") or []))
+        st.setdefault("undefined", {}).update(row.get("undefined") or {})
         # A reused seed follows the same rule as a new one: a completed run's unit printed under
         # another name is a labeling defect, not an incomplete stage.
-        errs, defects = split_units(set(row.get("units") or []), row.get("staged") or [], bool(row.get("error")), "")
+        errs, defects = split_units(set(row.get("units") or []), row.get("staged") or [], bool(row.get("error")), "",
+                                    row.get("undefined"))
         for s in errs:                                  # only a declared unit can be incomplete
             if s in (row.get("stage_errors") or {}):
                 st.setdefault("stage_errors", {}).setdefault(s, row["stage_errors"][s])
@@ -1720,6 +1806,8 @@ def _finish(cfg: state.Config, root: Path, check: dict, st: dict) -> bool:
         outcome.update(_reconciled(check, st, authorized, why),
                        values=st.get("values", []), runs=st.get("records", 0) + st.get("reused", 0), records="execution.jsonl",
                        finished_at=state.now())
+        if authorized and (again := varied_nothing(check, st)):
+            outcome["revisable"] = again          # tasks._step returns the approved script to its author with this
     outcome["protocol"] = protocol(check, st, outcome.get("rule", ""))
     # How the runs went (execution), apart from what their results say (the status above).
     outcome["execution"] = {"runs_planned": max(int(check.get("runs") or 1), int(st.get("runs_extended") or 0)),
@@ -1738,7 +1826,7 @@ def _finish(cfg: state.Config, root: Path, check: dict, st: dict) -> bool:
         outcome["completed_stages"] = _stage_summary(st["staged"])
     if st.get("reused"):          # seeds that ended earlier (seeds.jsonl) count as runs; which ones is said
         outcome["reused_seeds"] = st["reused"]
-    for k in ("data_identity", "stage_times", "peak_mb"):
+    for k in ("data_identity", "stage_times", "peak_mb", "units", "undefined"):   # units: every declared one is accounted
         if st.get(k):
             outcome[k] = st[k]
     if (d := state.read_json(root / "checks" / check["id"] / "data.json")):
