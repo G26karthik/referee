@@ -1486,6 +1486,16 @@ def _storage_changed(st: dict, env_dir: Path, root: Path, check: dict) -> bool:
                + [m[0] for m in data_mount(root, check["id"])] if v)
 
 
+_GPU_OOM = re.compile(r"cuda out of memory|outofmemoryerror|cuda error: out of memory|out of memory on device|"
+                      r"allocation failed with oom|cublas_status_alloc_failed|hip out of memory", re.I)
+
+
+def gpu_oom(text: str) -> bool:
+    """Does a run's error say the GPU ran out of memory, in any of the wordings the stacks print (Oct-06 GRACE C4:
+    PyTorch's allocator printed "memory allocation failed with OOM on device 0", not "CUDA out of memory")?"""
+    return bool(_GPU_OOM.search(text or ""))
+
+
 def resource_action(done: dict, st: dict, key: str, timeout: int) -> tuple[str, str]:
     """What a run that hit a resource limit leads to: ("retry", "") once alone after an
     out-of-memory kill that may have shared memory, or once for a replicate past the per-run limit
@@ -1497,7 +1507,7 @@ def resource_action(done: dict, st: dict, key: str, timeout: int) -> tuple[str, 
     if "no space left on device" in err or "disk quota exceeded" in err:
         return "blocker", ("storage", "a run ran out of disk space on this host (a measured limit); the protocol "
                            "is not shortened, so it is not repeated.")
-    if "cuda out of memory" in err or "outofmemoryerror" in err:
+    if gpu_oom(err):
         if not st.get("vram_retry"):
             st.update(width=1, vram_retry=True)          # another run may have shared the GPU: once, alone
             return "retry", ""

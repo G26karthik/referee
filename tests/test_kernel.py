@@ -5180,6 +5180,42 @@ def test_a_place_in_the_line_lapses_when_its_review_stops_polling():
         assert execute.wait_turn(cfg, "p/B", False) == (0, 0)
 
 
+def test_a_gpu_out_of_memory_in_any_wording_is_retried_alone_and_a_lost_seed_is_resumed():
+    """Oct-06 GRACE C4: seed 0 died with PyTorch's allocator message ("memory allocation failed with OOM on device 0 ...
+    free: 0") while seeds 1 and 2 later ran the same setting; the harness knew only "CUDA out of memory", so the seed was
+    a script failure: never retried alone, the check PARTIAL, and its zero-variance stages never extended to six. Any
+    wording of a GPU memory failure takes the retry-once-alone path; a PARTIAL check whose every failed seed failed so is
+    resumed by `reopen`: the same approved script, the completed seeds reused, the failed seeds run again."""
+    err = ("[W1005 18:29:41] CUDACachingAllocator.cpp:3934] memory allocation failed with OOM on device 0 while trying "
+           "to allocate 960495616 bytes (free: 0, total: 8585216000).\nFAILED (out of GPU/host memory)")
+    st = {}
+    assert execute.resource_action({"mode": "evidence", "returncode": 1, "stderr": err}, st, "0", 3600) == ("retry", "")
+    act, why = execute.resource_action({"mode": "evidence", "returncode": 1, "stderr": err}, st, "0", 3600)
+    assert act == "blocker" and why[0] == "vram", why
+    assert execute.gpu_oom("RuntimeError: CUDA error: out of memory") and not execute.gpu_oom("ValueError: bad shape")
+    with tempfile.TemporaryDirectory() as t:
+        cfg, pid, root = _ready(Path(t))
+        cdir = root / "checks" / "C1"
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "script.py").write_text("print(1)\n", encoding="utf-8")
+        state.write_json(cdir / "check.json", {"id": "C1", "kind": "RECONSTRUCTION", "script_sha256": "s", "runs": 3})
+        rows = [{"key": "s", "seed": 0, "values": [], "error": "exit 1 after 1361s: " + err.replace("\n", " | ")},
+                {"key": "s", "seed": 1, "values": [1.0]}, {"key": "s", "seed": 2, "values": [1.0]}]
+        (cdir / "seeds.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        state.write_json(cdir / "exec.json", {"seed": 3})
+        part = {"status": "PARTIAL", "authorized": True, "values": [1.0, 1.0], "failed_seeds": {"0": rows[0]["error"]}}
+        state.write_json(cdir / "outcome.json", part)
+        seals = state.read_json(root / "seals.json", {}) or {}
+        state.write_json(root / "seals.json", {**seals, "gen:C1.1": "x", "verify:C1.1": "y"})
+        res = tasks.reopen(cfg, pid, "C1", "GPU OOM wording (test)")
+        assert res.get("same_approved_script") and res.get("seeds_rerun") == ["0"], res
+        assert [json.loads(x)["seed"] for x in (cdir / "seeds.jsonl").read_text(encoding="utf-8").splitlines()] == [1, 2]
+        assert (cdir / "seeds.rerun.1.jsonl").exists() and (cdir / "script.py").exists() and not (cdir / "exec.json").exists()
+        assert {"gen:C1.1", "verify:C1.1"} <= set(state.read_json(root / "seals.json"))   # the approval stands
+        state.write_json(cdir / "outcome.json", {**part, "failed_seeds": {"0": "exit 1: ValueError: bad shape"}})
+        assert "error" in tasks.reopen(cfg, pid, "C1", "a script failure is not resumed")
+
+
 def test_a_waiter_nobody_is_polling_never_blocks_the_line():
     """Oct-06 run: changepoint C7/C8 headed the GPU line while their review's controller sat for 54 minutes on a script
     review (no `tasks` call, so nobody polled them); seven GPU checks of all three reviews waited behind them with the GPU

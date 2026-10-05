@@ -771,10 +771,26 @@ def reopen(cfg: state.Config, pid: str, cid: str, why: str) -> dict:
         o = state.read_json(cdir / "outcome.json")
         if not o:
             return {"error": f"{cid} has no outcome to reopen"}
-        if o.get("status") not in ("NOT_CHECKABLE", "BLOCKED", "INCONCLUSIVE"):
+        # A partial check whose every lost seed died of the GPU's memory (a failure the harness retries once, alone, and
+        # had not recognised) is resumed: the same approved script, its completed seeds reused, the lost seeds run
+        # again — nothing measured is re-rolled.
+        lost = {k: v for k, v in (o.get("failed_seeds") or {}).items()}
+        resume = (o.get("status") in ("PARTIAL", "INCONCLUSIVE") and bool(lost) and all(execute.gpu_oom(v) for v in lost.values())
+                  and o.get("authorized") is not False and (cdir / "script.py").exists())
+        if o.get("status") not in ("NOT_CHECKABLE", "BLOCKED", "INCONCLUSIVE") and not resume:
             return {"error": f"{cid} is {o.get('status')}: a check that found something is never reopened"}
         n = len(list(cdir.glob("outcome.reopened.*.json"))) + 1
         (cdir / "outcome.json").replace(cdir / f"outcome.reopened.{n}.json")
+        if resume:
+            rows = (cdir / "seeds.jsonl").read_text(encoding="utf-8").splitlines() if (cdir / "seeds.jsonl").exists() else []
+            again = [r for r in rows if str(json.loads(r).get("seed")) in lost]
+            k = len(list(cdir.glob("seeds.rerun.*.jsonl"))) + 1
+            (cdir / f"seeds.rerun.{k}.jsonl").write_text("".join(r + "\n" for r in again), encoding="utf-8")
+            (cdir / "seeds.jsonl").write_text("".join(r + "\n" for r in rows if r not in again), encoding="utf-8")
+            (cdir / "exec.json").unlink(missing_ok=True)
+            state.append_jsonl(root / "log.jsonl", {"event": "reopen", "check": cid, "was": o.get("status"), "why": why[:500],
+                                                     "same_approved_script": True, "seeds_rerun": sorted(lost)})
+            return {"reopened": cid, "was": o.get("status"), "same_approved_script": True, "seeds_rerun": sorted(lost)}
         seals = state.read_json(root / "seals.json", {}) or {}
         # A RESOURCE BLOCKER is a fact about how the host ran an approved script, never about the script: the same
         # approved script runs again (its gen/verify seals kept, its completed seeds reused from seeds.jsonl), so a
