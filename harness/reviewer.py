@@ -538,7 +538,7 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
                   f"**Decision: {'Verified' if d.get('decision') == VERIFIED else 'Not verified'}.** {d.get('reason_text', '')}",
                   "", f"The paper (p{cc.get('page')}): \"{_short(cc['quote'], 300)}\""]
         if cc.get("assumptions"):
-            lines.append("Assumptions as printed: " + "; ".join(f"\"{_short(a['quote'], 120)}\"" for a in cc["assumptions"][:3]))
+            lines += ["", "Assumptions as printed: " + "; ".join(f"\"{_short(a['quote'], 120)}\"" for a in cc["assumptions"][:3])]
         if expl.get(k):
             lines += ["", prose(expl[k], f"{k} explanation")]
         lines.append("")
