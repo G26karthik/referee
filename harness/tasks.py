@@ -777,6 +777,19 @@ def reopen(cfg: state.Config, pid: str, cid: str, why: str) -> dict:
         lost = {k: v for k, v in (o.get("failed_seeds") or {}).items()}
         resume = (o.get("status") in ("PARTIAL", "INCONCLUSIVE") and bool(lost) and all(execute.gpu_oom(v) for v in lost.values())
                   and o.get("authorized") is not False and (cdir / "script.py").exists())
+        if resume:
+            # ...once: a seed whose approved script already ran out of the GPU's memory twice, or that the harness already
+            # judged a lone run's limit, fails the same way again (every GPU run holds the GPU alone; Oct-06 GRACE C4 seed 0
+            # three times). Resuming it would loop; it stays a lost seed.
+            c = state.read_json(cdir / "check.json") or {}
+            log = root / "execution.jsonl"
+            runs = [r for r in map(json.loads, log.read_text(encoding="utf-8").splitlines() if log.exists() else [])
+                    if r.get("target") == cid and r.get("mode") == "evidence" and r.get("script_sha256") == c.get("script_sha256")]
+            again = [k for k, v in lost.items() if str(v).startswith("RESOURCE LIMIT") or sum(
+                1 for r in runs if str(r.get("seed")) == str(k) and execute.gpu_oom(r.get("stderr") or "")) >= 2]
+            if again:
+                return {"error": f"{cid}: seed(s) {again} already ran out of the GPU's memory running alone with this approved "
+                                 "script; a rerun would fail the same way (a measured limit, not repeated)"}
         if o.get("status") not in ("NOT_CHECKABLE", "BLOCKED", "INCONCLUSIVE") and not resume:
             return {"error": f"{cid} is {o.get('status')}: a check that found something is never reopened"}
         n = len(list(cdir.glob("outcome.reopened.*.json"))) + 1

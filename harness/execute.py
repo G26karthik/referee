@@ -1302,7 +1302,6 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         fly["-1" if st["stage"] == "prepare" else str(st["seed"])] = st["rec"]
         st.setdefault("next", st["seed"] + (st["stage"] == "run"))
     st["rec"] = None
-    st.setdefault("next", 0)        # the loop below skips finished seeds; a resumed check's lost seed may lie below them
     runs, width = max(int(check.get("runs") or 1), int(st.get("runs_extended") or 0)), 1 if kind == "AUTHOR_CODE" else max(1, cfg.parallel)
     timeout = cfg.install_timeout_s if st["stage"] == "prepare" else cfg.run_timeout_s
     for key, rec in sorted(fly.items(), key=lambda kv: int(kv[0])):
@@ -1311,16 +1310,31 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             continue
         state.append_jsonl(root / "execution.jsonl", done)
         del fly[key]
-        act, text = resource_action(done, st, key, timeout)
+        last = next((s for s in reversed([str(d.get("stage")) for d in json_lines(
+            (done.get("stdout") or "") + "\n" + (done.get("stderr") or ""), "REFEREE_PROGRESS") if d.get("stage")])), "")
+        act, text = resource_action(done, st, key, timeout, alone=gpu_run(cfg, check))
         if act == "retry":
             st.setdefault("redo", []).append(int(key))
             continue
+        limit = ""
         if act == "blocker":
-            if kind in ("RECONSTRUCTION", "RELEASED_DATA"):      # what it printed before the limit is kept beside the
-                kept = staged_values(done.get("stdout") or "", (check.get("target") or {}).get("relation", ""),
-                                     check.get("metric", ""))   # blocker (pilot_stages), deciding nothing (Oct-01 C8)
+            kind_of, why = text
+            rel_ = (check.get("target") or {}).get("relation", "")
+            kept = staged_values(done.get("stdout") or "", rel_, check.get("metric", "")) if kind in (
+                "RECONSTRUCTION", "RELEASED_DATA") else []
+            if kind == "AUTHOR_CODE" or not (st.get("done_seeds") or kept):
+                # Nothing was measured anywhere: one documented blocker, with what this run printed before its limit kept
+                # beside it (pilot_stages), deciding nothing (Oct-01 C8).
                 st["values"], st["staged"] = st.get("values", []) + [e[1] for e in kept], st.get("staged", []) + kept
-            return _finish(cfg, root, check, {**_cancel(root, st), "blocker": text})
+                return _finish(cfg, root, check, {**_cancel(root, st), "blocker": (
+                    kind_of, why.rstrip(".") + (f" (during {last})." if last else "."))})
+            # Measurements exist (completed seeds, or stages this run finished first): they survive the limit (invariant
+            # 20). This seed is a failed seed with its limit and stage; the other seeds still run, unless the limit would
+            # end every one of them (a per-run time limit, the disk) or already ended a second seed the same way.
+            st.setdefault("limits", {})[key] = {"kind": kind_of, "stage": last, "text": why}
+            if kind_of in ("per_run_timeout", "storage") or sum(1 for v in st["limits"].values() if v["kind"] == kind_of) >= 2:
+                st["halted"] = f"{kind_of}: {why}"
+            limit = f"RESOURCE LIMIT ({kind_of})" + (f" during {last}" if last else "") + f": {why}"
         per = st.setdefault("restarts_by_seed", {})
         if (_vanished(done) or (done["mode"] == "evidence" and classify(done)["infra_error"])) and per.get(key, 0) < 3:
             per[key] = per.get(key, 0) + 1
@@ -1353,8 +1367,6 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         undef = undefined_units(done.get("stdout") or "") if kind in ("RECONSTRUCTION", "RELEASED_DATA") else {}
         st["units"] = sorted(set(st.get("units") or []) | declared)
         st.setdefault("undefined", {}).update(undef)
-        last = next((s for s in reversed([str(d.get("stage")) for d in json_lines(
-            (done.get("stdout") or "") + "\n" + (done.get("stderr") or ""), "REFEREE_PROGRESS") if d.get("stage")])), "")
         failed_stages, defects = split_units(declared, staged, ev["failed"], failure_text(done) if ev["failed"]
                                              else "a declared unit printed no result line", undef)
         for s, e in failed_stages.items():
@@ -1367,7 +1379,7 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         st["cohort_mismatch"] = sorted(set(st.get("cohort_mismatch") or []) | set(mism))
         st["ok_runs"] = st.get("ok_runs", 0) + (not ev["failed"])
         if ev["failed"] or not vs:
-            err = (failure_text(done) + (f" (during {last})" if last else "")) if ev["failed"] else \
+            err = (limit or failure_text(done) + (f" (during {last})" if last else "")) if ev["failed"] else \
                 f"exit 0 after {done.get('seconds', 0):.0f}s with no result line"
             if kind == "AUTHOR_CODE" or not st.get("done_seeds") and not vs:
                 return _finish(cfg, root, check, {**_cancel(root, st), "ev": ev, "failure": err} if ev["failed"]
@@ -1401,6 +1413,8 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         if (why := _over_budget(cfg, check, st, runs)):
             return _finish(cfg, root, check, {**_cancel(root, st), "blocker": why})
         st["budget_s"] = budget(cfg, check)[0]
+    if st["stage"] == "run" and st.get("halted") and not fly:
+        return _finish(cfg, root, check, st)                # a limit that would end every further seed: none starts
     if st["stage"] == "run" and st["seed"] >= runs and not fly:
         if not (more := _extension(cfg, check, st, runs)):
             return _finish(cfg, root, check, st)
@@ -1423,24 +1437,23 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         # the GPU on a GPU host, so there they run one at a time (CPU-only scripts too: a throughput cost, stated).
         width = 1
         free = 0 if fly or gpu_busy() else min(free, 1)
+    # What may start is derived from what ended, never from a stored counter (Oct-06 GRACE C4: `next` stood at 3 with
+    # seed 0 lost below it, and nothing launched for 13.7 h): a seed runs if it has neither ended nor started; a seed to
+    # run again (an infrastructure restart, a retry alone) goes first.
     done_set = set(st.get("done_seeds", []))
-    while st["next"] in done_set:
-        st["next"] += 1
+    pending = [s for s in range(runs) if s not in done_set and str(s) not in fly]
+    order = [] if st.get("halted") else [s for s in st.get("redo") or [] if s in pending] + [
+        s for s in pending if s not in (st.get("redo") or [])]
     turn = f"{pid}/{cid}"
-    if st["stage"] == "run" and len(fly) < width and (st.get("redo") or st["next"] < runs):
+    if st["stage"] == "run" and len(fly) < width and order:
         # Fair turns across checks: a slot (or the GPU) that a check waiting longer could take is left to it.
         ahead_cpu, ahead_gpu = wait_turn(cfg, turn, gpu_run(cfg, check))
         free = (0 if ahead_gpu or not free else min(1, max(0, slots - ahead_cpu))) if gpu_run(cfg, check) else \
             max(0, free - ahead_cpu - (min(1, ahead_gpu) if ahead_gpu and not gpu_busy() else 0))
-    while st["stage"] == "run" and len(fly) + len(todo) < width and len(todo) < free and (
-            st.get("redo") or st["next"] < runs):
-        if st.get("redo"):
-            todo.append(st["redo"].pop(0))
-        else:
-            todo.append(st["next"])
-            st["next"] += 1
-            while st["next"] in done_set:
-                st["next"] += 1
+    while st["stage"] == "run" and len(fly) + len(todo) < width and len(todo) < free and order:
+        todo.append(order.pop(0))
+    st["redo"] = [s for s in st.get("redo") or [] if s not in todo]
+    st["next"] = min(order + [runs])                     # informational: the next seed that would start
     if todo and _storage_changed(st, env_dir, root, check):
         # Docker's storage was reset under a running check (a volume is gone, or its environment
         # or data is being rebuilt under the same name): every in-flight step is recorded as
@@ -1496,27 +1509,32 @@ def gpu_oom(text: str) -> bool:
     return bool(_GPU_OOM.search(text or ""))
 
 
-def resource_action(done: dict, st: dict, key: str, timeout: int) -> tuple[str, str]:
-    """What a run that hit a resource limit leads to: ("retry", "") once alone after an
+def resource_action(done: dict, st: dict, key: str, timeout: int, alone: bool = False) -> tuple[str, str]:
+    """What a run that hit a resource limit leads to: ("retry", "") once per seed, alone, after an
     out-of-memory kill that may have shared memory, or once for a replicate past the per-run limit
-    whose pilot took under a quarter of it (a stalled host); ("blocker", why) when the same failure
-    would repeat (killed out of memory alone, or past the per-run limit); ("", "") otherwise."""
+    whose pilot took under a quarter of it (a stalled host); ("blocker", (kind, why)) when the same failure
+    would repeat (out of memory alone, or past the per-run limit); ("", "") otherwise. `alone`: the run held
+    the GPU by itself (every run given the GPU does), so a GPU out-of-memory is already a lone run's: retrying
+    it "alone" repeats it (Oct-06 GRACE C4: seed 0 failed the same way three times)."""
     if done.get("mode") != "evidence":
         return "", ""
     err = (done.get("stderr") or "").lower()
     if "no space left on device" in err or "disk quota exceeded" in err:
         return "blocker", ("storage", "a run ran out of disk space on this host (a measured limit); the protocol "
                            "is not shortened, so it is not repeated.")
+    tried = st.setdefault("retried", {})
     if gpu_oom(err):
-        if not st.get("vram_retry"):
-            st.update(width=1, vram_retry=True)          # another run may have shared the GPU: once, alone
+        if not alone and tried.get(key) != "vram":
+            tried[key] = "vram"
+            st.update(width=1)                             # another run may have shared the GPU: once, alone
             return "retry", ""
-        return "blocker", ("vram", f"a single run exhausted the GPU's memory even when running alone "
+        return "blocker", ("vram", f"a single run exhausted the GPU's memory while it held the GPU alone "
                            f"(this host's GPU memory: {_gpu_mb()} MB, a measured hardware limit); it is not "
                            "repeated and never downscaled.")
     if done.get("error") == "out of memory":
-        if not st.get("oom_retry"):
-            st.update(width=1, oom_retry=True)
+        if tried.get(key) != "memory":
+            tried[key] = "memory"
+            st.update(width=1)
             return "retry", ""
         return "blocker", ("memory", f"a single run was killed out of memory after {done.get('seconds', 0):.0f}s even "
                            f"when running alone (peak observed {st.get('peak_mb', {}).get(key, '?')} MB; this host's "
@@ -1880,9 +1898,15 @@ def stop(cfg: state.Config, pid: str, cid: str, why: str) -> dict:
         st = state.read_json(cdir / "exec.json") or {}
         if (cdir / "outcome.json").exists() or not st:
             return {"error": f"{cid} is not running"}
-        _finish(cfg, root, state.read_json(cdir / "check.json"), {
-            **_cancel(root, st), "ev": {"infra_error": "stopped by the operator"},
-            "failure": f"stopped by the operator after {st.get('seed', 0)} completed run(s): {why}"})
+        if st.get("done_seeds"):
+            # Completed seeds survive the stop (invariant 20): every run in flight is cancelled and recorded, the seeds
+            # that never ran are lost seeds, and the check is decided on what completed: PARTIAL, never a finding.
+            _finish(cfg, root, state.read_json(cdir / "check.json"), {
+                **_cancel(root, st), "halted": f"stopped by the operator after {len(st['done_seeds'])} completed run(s): {why}"})
+        else:
+            _finish(cfg, root, state.read_json(cdir / "check.json"), {
+                **_cancel(root, st), "ev": {"infra_error": "stopped by the operator"},
+                "failure": f"stopped by the operator after {st.get('seed', 0)} completed run(s): {why}"})
         return state.read_json(cdir / "outcome.json")
 
 
@@ -1901,6 +1925,14 @@ def _finish(cfg: state.Config, root: Path, check: dict, st: dict) -> bool:
     kind, src = check["kind"], state.read_json(root / "source.json", {})
     authorized = st.get("authorized", True)
     why = st.get("why", "")
+    if st.get("halted") and st.get("done_seeds") and not st.get("blocker"):
+        # Launches stopped early (a limit that would end every further seed, or the operator): the planned seeds that
+        # never started are lost seeds of a partial check, said with the reason; what completed is decided as usual.
+        planned = max(int(check.get("runs") or 1), int(st.get("runs_extended") or 0))
+        ended = set(st["done_seeds"]) | {int(k) for k in st.get("failed_seeds") or {}}
+        for s in range(planned):
+            if s not in ended:
+                st.setdefault("failed_seeds", {})[str(s)] = f"not run: {st['halted']}"
     outcome = {"check": check["id"], "kind": kind, "evidence": EVIDENCE.get(kind, "NONE"), "authorized": authorized,
                "authorization": why, "commit": src.get("commit", "") if (root / "repo" / ".git").is_dir() else ""}
     if st.get("blocker"):         # a documented final blocker of this host: nothing about the paper is established
@@ -1915,6 +1947,11 @@ def _finish(cfg: state.Config, root: Path, check: dict, st: dict) -> bool:
                        finished_at=state.now())
         if authorized and (again := varied_nothing(check, st)):
             outcome["revisable"] = again          # tasks._step returns the approved script to its author with this
+    if st.get("limits"):          # seeds a resource limit ended after measurements existed: which limit, in which stage
+        outcome["resource_failures"] = st["limits"]
+        outcome.setdefault("resource", next(iter(st["limits"].values()))["kind"])
+    if st.get("halted"):
+        outcome["halted"] = st["halted"]
     outcome["protocol"] = protocol(check, st, outcome.get("rule", ""))
     # How the runs went (execution), apart from what their results say (the status above).
     outcome["execution"] = {"runs_planned": max(int(check.get("runs") or 1), int(st.get("runs_extended") or 0)),

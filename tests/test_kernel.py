@@ -5391,6 +5391,145 @@ def test_counts_and_completion_read_unnamed_and_undefined_units_honestly():
     assert decision(mixed, {})["reason"] == "changed_protocol"                     # never "no test was run"
 
 
+def _line(stage, a, b, fp):
+    return "REFEREE_RESULT " + json.dumps({"stage": stage, "a": a, "b": b, "data_fingerprint": fp})
+
+
+def _ok(seed, stages=("s1", "s2")):
+    """A completed run of a two-stage script (b - a > 0 in each stage, different draws per seed)."""
+    out = ['REFEREE_PROGRESS {"units": ["s1", "s2"]}']
+    for i, s in enumerate(stages):
+        out += [f'REFEREE_PROGRESS {{"stage": "{s}"}}', _line(s, 1.0 + 0.01 * seed + i, 2.0 + 0.02 * seed + i, f"fp{seed}{s}")]
+    return {"mode": "evidence", "returncode": 0, "stdout": "\n".join(out), "stderr": "", "seconds": 60.0}
+
+
+def _gpu_oom_after_s1(seed):
+    """Measured stage s1, then the GPU ran out of memory inside s2 (Oct-06 GRACE C4 seed 0)."""
+    out = ['REFEREE_PROGRESS {"units": ["s1", "s2"]}', 'REFEREE_PROGRESS {"stage": "s1"}',
+           _line("s1", 1.0 + 0.01 * seed, 2.0 + 0.02 * seed, f"fp{seed}s1"), 'REFEREE_PROGRESS {"stage": "s2"}']
+    return {"mode": "evidence", "returncode": 1, "stdout": "\n".join(out), "seconds": 1361.0,
+            "stderr": "memory allocation failed with OOM on device 0 while trying to allocate 960495616 bytes (free: 0)"}
+
+
+def _drive(td: Path, results: dict, runs: int, pre: dict | None = None, polls: int = 40, stop_after: int | None = None):
+    """Poll one RECONSTRUCTION check given the GPU (one run at a time) against a fake container runtime: `results[seed]`
+    lists what each successive launch of that seed returns (None: still running). Returns (outcome, launches, root)."""
+    cfg = state.Config()
+    cfg.projects, cfg.parallel = td, 2
+    root, cid = td / "p", "C1"
+    cdir = root / "checks" / cid
+    (cdir / "run").mkdir(parents=True)
+    check = {"id": cid, "kind": "RECONSTRUCTION", "runs": runs, "stochastic": True, "script_sha256": "s",
+             "target": {"relation": "b - a > 0"}, "deviations": []}
+    state.write_json(cdir / "check.json", check)
+    st = {"env": {"ok": True, "image": "img", "detail": "d"}, "env_dir": str(td / "env"), "why": "", "seed": 0, "values": [],
+          "cert": [], "staged": [], "rec": None, "stage": "run", "done_seeds": [], "failed_seeds": {}, "image": "img",
+          "token": "t", **(pre or {})}
+    state.write_json(cdir / "exec.json", st)
+    launched, seen = [], {}
+
+    def start(name, argv, **kw):
+        launched.append(kw["meta"]["seed"])
+        return {"container": f"{name}-{len(launched)}", "mode": kw["mode"], "target": kw["target"], **kw["meta"],
+                "started_at": state.now()}
+
+    def collect(rec, timeout):
+        k = seen[rec["container"]] = seen.get(rec["container"]) or sum(1 for s in launched if s == rec["seed"])
+        got = results[rec["seed"]][min(k, len(results[rec["seed"]])) - 1]
+        return None if got is None else {**rec, **got}
+    fakes = dict(start=start, collect=collect, evidence_slots=lambda cfg: 2, gpu_busy=lambda: False, gpu=lambda cfg: True,
+                 gpu_run=lambda cfg, c: True, _storage_changed=lambda *a: False, _sample_memory=lambda *a: None,
+                 env_mounts=lambda d, e: ([], {}), data_mount=lambda r, c: [], _gpu_mb=lambda: "8188", _vm_mb=lambda: "5926",
+                 _docker=lambda a, t: (0, ""))
+    real = {k: getattr(execute, k) for k in fakes}
+    for k, v in fakes.items():
+        setattr(execute, k, v)
+    try:
+        for i in range(polls):
+            if stop_after is not None and i == stop_after:
+                execute.stop(cfg, "p", cid, "the operator ends it")
+                break
+            if not execute.poll(cfg, "p", cid):
+                break
+    finally:
+        for k, v in real.items():
+            setattr(execute, k, v)
+    return state.read_json(cdir / "outcome.json"), launched, root
+
+
+def test_a_resource_limit_after_measurements_keeps_the_completed_seeds():
+    """Oct-06 GRACE C4: seed 0 ran out of GPU memory inside one stage after measuring the others, three times, while seeds
+    1 and 2 completed every stage; the harness retried a run that already held the GPU alone, a second failure would have
+    filed the completed seeds as a pilot (BLOCKED, deciding nothing), and the check was closed by a hand-written script.
+    A limit that ends one seed after measurements keeps them: the failed seed is recorded with its limit and stage, the
+    other seeds run, a limit that repeats on a second seed stops further launches, and the check is PARTIAL."""
+    from harness.reconcile import PARTIAL
+    with tempfile.TemporaryDirectory() as t:              # a GPU OOM mid-run on a lone GPU run: not retried, recorded
+        o, launched, _ = _drive(Path(t), {0: [_ok(0)], 1: [_gpu_oom_after_s1(1)], 2: [_ok(2)]}, runs=3)
+        assert launched == [0, 1, 2], launched                                   # no pointless retry, seed 2 still runs
+        assert o["status"] == PARTIAL and o["stages"]["s1"]["n"] == 3 and o["stages"]["s2"]["n"] == 2, o
+        lim = o["resource_failures"]["1"]
+        assert lim["kind"] == "vram" and lim["stage"] == "s2" and "GPU" in lim["text"], lim
+        assert o["execution"]["runs_failed"] == ["1"] and "pilot_values" not in o
+    with tempfile.TemporaryDirectory() as t:              # the same limit on a second seed: no further launches
+        o, launched, _ = _drive(Path(t), {0: [_ok(0)], 1: [_gpu_oom_after_s1(1)], 2: [_gpu_oom_after_s1(2)],
+                                          3: [_ok(3)]}, runs=4)
+        assert launched == [0, 1, 2], launched
+        assert o["status"] == PARTIAL and set(o["execution"]["runs_failed"]) == {"1", "2", "3"}, o
+        assert "not run" in o["failed_seeds"]["3"] and "vram" in o["halted"], o
+    with tempfile.TemporaryDirectory() as t:              # the last seed fails: the check ends PARTIAL, never BLOCKED
+        o, launched, _ = _drive(Path(t), {0: [_ok(0)], 1: [_ok(1)], 2: [_gpu_oom_after_s1(2)]}, runs=3)
+        assert o["status"] == PARTIAL and o["stages"]["s1"]["n"] == 3 and o["status_on_completed"], o
+    with tempfile.TemporaryDirectory() as t:              # nothing measured anywhere: one documented blocker, with its stage
+        dead = {**_gpu_oom_after_s1(0), "stdout": 'REFEREE_PROGRESS {"stage": "s1"}'}
+        o, launched, _ = _drive(Path(t), {0: [dead], 1: [_ok(1)], 2: [_ok(2)]}, runs=3)
+        assert launched == [0] and o["status"] == "BLOCKED" and o["resource"] == "vram", (launched, o)
+        assert "during s1" in o["reason"], o["reason"]
+
+
+def test_an_interrupted_or_stalled_check_resumes_without_rerunning_valid_seeds():
+    """A container that vanished (a daemon restart, a host sleep) reruns that seed only; a check whose seed counter points
+    past a lost seed (Oct-06 GRACE C4: next=3 with seed 0 lost, 13.7 h with nothing launched) launches the lost seed; an
+    operator stop keeps the completed seeds and records the run it cancels."""
+    from harness.reconcile import PARTIAL
+    gone = {"mode": "evidence", "returncode": None, "stdout": "", "stderr": "", "seconds": 0,
+            "error": "the container disappeared before it was collected"}
+    with tempfile.TemporaryDirectory() as t:
+        o, launched, _ = _drive(Path(t), {0: [_ok(0)], 1: [gone, _ok(1)], 2: [_ok(2)]}, runs=3)
+        assert launched.count(0) == 1 and launched.count(1) == 2 and launched.count(2) == 1, launched
+        assert o["status"] != PARTIAL and o["stages"]["s1"]["n"] == 3, o
+    with tempfile.TemporaryDirectory() as t:
+        pre = {"seed": 2, "next": 3, "done_seeds": [1, 2], "records": 2,          # what seeds 1 and 2 printed (_ok)
+               "staged": [[s, 1 + 0.01 * k] for k in (1, 2) for s in ("s1", "s2")], "values": [1.01, 1.01, 1.02, 1.02],
+               "detail": [{"seed": k, "stage": s, "reading": "", "out": {"a": 1.0 + 0.01 * k, "b": 2.0 + 0.02 * k},
+                           "data_fp": f"fp{k}{s}", "trials": {}} for k in (1, 2) for s in ("s1", "s2")], "pilot_s": 60.0}
+        o, launched, _ = _drive(Path(t), {0: [_ok(0)]}, runs=3, pre=pre)
+        assert launched == [0] and o and o["stages"]["s1"]["n"] == 3, (launched, o)
+    with tempfile.TemporaryDirectory() as t:
+        o, launched, root = _drive(Path(t), {0: [_ok(0)], 1: [_ok(1)], 2: [None], 3: [_ok(3)]}, runs=5, stop_after=4)
+        assert o["status"] == PARTIAL and o["stages"]["s1"]["n"] == 2, o
+        recs = [json.loads(x) for x in (root / "execution.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert any(r.get("seed") == 2 and "cancelled" in str(r.get("error")) for r in recs), recs
+
+
+def test_a_seed_that_ran_out_of_gpu_memory_alone_is_never_resumed_into_a_loop():
+    """Reopening a partial check reruns its lost seeds once; a seed that already ran out of the GPU's memory twice with the
+    same approved script (alone, as every GPU run is) would fail the same way again: it is not resumed."""
+    err = "memory allocation failed with OOM on device 0 (free: 0)"
+    with tempfile.TemporaryDirectory() as t:
+        cfg, pid, root = _ready(Path(t))
+        cdir = root / "checks" / "C1"
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "script.py").write_text("print(1)\n", encoding="utf-8")
+        state.write_json(cdir / "check.json", {"id": "C1", "kind": "RECONSTRUCTION", "script_sha256": "s", "runs": 3})
+        for _ in range(2):
+            state.append_jsonl(root / "execution.jsonl", {"target": "C1", "mode": "evidence", "seed": 0, "script_sha256": "s",
+                                                          "returncode": 1, "stderr": err})
+        state.write_json(cdir / "outcome.json", {"status": "PARTIAL", "authorized": True, "failed_seeds": {"0": "exit 1: " + err}})
+        res = tasks.reopen(cfg, pid, "C1", "again")
+        assert "error" in res and "GPU" in res["error"], res
+
+
 if __name__ == "__main__":
     fns = [v for k, v in dict(globals()).items() if k.startswith("test_")]
     for fn in fns:
