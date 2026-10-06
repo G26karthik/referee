@@ -2065,10 +2065,13 @@ def test_one_fetch_per_plan_in_flight_and_a_follow_up_that_covers_an_omission_re
         (root / "sealed").mkdir(exist_ok=True)
         state.write_json(root / "sealed" / "report.json", {"prose": "p"})
         (root / "review.md").write_text("old review", encoding="utf-8")
-        state.write_json(root / "seals.json", {"plan": 1, "report": state.sha256((root / "sealed" / "report.json").read_bytes())})
+        state.write_json(root / "sealed" / "compare.json", {"claims": []})
+        state.write_json(root / "seals.json", {"plan": 1, "report": state.sha256((root / "sealed" / "report.json").read_bytes()),
+                                               "compare": state.sha256((root / "sealed" / "compare.json").read_bytes())})
         out = tasks.reopen(cfg, pid, "report", "a report-code fix")
         assert out["kept"] == "review.reopened.1.md" and (root / "review.reopened.1.md").read_text(encoding="utf-8") == "old review"
         assert set(state.read_json(root / "seals.json")) == {"plan"} and (root / "sealed" / "report.withdrawn.1.json").exists()
+        assert (root / "sealed" / "compare.withdrawn.1.json").exists() and out["seals_withdrawn"] == ["report", "compare"]
 
 
 def test_a_criterion_the_planner_supplied_makes_the_result_about_that_criterion():

@@ -952,16 +952,20 @@ def reopen(cfg: state.Config, pid: str, cid: str, why: str) -> dict:
             if "report" not in seals:
                 return {"error": "no sealed report to withdraw"}
             n = len(list(root.glob("review.reopened.*.md"))) + 1
+            # The comparison with another record was made against these decisions and this report: it is made again.
             for src, dst in ((root / "sealed" / "report.json", root / "sealed" / f"report.withdrawn.{n}.json"),
+                             (root / "sealed" / "compare.json", root / "sealed" / f"compare.withdrawn.{n}.json"),
                              (root / "review.md", root / f"review.reopened.{n}.md")):
                 if src.exists():
                     src.replace(dst)
-            seals.pop("report")
+            gone = [t for t in ("report", "compare") if t in seals]
+            for t in gone:
+                seals.pop(t)
             state.write_json(root / "seals.json", seals)
             tried = state.read_json(root / "attempts.json", {}) or {}
-            state.write_json(root / "attempts.json", {k: v for k, v in tried.items() if k != "report"})
-            state.append_jsonl(root / "log.jsonl", {"event": "reopen", "check": "report", "why": why[:500]})
-            return {"reopened": "report", "kept": f"review.reopened.{n}.md"}
+            state.write_json(root / "attempts.json", {k: v for k, v in tried.items() if k not in gone})
+            state.append_jsonl(root / "log.jsonl", {"event": "reopen", "check": "report", "why": why[:500], "withdrawn": gone})
+            return {"reopened": "report", "kept": f"review.reopened.{n}.md", "seals_withdrawn": gone}
     with state.lock(root / ".lock"):
         cdir = root / "checks" / cid
         o = state.read_json(cdir / "outcome.json")
