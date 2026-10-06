@@ -577,7 +577,7 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
                 shown[c["id"]] = k
                 details += _details(c, x.root, prose, cites.get(c["id"], []), led)
         if comp.get("scope_not_run"):
-            lines.append("- **Not tested:** " + ", ".join(comp["scope_not_run"][:12])
+            lines.append("- **Not tested to completion** (no test covering it ran all its runs): " + ", ".join(comp["scope_not_run"][:12])
                          + (" …" if len(comp["scope_not_run"]) > 12 else "") + ".")
         # Only a reason of its own is listed: an item whose test did not finish says so under "What ran" already.
         why_not = [b for b in comp.get("not_run") or [] if not (b.get("item", "").startswith("C") and b["item"][1:].isdigit())

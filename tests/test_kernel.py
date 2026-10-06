@@ -4933,10 +4933,10 @@ def test_the_reviewer_page_is_built_from_the_record_and_publishes_only_checked_p
         page = reviewer.render(x, led, rep)
         assert "| K1. GRACE has lower error than the baselines. | **Not verified** | incomplete coverage |" in page
         assert "**Unresolved claims:** K1, K2." in page
-        assert page.index("**Decision: Not verified.**") < page.index("**Not tested:**")       # the finding before its limits
+        assert page.index("**Decision: Not verified.**") < page.index("**Not tested to completion**")       # the finding before its limits
         assert "0.9918" in page and "0.0973 ± 0.0319" in page and "100 (100)" in page            # magnitudes and uncertainty
         assert "3 settings declared = 2 with a result + 1 undefined + 0 missing" in page          # denominators reconcile
-        assert "Not tested:** BART, IHDP" in page and "budget" in page
+        assert "ran all its runs): BART, IHDP" in page and "budget" in page
         assert "37.2%" not in page and "withheld" in page                                        # an invented number
         assert "This is verified in Table 2" not in page                                         # an unearned status word
         assert "GRACE, a tree layer trained with gradients" in page and "root mean squared error" in page
