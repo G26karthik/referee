@@ -1002,8 +1002,11 @@ def reopen(cfg: state.Config, pid: str, cid: str, why: str) -> dict:
         for f in ([cdir / "exec.json"] if keep else
                   [*cdir.glob("smoke.*.json"), *cdir.glob("setup.*.txt"), cdir / "exec.json", cdir / "check.json", cdir / "script.py"]):
             f.unlink(missing_ok=True)
-        if not keep and (o.get("data_blocker") or execute.data_gaps(state.read_json(cdir / "data.json") or {})):
-            (cdir / "data.json").unlink(missing_ok=True)       # a failed, cut or partial acquisition is tried again
+        d = state.read_json(cdir / "data.json") or {}
+        if not keep and ((o.get("data_blocker") and not d.get("n_files")) or execute.data_gaps(d)):
+            # A failed, cut or partial acquisition is tried again; a set the current rules read as complete (Oct-06
+            # changepoint C3: blocked by a dead duplicate link whose content had arrived) is kept, never re-downloaded.
+            (cdir / "data.json").unlink(missing_ok=True)
             shutil.rmtree(cdir / "record_src", ignore_errors=True)
         state.append_jsonl(root / "log.jsonl", {"event": "reopen", "check": cid, "was": o.get("status"), "why": why[:500],
                                                  **({"same_approved_script": True} if keep else {})})

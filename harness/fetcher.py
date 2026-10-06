@@ -414,6 +414,19 @@ def pick(links: list[str], include: list[str]) -> list[str]:
     return [u for u in links if urllib.parse.urlparse(u).path.lower().endswith(DATA)]
 
 
+def _affinity(name: str, include: str) -> int:
+    """How many leading characters an archive's name (without its suffix) shares with an `include` name (case folded)."""
+    a, b = name.rsplit("/", 1)[-1].lower(), include.rsplit("/", 1)[-1].lower()
+    for s in ARCHIVES:
+        if a.endswith(s):
+            a = a[:-len(s)]
+            break
+    n = 0
+    while n < min(len(a), len(b)) and a[n] == b[n]:
+        n += 1
+    return n
+
+
 def record_api(url: str) -> str:
     """The documented records-API URL of a repository record page, or "" when the host has no adapter or the
     URL is no record."""
@@ -472,14 +485,17 @@ def _textual(name: str) -> bool:
 
 
 def admit(path: str, name: str, dest: str, expect_md5: str = "", members: list[str] | None = None, *,
-          keep=None, limit: int | None = None) -> tuple[list[dict], list[dict]]:
+          keep=None, limit: int | None = None, only: bool = False) -> tuple[list[dict], list[dict]]:
     """Validate one downloaded file and place it under `dest`: -> (admitted, rejected). Rejected files
     are removed; each rejection says why. `members`: the plan's `include` patterns, applied to the
     files INSIDE an archive when they named no link on the page (they named what the download holds):
     the members they match are kept, all of them if none matches. Only an archive SUFFIX unpacks (an .npz,
     .xlsx or .pt is a zip and stays whole), into the folder its name has. `limit`: the bytes an archive may
     unpack to (what is left under the storage cap; a zip bomb is refused whole). `keep(name, bytes, origin)`
-    receives the text of released code, notebooks and READMEs, whole files or members (quote-only text)."""
+    receives the text of released code, notebooks and READMEs, whole files or members (quote-only text). `only`: one of
+    several archives opened on speculation (the plan named a member, not an archive) keeps the matching members and
+    nothing else: an unrelated archive of the same page never enters the data (Oct-06: WISDM_ar_latest beside WISDM_at);
+    a page's single archive keeps all its members when none matches (the planner could not see inside it)."""
     rej = lambda why, cls="content_invalid": ([], [{"file": name, "class": cls, "why": why}])
     low = name.lower()
     if keep and _textual(name):
@@ -522,7 +538,7 @@ def admit(path: str, name: str, dest: str, expect_md5: str = "", members: list[s
                         return rej(f"unsafe path in archive: {m}", "content_invalid")
                 files = [m for m in z.infolist() if not m.is_dir()]
                 data = [m for m in files if not m.filename.lower().endswith(CODE)]
-                chosen = ([m for m in data if _named(m.filename, members)] if members else []) or data
+                chosen = ([m for m in data if _named(m.filename, members)] if members else []) or ([] if only else data)
                 if limit is not None and sum(m.file_size for m in chosen) > limit:   # a member never unpacks past its size
                     return over(sum(m.file_size for m in chosen))
                 bad = z.testzip()
@@ -545,7 +561,7 @@ def admit(path: str, name: str, dest: str, expect_md5: str = "", members: list[s
                         return rej(f"unsafe path in archive: {m.name}")
                 files = [m for m in every if m.isfile()]
                 data = [m for m in files if not m.name.lower().endswith(CODE)]
-                chosen = ([m for m in data if _named(m.name, members)] if members else []) or data
+                chosen = ([m for m in data if _named(m.name, members)] if members else []) or ([] if only else data)
                 if limit is not None and sum(m.size for m in chosen) > limit:
                     return over(sum(m.size for m in chosen))
                 for m in files:
@@ -658,7 +674,7 @@ def _follow(f: Fetcher, targets: list[dict], dest: str, tmp: str, rec: dict, mem
             row.update(final_url=info.get("final_url"), http_status=info.get("http_status"), redirects=info.get("redirects"),
                        from_cache=info.get("from_cache", False), bytes=info.get("bytes"))
             ok, bad = admit(p, t.get("name") or filename(info, t["url"]), dest, t.get("md5", ""), t.get("members", members),
-                            keep=f.keep, limit=f.room())
+                            keep=f.keep, limit=f.room(), only=bool(t.get("only")))
             f.unpacked += sum(o["bytes"] for o in ok if o["file"] != o["from"])
             rec["admitted"] += ok
             rec["rejected"] += bad
@@ -724,14 +740,23 @@ def _web(f: Fetcher, url: str, s: dict, dest: str, tmp: str, rec: dict) -> None:
     unmatched = [q for q in include if not any(_named(t.get("name") or _path(t["url"]), [q]) for t in targets)]
     took = {t["url"] for t in targets}
     arch = [t for t in pool if _archive(t.get("name") or _path(t["url"])) and t["url"] not in took]
-    if unmatched and 0 < len(arch) <= MAX_ARCHIVES:
+    if unmatched and arch:
         # `include` names no file the record lists or the page links: the planner could not see inside the download, so
-        # it may have named what an archive holds. The few archives are followed and the patterns filter their members.
-        # These follows are speculative: what they fail at is recorded, never counted as a missing named file.
-        targets += [{**t, "named": False, "speculative": True, "members": unmatched} for t in arch]
+        # it may have named what an archive holds. A few archives are followed and the patterns filter their members;
+        # past MAX_ARCHIVES, those whose names share the most with `include` (5+ leading characters), and the archives
+        # not opened are recorded (Oct-06 changepoint C9: 5 archives, none opened, silently). These follows are
+        # speculative: what they fail at is recorded, never counted as a missing named file.
+        near = lambda t: max(_affinity(t.get("name") or _path(t["url"]), q) for q in unmatched)
+        opened = arch if len(arch) <= MAX_ARCHIVES else sorted(
+            [t for t in arch if near(t) >= 5], key=lambda t: -near(t))[:MAX_ARCHIVES]
+        if len(arch) > len(opened):
+            rec["archives_not_opened"] = [t.get("name") or _path(t["url"]) for t in arch if t not in opened]
+        targets += [{**t, "named": False, "speculative": True, "members": unmatched, "only": len(opened) > 1} for t in opened]
         where = "file of the record" if listed is not None else "link on the landing page"
-        rec["recovery"].append(f"no {where} matched {unmatched}: its {len(arch)} archive(s) were followed "
-                               "and `include` was applied to their members")
+        rec["recovery"].append(f"no {where} matched {unmatched}: {len(opened)} of its {len(arch)} archive(s) were followed "
+                               "and `include` was applied to their members" + (
+                                   f"; {len(arch) - len(opened)} not opened (MAX_ARCHIVES={MAX_ARCHIVES}; those named "
+                                   "least like `include`)" if len(arch) > len(opened) else ""))
     if not targets and "doi.org" in urllib.parse.urlparse(url).netloc:
         doi = urllib.parse.urlparse(url).path.lstrip("/")
         try:

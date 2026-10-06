@@ -885,11 +885,33 @@ DATA_MOUNT = f"{MOUNT}/data"
 FETCHER = Path(__file__).with_name("fetcher.py")   # mounted read-only into the network-on container that runs it
 
 
+_ARCHIVE_SUFFIXES = (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz2", ".txz", ".zip", ".tar")
+
+
+def duplicates(r: dict) -> list[dict]:
+    """Named files a dead link (HTTP 404) kept out whose content arrived in another file of the same source: an archive
+    named after the folder its admitted members sit in (a page that links one release under a stale path and a live one;
+    Oct-06 changepoint C3: WISDM_at_v2.0.tar.gz 404, WISDM_at_v2.0/ admitted from WISDM_at_latest.tar.gz). Kept in the
+    record with what superseded it; never a gap of the set. A dead link whose content never arrived stays missing."""
+    out = []
+    for m in r.get("missing") or []:
+        name = str(m.get("file") or "").rsplit("/", 1)[-1]
+        stem = next((name[:-len(s)] for s in _ARCHIVE_SUFFIXES if name.lower().endswith(s)), "")
+        by = [a for a in r.get("admitted") or [] if stem and stem in str(a.get("file") or "").split("/")[:-1]]
+        if m.get("class") == "missing" and by:
+            out.append({**m, "superseded_by": by[0].get("from") or by[0]["file"],
+                        "why": f"{m.get('why', '')}; its content ({stem}/) arrived in {by[0].get('from') or by[0]['file']}"})
+    return out
+
+
 def _named_missing(r: dict) -> list[dict]:
-    """The NAMED files a source's set lacks: listed or include-matched files not admitted, and include names without
-    a wildcard that matched no file (a glob that matched nothing is a gap of the set, not a missing name)."""
-    return list(r.get("missing") or []) + [{"file": p, "class": "missing", "why": "no file of the source has this name"}
-                                           for p in r.get("unmatched_include") or [] if not re.search(r"[*?\[]", p)]
+    """The NAMED files a source's set lacks: listed or include-matched files not admitted (less a dead duplicate link whose
+    content arrived), and include names without a wildcard that matched no file (a glob that matched nothing is a gap of
+    the set, not a missing name)."""
+    dup = {d["file"] for d in duplicates(r)}
+    return [m for m in r.get("missing") or [] if m.get("file") not in dup] + [
+        {"file": p, "class": "missing", "why": "no file of the source has this name"}
+        for p in r.get("unmatched_include") or [] if not re.search(r"[*?\[]", p)]
 
 
 def data_blocker(sources: list[dict], man: dict) -> list[dict]:
@@ -933,7 +955,9 @@ def data_gaps(data: dict) -> list[str]:
         if t := r.get("truncated"):
             out.append(f"{src}: {t.get('followed')} of {t.get('matched')} matching files followed (a cap); not followed: "
                        + ", ".join(map(str, (t.get("not_followed") or [])[:5])))
-        out += [f"{src}: {m.get('file')} not admitted ({m.get('class')}: {str(m.get('why', ''))[:120]})" for m in r.get("missing") or []]
+        dup = {d["file"] for d in duplicates(r)}
+        out += [f"{src}: {m.get('file')} not admitted ({m.get('class')}: {str(m.get('why', ''))[:120]})" for m in r.get("missing") or []
+                if m.get("file") not in dup]
         out += [f"{src}: include {p!r} matched no file" for p in r.get("unmatched_include") or []]
     return out
 

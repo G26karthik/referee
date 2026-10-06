@@ -5738,6 +5738,55 @@ def test_the_audit_of_what_a_test_computes_rests_on_the_scripts_own_lines():
         assert [c["form"] for c in rec["claims"]] == ["compatibility", "empirical", "universal"], rec   # the strictest
 
 
+def _tgz(files: dict) -> bytes:
+    import io
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for name, data in files.items():
+            raw = data.encode()
+            info = tarfile.TarInfo(name)
+            info.size = len(raw)
+            tf.addfile(info, io.BytesIO(raw))
+    return buf.getvalue()
+
+def test_a_stale_duplicate_link_never_blocks_data_that_arrived_and_an_archive_cap_is_never_silent():
+    """Oct-06 changepoint C3/C9: the WISDM page links one release twice, under a stale path (HTTP 404) and a live one; the
+    live archive delivered WISDM_at_v2.0/ (1,369,349 frames, the paper's count), yet the dead duplicate made the source
+    'incomplete' and the check a DATA BLOCKER before any script. The follow-up named the file inside the archive; the page
+    had 5 archives, over the cap of 3 opened, so none was opened, silently, and the source read `no_data`."""
+    from harness import fetcher
+    rec = {"source": "https://w/dataset.php", "dir": "0", "admitted_files": 2, "unmatched_include": [],
+           "admitted": [{"file": "pub/WISDM_at_v2.0/readme.txt", "from": "WISDM_at_latest.tar.gz"},
+                        {"file": "pub/WISDM_at_v2.0/at_unlabeled.arff", "from": "WISDM_at_latest.tar.gz"}],
+           "missing": [{"file": "w/includes/dataset/latest/WISDM_at_v2.0.tar.gz", "class": "missing", "why": "HTTP 404"}]}
+    man = {"sources": [rec]}
+    src = [{"source": rec["source"], "include": ["WISDM_at_latest*", "WISDM_at_v2.0*"], "required": True}]
+    assert execute.data_blocker(src, man) == [] and execute.data_gaps(man) == [], execute.data_blocker(src, man)
+    assert execute.duplicates(rec)[0]["file"].endswith("WISDM_at_v2.0.tar.gz")       # recorded, with what superseded it
+    other = {**rec, "missing": [{"file": "w/part2.tar.gz", "class": "missing", "why": "HTTP 404"}]}
+    assert execute.data_blocker(src, {"sources": [other]}), "a dead link whose content never arrived still blocks"
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        arch = {"WISDM_ar_v1.1.tar.gz": None, "WISDM_at_v2.0.tar.gz": None,
+                "WISDM_ar_latest.tar.gz": _tgz({"ar/x.txt": "x"}), "WISDM_transformation_v1.0.tar.gz": _tgz({"t/y.txt": "y"}),
+                "WISDM_at_latest.tar.gz": _tgz({"pub/WISDM_at_v2.0/WISDM_at_v2.0_unlabeled_transformed.arff": "@data\n1\n"})}
+        links = "".join(f'<a href="/files/{n}">{n}</a>' for n in arch)
+        routes = {"/ds": lambda h: (200, {"Content-Type": "text/html"}, links.encode())}
+        for n, body in arch.items():
+            routes[f"/files/{n}"] = (lambda b: lambda h: (404, {}, b"gone") if b is None else (200, {}, b))(body)
+        srv, host = _serve(routes)
+        try:
+            rec = _fetch(fetcher, td, [{"source": f"http://{host}/ds",
+                                        "include": ["WISDM_at_v2.0_unlabeled_transformed.arff"]}])[0]
+            got = [a["file"] for a in rec["admitted"]]
+            assert got == ["pub/WISDM_at_v2.0/WISDM_at_v2.0_unlabeled_transformed.arff"], rec
+            assert len(rec["archives_not_opened"]) == 2 and not rec.get("unmatched_include"), rec   # the cut, said
+            assert any("archive" in r for r in rec["recovery"]), rec["recovery"]
+        finally:
+            srv.shutdown()
+
+
 if __name__ == "__main__":
     fns = [v for k, v in dict(globals()).items() if k.startswith("test_")]
     for fn in fns:
