@@ -723,6 +723,12 @@ def _completion_row(cc: dict, by_id: dict) -> dict:
             elif h.get("how") == "transfer":
                 transfers.append({"check": c["id"], "item": s, "argument": h.get("argument", "")})
     done = ({flat(p) for s in entries for p in parts(s)} | {flat(s) for s in entries if not {flat(p) for p in parts(s)} & said}) - said
+    touched = set()
+    for c in ran:
+        how = {flat(k): v for k, v in ((c.get("scope_audit") or {}).get("covers") or {}).items()}
+        for s in c.get("covers") or []:
+            if c.get("scope_audit") is None or (how.get(flat(s)) or {}).get("how") == "computed":
+                touched |= {flat(s)} | {flat(p) for p in parts(s)}
     scope = cc.get("scope") or []
     unrun = [s for s in scope if flat(s) not in done] if scope else [o["item"] for o in cc.get("omitted") or [] if o.get("why")]
     unran = [c["id"] for c in target if c not in ran]
@@ -740,7 +746,9 @@ def _completion_row(cc: dict, by_id: dict) -> dict:
         exp, matched = "RAN_AS_SPECIFIED", True
     return {"claim": cc["quote"], "page": cc["page"], "claim_type": cc.get("claim_type") or "", "form": claim_form(cc),
             "transfers": transfers, "coverage_unverified": unverified,
-            "none_covered": bool(ran and scope and not any(flat(s) in done for s in scope)),
+            # no test that ran computed any item the claim names (it computed other cases): a fact of the audit, apart from
+            # whether the test completed
+            "none_covered": bool(ran and scope and not any(flat(s) in touched for s in scope)),
             "requested": "a mathematical statement on exact instances" if not empirical else "an experiment",
             "experiment": exp, "protocol_matched": matched, "partial": partial, "changes": changes[:6],
             "data_mismatch": mismatch, "scope_not_run": unrun, "targets_not_run": unran, "ran": [c["id"] for c in ran],

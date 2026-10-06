@@ -85,9 +85,7 @@ def decision(cc: dict, by_id: dict) -> dict:
     tgt = [c for c in cs if c.get("role", "target") == "target"]
     witness = [c for c in tgt if c["kind"] == "CERTIFICATE" and c.get("status") == "WITNESS_FOUND"]
     shown = comp.get("experiment") == "RAN_AS_SPECIFIED" and not comp.get("coverage_unverified")
-    if comp.get("none_covered") and st not in ("FAILURE_FOUND", "PROOF_GAP_FOUND", "PENDING"):
-        reason = "scope_not_tested"
-    elif st == "SUPPORT_FOUND" and theory:
+    if st == "SUPPORT_FOUND" and theory:
         reason = ("existence_shown" if witness and form == "existential" and shown else
                   "witness_cases_only" if witness and form == "universal_existential" else
                   "incomplete_coverage" if witness and form == "existential" else "finite_cases_only")
@@ -132,6 +130,11 @@ def decision(cc: dict, by_id: dict) -> dict:
         reason = why
     else:
         reason = "not_checked"
+    # A test that computed none of the items the claim names (other cases: an ARL bound for an ADD claim) speaks for none
+    # of it; a finding about the printed text itself (a premise, a definition, a failure, the readings) still stands.
+    if comp.get("none_covered") and reason in ("supported", "existence_shown", "finite_cases_only", "witness_cases_only",
+                                               "incomplete_coverage", "changed_protocol", "undecided"):
+        reason = "scope_not_tested"
     text = REASONS[reason]
     if any(c["status"] == "VIOLATION_UNDER_CHANGED_READING" for c in tgt):
         if reason == "notation_defect":
@@ -175,9 +178,10 @@ def narrower(tgt: list[dict]) -> list[str]:
                        f"constructed cases{tail}")
         st = c.get("stages") or {}
         held = [s for s, p in st.items() if p.get("status") in SUPPORT + ("NO_VIOLATION_FOUND",)]
-        if held and len(held) < len(st):
+        if held and (len(held) < len(st) or c.get("status") not in SUPPORT):
             out.append(f"the comparison held in {len(held)} of {len(st)} settings" + (" under every reading" if c.get(
-                "readings") else "") + ": " + ", ".join(held[:8]) + (" and more" if len(held) > 8 else "") + tail)
+                "readings") else "") + (" that completed" if c.get("status") == "PARTIAL" else "") + ": "
+                + ", ".join(held[:8]) + (" and more" if len(held) > 8 else "") + tail)
     return out
 
 

@@ -5637,6 +5637,8 @@ def test_a_printed_premise_argued_unsatisfiable_is_premise_not_met_never_undefin
     assert decision(_claim_row("READING_CHANGED", "theory", checks=["C6"]), {"C6": {**cert, "premise_argument": ""}})[
         "reason"] == "premise_not_met"
     assert decision(_claim_row("PREMISE_NOT_MET", "theory"), {})["reason"] == "premise_not_met"
+    other = _claim_row("READING_CHANGED", "theory", checks=["C6"], form="universal", comp={"none_covered": True})
+    assert decision(other, {"C6": cert})["reason"] == "premise_impossible"   # coverage never hides the printed text's state
     assert certificate(rows, True, False)["literal"]["undefined"] == 3                   # no argument: as the script said
 
 
@@ -5709,6 +5711,11 @@ def test_scope_items_count_as_tested_only_where_an_audit_found_them_computed():
     row = report._completion_row(cc, {"C4": c})
     assert row["scope_not_run"] == ["Theorem 4.2"] and row["experiment"] == "RAN_PARTIAL", row
     assert row["transfers"] == [{"check": "C4", "item": "Theorem 4.2", "argument": "same with delays"}], row
+    part = {**c, "state": "PARTIALLY_COMPLETED"}
+    row = report._completion_row(cc, {"C4": part})
+    assert not row["none_covered"] and row["experiment"] == "RAN_PARTIAL", row      # computed, though not completed
+    ad = {**c, "scope_audit": {"covers": {"Theorem 4.1": {"how": "not_computed"}, "Theorem 4.2": {"how": "not_computed"}}}}
+    assert report._completion_row(cc, {"C4": ad})["none_covered"]
     legacy = {**c, "scope_audit": None}
     row = report._completion_row({**cc, "scope": ["Theorem 4.1"]}, {"C4": legacy})
     assert row["coverage_unverified"] == ["C4"], row
