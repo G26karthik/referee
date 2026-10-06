@@ -537,12 +537,13 @@ _RECORD_SENT = re.compile(r"(?i)\b(?:the|this|that|other|each|every|its|one|all|
 
 
 def problems(text: str, led: dict, paper, allowed: list[float], refs_flat: str = "", record: bool = False,
-             verified: bool = False) -> list[str]:
+             verified: bool = False, whole: bool = False) -> list[str]:
     """Why a model-written passage cannot be published: markup or an entity (it would render as something the checks never
     saw), a status word no cited check earns, a quote not in the paper (or the registered record), a number the record
     and the paper do not hold. `record`: the passage says what ANOTHER reproduction record found; when every sentence of
     it is attributed to that record ("The record reports ..."), its verdict words are the record's, not REFEREE's, and
-    are not REFEREE status language (numbers and quotes are still checked)."""
+    are not REFEREE status language (numbers and quotes are still checked). `whole`: the field itself is about the other
+    record (its setup), so every sentence that does not name REFEREE is the record's."""
     if not text:
         return []
     if _MARKUP.search(text):
@@ -554,7 +555,8 @@ def problems(text: str, led: dict, paper, allowed: list[float], refs_flat: str =
     if record and not theirs:
         # In a comparison, a sentence about the other record (and not about REFEREE) reports that record's verdict; a
         # sentence about REFEREE may use its own decision word only when that is the claim's decision (`verified`).
-        body = " ".join(s for s in re.split(r"(?<=[.!?])\s+", body) if "REFEREE" in s or not _RECORD_SENT.search(s))
+        body = " ".join(s for s in re.split(r"(?<=[.!?])\s+", body)
+                        if "REFEREE" in s or not (whole or _RECORD_SENT.search(s)))
     status = [] if theirs else [f"status language: {s[:120]!r}" for s in report.unearned(body, led, earned_support=verified)]
     return (status[:2] + [f"quote not in the paper or the record: {q[:80]!r}" for q in quotes][:2]
             + [f"number not in the record or the paper: {n}" for n in unknown_numbers(text, allowed)][:3])
@@ -603,8 +605,8 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
     refs_flat = report.flat(refs)
     held: list[str] = []
 
-    def prose(text: str, where: str, record: bool = False, verified: bool = False) -> str:
-        bad = problems(text, led, x.paper, allowed, refs_flat, record, verified)
+    def prose(text: str, where: str, record: bool = False, verified: bool = False, whole: bool = False) -> str:
+        bad = problems(text, led, x.paper, allowed, refs_flat, record, verified, whole)
         if bad:
             if not any(h.startswith(f"{where}: ") for h in held):
                 held.append(f"{where}: " + "; ".join(bad))
@@ -685,14 +687,14 @@ def page(x, led: dict, rep: dict, cmp: dict, prose) -> str:
             right.append(f"{tag(k)}{said} **{'Verified' if d.get('decision') == VERIFIED else 'Not verified'}** "
                          f"({REASON_WORDS.get(d.get('reason', ''), d.get('reason', '').replace('_', ' '))}).")
         lines.append("| " + " | ".join("<br>".join(col) for col in (left, mid, right)) + " |")
-    lines += ["", "## How the tests line up", "",
-              "- **Other record (data, model, baselines, seeds, metric):** "
-              + (prose(_cell(cmp.get("hf_setup")), "record setup", record=True) if cmp.get("hf_setup") else "not stated."),
-              "- **This run (data, model, baselines, seeds, metric):** "
+    lines += ["", "## How the tests line up (data, model, baselines, seeds, metric)", "",
+              "- **Other record:** "
+              + (prose(_cell(cmp.get("hf_setup")), "record setup", record=True, whole=True) if cmp.get("hf_setup") else "not stated."),
+              "- **This run:** "
               + (prose(_cell(rep.get("setup")), "our setup") if rep.get("setup") else "see the trace record."),
               "- **What differs, or why a test did not run:** "
               + (prose(_cell(cmp.get("differences")), "differences", record=True) if cmp.get("differences") else "see the trace record."),
-              "", "## Comparison", ""]
+              "", "## Comparison: what the evidence supports", ""]
     alone = []
     for cc in claims:
         k, d, o = cc.get("id"), cc.get("decision") or {}, other.get(cc.get("id")) or {}
@@ -700,26 +702,25 @@ def page(x, led: dict, rep: dict, cmp: dict, prose) -> str:
             alone.append(pos[k])                  # the record is silent: REFEREE's result in the table stands alone
             continue
         if o.get("supports"):
-            lines.append(f"- **For claim {pos[k]}, the evidence supports:** "
+            lines.append(f"- **Claim {pos[k]}:** "
                          + prose(_cell(o["supports"]), f"{k} supports", True, d.get("decision") == VERIFIED))
     if alone:
-        lines.append(f"- **For claim{'s' if len(alone) > 1 else ''} {_numbers(alone)}:** the other record says nothing, so "
+        lines.append(f"- **Claim{'s' if len(alone) > 1 else ''} {_numbers(alone)}:** the other record says nothing, so "
                      "the evidence is REFEREE's result in the table alone.")
     if cmp.get("overall"):
-        lines.append("- **Overall comparison and limits of this conclusion:** "
+        lines.append("- **Overall, and the limits of this conclusion:** "
                      + prose(_cell(cmp["overall"]), "overall", record=True))
     if not cmp:
         lines.append("- No other record is registered for this paper, so there is nothing to compare.")
-    terms = [t for t in rep.get("terms") or [] if isinstance(t, dict) and t.get("term") and t.get("definition")][:10]
+    # ponytail: 6 terms on the page (two printed pages); every term is in the trace record
+    terms = [t for t in rep.get("terms") or [] if isinstance(t, dict) and t.get("term") and t.get("definition")]
     if terms:
         lines += ["", "## Terms and symbols", ""] + [
-            f"- **{_short(t['term'], 40)}**: {prose(_short(t['definition'], 240), 'term ' + str(t['term'])[:20])}" for t in terms]
-    revs = sorted({_cell((o.get("entry") or {}).get("revision")) for o in other.values() if (o.get("entry") or {}).get("revision")})
-    lines += ["", "## Record checked", "",
-              f"Paper: PDF sha256 `{p['sha256'][:12]}`. Other record revision: "
-              + (", ".join(f"`{r[:10]}`" for r in revs[:4]) if revs else "not stated") + ". Run output: "
-              f"`projects/{x.root.name}/` (this page `reviewer.md`, trace record `trace.md`, ledger `ledger.json`, every "
-              "process `execution.jsonl`)."]
+            f"- **{_short(t['term'], 40)}**: {prose(_short(t['definition'], 240), 'term ' + str(t['term'])[:20])}"
+            for t in terms[:6]]
+    lines += ["", "## Record checked", "",            # (the paper's hash and each entry's revision are in the header)
+              f"Run output: `projects/{x.root.name}/` (`reviewer.md`, `trace.md` with every term and test, `ledger.json`, "
+              "`execution.jsonl`)."]
     return "\n".join(lines) + "\n"
 
 

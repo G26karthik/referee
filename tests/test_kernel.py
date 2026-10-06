@@ -428,6 +428,14 @@ def test_a_counterexample_satisfies_every_premise_of_the_exact_claim():
         assert "literal" in _refused(lambda: tasks._seal_gen(
             x, "gen:C1.1", {**g, "deviations": [{**dev, "changes_claim": True}]}, final=False))
         assert tasks._seal_gen(x, "gen:C1.1", {**g, "deviations": [{**dev, "changes_claim": False}]}, final=False)["deviations"]
+        # Oct-06 label ranking C7.2: a deviation's `used` was cut at 600 characters mid-word; a verifier judges the whole
+        # departure, so it is kept whole, or refused past the stated limit
+        long = "the script evaluates the top-k prefix event of Definition 5 on every candidate model, " * 9
+        kept = tasks._seal_gen(x, "gen:C1.1", {**g, "deviations": [{**dev, "used": long, "changes_claim": False}]},
+                               final=False)["deviations"][0]
+        assert kept["used"] == long, len(kept["used"])
+        assert "at most" in _refused(lambda: tasks._seal_gen(x, "gen:C1.1", {**g, "deviations": [
+            {**dev, "used": "x" * (tasks.FIELD_MAX + 1), "changes_claim": False}]}, final=False))
 
 
 def test_small_samples_are_decided_with_student_t():
@@ -4531,6 +4539,11 @@ def test_a_revision_never_drops_a_claim_changing_choice_without_saying_why():
         assert rec["revisions"]["dropped_claim_changing"] == [dev["used"]] and rec["revisions"]["notes"][0]["why"] == note["why"]
         strict = tasks._seal_gen(x, "gen:C1.2", g, final=True)                         # the last attempt: carried, strictest
         assert strict.get("refused") or any(d["used"] == dev["used"] and d["changes_claim"] for d in strict["deviations"]), strict
+        # Oct-06 label ranking C7.2/C7.3: the revising author saw only a 100-character prefix in the refusal and rebuilt
+        # its deviations from memory. The brief shows the previous round's sealed deviations in full.
+        shown = tasks._previous_deviations(x, "C1", 2)
+        assert dev["used"] in shown and "changes the claim" in shown, shown
+        assert tasks._previous_deviations(x, "C1", 1) == ""
 
 
 def test_a_follow_up_rounds_re_examined_omission_is_the_one_reported():
@@ -4993,6 +5006,9 @@ def test_the_reviewer_page_is_built_from_the_record_and_publishes_only_checked_p
         assert "GRACE, a tree layer trained with gradients" in page and "root mean squared error" in page
         assert "PDF file" in page or "arXiv" in page or "OpenReview" in page
         assert len(page.split()) < 700
+        # Oct-06 label ranking: 3 printed pages; the record-checked section repeated the header's paper hash and the other
+        # record's revisions. Each is printed once (the header); at most 6 terms on the page, every term in the trace.
+        assert page.count("PDF sha256") == 1, page.count("PDF sha256")
 
 
 def test_each_reading_shows_its_numbers_and_an_audit_says_what_a_failure_depends_on():
@@ -5160,6 +5176,13 @@ def test_another_reproduction_record_is_compared_only_after_the_decisions_are_se
         cfg.max_followup_checks = 0
         phase, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
         assert phase == "report" and "Decisions on the main claims" in Path(owed[0]["prompt"]).read_text(encoding="utf-8")
+        # page prose was cut mid-sentence at a silent limit; it is refused, and on the last attempt it keeps whole sentences
+        wordy = {"overview": "One sentence here. " * 100, "claims": [{"id": k, "title": "A claim", "result": "Not tested."}
+                                                                      for k in ("K1", "K2", "K3")]}
+        x = tasks._Ctx(cfg, pid)
+        assert "shorten" in _refused(lambda: tasks._seal_report(x, "report", wordy, final=False))
+        last = tasks._seal_report(x, "report", wordy, final=True)
+        assert last["overview"].endswith("here.") and len(last["overview"]) <= 1400 and last["cut"], last["cut"]
         _seal(cfg, pid, "report", {"overview": "A paper.", "claims": [{"id": k, "title": "A claim", "result": "Not tested."}
                                                                      for k in ("K1", "K2", "K3")]}, td)
         assert tasks._plan(tasks._Ctx(cfg, pid))[0] == "done"
@@ -5584,6 +5607,122 @@ def test_a_seed_that_ran_out_of_gpu_memory_alone_is_never_resumed_into_a_loop():
         assert "error" in res and "GPU" in res["error"], res
 
 
+def test_a_stage_that_shows_no_example_exists_is_never_pooled_with_the_constructions():
+    """Oct-06 label ranking C8: stage m3 built the paper's examples (violated = not a valid example) and stage m2 showed,
+    over every model, that NO example exists at m = 2 (violated = 1 on 9 admissible instances). The scope audit read the
+    whole check as building examples, so the 9 m = 2 instances were filed as 'failed constructions' and the possible
+    counterexample never reached the independent failure audit. Witness polarity is per stage: only the stages the audit
+    lists build examples; every other stage is decided as any certificate is, and its failure leads (and is audited)."""
+    from harness.reconcile import certificate
+    row = lambda st, v: {"stage": st, "violated": v, "premises": 1, "literal": None, "exact": True}
+    rows = [row("m3", 0)] * 9 + [row("m2", 1)] * 9
+    o = certificate(rows, False, False, witness=["m3"])
+    assert o["status"] == "COUNTEREXAMPLE_FOUND" and o["witnesses"] == 9 and o["constructions_failed"] == 0, o
+    assert o["witness_stages"] == ["m3"] and o["n"] == 18 and "build examples" in o["reason"], o
+    w = certificate([row("m3", 0)] * 3 + [row("m2", 0)] * 3, False, False, witness=["m3"])
+    assert w["status"] == "WITNESS_FOUND" and w["witnesses"] == 3 and "test the statement" in w["reason"], w
+    one = certificate([row("m3", 0)] * 2 + [row("m3", 1)], False, False, witness=True)       # one stage: as before
+    assert one["status"] == "WITNESS_FOUND" and one["constructions_failed"] == 1, one
+    legacy = certificate(rows, False, False, witness=True)       # an audit that read several stages as one: unread
+    assert legacy["status"] == "COUNTEREXAMPLE_FOUND" and legacy["witness_unread"] is True, legacy
+    assert legacy["cert_units"] == ["m2", "m3"], legacy
+    out = 'REFEREE_RESULT {"stage": "m2", "premises_hold": 1, "violated": 1, "lhs_exact": "0", "rhs_exact": "1"}\n'
+    assert execute.cert_rows(out)[0]["stage"] == "m2"
+    # Oct-06 label ranking C9: one stage, two polarities by reading. The untagged line tests the printed definition (no
+    # model meets it: `literal` fails); the `topk` lines build examples under the repaired reading. The printed finding
+    # leads (and is audited); the examples are reported beside it as about the changed statement.
+    c9 = [{"violated": 1, "premises": 1, "literal": "fails", "exact": True}] * 4 + \
+         [{"violated": 0, "premises": 1, "literal": None, "exact": True, "reading": "topk"}] * 3
+    o = certificate(c9, True, False, witness=["reading:topk"])
+    assert o["status"] == "COUNTEREXAMPLE_FOUND" and "WITNESS_UNDER_CHANGED_READING" in o["reason"], o
+    assert o["cert_units"] == ["reading:topk"], o
+    with tempfile.TemporaryDirectory() as t:                     # the audit names the stages; a legacy answer is re-asked
+        td = Path(t)
+        cfg, pid, root = _ready(td)
+        cert = {"id": "B", "kind": "CERTIFICATE", "claim_quote": THM, "statement_quote": THM, "role": "target",
+                "covers": ["Theorem 1"]}
+        _seal(cfg, pid, "plan", {"checks": [cert], "central_claims": [
+            {"quote": THM, "claim_type": "theory", "checks": ["B"], "scope": ["Theorem 1"]}]}, td)
+        cdir = root / "checks" / "C1"
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "script.py").write_text("ok = valid and holds(inst)\nviolated = int(premises and not ok)\n", encoding="utf-8")
+        state.write_json(cdir / "check.json", {"kind": "CERTIFICATE", "script_sha256": "s", "deviations": []})
+        state.write_json(cdir / "outcome.json", {"status": "COUNTEREXAMPLE_FOUND", "values": [0, 1], "authorized": True})
+        for k, (st, v) in enumerate((("m3", 0), ("m2", 1))):
+            state.append_jsonl(root / "execution.jsonl", {
+                "target": "C1", "mode": "evidence", "script_sha256": "s", "seed": k, "returncode": 0,
+                "stdout": f'REFEREE_RESULT {{"stage": "{st}", "premises_hold": 1, "violated": {v}, "lhs_exact": "{v}", '
+                          f'"rhs_exact": "0"}}\n'})
+        ans = lambda **w: {"checks": [{"id": "C1", "covers": [{"item": "Theorem 1", "how": "computed", "code": "holds(inst)"}],
+                                       "witness": {"is_witness": True, "code": "violated = int(premises and not ok)", **w}}]}
+        assert "several stages" in _refused(lambda: tasks._seal_scope(tasks._Ctx(cfg, pid), "scope", ans(), final=False))
+        assert "not units it printed" in _refused(
+            lambda: tasks._seal_scope(tasks._Ctx(cfg, pid), "scope", ans(stages=["m9"]), final=False))
+        legacy = tasks._seal_scope(tasks._Ctx(cfg, pid), "scope", ans(stages=["m3"]), final=False)
+        assert legacy["checks"]["C1"]["witness"] == ["m3"], legacy
+        legacy["checks"]["C1"]["witness"] = True                 # as an audit sealed before stages were asked for
+        state.write_json(root / "sealed" / "scope.json", legacy)
+        seals = state.read_json(root / "seals.json", {})
+        seals["scope"] = state.sha256((root / "sealed" / "scope.json").read_bytes())
+        state.write_json(root / "seals.json", seals)
+        owed = [o["id"] for o in tasks._plan(tasks._Ctx(cfg, pid))[1]]
+        o = state.read_json(cdir / "outcome.json")
+        assert o["status"] == "COUNTEREXAMPLE_FOUND" and o["witness_unread"] is True, o
+        assert "scope" in owed and "audit:C1" not in owed, owed                       # asked again, per stage, first
+        _seal(cfg, pid, "scope", ans(stages=["m3"]), td)
+        owed = [o["id"] for o in tasks._plan(tasks._Ctx(cfg, pid))[1]]
+        o = state.read_json(cdir / "outcome.json")
+        assert o["status"] == "COUNTEREXAMPLE_FOUND" and o["witnesses"] == 1 and not o.get("witness_unread"), o
+        assert "audit:C1" in owed and "scope" not in owed, owed                       # the m2 failure is audited
+
+
+def test_the_report_and_comparison_briefs_show_every_check_whole():
+    """Oct-06 label ranking: the compare and report briefs cut the checks' JSON at 40,000 characters (and the trace at
+    30,000), mid-structure; the workers never saw C5 to C8. Every check is shown, whole and parseable."""
+    checks = [{"id": f"C{i}", "kind": "CERTIFICATE", "status": "WITNESS_FOUND", "reason": "x" * 9000} for i in range(1, 11)]
+    real = tasks._brief
+    tasks._brief = lambda c: c
+    try:
+        text = tasks._briefs({"checks": checks})
+    finally:
+        tasks._brief = real
+    assert [c["id"] for c in json.loads(text)] == [f"C{i}" for i in range(1, 11)]
+    lines = tasks._whole_lines(["a" * 10, "b" * 10, "c" * 10], 25)        # audit result lines: whole, the rest counted
+    assert lines.split("\n")[:2] == ["a" * 10, "b" * 10] and lines.endswith("1 more result line(s) not shown; failing "
+                                                                             "lines come first)"), lines
+
+
+def test_a_check_that_ends_during_the_poll_is_audited_before_the_report():
+    """Oct-06 label ranking C7: its evidence run ended inside the `tasks` call that polled it, after the scope and failure
+    audits had been listed; nothing else was running, so the harness owed the report at once and C7's counterexample was
+    never read by the scope audit nor by the failure audit. A check that ends during the poll is audited first."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid, root = _ready(td)
+        cfg.max_followup_checks = 0
+        cert = {"id": "B", "kind": "CERTIFICATE", "claim_quote": THM, "statement_quote": THM, "role": "target",
+                "covers": ["Theorem 1"]}
+        _seal(cfg, pid, "plan", {"checks": [cert], "central_claims": [
+            {"quote": THM, "claim_type": "theory", "checks": ["B"], "scope": ["Theorem 1"]}]}, td)
+        cdir = root / "checks" / "C1"
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "script.py").write_text("ok = holds(inst)\nviolated = int(premises and not ok)\n", encoding="utf-8")
+        state.write_json(cdir / "check.json", {"kind": "CERTIFICATE", "script_sha256": "s", "deviations": []})
+
+        def ends(*a, **k):                                   # the run ends while it is polled
+            if not (cdir / "outcome.json").exists():
+                state.write_json(cdir / "outcome.json", {"status": "COUNTEREXAMPLE_FOUND", "values": [1],
+                                                         "authorized": True})
+            return False
+        real_poll, real_step = execute.poll, tasks._step
+        execute.poll, tasks._step = ends, (lambda x, c: [])
+        try:
+            phase, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
+        finally:
+            execute.poll, tasks._step = real_poll, real_step
+        assert phase != "report" and "scope" in [o["id"] for o in owed], (phase, owed)
+
+
 def test_an_existence_claim_is_shown_by_a_valid_example_and_a_failed_construction_refutes_nothing():
     """Oct-06 label ranking C2/C3: the scripts built the paper's examples (a model that is sub-k calibrated and not top-k
     calibrated) and printed violated = 1 where the construction did NOT give a valid example. The harness read 12 failed
@@ -5707,6 +5846,10 @@ def test_a_comparison_note_may_report_the_records_verdict_and_referees_own_decis
     assert ok("REFEREE verified this claim within its tested scope.", verified=True)
     assert not ok("REFEREE verified this claim within its tested scope.")                 # its decision says otherwise
     assert not ok("Both tests confirm the theorem.")                                      # nobody's verdict is free
+    # Oct-06 label ranking: the record-setup field (about the other record by definition) was withheld for naming that
+    # record's labels; in it every sentence is the record's unless it names REFEREE
+    assert ok("Verdict labels verified, falsified, inconclusive and toy are not defined.", whole=True)
+    assert not ok("REFEREE verified the theorem.", whole=True)
 
 
 def test_scope_items_count_as_tested_only_where_an_audit_found_them_computed():
@@ -5770,7 +5913,7 @@ def test_the_audit_of_what_a_test_computes_rests_on_the_scripts_own_lines():
             "witness": {"is_witness": True, "code": "violated = int(premises and not ok)"}}]}
         _seal(cfg, pid, "scope", good, td)
         rec = report.sealed_record(root, "scope")["checks"]["C1"]
-        assert rec["covers"]["Theorem 2 (ADD)"]["how"] == "transfer" and rec["witness"] is True, rec
+        assert rec["covers"]["Theorem 2 (ADD)"]["how"] == "transfer" and rec["witness"] == [""], rec   # one stage
         x = tasks._Ctx(cfg, pid)
         assert "scope" not in [o["id"] for o in tasks._plan(x)[1]]                     # audited once, not asked again
         o = state.read_json(cdir / "outcome.json")
@@ -5872,6 +6015,13 @@ def test_every_main_claim_gets_a_slot_and_each_check_states_its_projected_cost()
         dfn = _plan(x, [_run(define={"acc_a": {"definition": "top-1 accuracy", "unit": "fraction", "aggregation": "mean over test"}})],
                     [_claim()])["checks"][0]["define"]
         assert dfn["acc_a"]["unit"] == "fraction", dfn
+        # Oct-06 changepoint C3: a 711-character definition was sealed cut at 300 ("the unlabeled threshold grids of
+        # calc_es"), so the script author never saw what the dispersion is. A definition is kept whole, or refused.
+        long = "Per stage, the dispersion of the KM-ARL estimates over thresholds, " * 10
+        whole = _plan(x, [_run(define={"d": {"definition": long, "unit": "frames", "aggregation": "mean"}})],
+                      [_claim()])["checks"][0]["define"]
+        assert whole["d"]["definition"] == long, len(whole["d"]["definition"])
+        assert "at most" in _refused(lambda: _plan(x, [_run(define={"d": "x" * (tasks.FIELD_MAX + 1)})], [_claim()]))
     n = report.counts({"stages": {}, "values": [1.0], "processes": {"processes": 5, "seeds": 3, "retries": 2, "cancelled": 0},
                        "data_identity": {"a": {}, "b": {}}, "execution": {"runs_ended": 3}})
     assert (n["processes"], n["seeds"], n["retries"], n["datasets"], n["launches"]) == (5, 3, 2, 2, 3), n

@@ -617,7 +617,8 @@ def cert_rows(stdout: str) -> list[dict]:
                          **{k: float(d[k]) for k in ("lhs", "rhs") if isinstance(d.get(k), (int, float))
                             and not isinstance(d.get(k), bool)},
                          "exact": all(isinstance(d.get(k), str) and d.get(k) for k in ("lhs_exact", "rhs_exact")),
-                         **({"reading": str(d["reading"])[:40]} if d.get("reading") else {})})
+                         **({"reading": str(d["reading"])[:40]} if d.get("reading") else {}),
+                         **({"stage": str(d["stage"])[:80]} if d.get("stage") else {})})
     return rows
 
 
@@ -1674,7 +1675,7 @@ def _reconciled(check: dict, st: dict, authorized: bool, why: str, failure: str 
                      metric=check.get("metric", ""), undefined=st.get("undefined"),
                      # what an independent audit of the script found (report.audit_of): stages that compute an exact
                      # quantity, and a certificate that builds examples of an existence statement
-                     exact=(st.get("audit") or {}).get("exact"), witness=bool((st.get("audit") or {}).get("witness")),
+                     exact=(st.get("audit") or {}).get("exact"), witness=(st.get("audit") or {}).get("witness") or False,
                      argued=bool(check.get("premise_argument")))
 
 
@@ -1739,11 +1740,12 @@ def _redecide(cfg: state.Config, root: Path, cid: str, why: str, extra: dict | N
         else:
             rows += cert_rows(recs[seed].get("stdout") or "")
     new = certificate(rows, any(d.get("changes_claim") for d in c.get("deviations") or []), bool(c.get("step")),
-                      crashed=crashed, witness=bool(au.get("witness")), argued=bool(c.get("premise_argument")))
+                      crashed=crashed, witness=au.get("witness") or False, argued=bool(c.get("premise_argument")))
     shutil.copyfile(cdir / "outcome.json", cdir / f"outcome.redecided.{k}.json")
     decided = ("status", "reason", "rule", "n", "instances", "admissible", "admissible_instances", "readings_per_instance",
                "violated_admissible", "reading", "literal", "premises_unsaid", "under_named_reading", "below_precision",
-               "crashed", "values", "witness", "witnesses", "constructions_failed")
+               "crashed", "values", "witness", "witnesses", "constructions_failed", "witness_stages", "cert_stages", "cert_units",
+               "witness_unread")
     out = {**{x: v for x, v in o.items() if x not in decided}, **new, "values": [r["violated"] for r in rows],
            "redecided": stamp(len(recs)), **(extra or {})}
     state.write_json(cdir / "outcome.json", out)

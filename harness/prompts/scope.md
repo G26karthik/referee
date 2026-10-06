@@ -36,7 +36,12 @@ Paper: {{title}}   (full text under READ, page-tagged)
      full-rank calibrated" when no full-rank deviation is computed).
    - `witness` (exact-arithmetic tests only): does the script BUILD EXAMPLES of an existence statement, so that
      `violated` = 1 means "this constructed instance is not a valid example" (not "this instance breaks a universal
-     statement")? {"is_witness": true or false, "code": "the verbatim line that computes `violated`"}.
+     statement")? {"is_witness": true or false, "code": "the verbatim line that computes `violated`", "stages": [...]}.
+     Judge each unit the script prints (listed under `stages`: each stage, and `reading:<name>` for the lines of one
+     named reading). `stages` names only the units that BUILD examples: a stage (all its lines), or `reading:<name>`
+     (only that reading's lines). A unit whose `violated` = 1 means "no example exists on this admissible instance" (for
+     every model, every choice), or that the text as printed fails, TESTS the statement: leave it out, even when other
+     units build examples. Leave `stages` empty only when the script prints one unit.
    - `exact`: the stages whose compared values are an EXACT function of the configuration, the same for every seed and
      every data draw (a parameter count, a model size). For each: {"stage": "<stage name>", "code": "<the verbatim line
      that computes the compared value>"}. A timing, an error on data, anything trained or sampled is NOT exact. Leave the
@@ -49,6 +54,6 @@ Paper: {{title}}   (full text under READ, page-tagged)
 Write ONLY this JSON to the output path you were given:
 {"forms": [{"id": "K1", "form": "", "quote": "verbatim"}],
  "checks": [{"id": "C1", "covers": [{"item": "", "how": "computed|transfer|not_computed", "code": "", "argument": "", "why": ""}],
-             "witness": {"is_witness": false, "code": ""}, "exact": [{"stage": "", "code": ""}],
+             "witness": {"is_witness": false, "code": "", "stages": []}, "exact": [{"stage": "", "code": ""}],
              "outputs": [{"name": "", "reading": "", "definition": "", "unit": "", "aggregation": "", "code": ""}]}],
  "notes": ""}

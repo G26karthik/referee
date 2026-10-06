@@ -69,8 +69,40 @@ def _below_precision(r: dict) -> bool:
     return abs(r["lhs"] - r["rhs"]) <= _TOL * max(1.0, abs(r["lhs"]), abs(r["rhs"]))
 
 
-def certificate(results: list[dict], changed: bool, step: bool, crashed: int = 0, witness: bool = False,
+def certificate(results: list[dict], changed: bool, step: bool, crashed: int = 0, witness: bool | list = False,
                 argued: bool = False) -> dict:
+    """`witness`: the units an independent audit found BUILD EXAMPLES of an existence statement: stage names, and
+    `reading:<name>` for the lines of one named reading (a list; True from an audit that read the check as one, honoured
+    only when it printed one stage). Every other unit tests the statement and is decided as any certificate is: a unit
+    that shows no example exists on an admissible instance is never a failed construction (Oct-06 label ranking C8,
+    m = 2; C9, the printed definition no model meets), and its failure leads, so it is audited."""
+    stages = sorted({str(r.get("stage") or "") for r in results})
+    units = sorted(({s for s in stages if s} or set()) | {f"reading:{r['reading']}" for r in results if r.get("reading")})
+    tag = {"cert_units": units} if units else {}
+    if witness is True and len(stages) > 1:     # one answer for several stages: unread, decided strictest, asked again
+        return {**_certificate(results, changed, step, crashed, False, argued), **tag, "witness_unread": True}
+    if not witness or witness is True:
+        return {**_certificate(results, changed, step, crashed, bool(witness), argued), **tag}
+    ws = {str(w) for w in witness}
+    builds = lambda r: str(r.get("stage") or "") in ws or f"reading:{r.get('reading') or ''}" in ws
+    built = [r for r in results if builds(r)]
+    tested = [r for r in results if not builds(r)]
+    if not tested or not built:
+        return {**_certificate(results, changed, step, crashed, bool(built), argued), **tag}
+    t = _certificate(tested, changed, step, crashed, False, argued)
+    w = _certificate(built, changed, step, 0, True, argued, examples=True)
+    lead, side, where = ((t, w, "in the units that build examples") if t["status"] in FAILURE else
+                         (w, t, "in the units that test the statement"))
+    return {**lead, **tag, "n": t["n"] + w["n"], "instances": t.get("instances", 0) + w.get("instances", 0),
+            "admissible": t.get("admissible", 0) + w.get("admissible", 0),
+            "admissible_instances": t.get("admissible_instances", 0) + w.get("admissible_instances", 0),
+            "witness": lead is w, "witness_stages": sorted(ws), "witnesses": w.get("witnesses", 0),
+            "constructions_failed": w.get("constructions_failed", 0),
+            "reason": f"{lead['reason']}; {where}: {side['status']}: {side['reason']}"}
+
+
+def _certificate(results: list[dict], changed: bool, step: bool, crashed: int = 0, witness: bool = False,
+                 argued: bool = False, examples: bool = False) -> dict:
     """Per instance: `violated`, `premises` (1 if every premise of the tested reading holds on
     it, evaluated exactly; None if the script did not say — not admissible, and not 'unmet'),
     `literal` (the text exactly as printed: holds, fails = its printed premises hold and its printed
@@ -109,7 +141,7 @@ def certificate(results: list[dict], changed: bool, step: bool, crashed: int = 0
         lit["premise_not_met"], lit["undefined"] = lit["undefined"], 0
         relabel = ("; the script labels the text as printed 'undefined', but its premise argument (checked by its verifier) "
                    "says a printed premise can never hold: as printed, the premise is not met")
-    if witness and groups.get(""):
+    if witness and (groups.get("") or examples):    # (`examples`: units the audit named, all under a named reading)
         return _witness(results, base, groups, lit, crashed, n, len(fuzzy), changed)
     # A witness certificate whose every line is a named (changed) reading built no example of the statement AS PRINTED
     # (Oct-06 GRACE C3: the printed index runs out of the tree, `undefined` in every case): it is decided as any
@@ -189,10 +221,12 @@ def _witness(results: list[dict], base: list[dict], groups: dict, lit: dict, cra
                   "(`literal`), beside the recorded change of reading: they show the existence statement for the cases they "
                   f"cover{gap}", **out)
     if changed:
-        return _r("WITNESS_UNDER_CHANGED_READING" if valid else "VIOLATION_UNDER_CHANGED_READING",
-                  (f"{len(valid)} valid example(s) only under the recorded change of reading" if valid else
+        ok = len(valid) + len(moved)            # under the recorded change, a named reading's examples are as changed
+        return _r("WITNESS_UNDER_CHANGED_READING" if ok else "VIOLATION_UNDER_CHANGED_READING",
+                  (f"{ok} valid example(s) only under the recorded change of reading" if ok else
                    f"no valid example under the recorded change of reading ({len(failed)} failed)")
-                  + "; as printed: " + ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in lit.items() if v)
+                  + ("; as printed: " + ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in lit.items() if v)
+                     if any(lit.values()) else "")
                   + ": about the changed statement, never that no example exists", **out)
     if valid:
         return _r("WITNESS_FOUND", f"{len(valid)} of {len(printed)} constructed case(s) meet every premise and show the "
@@ -203,8 +237,8 @@ def _witness(results: list[dict], base: list[dict], groups: dict, lit: dict, cra
                                           "changed statement" if moved else "")
                   + ": a failed construction shows a gap in the construction, never that no example exists", **out)
     if not printed and moved:
-        return _r(CONSTRUCTION_FAILED, f"valid examples only under a changed reading ({len(moved)}), none as printed: about "
-                  "the changed statement, never that no example exists", **out)
+        return _r("WITNESS_UNDER_CHANGED_READING", f"{len(moved)} valid example(s), all under a named (changed) reading: "
+                  "about the changed statement", **out)
     return _r("PREMISE_NOT_MET", f"none of the {n} constructed case(s) meets the premises of the statement: nothing was "
               "shown", **out)
 

@@ -534,7 +534,8 @@ def _checks(root: Path, plan: dict) -> list[dict]:
                     "values": o.get("values"), "literal": o.get("literal"),
                     "admissible": o.get("admissible"), "protocol": o.get("protocol"),
                     **{k: o[k] for k in ("instances", "admissible_instances", "readings_per_instance", "redecided", "witness",
-                                         "witnesses", "constructions_failed", "resource_failures", "halted") if k in o},
+                                         "witnesses", "constructions_failed", "witness_stages", "witness_unread", "resource_failures",
+                                         "halted") if k in o},
                     # what an independent audit found the check's code computes (scope items, exact quantities, outputs)
                     "scope_audit": audit.get(c["id"]), "processes": procs.get(c["id"]),
                     "image_check": o.get("image_check"), "pilot_values": o.get("pilot_values"), "pilot_stages": o.get("pilot_stages"),

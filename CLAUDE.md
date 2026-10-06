@@ -100,7 +100,11 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     EXAMPLES of an existence statement (`violated` = not a valid example) is a witness certificate: a
     valid example under the printed reading is WITNESS_FOUND (it shows the statement for the cases it
     covers); a failed construction is CONSTRUCTION_FAILED, a gap in the construction (like a failed proof
-    step), never a counterexample.
+    step), never a counterexample. Witness polarity is per unit (a stage, or `reading:<name>` for one reading's
+    lines): the audit names the units that build examples; a unit whose `violated` means no example exists on an
+    admissible instance, or whose printed text fails, tests the statement, is decided as any certificate is, and
+    its failure leads (and is audited); an older one-answer audit of a check that printed several stages is
+    unread and asked again.
 17. **Small samples are decided with Student-t** (two-sided 95%): a relation beyond t·SE; a
     reproduction RESOLVED inside the CI of the mean, FAILED outside the prediction interval.
     Runs are ONE measurement (`n_independent` 1) only when they are identical in every output and
@@ -251,8 +255,10 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     A scope entry that lists several items is several (`report.parts`; refused, split on the last attempt).
 26. **Self-correction keeps the scope.** A revised script that drops or relabels a claim-changing deviation
     of its previous round, or runs fewer instances or seeds, says why in `revision_notes` (shown to the
-    verifier, kept in the ledger); unexplained on the last attempt, the deviation is carried forward. A
-    revision fixes what was named; it never weakens the experiment to pass.
+    verifier, kept in the ledger); unexplained on the last attempt, the deviation is carried forward. The
+    revision brief shows the previous round's sealed deviations in full. A revision fixes what was named; it
+    never weakens the experiment to pass. Free text a later reader judges (a definition, a deviation, a fidelity
+    line, a revision note) is kept whole or refused past its limit, never cut silently.
 
 27. **Claims are the paper's, extracted before any plan.** A `claims` task reads the paper alone (beside the lenses)
     and seals every main claim with its words, a plain statement, `claim_type`, scope (one item per entry), the

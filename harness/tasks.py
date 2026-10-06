@@ -53,6 +53,15 @@ CRITERIA = ("stated", "supplied")
 # ponytail: 16 deviations per script; more is several choices of one kind, merged into one entry. Past the cap
 # a script is refused, never cut: a verifier must see every departure it judges.
 MAX_DEVIATIONS = 16
+# ponytail: 2000 characters per free-text field a later reader judges (an output's definition, unit and aggregation; a
+# deviation's `used` and `why`; a fidelity line; a revision note): kept whole or refused, never cut mid-word.
+FIELD_MAX = 2000
+
+
+def _cap(text, n: int) -> str:
+    """A model's free text past its limit is cut visibly, with what was cut, never silently (a reader must know)."""
+    t = str(text or "")
+    return t if len(t) <= n else f"{t[:n]} [cut here: {len(t)} characters, past the limit of {n}]"
 SEVERITY = ("NOTE", "MINOR", "MAJOR", "FATAL")
 CLASSES = ("CONFIRMED_FINDING", "PLAUSIBLE_CONCERN", "OPEN_QUESTION", "DISMISSED")
 PROMPTS = Path(__file__).parent / "prompts"
@@ -264,12 +273,15 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
             x.waiting.add(c["id"])
     for c in plan["checks"]:
         tasks += _step(x, c)
-    tasks += _audits(x, plan)
-    # What each finished test computed is audited by an independent reader as soon as it ends (scope items, exact
-    # quantities, examples): coverage, the follow-up round and every decision rest on it, never on the plan's word.
-    _apply_scope(x, plan)
-    tasks += _scope_task(x, plan)
+    # Runs are polled first: a check that ends in this poll is audited in this same call, never skipped on the way to
+    # the report (Oct-06 label ranking C7).
     executing = [c["id"] for c in plan["checks"] if execute.poll(x.cfg, x.pid, c["id"])]
+    # What each finished test computed is audited by an independent reader as soon as it ends (scope items, exact
+    # quantities, examples): coverage, the follow-up round and every decision rest on it, never on the plan's word. It
+    # is applied before failures are listed for their audit: a failure it reclassifies is never sent to one first.
+    _apply_scope(x, plan)
+    tasks += _audits(x, plan)
+    tasks += _scope_task(x, plan)
     running = executing + sorted(x.waiting)
     # The follow-up round does not wait on a long run: once only executions remain and each has at least
     # FOLLOWUP_AFTER_S left (measured from its pilot), the follow-up plans for what has ended, beside them; what they
@@ -301,11 +313,10 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
         reviewer.render(x, ledger, None)                  # the harness's own pages, before any model text
         draft = (x.root / "trace.md").read_text(encoding="utf-8")
         return "report", [x.task("report", "report", _template(
-            "report", title=title, draft=draft[:30_000],
-            checks=json.dumps([_brief(c) for c in ledger["checks"]], ensure_ascii=False, indent=1)[:40_000],
+            "report", title=title, draft=draft, checks=_briefs(ledger),
             central=json.dumps([{k: cc.get(k) for k in ("id", "statement", "quote", "claim_type", "scope", "decision",
                                                         "completion", "checks", "why_unchecked")}
-                                for cc in ledger["central_claims"]], ensure_ascii=False, indent=1)[:40_000]))], []
+                                for cc in ledger["central_claims"]], ensure_ascii=False, indent=1)))], []
     # Another reproduction record (an HF logbook) is compared only once the decisions are sealed: it is shown beside each
     # claim with whether the tests are comparable, and never changes a decision.
     if references(x) and x.sealed("compare") is None:
@@ -330,11 +341,22 @@ def _scope_owed(x: _Ctx, plan: dict) -> tuple[list[dict], list[dict]]:
         if not o.get("values") or o.get("status") in ("BLOCKED", "NOT_CHECKABLE") or o.get("authorized") is False:
             continue
         sha = run.get("script_sha256") or run.get("command") or ""
-        if (done.get(c["id"]) or {}).get("script") == sha or (skip.get(c["id"]) or {}).get("script") == sha:
-            continue
+        if ((done.get(c["id"]) or {}).get("script") == sha and not o.get("witness_unread"))                 or (skip.get(c["id"]) or {}).get("script") == sha:
+            continue                     # (an audit that read several stages as one is asked again, per stage)
         checks.append({**c, "_run": run, "_outcome": o, "_sha": sha})
     forms = [k for k in report.claims_of(x.root) if not k.get("form") and k.get("id") not in (rec.get("unformed") or [])]
     return forms, checks
+
+
+def _cert_units(x: _Ctx, c: dict) -> set[str]:
+    """The units a certificate's evidence runs of its approved script printed: each stage ("" for lines that name none)
+    and `reading:<name>` for each named reading."""
+    log, out = x.root / "execution.jsonl", set()
+    for r in map(json.loads, log.read_text(encoding="utf-8").splitlines() if log.exists() else []):
+        if r.get("target") == c["id"] and r.get("mode") == "evidence" and r.get("script_sha256") == c.get("_sha"):
+            for row in execute.cert_rows(r.get("stdout") or ""):
+                out |= {row.get("stage", "")} | ({f"reading:{row['reading']}"} if row.get("reading") else set())
+    return out or {""}
 
 
 def _scope_task(x: _Ctx, plan: dict) -> list[dict]:
@@ -352,7 +374,8 @@ def _scope_task(x: _Ctx, plan: dict) -> list[dict]:
             "id": c["id"], "kind": c["kind"], "claim": c["claim"][:300], "covers": c.get("covers") or [],
             "relation": (c.get("target") or {}).get("relation") or "", "metric": run.get("metric") or c.get("metric") or "",
             "readings": [r.get("name") for r in run.get("readings") or c.get("readings") or [] if isinstance(r, dict)],
-            "stages": sorted(o.get("stages") or {})[:80], "statement": c.get("statement") or "", "step": c.get("step") or "",
+            "stages": sorted(o.get("stages") or {} if c["kind"] != "CERTIFICATE" else _cert_units(x, c) - {""})[:80],
+            "statement": c.get("statement") or "", "step": c.get("step") or "",
             "script": script.as_posix() if script.exists() else f"(no script: the authors' command {str(run.get('command'))[:200]!r})",
             "declared_changes": [str(d.get("used", ""))[:200] for d in run.get("deviations") or []][:12]}, ensure_ascii=False))
     return [x.task("scope", "scope", _template("scope", title=x.meta["title"], claims=claims, checks="\n".join(lines)),
@@ -379,7 +402,7 @@ def _seal_scope(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     prev = x.sealed("scope") or {}
     rec = {"forms": dict(prev.get("forms") or {}), "unformed": list(prev.get("unformed") or []),
            "checks": dict(prev.get("checks") or {}), "unaudited": dict(prev.get("unaudited") or {}),
-           "notes": str(obj.get("notes") or "")[:2000]}
+           "notes": _cap(obj.get("notes"), 2000)}
     errors: list[str] = []
     want = {k["id"]: k for k in forms_owed}
     for f in [f for f in obj.get("forms") or [] if isinstance(f, dict)]:
@@ -432,10 +455,23 @@ def _seal_scope(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
                 errors.append(f"{c['id']}: no `covers` entry for {s[:80]!r}")
                 cov[s] = {"how": "not_computed", "why": "the audit gave no entry for it"}
         w = e.get("witness") if isinstance(e.get("witness"), dict) else {}
-        witness = c["kind"] == "CERTIFICATE" and w.get("is_witness") is True
-        if witness and not (found(str(w.get("code") or "")) and "violated" in str(w.get("code"))):
-            errors.append(f"{c['id']}: a witness certificate cites the verbatim script line that computes `violated`")
-            witness = False
+        witness: list[str] = []
+        if c["kind"] == "CERTIFICATE" and w.get("is_witness") is True:
+            names = _cert_units(x, c)
+            listed = [str(v) for v in w.get("stages") or []]
+            if not (found(str(w.get("code") or "")) and "violated" in str(w.get("code"))):
+                errors.append(f"{c['id']}: a witness certificate cites the verbatim script line that computes `violated`")
+            elif [v for v in listed if v not in names]:
+                errors.append(f"{c['id']}: witness `stages` {[v for v in listed if v not in names][:6]} are not units it "
+                              f"printed ({sorted(names)[:40]})")
+            elif len(names) == 1:
+                witness = sorted(names)
+            elif not listed:
+                errors.append(f"{c['id']}: it printed several stages or readings ({sorted(names)[:40]}): `stages` lists the "
+                              "units that BUILD examples (a stage, or `reading:<name>` for that reading's lines only); a "
+                              "unit whose `violated` means no example exists tests the statement, and is left out")
+            else:
+                witness = sorted(set(listed))
         stages = set((c["_outcome"].get("stages") or {}).keys()) or {""}
         exact = []
         for v in [v for v in e.get("exact") or [] if isinstance(v, dict) and (v.get("stage") or v.get("code"))]:
@@ -454,7 +490,10 @@ def _seal_scope(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
                 errors.append(f"{c['id']}: output {str(v['name'])[:40]!r} needs to be a compared output ({sorted(names)}) "
                               "with its definition, unit, aggregation and the verbatim line computing it")
                 continue
-            outs.append({k: str(v.get(k) or "")[:300] for k in ("name", "reading", "definition", "unit", "aggregation")})
+            if any(len(str(v.get(k) or "")) > FIELD_MAX for k in ("definition", "unit", "aggregation")):
+                errors.append(f"{c['id']}: output {str(v['name'])[:40]!r}: at most {FIELD_MAX} characters per field")
+                continue
+            outs.append({k: str(v.get(k) or "") for k in ("name", "reading", "definition", "unit", "aggregation")})
         rec["checks"][c["id"]] = {"script": c["_sha"], "covers": cov, "witness": witness, "exact": exact, "outputs": outs}
         rec["unaudited"].pop(c["id"], None)
     for cid in by:
@@ -487,7 +526,8 @@ def _apply_scope(x: _Ctx, plan: dict) -> None:
         if not o or not (a and (a.get("exact") or a.get("witness")) or argued):
             continue
         key = state.sha256(json.dumps({"exact": (a or {}).get("exact"), "witness": (a or {}).get("witness"),
-                                       "argued": bool(argued)}, sort_keys=True))[:16]
+                                       "argued": bool(argued), **({"rule": "per stage"} if (a or {}).get("witness") is True
+                                                                  else {})}, sort_keys=True))[:16]
         if o.get("audit_applied") != key and o.get("status") not in ("BLOCKED", "NOT_CHECKABLE") and o.get("authorized") is not False:
             execute._redecide(x.cfg, x.root, c["id"], "applying the independent audit of what its code computes",
                               {"audit_applied": key})
@@ -542,14 +582,33 @@ def register_reference(cfg: state.Config, pid: str, path: str, source: str) -> d
         return {"registered": name, "sha256": state.sha256(data)}
 
 
+def _whole_lines(lines: list[str], budget: int) -> str:
+    """Lines up to a character budget, never cut mid-line; what is left out is counted, visibly."""
+    out, used = [], 0
+    for ln in lines:
+        if out and used + len(ln) + 1 > budget:
+            break
+        out.append(ln)
+        used += len(ln) + 1
+    rest = len(lines) - len(out)
+    return "\n".join(out) + (f"\n({rest} more result line(s) not shown; failing lines come first)" if rest else "")
+
+
+def _briefs(ledger: dict) -> str:
+    """Every check, whole and indented (short lines: a worker's Read cuts a very long line), read in parts: never cut
+    mid-structure (Oct-06 label ranking: a 40,000-character cut hid C5 to C8 from the report and comparison workers)."""
+    # ponytail: no size cap; about 130 KB for nine checks. Trim `_brief`'s fields if briefs grow past what a worker reads.
+    return json.dumps([_brief(c) for c in ledger["checks"]], ensure_ascii=False, indent=1)
+
+
 def _compare_task(x: _Ctx, ledger: dict) -> dict:
     refs = references(x)
     return x.task("compare", "compare", _template(
         "compare", title=x.meta["title"],
         refs="\n".join(f"- {(x.root / 'reference' / r['file']).as_posix()} (source: {r['source']})" for r in refs),
         central=json.dumps([{k: cc.get(k) for k in ("id", "statement", "quote", "claim_type", "scope", "decision", "checks")}
-                            for cc in ledger["central_claims"]], ensure_ascii=False, indent=1)[:30_000],
-        checks=json.dumps([_brief(c) for c in ledger["checks"]], ensure_ascii=False, indent=1)[:40_000]),
+                            for cc in ledger["central_claims"]], ensure_ascii=False, indent=1),
+        checks=_briefs(ledger)),
         tuple(x.root / "reference" / r["file"] for r in refs), paper=False)
 
 
@@ -596,7 +655,7 @@ def _seal_compare(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     if refs and out and len(paper_level["overall"]) < 20:
         errors.append("`overall`: what the two records together support, and the limits of that conclusion")
     _fail_or_drop(errors, final)
-    return {"claims": out, **paper_level, "notes": str(obj.get("notes") or "")[:2000]}
+    return {"claims": out, **paper_level, "notes": _cap(obj.get("notes"), 2000)}
 
 
 def _discovery_text(x: _Ctx) -> str:
@@ -658,7 +717,7 @@ def _followup_text(ledger: dict, undecided: list[dict], executing: list[str] = (
             + ("\n".join(f"- {cc['id'] + ' ' if cc.get('id') else ''}{cc['quote']!r}: {cc['claim_status']} (checks {', '.join(cc['checks']) or 'none'}; "
                          f"why unchecked: {cc.get('why_unchecked') or '-'})" for cc in undecided) or "- none") + busy
             + "\n=== WHAT EACH CHECK FOUND (harness statuses and reasons) ===\n"
-            + json.dumps(done, ensure_ascii=False, indent=1)[:20_000]
+            + json.dumps(done, ensure_ascii=False, indent=1)                                  # every check, whole
             + "\nA check with a `data_blocker` could not acquire its data: its class says whether the source is missing, "
               "inaccessible, empty, failed validation, or a network fault of this run; another registry record, another file "
               "of the same record, or the same source again (after a transient fault) is a legitimate follow-up.\n"
@@ -791,11 +850,12 @@ def _step(x: _Ctx, c: dict) -> list[dict]:
                 f"acquired-data manifest). Never fix it by weakening the claim. The error (result lines masked):\n"
                 f"{setup.read_text(encoding='utf-8')[-2500:]}\n"
                 f"--- the script ---\n{(cdir / f'script.{r - 1}.py').read_text(encoding='utf-8')}\n"
+                + _previous_deviations(x, cid, r)
                 if r > 1 and setup.exists() else "" if not prev else
                 f"\n=== REVISION {r}: an independent verifier rejected the previous attempt ===\nFix exactly "
                 f"this, from the paper's own words (never by weakening the claim or inventing a detail):\n"
                 f"{prev['required_changes'] or prev['notes']}\n--- the rejected script ---\n"
-                f"{(cdir / f'script.{r - 1}.py').read_text(encoding='utf-8')}\n")
+                f"{(cdir / f'script.{r - 1}.py').read_text(encoding='utf-8')}\n" + _previous_deviations(x, cid, r))
             try_cmd = (f'cd "{state.ROOT.as_posix()}" && PYTHONUTF8=1 SH_PROJECTS_DIR="{x.cfg.projects.as_posix()}" '
                        f'SH_ALLOW_INSTALL={int(x.cfg.allow_install)} SH_ALLOW_SCRIPT_EXEC={int(x.cfg.allow_script_exec)} '
                        f'"{Path(x.cfg.python).as_posix()}" run.py try {x.pid} gen:{cid}.{r}')
@@ -1128,8 +1188,9 @@ def _audits(x: _Ctx, plan: dict) -> list[dict]:
     read = set(((x.sealed("scope") or {}).get("checks") or {})) | set(((x.sealed("scope") or {}).get("unaudited") or {}))
     # a certificate's failure is audited once the scope audit said whether it builds examples (a failed construction is
     # no counterexample, and needs no audit)
+    unread = lambda c: (state.read_json(x.root / "checks" / c["id"] / "outcome.json") or {}).get("witness_unread")
     return [_audit_task(x, c) for c in plan["checks"]
-            if (c["kind"] != "CERTIFICATE" or c["id"] in read)
+            if (c["kind"] != "CERTIFICATE" or (c["id"] in read and not unread(c)))
             and report.needs_audit(x.root, c) and x.sealed(f"audit:{c['id']}") is None]
 
 
@@ -1150,11 +1211,11 @@ def _audit_task(x: _Ctx, c: dict) -> dict:
     script = cdir / "script.py"
     return x.task(f"audit:{c['id']}", "audit", _template(
         "audit", title=x.meta["title"], pages_dir=x.pages_dir, check_id=c["id"], kind=c["kind"], status=o.get("status"),
-        claim=c["claim"], spec=_spec_text(c), outcome=json.dumps(shown, ensure_ascii=False, indent=1)[:6000],
+        claim=c["claim"], spec=_spec_text(c), outcome=json.dumps(shown, ensure_ascii=False, indent=1),
         script=script.as_posix() if script.exists() else "(no script: the authors' documented command)",
         deviations=json.dumps([{"index": i, **{k: d.get(k) for k in ("printed", "used", "why", "changes_claim")}}
-                               for i, d in enumerate(run.get("deviations") or [])], ensure_ascii=False, indent=1)[:8000],
-        results="\n".join(lines)[:12_000] or "(no result lines recorded)"),
+                               for i, d in enumerate(run.get("deviations") or [])], ensure_ascii=False, indent=1),
+        results=_whole_lines(lines, 12_000) or "(no result lines recorded)"),
         (script,) if script.exists() else ())
 
 
@@ -1345,7 +1406,7 @@ def _seal_lens(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
                      "calculation": c.get("calculation") if isinstance(c.get("calculation"), dict) else None})
     _fail_or_drop(errors, final)
     return {"lens": lens, "concerns": kept, "dropped": dropped,
-            "unasked_question": str(obj.get("unasked_question") or "")[:2000], "notes": str(obj.get("notes") or "")[:2000]}
+            "unasked_question": _cap(obj.get("unasked_question"), 2000), "notes": _cap(obj.get("notes"), 2000)}
 
 
 # No fixed number of main claims: the extractor lists every main claim and no more (one per distinct conclusion; a
@@ -1366,7 +1427,7 @@ def _seal_claims(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     if not out:
         errors.append("no main claim was extracted: every paper states at least one result")
     _fail_or_drop(errors, final)
-    return {"claims": out, "dropped": dropped, "notes": str(obj.get("notes") or "")[:2000]}
+    return {"claims": out, "dropped": dropped, "notes": _cap(obj.get("notes"), 2000)}
 
 
 def _validate_claims(x: _Ctx, raw: list[dict], known: list[dict], first: int) -> tuple[list, list, list]:
@@ -1791,8 +1852,13 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         if isinstance(c.get("define"), dict):
             # what each compared output is, carried to the script author, the verifier, the audit and the report: its
             # definition, unit and aggregation (a legacy plain string is its definition)
-            rec["define"] = {str(k)[:60]: ({f: str(v.get(f) or "")[:300] for f in ("definition", "unit", "aggregation")}
-                                           if isinstance(v, dict) else str(v)[:300]) for k, v in list(c["define"].items())[:12]}
+            rec["define"] = {str(k)[:60]: ({f: str(v.get(f) or "") for f in ("definition", "unit", "aggregation")}
+                                           if isinstance(v, dict) else str(v)) for k, v in list(c["define"].items())[:12]}
+            long = [k for k, v in rec["define"].items()
+                    if any(len(f) > FIELD_MAX for f in (v.values() if isinstance(v, dict) else [v]))]
+            if long:
+                errs.append(f"{cid}: `define` {long}: at most {FIELD_MAX} characters per field; state what the output "
+                            "is, its unit and aggregation, and leave the protocol to the check's other fields")
         est = c.get("estimate") if isinstance(c.get("estimate"), dict) else {}
         try:
             mins, n = float(est.get("minutes_per_run") or 0), int(est.get("runs") or 0)
@@ -1971,7 +2037,7 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         if c["central"] and c["id"] not in linked:
             c["central"], c["incidental_why"] = False, c["incidental_why"] or "its link to a central claim was refused at the seal"
     return {"checks": checks, "central_claims": central, "dropped": dropped,
-            "repo_is_authors": attributed, "repo_note": str(obj.get("repo_note") or "")[:1000]}
+            "repo_is_authors": attributed, "repo_note": _cap(obj.get("repo_note"), 1000)}
 
 
 def _readings(x: _Ctx, items, errs: list[str], cid: str, record: Path | None = None) -> list[dict]:
@@ -2079,8 +2145,8 @@ def _seal_bind(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     return {"identity": {"established": not why, "reason": "; ".join(why) or "two independent keys agree",
                          "basis": "independent verifier + whole documented command and metric key at the pinned commit"},
             "command": cmd, "metric": key or c["metric"], "seed_flag": flag if seeded else "",
-            "runs": runs or 3, "runs_quote": str(obj.get("runs_quote") or "")[:500],
-            "prepare": prepare, "notes": str(obj.get("notes") or "")[:1000]}
+            "runs": runs or 3, "runs_quote": _cap(obj.get("runs_quote"), 500),
+            "prepare": prepare, "notes": _cap(obj.get("notes"), 1000)}
 
 
 def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
@@ -2180,8 +2246,11 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
             errors.append("each deviation needs `changes_claim`: true if it changes what the printed claim says (a "
                           "premise dropped or added, the conclusion, an index or a definition), false if it only fixes "
                           "a detail the claim leaves open")
+        if max(len(str(d.get("used") or "")), len(str(d.get("why") or ""))) > FIELD_MAX:
+            errors.append(f"deviation {str(d.get('used') or '')[:60]!r}: `used` and `why` at most {FIELD_MAX} characters "
+                          "each; say what the script does and why, and leave its code to the script")
         deviations.append({"printed": h["quote"] if h else "", "page": h["page"] if h else None,
-                           "used": str(d.get("used") or "")[:600], "why": str(d.get("why") or "")[:600],
+                           "used": str(d.get("used") or ""), "why": str(d.get("why") or ""),
                            "changes_claim": d.get("changes_claim") is True})
     names = {rd["name"] for rd in (c.get("readings") or []) + readings}
     declared = {str(rd.get("name")) for rd in obj.get("readings") or [] if isinstance(rd, dict)}
@@ -2227,15 +2296,15 @@ def _seal_gen(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     cdir = x.root / "checks" / cid
     cdir.mkdir(parents=True, exist_ok=True)
     (cdir / f"script.{r}.py").write_bytes(script.encode("utf-8"))   # bytes: the sha is of exactly these
-    return {"script_sha256": state.sha256(script), "runs": runs, "runs_quote": str(obj.get("runs_quote") or "")[:500],
+    return {"script_sha256": state.sha256(script), "runs": runs, "runs_quote": _cap(obj.get("runs_quote"), 500),
             "metric": metric, "outputs": outputs, "deviations": deviations, "bindings": out,
             "stochastic": stochastic if isinstance(stochastic, bool) else None, "seed_flow": flow, "readings": readings,
             **({"revisions": revisions} if revisions else {}), **({"fidelity": fidelity} if fidelity else {}),
             "checked_statement": "proof_step" if c.get("step") else str(obj.get("checked_statement") or "conclusion"),
             # A general argument (e.g. that a printed premise can never hold) is the author's reasoning:
             # shown to the verifier and the reader as such, never counted as an executed result.
-            "premise_argument": str(obj.get("premise_argument") or "")[:2000] if c["kind"] == "CERTIFICATE" else "",
-            "notes": str(obj.get("notes") or "")[:2000]}
+            "premise_argument": _cap(obj.get("premise_argument"), 2000) if c["kind"] == "CERTIFICATE" else "",
+            "notes": _cap(obj.get("notes"), 2000)}
 
 
 FIDELITY = ("data", "model", "metric", "baselines", "preprocessing", "sample_size", "statistics")
@@ -2270,6 +2339,8 @@ def _fidelity(x: _Ctx, c: dict, items, names: set, deviations: list[dict], error
         used = str(f.get("used") or "").strip()
         if len(used) < 5:
             errors.append(f"fidelity {a}: `used` says what the script does")
+        elif max(len(used), len(cq)) > FIELD_MAX:
+            errors.append(f"fidelity {a}: `used` and the code quote at most {FIELD_MAX} characters each")
         agrees = f.get("agrees")
         rd, expl = str(f.get("reading") or "").strip()[:24], str(f.get("explained") or "").strip()[:600]
         if pq and src and not isinstance(agrees, bool):
@@ -2285,13 +2356,26 @@ def _fidelity(x: _Ctx, c: dict, items, names: set, deviations: list[dict], error
             errors.append(f"fidelity {a}: neither the paper's words nor the code's lines are given — if the paper is silent "
                           "here, the script's choice is a deviation with an empty `printed`")
         out.append({"aspect": a, "paper": h["quote"] if h else "", **({"page": h["page"]} if h else {}),
-                    "code": {"file": src, "quote": cq[:600]} if src else None, "used": used[:600],
+                    "code": {"file": src, "quote": cq} if src else None, "used": used,
                     "agrees": agrees if isinstance(agrees, bool) else None, **({"reading": rd} if rd else {}),
                     **({"explained": expl} if expl else {})})
     if (miss := [a for a in FIDELITY if a not in seen]):
         errors.append(f"fidelity: state every aspect {miss} against the paper and the released code (or `not_applicable` "
                       "with why)")
     return out
+
+
+def _previous_deviations(x: _Ctx, cid: str, r: int) -> str:
+    """The previous round's sealed deviations, in full, for the author of a revision: every claim-changing one stays
+    declared unless the script no longer departs there, and `revision_notes` names it by its `used` text."""
+    prev = x.sealed(f"gen:{cid}.{r - 1}") if r > 1 else None
+    if not prev or not prev.get("deviations"):
+        return ""
+    rows = [f"[{i}] {'changes the claim' if d.get('changes_claim') else 'a detail the claim leaves open'}"
+            + (f"; the paper: {d['printed']!r}" if d.get("printed") else "") + f"\n    used: {d.get('used', '')}"
+            + (f"\n    why: {d['why']}" if d.get("why") else "") for i, d in enumerate(prev["deviations"])]
+    return ("--- the previous round's declared deviations (keep each one that changes the claim, or say in "
+            "`revision_notes` why the script no longer departs there, `was` = its `used` text) ---\n" + "\n".join(rows) + "\n")
 
 
 def _revision(x: _Ctx, cid: str, r: int, runs: int, deviations: list[dict], obj: dict, errors: list[str], final: bool) -> dict:
@@ -2306,8 +2390,10 @@ def _revision(x: _Ctx, cid: str, r: int, runs: int, deviations: list[dict], obj:
     same = lambda a, b: (a.get("printed") and flat(a["printed"]) == flat(b.get("printed") or "")) or flat(a["used"]) == flat(b["used"])
     gone = [d for d in prev.get("deviations") or [] if d.get("changes_claim") and not d.get("changes_claim_by")
             and "supplied the decision criterion" not in d.get("used", "") and not any(same(d, k) for k in keep)]
-    notes = [{"was": str(n.get("was") or "")[:300], "why": str(n.get("why") or "").strip()[:600]}
+    notes = [{"was": str(n.get("was") or ""), "why": str(n.get("why") or "").strip()}
              for n in obj.get("revision_notes") or [] if isinstance(n, dict)]
+    if any(len(n["was"]) > FIELD_MAX or len(n["why"]) > FIELD_MAX for n in notes):
+        errors.append(f"`revision_notes`: `was` and `why` at most {FIELD_MAX} characters each")
     told = lambda d: any(len(n["why"]) >= 20 and len(flat(n["was"])) >= 10 and (flat(n["was"]) in flat(d["used"]) or flat(d["used"])
                                                                                 in flat(n["was"])) for n in notes)
     open_ = [d for d in gone if not told(d)]
@@ -2359,8 +2445,8 @@ def _seal_verify(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         keys = {"criterion": crit or ("supplied" if two else ""),                   # the last attempt: the strictest reading
                 "claim_changing": sorted({i for i in chg if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < n})
                 if isinstance(chg, list) and not errs else list(range(n))}
-    return {"verdict": verdict, "required_changes": str(obj.get("required_changes") or "")[:3000],
-            "notes": str(obj.get("notes") or "")[:2000], "quotes": quotes, "script_sha256": g.get("script_sha256", ""), **keys}
+    return {"verdict": verdict, "required_changes": _cap(obj.get("required_changes"), 3000),
+            "notes": _cap(obj.get("notes"), 2000), "quotes": quotes, "script_sha256": g.get("script_sha256", ""), **keys}
 
 
 def _seal_audit(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
@@ -2400,12 +2486,12 @@ def _seal_audit(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     if (verdict == "STANDS" and not quotes) or (verdict == "DEPENDS" and not items):
         verdict = "UNRESOLVED"
     return {"verdict": verdict, "depends_on": items if verdict == "DEPENDS" else [], "quotes": quotes,
-            "notes": str(obj.get("notes") or "")[:2000]}
+            "notes": _cap(obj.get("notes"), 2000)}
 
 
 def _seal_vision(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     return {"read": {str(i.get("id")): str(i.get("printed") or "")[:120] for i in obj.get("items") or []
-                     if isinstance(i, dict)}, "notes": str(obj.get("notes") or "")[:1000]}
+                     if isinstance(i, dict)}, "notes": _cap(obj.get("notes"), 1000)}
 
 
 def _seal_report(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
@@ -2413,8 +2499,20 @@ def _seal_report(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     overview, a short title and a result sentence per claim, groups of related claims for the page's table, the
     setup of this run's tests, and the terms and symbols a reader needs."""
     ids = {cc.get("id") for cc in (x.plan() or {}).get("central_claims", []) if cc.get("id")}
-    claims = [{"id": str(e.get("id")), "title": re.sub(r"\s+", " ", str(e.get("title") or "")).strip()[:120],
-               "result": str(e.get("result") or "")[:700], "explanation": str(e.get("explanation") or "")[:1200]}
+    cut: list[str] = []
+
+    def fit(text, n: int, what: str) -> str:
+        """Page prose past its limit is refused (the page is two printed pages); on the last attempt it keeps its whole
+        sentences within the limit, and the cut is recorded (`cut`), never published mid-sentence."""
+        t = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(t) <= n:
+            return t
+        cut.append(f"{what}: {len(t)} characters, past the limit of {n}")
+        head = t[:n]
+        return head[:head.rfind(". ") + 1] if head.rfind(". ") > 0 else head
+    claims = [{"id": str(e.get("id")), "title": fit(e.get("title"), 120, f"{e.get('id')} title"),
+               "result": fit(e.get("result"), 700, f"{e.get('id')} result"),
+               "explanation": fit(e.get("explanation"), 1200, f"{e.get('id')} explanation")}
               for e in obj.get("claims") or [] if isinstance(e, dict) and str(e.get("id")) in ids]
     if ids and (miss := sorted(ids - {c["id"] for c in claims if c["title"] and (c["result"] or c["explanation"])})) and not final:
         raise SealError(f"every main claim needs a `title` and a `result`: missing {miss}")
@@ -2424,11 +2522,14 @@ def _seal_report(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         if len(gi) > 1:
             seen |= set(gi)
             groups.append({"title": str(g.get("title") or "")[:120], "claims": gi})
-    return {"overview": str(obj.get("overview") or "")[:1400], "claims": claims, "groups": groups,
-            "setup": str(obj.get("setup") or "")[:900],
-            "terms": [{"term": str(t.get("term"))[:60], "definition": str(t.get("definition") or "")[:400]}
-                      for t in obj.get("terms") or [] if isinstance(t, dict) and t.get("term")][:12],
-            "open_questions": [str(q)[:400] for q in obj.get("open_questions") or [] if isinstance(q, str)][:5],
+    rec = {"overview": fit(obj.get("overview"), 1400, "overview"), "claims": claims, "groups": groups,
+           "setup": fit(obj.get("setup"), 900, "setup"),
+           "terms": [{"term": str(t.get("term"))[:60], "definition": fit(t.get("definition"), 400, f"term {t.get('term')}")}
+                     for t in obj.get("terms") or [] if isinstance(t, dict) and t.get("term")][:12],
+           "open_questions": [fit(q, 400, "open question") for q in obj.get("open_questions") or [] if isinstance(q, str)][:5]}
+    if cut and not final:
+        raise SealError("shorten (the page is two printed pages): " + "; ".join(cut))
+    return {**rec, **({"cut": cut} if cut else {}),
             # the trace (review.md) still shows one summary: the overview
             "summary_md": str(obj.get("summary_md") or obj.get("overview") or "")[:8000]}
 
