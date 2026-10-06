@@ -18,15 +18,31 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def load_settings(path: Path, env=os.environ) -> None:
+    """SH_* settings from one file (KEY=VALUE lines, `#` comments), so every command of a run, and a resumed run, uses
+    the same ones: a compute host's budgets, gates and caps live in it. A variable already set in the environment wins."""
+    if not Path(path).is_file():
+        return
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        key, sep, value = line.strip().partition("=")
+        if sep and key.strip() and not key.strip().startswith("#"):
+            value = re.split(r"\s#", value, maxsplit=1)[0]          # an inline comment is not part of the value
+            env.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+load_settings(Path(os.environ.get("SH_ENV_FILE") or ROOT / "referee.env"))
+
+
 def _flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _int(name: str, default: int) -> int:
+    """A whole-number setting; a value that is not one is refused, never replaced by the default unseen."""
     try:
         return int(os.environ.get(name, default))
     except ValueError:
-        return default
+        raise SystemExit(f"setting {name}={os.environ.get(name)!r} is not a whole number (referee.env or the environment)")
 
 
 @dataclass
@@ -67,8 +83,9 @@ class Config:
     max_runs: int = field(default_factory=lambda: _int("SH_MAX_RUNS", 100))
     # ponytail: 3 seeded replicates give a reconstruction a noise band; raise via env for tighter ones.
     replicates: int = field(default_factory=lambda: _int("SH_REPLICATES", 3))
-    # ponytail: 2 concurrent script seeds fit a 6-CPU Docker VM; raise via env on a bigger host.
-    parallel: int = field(default_factory=lambda: _int("SH_PARALLEL", 2))
+    # Concurrent script runs on this host; 0 (unset) follows the measured host (execute.parallel: CPUs and container
+    # memory; 2 when the daemon cannot say).
+    parallel: int = field(default_factory=lambda: _int("SH_PARALLEL", 0))
     # ponytail: a check projected (from its timed pilot run) past 2 h is a documented blocker, not downscaled.
     check_budget_s: int = field(default_factory=lambda: _int("SH_CHECK_BUDGET_S", 7200))
     # ponytail: an engineering compatibility test (does the component integrate and train) is a few

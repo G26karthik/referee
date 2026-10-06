@@ -16,5 +16,5 @@ STEP 1 — CENTRAL CLAIMS. No claim extraction is on record, so you list the cla
 the contribution list and the conclusion say the paper shows (at most 8, most important first; more is refused), each
 as a verbatim quote: its headline experiments, its theorems, and its engineering claims (e.g. "can replace a layer of an
 existing model" is exercised by swapping it in and training — it is NOT a qualitative claim). For each give `scope`:
-every method, dataset, setting and metric the claim names or compares, ONE per entry (e.g. ["RPC", "PL", "Mallows",
-"political", "movies"] — never "MMLU, CMExam and PubMedQA" in one entry: the harness refuses a listing entry).
+every method, dataset, setting and metric the claim names or compares, ONE per entry (e.g. ["Method A", "Baseline B",
+"Dataset D1", "Dataset D2"] — never "D1, D2 and D3" in one entry: the harness refuses a listing entry).

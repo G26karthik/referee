@@ -66,7 +66,10 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
    never reported as the author's); the harness says "executions running" whenever a run is in flight.
    A RELEASED_DATA check needs a released file or an acquisition: the plan seal refuses one with neither.
 10. **Execution is auditable**: every process leaves an ExecutionRecord (argv, image,
-    commit, script sha, times, exit code, stdout/stderr) in `execution.jsonl`.
+    commit, script sha, times, exit code, stdout/stderr) in `execution.jsonl`. Each project records the settings it
+    ran under whenever they change (`settings.json`, a `settings` log event). A sealed record whose bytes changed after
+    sealing is never read, and its paper stops (phase `integrity`, named records): nothing is owed or re-planned until
+    an operator restores the record or reopens its task.
 11. **No paper-specific logic**, names, thresholds or special cases.
 12. **Report != trace; no acceptance layer.** The status table is deterministic; model prose
     is published only if every status word it uses is earned by a cited check.
@@ -132,11 +135,13 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     setting —, memory — measured —, per_run_timeout, storage). A run's time is the host's awake
     time: hours a sleeping host froze its containers are not run time (`host_slept_s` recorded).
     What a run printed before its limit is kept beside the blocker (`pilot_stages`), deciding
-    nothing. A run given the GPU holds it alone (no second GPU run, draft or evidence, starts beside it) and
-    is projected one at a time against the budget: a limit measured under another run's load measures
+    nothing. A run given a GPU holds it alone (no second GPU run, draft or evidence, starts on it); on a host with
+    several GPUs each run holds one device (`--gpus device=<i>`) and a check is projected over its devices, with one
+    GPU one at a time against the budget: a limit measured under another run's load measures
     the sharing, not the protocol; a synchronous draft waits too (`referee.sync`) and costs no try. Only a
     run that can use the GPU is given it (`execute.wants_gpu`: a GPU library imported or declared, a dynamic
-    import, or a checkout it may drive): a CPU script never queues behind a GPU run. SH_PARALLEL counts
+    import, or a checkout it may drive): a CPU script never queues behind a GPU run. SH_PARALLEL (unset: sized from
+    the measured CPUs and container memory, `execute.parallel`) counts
     script runs (evidence runs and drafts); a fetch or an install takes no slot. A refused replicate extension is
     recorded (`extension_refused`, its setting). Remaining
     runs are projected from the completed seeds' median time (the pilot's until two completed). A limit that ends a seed after
@@ -203,7 +208,8 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     tested only where an independent scope audit (task `scope`, owed as each test ends) found code of the test that computes
     it, re-found in the script; a transfer argument ("the same proof with delays") is shown and never counted; a test no
     audit has read supports no Verified decision. Each main claim's first target check takes a slot before any claim gets
-    a second; a plan that leaves a claim unchecked for want of a slot beside a claim with several is refused. A check may
+    a second; a plan that leaves a claim unchecked for want of a slot beside a claim with several is refused, and a first
+    plan always has at least one slot per extracted main claim (`tasks.check_cap`). A check may
     state its projected cost (`estimate`), recorded as the planner's projection beside the limits of this run.
     A follow-up claim may link a check an earlier round ran (its covers count). Re-planning never removes a
     claim: a withdrawn follow-up plan stays sealed (`plan:2.withdrawn.N`) and every claim it listed stays in
@@ -343,6 +349,7 @@ python run.py redecide <paper-id> <check> <why>            # a finished certific
 python run.py env <paper-id>                               # authors' env (the harness starts it)
 python run.py reference <paper-id> <file> [--source NAME]   # another reproduction record, only after the review is sealed
 python run.py status [<paper-id>]                          # read-only, recomputed: FINISHED only if review.md is newest
+python run.py resume                                       # read-only: unfinished reviews + workflow args (/referee-resume)
 python run.py pack <out.zip> [<paper-id> ...] --clean      # zip artifacts, then delete clones/venvs
 python tests/test_kernel.py
 python tools/replay.py <projects dir> [--out f.json]              # re-decide recorded runs, no model or container
@@ -355,8 +362,8 @@ data downloads need the network gate alone, a Hugging Face download also the ins
 `SH_MAX_DISCOVERIES` (12 searches per paper),
 `SH_MAX_CHECKS` (6), `SH_MAX_FOLLOWUP_CHECKS` (3), `SH_MAX_REVISIONS` (3), `SH_MAX_TRIES` (3),
 `SH_MAX_DATA_GB` (20), `SH_FETCH_TIMEOUT_S` (the data cap at 1 MB/s), `SH_CHECK_BUDGET_S` (7200), `SH_COMPAT_BUDGET_S` (1800),
-`SH_RUN_TIMEOUT_S` (3600; host awake time). Docker is the only
-execution backend.
+`SH_RUN_TIMEOUT_S` (3600; host awake time). Settings come from `referee.env` (see `referee.env.example`; the
+environment wins; a malformed number is refused). Docker is the only execution backend.
 
 Delegation has exactly one channel: the workflow's isolated subagents read a task's files,
 write JSON to `out`, and run `run.py seal`. The harness never spawns a model. Launch an

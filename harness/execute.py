@@ -54,13 +54,61 @@ def _docker(argv: list[str], timeout: int) -> tuple[int, str]:
 
 
 def gpu(cfg: state.Config) -> bool:
-    """Can a container get this host's GPU? Asked once by starting one, then cached."""
+    """Can a container get this host's GPU? Asked once by starting one (the GPUs it lists are cached), then cached."""
     cache = cfg.projects / ".gpu.json"
     if (known := state.read_json(cache)) is not None:
         return bool(known)
     rc, out = _docker(["docker", "run", "--rm", "--gpus", "all", DEFAULT_IMAGE, "sh", "-c", "nvidia-smi -L"], 300)
-    state.write_json(cache, rc == 0 and "GPU " in out)
-    return rc == 0 and "GPU " in out
+    ids = re.findall(r"^GPU (\d+):", out, re.M) if rc == 0 else []
+    state.write_json(cache, ids)
+    return bool(ids)
+
+
+def gpu_devices(cfg: state.Config) -> list[str]:
+    """The `--gpus` value of each GPU a run may hold alone: one GPU is "all" (as before, and on Docker Desktop); several
+    are "device=<i>", one run each (a cache written by an earlier version says only yes: one GPU)."""
+    if not gpu(cfg):
+        return []
+    known = state.read_json(cfg.projects / ".gpu.json")
+    ids = known if isinstance(known, list) else []
+    return [f"device={i}" for i in ids] if len(ids) > 1 else ["all"]
+
+
+def gpu_holds() -> set[str] | None:
+    """The GPU ids that running REFEREE containers hold ("all" for a request of every GPU, or of a count of them);
+    None when the daemon cannot say."""
+    found = []
+    for label in ("referee=1", "referee.sync=1"):
+        rc, ids = _docker(["docker", "ps", "-q", "--filter", f"label={label}"], 60)
+        if rc != 0:
+            return None
+        found += ids.split()
+    if not found:
+        return set()
+    rc, out = _docker(["docker", "inspect", "-f", "{{json .HostConfig.DeviceRequests}}", *found], 60)
+    if rc != 0:
+        return None
+    held: set[str] = set()
+    for line in out.splitlines():
+        try:
+            reqs = json.loads(line) if line.strip() else []
+        except ValueError:
+            return None
+        for r in reqs or []:
+            held |= set(r.get("DeviceIDs") or []) or ({"all"} if r.get("Count") else set())
+    return held
+
+
+def free_gpus(cfg: state.Config) -> list[str]:
+    """The GPUs no run holds now (each run holds its GPU alone; unknown is held). On a host with one GPU, as before:
+    "all" when no REFEREE container holds a GPU."""
+    devs = gpu_devices(cfg)
+    if len(devs) <= 1:
+        return [] if not devs or gpu_busy() else devs
+    held = gpu_holds()
+    if held is None or "all" in held:
+        return []
+    return [d for d in devs if d.split("=", 1)[1] not in held]
 
 
 _GPU_LIBS = ("torch", "torchvision", "torchaudio", "tensorflow", "keras", "jax", "jaxlib", "flax", "cupy", "numba", "pycuda",
@@ -91,6 +139,33 @@ def gpu_run(cfg: state.Config, check: dict) -> bool:
         check.get("kind") == "AUTHOR_CODE" or check.get("gpu") is not False) and gpu(cfg)
 
 
+def parallel(cfg: state.Config) -> int:
+    """Script runs at once on this host: SH_PARALLEL if set, else what the measured host carries (a third of its CPUs,
+    at most one run per 2.5 GB of container memory; a 6 GB laptop VM: 2), else 2 when the daemon cannot say."""
+    if cfg.parallel > 0:
+        return cfg.parallel
+    cpus, ram_mb = cpu_mem()
+    if not (cpus and ram_mb):
+        return 2
+    # ponytail: 3 CPUs and 2.5 GB per run fit the scripts measured so far (peak 1.9 GB); set SH_PARALLEL for others
+    return max(1, min(cpus // 3, ram_mb // 2560))
+
+
+_CPU_MEM: list = []
+
+
+def cpu_mem() -> tuple[int | None, int | None]:
+    """(CPUs, MB of memory) the Docker daemon gives containers, asked once per process; (None, None) if it cannot say
+    (not kept: the next call asks again)."""
+    if not _CPU_MEM:
+        rc, out = _docker(["docker", "info", "--format", "{{.NCPU}} {{.MemTotal}}"], 30)
+        parts = out.split() if rc == 0 else []
+        if len(parts) < 2 or not (parts[0].isdigit() and parts[1].isdigit()):
+            return None, None
+        _CPU_MEM.append((int(parts[0]), int(parts[1]) // 2 ** 20))
+    return _CPU_MEM[0]
+
+
 def evidence_slots(cfg: state.Config) -> int:
     """Evidence runs that may start now across every review on this host: SH_PARALLEL minus the script runs in flight
     (evidence runs and the harness's own drafts, which run the real script and share the host's CPU and memory). A data
@@ -103,7 +178,7 @@ def evidence_slots(cfg: state.Config) -> int:
         if rc != 0:
             return 0
         busy += len(out.split())
-    return max(0, cfg.parallel - busy)
+    return max(0, parallel(cfg) - busy)
 
 
 # ponytail: a waiting check not polled for an hour (its workflow stopped) gives up its place; polls come every few minutes.
@@ -219,14 +294,14 @@ def recover(stderr: str, image: str, checkout: Path | None) -> tuple[str, str] |
 
 
 def run(argv: list[str], *, mounts: list[tuple[Path, str, bool]], workdir: str, image: str,
-        network: bool, timeout: int, env: dict | None = None, gpus: bool = False, mode: str,
+        network: bool, timeout: int, env: dict | None = None, gpus: bool | str = False, mode: str,
         target: str, meta: dict | None = None) -> dict:
     """One process in a fresh container. Never raises: every ending is data."""
     name = f"referee-{uuid.uuid4().hex[:12]}"
     launch = ["docker", "run", "--rm", "--name", name, "--label", "referee.sync=1", "-w", workdir]   # seen by gpu_busy
     for host, inside, ro in mounts:   # a named volume stays a name (resolving it made an empty host dir)
         launch += ["-v", f"{_src(host)}:{inside}{':ro' if ro else ''}"]
-    launch += (["--network", "none"] if not network else []) + (["--gpus", "all"] if gpus else [])
+    launch += (["--network", "none"] if not network else []) + (["--gpus", "all" if gpus is True else gpus] if gpus else [])
     for k, v in sorted((env or {}).items()):
         launch += ["-e", f"{k}={v}"]
     launch += [image, *argv]
@@ -287,14 +362,14 @@ def _slept(rec: dict, wall: float) -> float:
 
 
 def start(name: str, argv: list[str], *, mounts: list[tuple[Path, str, bool]], workdir: str, image: str,
-          network: bool, env: dict | None = None, gpus: bool = False, mode: str, target: str,
+          network: bool, env: dict | None = None, gpus: bool | str = False, mode: str, target: str,
           meta: dict | None = None) -> dict:
     """Start one step detached; returns its pending record (the caller persists it)."""
     launch = ["docker", "run", "-d", "--name", name, "--label", "referee=1", "--label", f"referee.mode={mode}",
               "-w", workdir]
     for host, inside, ro in mounts:
         launch += ["-v", f"{_src(host)}:{inside}{':ro' if ro else ''}"]
-    launch += (["--network", "none"] if not network else []) + (["--gpus", "all"] if gpus else [])
+    launch += (["--network", "none"] if not network else []) + (["--gpus", "all" if gpus is True else gpus] if gpus else [])
     for k, v in sorted((env or {}).items()):
         launch += ["-e", f"{k}={v}"]
     launch += [image, *argv]
@@ -1201,8 +1276,9 @@ def smoke(cfg: state.Config, root: Path, cid: str, r: int, kind: str, attributed
     mounts = [(sdir, f"{MOUNT}/check", True)] + em + [(scratch, f"{MOUNT}/ckpt", False)] + (
         [(Path(root) / "repo", f"{MOUNT}/repo", True)] if has_repo else []) + data_mount(root, cid)
     gpus = kind == "RECONSTRUCTION" and gpu(cfg) and wants_gpu(script, has_repo)
-    if gpus and gpu_busy():                    # a draft never shares the GPU with a timed run: it waits its turn
+    if gpus and not (free := free_gpus(cfg)):  # a draft never shares a GPU with a timed run: it waits its turn
         return None
+    gpus = free[0] if gpus else False
     rec = start(_cname(cdir.resolve(), "smoke", r, state.sha256(script), st.get("starts", 0)),
                 ["/env/bin/python", f"{MOUNT}/check/script.py", "--seed", "0"], mounts=mounts, env=env,
                 workdir=f"{MOUNT}/repo" if has_repo else f"{MOUNT}/check",
@@ -1261,7 +1337,7 @@ def host_facts(cfg: state.Config) -> str:
     return (f"one Docker host: {q(h['cpus'], 'CPUs')}, {q(h['ram_mb'], 'MB RAM')} for containers, GPU inside containers: "
             f"{gpu_s}; disk for data: " + (f"{h['disk_free_gb']:g} GB free" if h["disk_free_gb"] is not None else
                                            "free space unknown (Docker's storage is not measurable from this host)") +
-            f"; {cfg.parallel} runs at a time; one run at most {cfg.run_timeout_s // 60} min; all runs of one check at "
+            f"; {parallel(cfg)} runs at a time; one run at most {cfg.run_timeout_s // 60} min; all runs of one check at "
             f"most {cfg.check_budget_s / 3600:g} h (configured); acquired data at most {cfg.max_data_gb} GB per check")
 
 
@@ -1327,7 +1403,7 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         fly["-1" if st["stage"] == "prepare" else str(st["seed"])] = st["rec"]
         st.setdefault("next", st["seed"] + (st["stage"] == "run"))
     st["rec"] = None
-    runs, width = max(int(check.get("runs") or 1), int(st.get("runs_extended") or 0)), 1 if kind == "AUTHOR_CODE" else max(1, cfg.parallel)
+    runs, width = max(int(check.get("runs") or 1), int(st.get("runs_extended") or 0)), 1 if kind == "AUTHOR_CODE" else max(1, parallel(cfg))
     timeout = cfg.install_timeout_s if st["stage"] == "prepare" else cfg.run_timeout_s
     for key, rec in sorted(fly.items(), key=lambda kv: int(kv[0])):
         done = collect(rec, timeout)
@@ -1451,17 +1527,18 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
     free = evidence_slots(cfg)
     # ...and shared fairly: with several checks running, each holds at most an equal share of the slots.
     active = [e for e in cfg.projects.glob("*/checks/*/exec.json") if not (e.parent / "outcome.json").exists()]
-    width = min(width, max(1, cfg.parallel // max(1, len(active))), st.get("width", width))
+    width = min(width, max(1, parallel(cfg) // max(1, len(active))), st.get("width", width))
     if "pilot_s" not in st:
         width = 1                                          # a bounded pilot: one run first, timed, then the rest
     slots = free
+    devs = free_gpus(cfg) if gpu_run(cfg, check) else []
     if gpu_run(cfg, check):
-        # ponytail: one GPU, one run on it. Two runs of different checks on one 8 GB GPU slowed each other until both
+        # A run given a GPU holds it alone. Two runs of different checks on one 8 GB GPU slowed each other until both
         # passed the per-run limit (Oct-01 PPRM C7/C8: 7446 of 8188 MiB used, no progress for 35 min), a blocker that
-        # measured the sharing, not the protocol. A run given the GPU holds it alone; every reconstruction is given
-        # the GPU on a GPU host, so there they run one at a time (CPU-only scripts too: a throughput cost, stated).
-        width = 1
-        free = 0 if fly or gpu_busy() else min(free, 1)
+        # measured the sharing, not the protocol. On a host with several GPUs, each run takes one free device, so a
+        # check's runs spread across them; with one GPU they run one at a time.
+        width = 1 if "pilot_s" not in st else max(1, min(width, len(gpu_devices(cfg))))
+        free = min(free, len(devs))
     # What may start is derived from what ended, never from a stored counter (Oct-06 GRACE C4: `next` stood at 3 with
     # seed 0 lost below it, and nothing launched for 13.7 h): a seed runs if it has neither ended nor started; a seed to
     # run again (an infrastructure restart, a retry alone) goes first.
@@ -1473,8 +1550,8 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
     if st["stage"] == "run" and len(fly) < width and order:
         # Fair turns across checks: a slot (or the GPU) that a check waiting longer could take is left to it.
         ahead_cpu, ahead_gpu = wait_turn(cfg, turn, gpu_run(cfg, check))
-        free = (0 if ahead_gpu or not free else min(1, max(0, slots - ahead_cpu))) if gpu_run(cfg, check) else \
-            max(0, free - ahead_cpu - (min(1, ahead_gpu) if ahead_gpu and not gpu_busy() else 0))
+        free = max(0, min(free, slots - ahead_cpu) - ahead_gpu) if gpu_run(cfg, check) else \
+            max(0, free - ahead_cpu - (min(ahead_gpu, len(free_gpus(cfg))) if ahead_gpu else 0))
     while st["stage"] == "run" and len(fly) + len(todo) < width and len(todo) < free and order:
         todo.append(order.pop(0))
     st["redo"] = [s for s in st.get("redo") or [] if s not in todo]
@@ -1503,7 +1580,7 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         ckpt = [(ckpt_volume(cdir, seed), f"{MOUNT}/ckpt", False)] if kind != "AUTHOR_CODE" and seed >= 0 else []
         fly[str(seed)] = start(_cname(cdir.resolve(), st.get("token", ""), f"{mode}{seed}"), argv, mounts=mounts + ckpt,
                                workdir=workdir, image=image, network=network, env=env,
-                               gpus=gpu_run(cfg, check),   # an experiment may use it
+                               gpus=devs.pop(0) if devs else False,   # one free GPU each, if it may use one
                                mode=mode, target=cid, meta=meta)
     if any(s >= 0 for s in todo):
         leave_turn(cfg, turn)
@@ -1588,7 +1665,8 @@ def budget(cfg: state.Config, check: dict) -> tuple[int, str]:
 def _projected(cfg: state.Config, check: dict, st: dict, runs: int, spent: float = 0.0) -> tuple[float, int, str, int]:
     """(seconds needed, budget, its setting, runs at a time): the time already `spent` plus the timed
     pilot's projection of the remaining runs."""
-    w = 1 if check["kind"] == "AUTHOR_CODE" or gpu_run(cfg, check) else max(1, min(cfg.parallel, st.get("width", cfg.parallel)))
+    w = 1 if check["kind"] == "AUTHOR_CODE" else max(1, min(len(gpu_devices(cfg)), parallel(cfg))) if gpu_run(cfg, check) \
+        else max(1, min(parallel(cfg), st.get("width", parallel(cfg))))
     limit, setting = budget(cfg, check)
     secs = sorted(v for v in (st.get("seed_seconds") or {}).values() if v)
     per = secs[len(secs) // 2] if len(secs) >= 2 else st.get("pilot_s", 0)   # completed seeds' upper median, else the pilot
@@ -2045,10 +2123,11 @@ def try_script(cfg: state.Config, pid: str, cid: str, script: str, c: dict) -> d
         return {"error": why}
     has_repo = (root / "repo" / ".git").is_dir()
     gpus = c.get("kind") == "RECONSTRUCTION" and gpu(cfg) and wants_gpu(script, has_repo)
-    if gpus and gpu_busy():                                         # never beside a timed run on the one GPU
+    if gpus and not (free := free_gpus(cfg)):                       # never beside a timed run on a GPU
         return {"error": "the GPU is held by another run (a timed evidence run or a draft): this draft was not run and "
                          "does not count against your drafts; try again in a few minutes, or finish without one",
                 "retry": True}
+    gpus = free[0] if gpus else False
     try:
         env_dir, envinfo = with_packages(cfg, root, *script_env(cfg, root, c.get("kind", ""),
                                                               bool(c.get("repo_attributed"))), script)

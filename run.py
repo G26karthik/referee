@@ -12,6 +12,7 @@ workers writing a check script use `try`; `exec` and `env` poll to completion by
   python run.py stop <paper-id> <check> <why>   # the operator ends a running check
   python run.py reference <paper-id> <file> [--source NAME]   # another reproduction record, after the review is sealed
   python run.py status [<paper-id>]
+  python run.py resume                  # every unfinished review, and the workflow arguments to continue them
   python run.py pack <out.zip> [<paper-id> ...] [--clean]
 """
 from __future__ import annotations
@@ -61,6 +62,7 @@ def main(argv: list[str]) -> int:
     rf.add_argument("pid"), rf.add_argument("file"), rf.add_argument("--source", default="reference record")
     st = sub.add_parser("status")
     st.add_argument("pid", nargs="?")
+    sub.add_parser("resume")
     p = sub.add_parser("pack")
     p.add_argument("out"), p.add_argument("pids", nargs="*"), p.add_argument("--clean", action="store_true")
     a = ap.parse_args(argv)
@@ -102,6 +104,8 @@ def main(argv: list[str]) -> int:
             root = d.parent.parent
             print(f"{root.name} [{report.progress(root)}]: {report.scientific_status(root)}")
             print("  completion: " + report.completion_line(root))
+    elif a.cmd == "resume":           # read-only: what to continue, from the records on disk
+        print(json.dumps(tasks.resumable(cfg), indent=1, ensure_ascii=False))
     elif a.cmd == "pack":
         return pack(cfg, Path(a.out), a.pids, a.clean)
     return 0

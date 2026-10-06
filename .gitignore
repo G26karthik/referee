@@ -25,9 +25,10 @@ venv/
 out_*.txt
 snippet*.txt
 
-# Credentials and personal settings
+# Credentials and personal settings (referee.env holds this host's settings; referee.env.example is committed)
 .env
 .env.*
+referee.env
 .claude/settings.local.json
 
 # OS and archive leftovers

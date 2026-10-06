@@ -38,7 +38,7 @@ FOR EACH CLAIM give:
     a bound, an implication between definitions). A claim about what happens on data is empirical
     even when the paper also proves something about it.
   - `scope`: every method, baseline, dataset, setting and metric the claim names or compares, ONE
-    per entry (["GRACE", "TARNet", "IHDP", "RMSE"], never "IHDP, ACIC and TCGA" in one entry). For a
+    per entry (["Method A", "Baseline B", "Dataset D1", "Metric M"], never "D1, D2 and D3" in one entry). For a
     theorem: the statement itself (one entry) and each case it covers.
   - `assumptions`: the conditions under which the paper claims it, each with the paper's words
     verbatim (a theorem's hypotheses; "for binary treatments"; "when the training data size is

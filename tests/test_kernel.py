@@ -192,6 +192,12 @@ def test_seals_keep_only_harness_derived_fields_and_detect_tampering():
         p = td / pid / "sealed" / "lens__overclaim.json"
         p.write_text(p.read_text(encoding="utf-8").replace("MINOR", "FATAL"), encoding="utf-8")
         assert tasks._sealed(td / pid, "lens:overclaim") is None       # tampered: not a seal
+        # Oct-06: two sealed plans edited after sealing read as unsealed, and the harness quietly owed a new plan. A
+        # changed sealed record stops the paper, named; nothing is owed and nothing re-planned until an operator acts.
+        phase, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
+        assert phase == "integrity" and owed == [], (phase, owed)
+        st = tasks.advance(cfg, pid, wait=0)
+        assert st["blocked_reason"].startswith("integrity") and "lens:overclaim" in st["blocked_reason"], st
         try:
             _seal(cfg, pid, "report", {"summary_md": "x"}, td)
             raise AssertionError("sealed a task that was not pending")
@@ -3492,6 +3498,46 @@ def test_a_gpu_holds_one_run_and_the_budget_counts_its_runs_one_at_a_time():
         execute._docker, execute.gpu = real
 
 
+def test_on_a_host_with_several_gpus_each_run_holds_one_device():
+    """A compute host with several GPUs: a run still holds its GPU alone, but each run takes ONE free device
+    (`--gpus device=<i>`), so the runs of one check spread across the devices and its budget is projected over them.
+    One GPU keeps `--gpus all`, one run at a time. Device selection only: not run on real multi-GPU hardware here."""
+    real = execute._docker
+    with tempfile.TemporaryDirectory() as t:
+        cfg = state.Config()
+        cfg.projects, cfg.parallel = Path(t), 8
+        state.write_json(Path(t) / ".gpu.json", ["0", "1", "2"])
+        try:
+            execute._docker = lambda a, timeout: (0, "aaa\nbbb\n") if a[:2] == ["docker", "ps"] else (
+                0, 'null\n[{"Driver":"","Count":0,"DeviceIDs":["1"]}]\n')
+            assert execute.gpu_devices(cfg) == ["device=0", "device=1", "device=2"]
+            assert execute.free_gpus(cfg) == ["device=0", "device=2"]                  # device 1 is held
+            execute._docker = lambda a, timeout: (0, "aaa\n") if a[:2] == ["docker", "ps"] else (
+                0, '[{"Driver":"","Count":-1}]\n')
+            assert execute.free_gpus(cfg) == []                                         # a run holds every GPU
+            execute._docker = lambda a, timeout: (1, "Cannot connect to the Docker daemon")
+            assert execute.free_gpus(cfg) == []                                         # unknown is held
+            recon = {"kind": "RECONSTRUCTION"}
+            assert execute._projected(cfg, recon, {"pilot_s": 600, "seed": 1}, 7)[3] == 3   # three devices at a time
+            state.write_json(Path(t) / ".gpu.json", ["0"])
+            execute._docker = lambda a, timeout: (0, "") if a[:2] == ["docker", "ps"] else (0, "")
+            assert execute.gpu_devices(cfg) == ["all"] and execute.free_gpus(cfg) == ["all"]
+            assert execute._projected(cfg, recon, {"pilot_s": 600, "seed": 1}, 7)[3] == 1
+            state.write_json(Path(t) / ".gpu.json", True)                               # cached by an earlier version
+            assert execute.gpu_devices(cfg) == ["all"]
+        finally:
+            execute._docker = real
+    launch = []
+    real_run = subprocess.run
+    try:
+        subprocess.run = lambda argv, **k: launch.append(argv) or subprocess.CompletedProcess(argv, 0, "", "")
+        execute.start("n", ["true"], mounts=[], workdir="/", image="i", network=False, gpus="device=2", mode="evidence",
+                      target="C1")
+    finally:
+        subprocess.run = real_run
+    assert launch and launch[0][launch[0].index("--gpus") + 1] == "device=2", launch
+
+
 def test_a_draft_never_shares_the_gpu_with_a_timed_run_and_a_skipped_one_costs_no_try():
     """Oct-01 PPRM: drafts (`run.py try`) of C7/C8 ran on the GPU beside C9's timed evidence run (gpu_overlap.txt). A
     synchronous draft on a GPU host now waits its turn: it is not run while another run holds the GPU, says so, and
@@ -5674,6 +5720,85 @@ def test_a_stage_that_shows_no_example_exists_is_never_pooled_with_the_construct
         o = state.read_json(cdir / "outcome.json")
         assert o["status"] == "COUNTEREXAMPLE_FOUND" and o["witnesses"] == 1 and not o.get("witness_unread"), o
         assert "audit:C1" in owed and "scope" not in owed, owed                       # the m2 failure is audited
+
+
+def test_settings_come_from_one_file_and_each_project_records_the_ones_it_ran_under():
+    """A compute host's settings live in one file (referee.env), so a resumed run uses the same ones; a variable set in the
+    environment wins. Each project records the settings in force whenever they change (a run resumed under a larger
+    budget says so). SH_PARALLEL, when unset, follows the measured host (CPUs and container memory)."""
+    with tempfile.TemporaryDirectory() as t:
+        f = Path(t) / "referee.env"
+        f.write_text("# a compute host\nSH_CHECK_BUDGET_S=43200   # all runs of one check\nSH_PARALLEL = 6\n"
+                     "SH_RUN_TIMEOUT_S=\"7200\"\n", encoding="utf-8")
+        env = {"SH_PARALLEL": "3"}
+        state.load_settings(f, env)
+        assert env == {"SH_PARALLEL": "3", "SH_CHECK_BUDGET_S": "43200", "SH_RUN_TIMEOUT_S": "7200"}, env
+        cfg = state.Config()
+        root = Path(t) / "p"
+        tasks._record_settings(cfg, root)
+        tasks._record_settings(cfg, root)                                             # unchanged: recorded once
+        cfg.check_budget_s = 43200
+        tasks._record_settings(cfg, root)
+        ev = [json.loads(ln) for ln in (root / "log.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert [e["event"] for e in ev] == ["settings", "settings"] and ev[1]["check_budget_s"] == 43200, ev
+    real = execute.cpu_mem
+    try:
+        execute.cpu_mem = lambda: (64, 256_000)
+        cfg = state.Config()
+        cfg.parallel = 0
+        assert execute.parallel(cfg) == 21                                            # 64 CPUs / 3, memory allows more
+        execute.cpu_mem = lambda: (16, 5926)
+        assert execute.parallel(cfg) == 2                                             # a laptop VM: memory-bound
+        execute.cpu_mem = lambda: (None, None)
+        assert execute.parallel(cfg) == 2                                             # unmeasured: the old default
+        cfg.parallel = 5
+        assert execute.parallel(cfg) == 5                                             # a setting wins
+    finally:
+        execute.cpu_mem = real
+
+
+def test_resume_lists_every_unfinished_review_and_never_one_with_a_changed_seal():
+    """One step continues every review that stopped (a closed session, a reboot): `run.py resume` lists the unfinished
+    papers and the workflow arguments to continue them from the records on disk. A paper whose sealed record changed
+    after sealing is listed apart, never resumed (resuming would re-plan over it)."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid = _project(td)
+        _seal(cfg, pid, "lens:overclaim", {"concerns": []}, td)
+        r = tasks.resumable(cfg)
+        assert r["resume"] == [pid] and not r["integrity"] and r["workflow_args"]["papers"] == [pid], r
+        p = td / pid / "sealed" / "lens__overclaim.json"
+        p.write_text(p.read_text(encoding="utf-8") + " ", encoding="utf-8")
+        r = tasks.resumable(cfg)
+        assert r["resume"] == [] and r["integrity"] == [{"paper_id": pid, "records": ["lens:overclaim"]}], r
+
+
+def test_a_plan_has_at_least_one_check_slot_per_main_claim():
+    """Oct-06 changepoint K1: eight main claims, six check slots: K1 went unchecked ("all six are spent"). No fixed
+    number of claims is imposed, so the slots are never fewer than the claims; the planner is told the same cap the
+    seal enforces."""
+    cfg = state.Config()
+    cfg.max_checks, cfg.max_followup_checks = 2, 3
+    x = type("X", (), {"cfg": cfg, "sealed": lambda self, tid: {"claims": [{"id": f"K{i}"} for i in range(1, 6)]}
+                       if tid == "claims" else None})()
+    assert tasks.check_cap(x) == 5 and tasks.check_cap(x, followup=True) == 3
+    cfg.max_checks = 9
+    assert tasks.check_cap(x) == 9
+
+
+def test_the_follow_up_brief_shows_what_each_check_was_audited_to_compute():
+    """The single follow-up round is where an item a check listed but never computed gets its own test (Oct-06
+    changepoint: theorem cases listed by checks that computed another quantity). The follow-up planner sees the scope
+    audit's verdict per item, and every item not run, uncut."""
+    au = {"covers": {"Bound for quantity B": {"how": "not_computed", "why": "the script computes quantity A only"}}}
+    cc = {"id": "K1", "quote": "q", "statement": "s", "claim_type": "theory", "claim_status": "NOT_CHECKED", "checks": ["C1"]}
+    ledger = {"checks": [{"id": "C1", "kind": "CERTIFICATE", "claim": "c", "covers": ["Bound for quantity B"],
+                          "scope_audit": au, "status": "NO_VIOLATION_FOUND"}], "central_claims": [cc],
+              "completion": {"claims": [{"claim": "q", "experiment": "NOT_RUN",
+                                         "not_run": [{"item": f"item {i}", "blocker": "not run", "basis": "harness"}
+                                                     for i in range(9)]}]}}
+    text = tasks._followup_text(ledger, [cc])
+    assert "not_computed" in text and "the script computes quantity A only" in text and "item 8" in text, text
 
 
 def test_the_report_and_comparison_briefs_show_every_check_whole():

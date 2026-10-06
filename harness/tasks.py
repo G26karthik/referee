@@ -8,6 +8,7 @@ Phases: read (4 lenses) -> critic -> plan -> verify (per check) -> report -> don
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import time
@@ -237,8 +238,19 @@ def _repo_text(x: _Ctx) -> tuple[str, str]:
             f"\"{x.src.get('evidence', '')[:300]}\")", listing(x.checkout, rel))
 
 
+def tampered(root: Path) -> list[str]:
+    """Sealed records whose bytes no longer hash to their seal (edited after sealing). Such a record is never read as a
+    seal, and the paper stops on it: owing its task again would re-plan or re-judge over a record silently, so an
+    operator restores the record or reopens the task (Oct-06: two edited plans read as unsealed and a plan was owed)."""
+    seals = state.read_json(root / "seals.json", {}) or {}
+    return sorted(tid for tid, h in seals.items() if (p := root / "sealed" / f"{_safe(tid)}.json").is_file()
+                  and state.sha256(p.read_bytes()) != h)
+
+
 def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
     """(phase, tasks, executions to start)."""
+    if tampered(x.root):
+        return "integrity", [], []
     missing = [lens for lens in LENSES if x.sealed(f"lens:{lens}") is None]
     title = x.meta["title"]
     # The main claims are extracted from the paper alone, beside the lenses and before any plan: a planner tests claims,
@@ -665,6 +677,15 @@ def _discovery_text(x: _Ctx) -> str:
         if "results" in r else f"  {r['id']}: files of {r['files_of']} -> {len(r['files'])} file(s)" for r in done) or "  (none yet)"
 
 
+def check_cap(x: _Ctx, followup: bool = False) -> int:
+    """Checks one plan round may hold: the setting, and in the first round never fewer than one per extracted main claim
+    (no number of claims is imposed, so the slots follow them; Oct-06 changepoint K1 went unchecked when eight claims met
+    six slots). The planner is told this cap and the seal enforces it."""
+    if followup:
+        return x.cfg.max_followup_checks
+    return max(x.cfg.max_checks, len((x.sealed("claims") or {}).get("claims") or []))
+
+
 def _plan_task(x: _Ctx, tid: str, followup: str) -> dict:
     repo_line, lst = _repo_text(x)
     find = (f'cd "{state.ROOT.as_posix()}" && PYTHONUTF8=1 SH_PROJECTS_DIR="{x.cfg.projects.as_posix()}" '
@@ -676,7 +697,7 @@ def _plan_task(x: _Ctx, tid: str, followup: str) -> dict:
         "plan", title=x.meta["title"], pages_dir=x.pages_dir, repo=repo_line, checkout=x.checkout.as_posix(),
         claims=_claims_text(x), claims_step=_section("plan_steps", "extracted" if extracted else "legacy"),
         host=execute.host_facts(x.cfg), concerns=_concern_lines(x.concerns()), listing=lst,
-        max_checks=x.cfg.max_followup_checks if followup else x.cfg.max_checks, followup=followup,
+        max_checks=check_cap(x, bool(followup)), followup=followup,
         limits=(f"{x.cfg.run_timeout_s // 60} min per run (SH_RUN_TIMEOUT_S) and {x.cfg.check_budget_s / 3600:.1f} h per "
                 f"check (SH_CHECK_BUDGET_S; {x.cfg.compat_budget_s // 60} min for a compatibility test)"),
         discover_cmd=find, discover_files_cmd=f"{find} --files", discoveries=_discovery_text(x), max_discoveries=x.cfg.max_discoveries,
@@ -690,8 +711,10 @@ FOLLOWUP_AFTER_S = 1200
 
 
 def _followup_text(ledger: dict, undecided: list[dict], executing: list[str] = ()) -> str:
-    done = [{k: c.get(k) for k in ("id", "kind", "claim", "role", "covers", "status", "state", "reason", "stages",
-                                   "data_identity", "data_blocker", "not_requested", "pilot_stages")
+    # `scope_audit`: what an independent reader found each check's code computes per covered item (computed, a
+    # transfer argument, not computed): a follow-up plans for what was not computed, never for what a plan only listed
+    done = [{k: c.get(k) for k in ("id", "kind", "claim", "role", "covers", "scope_audit", "status", "state", "reason",
+                                   "stages", "data_identity", "data_blocker", "not_requested", "pilot_stages")
              if c.get(k) not in (None, {}, [])} for c in ledger["checks"] if c["id"] not in executing]
     ran = {r["claim"]: r for r in ledger["completion"]["claims"]}
     busy = ("\n=== STILL RUNNING (long executions; each ends on its own and is reported then — never plan a duplicate of "
@@ -704,7 +727,7 @@ def _followup_text(ledger: dict, undecided: list[dict], executing: list[str] = (
                            f" [{b['item']}: {b['blocker']}{' ' + b['class'] if b.get('class') else ''}, asserted by the "
                            f"{b['basis']}{'; NOT verified: ' + b['unverified'][:160] if b.get('unverified') else ''}"
                            f"{'; the search budget was spent when it was planned, which shows nothing about the data' if b.get('budget_spent') else ''}]"
-                           for b in ran[cc["quote"]]["not_run"][:6]) for cc in ledger["central_claims"] if cc["quote"] in ran)
+                           for b in ran[cc["quote"]]["not_run"]) for cc in ledger["central_claims"] if cc["quote"] in ran)
     rests = "\n".join(f"- {c['id']} {c['status']}: tested as {d['tested_as'][:160]!r}; the claim may hold under "
                       f"{d['alternative'][:200]!r}" + (f" (the paper: {d['printed'][:120]!r})" if d.get("printed") else "")
                       for c in ledger["checks"] if (c.get("audit") or {}).get("verdict") == "DEPENDS"
@@ -1263,6 +1286,34 @@ def _spec_text(c: dict) -> str:
     return "\n".join(parts)
 
 
+def resumable(cfg: state.Config) -> dict:
+    """Every review under the projects folder, sorted for one step that continues them all from their records on disk
+    (`run.py resume`): unfinished ones to resume, finished ones, and ones stopped on a sealed record changed after
+    sealing (never resumed: an operator restores the record or reopens its task). The workflow arguments resume the
+    unfinished ones with this host's settings (referee.env)."""
+    out: dict = {"resume": [], "finished": [], "integrity": []}
+    for d in sorted(cfg.projects.glob("*/paper/doc.json")):
+        root = d.parent.parent
+        if (bad := tampered(root)):
+            out["integrity"].append({"paper_id": root.name, "records": bad})
+        else:
+            out["finished" if report.progress(root).startswith("FINISHED") else "resume"].append(root.name)
+    settings = Path(os.environ.get("SH_ENV_FILE") or state.ROOT / "referee.env")
+    return {**out, "settings_file": settings.as_posix() if settings.is_file() else None,
+            "workflow_args": {"papers": out["resume"], "repo": state.ROOT.as_posix(),
+                              "python": Path(cfg.python).as_posix(), "env": f"PYTHONUTF8=1 SH_PROJECTS_DIR={cfg.projects.as_posix()}"}}
+
+
+def _record_settings(cfg: state.Config, root: Path) -> None:
+    """The settings this project runs under, recorded whenever they change (`settings.json`, and a `settings` event in
+    the log): a run resumed under another budget or cap says which applied when."""
+    now = {k: (list(v) if isinstance(v, tuple) else v if isinstance(v, (bool, int, float, str)) else str(v))
+           for k, v in vars(cfg).items() if k not in ("projects", "python")}
+    if state.read_json(root / "settings.json") != now:
+        state.write_json(root / "settings.json", now)
+        state.append_jsonl(root / "log.jsonl", {"event": "settings", **now})
+
+
 def advance(cfg: state.Config, source: str, wait: int = 0) -> dict:
     """Advance one paper as far as the harness can alone; return what workers can do now."""
     pid = source if (state.pdir(cfg, source) / "paper" / "doc.json").exists() else None
@@ -1273,6 +1324,8 @@ def advance(cfg: state.Config, source: str, wait: int = 0) -> dict:
     from .repo import restore
     restore(cfg, root)                     # a packed run resumes on its recorded commit
     deadline = time.time() + wait
+    with state.lock(root / ".lock"):
+        _record_settings(cfg, root)
     while True:
         with state.lock(root / ".lock"):
             x = _Ctx(cfg, pid)
@@ -1280,11 +1333,14 @@ def advance(cfg: state.Config, source: str, wait: int = 0) -> dict:
             for t in tasks:   # an answer left by an earlier attempt must never be sealed as this one's
                 if (out := Path(t["out"])).exists():
                     out.replace(out.with_suffix(".stale.json"))
-        if tasks or phase == "done" or time.time() >= deadline:
+        if tasks or phase in ("done", "integrity") or time.time() >= deadline:
             break
         time.sleep(15)
+    bad = tampered(root) if phase == "integrity" else []
     return {"paper_id": pid, "phase": phase, "status": "workflow_finished" if phase == "done" else "waiting",
-            "blocked_reason": blocked_reason(running), "running": running,
+            "blocked_reason": (f"integrity: sealed record(s) {', '.join(bad)} changed after sealing; restore the record "
+                               "or reopen its task (nothing is owed until then)") if bad else blocked_reason(running),
+            "running": running,
             "scientific_status": report.scientific_status(root), "completion": report.completion_line(root),
             "tasks": tasks}
 
@@ -1744,7 +1800,7 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     # Follow-up ids continue after every id the first round used (a check dropped there left a gap).
     used = [int(m.group(1)) for c in (base or {}).get("checks", []) + (base or {}).get("dropped", [])
             if (m := re.fullmatch(r"C(\d+)", str(c.get("id") or c.get("check") or "")))]
-    cap, n0 = (x.cfg.max_followup_checks, max(used + [x.cfg.max_checks])) if base else (x.cfg.max_checks, 0)
+    cap, n0 = (check_cap(x, True), max(used + [x.cfg.max_checks])) if base else (check_cap(x), 0)
     proposed = [c for c in obj.get("checks") or [] if isinstance(c, dict)]
     raw_claims = [cc for cc in obj.get("central_claims") or [] if isinstance(cc, dict)]
     claims_in = raw_claims

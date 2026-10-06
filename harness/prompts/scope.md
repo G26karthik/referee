@@ -28,12 +28,12 @@ Paper: {{title}}   (full text under READ, page-tagged)
    - `covers`: one entry for EVERY item of the test's `covers` list, copied exactly:
        "computed": the script computes this item itself. `code`: the line(s) of the script, verbatim, that compute it.
        "transfer": the script computes another item, and the item follows only by an argument (for example "the same
-         proof with delays in place of run lengths"). `argument`: that argument, in one or two sentences. A transfer is
+         proof with quantity B in place of quantity A"). `argument`: that argument, in one or two sentences. A transfer is
          recorded and shown; it is NOT counted as tested.
        "not_computed": the script does not compute it. `why`: what the script computes instead.
-     Be strict. An ADD estimator is not computed by code that computes only ARL quantities. A theorem is not computed by
-     a script that checks one table. A property is not computed if the script never evaluates it (for example "not
-     full-rank calibrated" when no full-rank deviation is computed).
+     Be strict. A bound on quantity B is not computed by code that computes only quantity A. A theorem is not computed
+     by a script that checks one printed example. A property is not computed if the script never evaluates it (for
+     example "not P" when P itself is never computed).
    - `witness` (exact-arithmetic tests only): does the script BUILD EXAMPLES of an existence statement, so that
      `violated` = 1 means "this constructed instance is not a valid example" (not "this instance breaks a universal
      statement")? {"is_witness": true or false, "code": "the verbatim line that computes `violated`", "stages": [...]}.
@@ -49,7 +49,8 @@ Paper: {{title}}   (full text under READ, page-tagged)
    - `outputs`: for each compared output named in the test's relation or metric (under each reading): {"name": "",
      "reading": "<reading name, or empty>", "definition": "what the number is, in plain words", "unit": "", "aggregation":
      "how it is pooled or averaged (over thresholds, folds, seeds, methods)", "code": "<the verbatim line that computes it>"}.
-     Name the quantity exactly: a mean of standard errors is not a variance; a relative error is not an absolute one.
+     Name the quantity exactly: an average of one statistic is not another statistic; a relative error is not an
+     absolute one.
 
 Write ONLY this JSON to the output path you were given:
 {"forms": [{"id": "K1", "form": "", "quote": "verbatim"}],
