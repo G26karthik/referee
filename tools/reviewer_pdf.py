@@ -41,8 +41,12 @@ def main(argv: list[str]) -> None:
         html = Path(t) / "reviewer.html"
         html.write_text(f"<!doctype html><html><head><meta charset='utf-8'><style>{CSS}</style></head><body>{body}</body></html>",
                         encoding="utf-8")
-        subprocess.run([browser(), "--headless=new", "--disable-gpu", "--no-pdf-header-footer", f"--print-to-pdf={out}",
-                        html.as_uri()], check=True, timeout=180, capture_output=True)
+        out.unlink(missing_ok=True)
+        # its own profile: with the browser already open, a headless call on the user's profile hands off and prints nothing
+        subprocess.run([browser(), "--headless=new", "--disable-gpu", "--no-pdf-header-footer", f"--user-data-dir={Path(t) / 'profile'}",
+                        f"--print-to-pdf={out}", html.as_uri()], check=True, timeout=180, capture_output=True)
+    if not out.exists() or out.stat().st_size == 0:
+        raise SystemExit(f"no PDF was written to {out}")
     print(out)
 
 
