@@ -108,8 +108,11 @@ def certificate(results: list[dict], changed: bool, step: bool, crashed: int = 0
         lit["premise_not_met"], lit["undefined"] = lit["undefined"], 0
         relabel = ("; the script labels the text as printed 'undefined', but its premise argument (checked by its verifier) "
                    "says a printed premise can never hold: as printed, the premise is not met")
-    if witness:
+    if witness and groups.get(""):
         return _witness(results, base, groups, lit, crashed, n, len(fuzzy))
+    # A witness certificate whose every line is a named (changed) reading built no example of the statement AS PRINTED
+    # (Oct-06 GRACE C3: the printed index runs out of the tree, `undefined` in every case): it is decided as any
+    # certificate is, so the printed text's own state (undefined, premise not met) decides, never a failed construction.
     out = {"rule": "exact arithmetic; a counterexample must satisfy every premise of the exact claim", "n": n,
            "instances": len(base), "admissible_instances": sum(1 for r in base if r.get("premises") == 1),
            **({"readings_per_instance": len(groups)} if len(groups) > 1 else {}),

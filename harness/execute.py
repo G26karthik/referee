@@ -1346,15 +1346,15 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
             rel_ = (check.get("target") or {}).get("relation", "")
             kept = staged_values(done.get("stdout") or "", rel_, check.get("metric", "")) if kind in (
                 "RECONSTRUCTION", "RELEASED_DATA") else []
-            if kind == "AUTHOR_CODE" or not (st.get("done_seeds") or kept):
-                # Nothing was measured anywhere: one documented blocker, with what this run printed before its limit kept
-                # beside it (pilot_stages), deciding nothing (Oct-01 C8).
+            if kind == "AUTHOR_CODE" or not st.get("done_seeds"):
+                # No seed completed: one documented blocker, with what this run printed before its limit kept beside it
+                # (pilot_stages), deciding nothing (Oct-01 C8).
                 st["values"], st["staged"] = st.get("values", []) + [e[1] for e in kept], st.get("staged", []) + kept
                 return _finish(cfg, root, check, {**_cancel(root, st), "blocker": (
                     kind_of, why.rstrip(".") + (f" (during {last})." if last else "."))})
-            # Measurements exist (completed seeds, or stages this run finished first): they survive the limit (invariant
-            # 20). This seed is a failed seed with its limit and stage; the other seeds still run, unless the limit would
-            # end every one of them (a per-run time limit, the disk) or already ended a second seed the same way.
+            # Completed seeds exist: they survive the limit (invariant 20), with what this run measured first. This seed is
+            # a failed seed with its limit and stage; the other seeds still run, unless the limit would end every one of
+            # them (a per-run time limit, the disk) or already ended a second seed the same way.
             st.setdefault("limits", {})[key] = {"kind": kind_of, "stage": last, "text": why}
             if kind_of in ("per_run_timeout", "storage") or sum(1 for v in st["limits"].values() if v["kind"] == kind_of) >= 2:
                 st["halted"] = f"{kind_of}: {why}"
@@ -1721,7 +1721,7 @@ def _redecide(cfg: state.Config, root: Path, cid: str, why: str, extra: dict | N
                 "data", "environment", "setup_error", "setup_log", "resource_failures", "halted", "resource")
         shutil.copyfile(cdir / "outcome.json", cdir / f"outcome.redecided.{k}.json")
         state.write_json(cdir / "outcome.json", {**{x: o[x] for x in kept if x in o}, **new,
-                                                 "redecided": stamp(len(st["done_seeds"]))})
+                                                 "redecided": stamp(len(st["done_seeds"])), **(extra or {})})
         state.append_jsonl(root / "log.jsonl", {"event": "redecide", "check": cid, "was": o.get("status"),
                                                 "now": new["status"], "why": why[:300]})
         return {"redecided": cid, "was": o.get("status"), "status": new["status"]}

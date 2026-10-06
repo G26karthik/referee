@@ -5596,6 +5596,9 @@ def test_an_existence_claim_is_shown_by_a_valid_example_and_a_failed_constructio
     none = certificate([bad()] * 4 + [ok("fixed")] * 4, False, False, witness=True)
     assert none["status"] == "CONSTRUCTION_FAILED" and "changed reading" in none["reason"], none
     assert certificate([bad()] * 4, False, False)["status"] == "COUNTEREXAMPLE_FOUND"     # a universal statement: unchanged
+    named = [{"violated": 0, "premises": 1, "literal": "undefined", "reading": "zero_based"}] * 3
+    o = certificate(named, True, False, witness=True)      # Oct-06 GRACE C3: no example of the PRINTED text was built
+    assert o["status"] == "NO_VIOLATION_FOUND" and o["literal"]["undefined"] == 3, o   # its printed state decides
     cert = {"id": "C2", "kind": "CERTIFICATE", "role": "target", "status": "WITNESS_FOUND", "values": [0] * 8,
             "witnesses": 8, "instances": 20, "counts": {}}
     row = lambda form, **kw: _claim_row("SUPPORT_FOUND", "theory", checks=["C2"], form=form, **kw)
@@ -5758,6 +5761,20 @@ def test_the_audit_of_what_a_test_computes_rests_on_the_scripts_own_lines():
         assert not (cdir / "outcome.redecided.2.json").exists()
         row = report.ledger(tasks._Ctx(cfg, pid))["central_claims"][0]["completion"]
         assert row["scope_not_run"] == ["Theorem 2 (ADD)"] and row["transfers"][0]["item"] == "Theorem 2 (ADD)", row
+    with tempfile.TemporaryDirectory() as t:                     # a script check decided again records the audit once
+        cfg = state.Config()
+        cfg.projects = Path(t)
+        cdir = Path(t) / "p" / "checks" / "C1"
+        cdir.mkdir(parents=True)
+        state.write_json(cdir / "check.json", {"id": "C1", "kind": "RECONSTRUCTION", "runs": 2, "script_sha256": "s",
+                                               "target": {"relation": "a > b"}, "deviations": []})
+        for k in (0, 1):
+            state.append_jsonl(cdir / "seeds.jsonl", {"key": "s", "seed": k, "values": [2.0], "staged": [["params", 2.0]],
+                                                      "detail": [{"seed": k, "stage": "params", "reading": "", "out": {"a": 3.0, "b": 1.0},
+                                                                  "data_fp": f"f{k}", "trials": {}}], "seconds": 5})
+        state.write_json(cdir / "outcome.json", {"status": "INCONCLUSIVE", "authorized": True, "values": [2.0, 2.0]})
+        out = execute._redecide(cfg, Path(t) / "p", "C1", "audit", {"audit_applied": "k1"})
+        assert out.get("redecided") and state.read_json(cdir / "outcome.json")["audit_applied"] == "k1", out
     with tempfile.TemporaryDirectory() as t:                     # an extracted claim states its form
         cfg, pid = _project_pages(Path(t), CLAIM_PAGES)
         x = tasks._Ctx(cfg, pid)
