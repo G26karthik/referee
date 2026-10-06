@@ -5331,6 +5331,16 @@ def test_prose_cannot_slip_a_status_word_a_number_or_markup_past_the_checks():
     assert not ok("The result was &#114;eproduced.") and not ok("<b>bold</b> claim")
     assert not ok("<script src=x>") and not ok("a &amp; b") and not ok("<!-- hidden -->")
     assert ok("Two of five settings ran.")
+    # Oct-06 GRACE: explanations citing the harness's own blocker words ("the per-run limit of 3600s", "about 70.8 h")
+    # were withheld: those numbers live in a harness-written reason, not a numeric field. A model-written reason
+    # (reason_by model) lends nothing.
+    led2 = {"checks": [{"id": "C5", "status": "BLOCKED", "reason": "RESOURCE BLOCKER: a single run exceeded the per-run "
+                        "limit of 3600s; the 100 runs need about 70.8 h more"},
+                       {"id": "C7", "status": "NOT_CHECKABLE", "reason_by": "model", "reason": "it would take 99.5 h"}],
+            "concerns": [], "central_claims": []}
+    allowed2 = reviewer.allowed_numbers(led2, p.text, *reviewer.harness_texts(led2))
+    assert reviewer.problems("One run passed the 3600 s limit; all runs need about 70.8 hours.", led2, p, allowed2) == []
+    assert reviewer.problems("It would take 99.5 hours.", led2, p, allowed2) != []
     # Oct-06 changepoint K6: "the printed premise t_F<t_H" is mathematics, not a tag
     assert ok("The printed premise t_F<t_H fails while H(t)>=F holds, and x<y>z is an inequality.")
 

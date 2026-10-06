@@ -437,6 +437,12 @@ def numeric_leaves(obj, out: set | None = None) -> set:
     return out
 
 
+def harness_texts(led: dict) -> list[str]:
+    """The reasons the harness itself wrote (a resource blocker's measurement, a limit it enforced): their numbers are
+    the record's. A reason a model wrote (`reason_by` model) is not."""
+    return [str(c.get("reason") or "") for c in led.get("checks") or [] if c.get("reason_by", "harness") == "harness"]
+
+
 def allowed_numbers(record, *texts: str) -> list[float]:
     vals = numeric_leaves(record)
     for t in texts:
@@ -488,7 +494,7 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
     by_id = {c["id"]: c for c in led["checks"]}
     claims = led["central_claims"]
     refs = _reference_text(x.root)
-    allowed = allowed_numbers(led, "\n".join(x.paper.pages) if hasattr(x.paper, "pages") else "", refs)
+    allowed = allowed_numbers(led, "\n".join(x.paper.pages) if hasattr(x.paper, "pages") else "", refs, *harness_texts(led))
     refs_flat = report.flat(refs)
     held: list[str] = []
 
