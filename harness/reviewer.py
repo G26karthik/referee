@@ -617,6 +617,14 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
     return text
 
 
+def _numbers(ns: list[int]) -> str:
+    """Claim numbers as a reader writes them: "3 to 10", "3, 5 and 7"."""
+    ns = sorted(ns)
+    if len(ns) > 2 and ns == list(range(ns[0], ns[-1] + 1)):
+        return f"{ns[0]} to {ns[-1]}"
+    return ", ".join(map(str, ns[:-1])) + (" and " if len(ns) > 1 else "") + str(ns[-1])
+
+
 def _theirs(prose, text: str, where: str) -> str:
     """A field that is the other record's own finding (its verdict, its measurement): its verdict words are the
     record's; its numbers and quotes are still checked against the registered record."""
@@ -658,6 +666,7 @@ def page(x, led: dict, rep: dict, cmp: dict, prose) -> str:
               "| Claim in the paper | Other record | This REFEREE run |", "|---|---|---|"]
     for group in _groups(claims, rep):
         left, mid, right = [], [], []
+        tag = (lambda k: f"{pos[k]}: ") if len(group) > 1 else (lambda k: "")     # a grouped row names each claim
         for cc in group:
             k, d, o = cc.get("id"), cc.get("decision") or {}, other.get(cc.get("id"))
             left.append(f"**{pos[k]}. {title(cc)}.** {_cell(cc.get('statement') or cc['quote'])} (p{cc.get('page')})")
@@ -668,10 +677,10 @@ def page(x, led: dict, rep: dict, cmp: dict, prose) -> str:
             else:
                 verdict = _short(_cell(o.get("hf_verdict") or o.get("reference_finding")), 200)
                 meas = _theirs(prose, _cell(o.get("hf_measurement")), f"{k} record measurement") if o.get("hf_measurement") else ""
-                mid.append(f"{pos[k]}: " + _theirs(prose, verdict, f"{k} record verdict") + (f" {meas}" if meas else ""))
+                mid.append(tag(k) + _theirs(prose, verdict, f"{k} record verdict") + (f". {meas}" if meas else ""))
             res = mine.get(k, {}).get("result")
             said = prose(_cell(res), f"{k} result") if res else _harness_result(cc, by_id)
-            right.append(f"{pos[k]}: {said} **{'Verified' if d.get('decision') == VERIFIED else 'Not verified'}** "
+            right.append(f"{tag(k)}{said} **{'Verified' if d.get('decision') == VERIFIED else 'Not verified'}** "
                          f"({REASON_WORDS.get(d.get('reason', ''), d.get('reason', '').replace('_', ' '))}).")
         lines.append("| " + " | ".join("<br>".join(col) for col in (left, mid, right)) + " |")
     lines += ["", "## How the tests line up", "",
@@ -682,12 +691,18 @@ def page(x, led: dict, rep: dict, cmp: dict, prose) -> str:
               "- **What differs, or why a test did not run:** "
               + (prose(_cell(cmp.get("differences")), "differences", record=True) if cmp.get("differences") else "see the trace record."),
               "", "## Comparison", ""]
+    alone = []
     for cc in claims:
         k, d, o = cc.get("id"), cc.get("decision") or {}, other.get(cc.get("id")) or {}
-        sup = o.get("supports") or ""
-        if sup:
+        if o and o.get("agreement") == "not_covered":
+            alone.append(pos[k])                  # the record is silent: REFEREE's result in the table stands alone
+            continue
+        if o.get("supports"):
             lines.append(f"- **For claim {pos[k]}, the evidence supports:** "
-                         + prose(_cell(sup), f"{k} supports", True, d.get("decision") == VERIFIED))
+                         + prose(_cell(o["supports"]), f"{k} supports", True, d.get("decision") == VERIFIED))
+    if alone:
+        lines.append(f"- **For claim{'s' if len(alone) > 1 else ''} {_numbers(alone)}:** the other record says nothing, so "
+                     "the evidence is REFEREE's result in the table alone.")
     if cmp.get("overall"):
         lines.append("- **Overall comparison and limits of this conclusion:** "
                      + prose(_cell(cmp["overall"]), "overall", record=True))
@@ -717,7 +732,7 @@ REASON_WORDS = {"supported": "supported within the tested scope", "existence_sho
                 "only part of the scope tested", "scope_not_tested": "the test computed other cases",
                 "witness_cases_only": "examples for tested cases only", "finite_cases_only": "finite cases only",
                 "undecided": "within noise", "missing_input": "missing data or credentials", "resource_limit":
-                "a time or memory limit of this run", "test_failed": "the test failed to run", "blocked": "refused by a gate",
+                "a limit of this run: time, memory or the number of tests", "test_failed": "the test failed to run", "blocked": "refused by a gate",
                 "not_checked": "no test", "pending": "not finished"}
 
 
@@ -844,11 +859,12 @@ def trace(x, led: dict, rep: dict, cmp: dict, prose) -> str:
         o = other.get(k)
         if o:
             said = "; ".join(f"\"{_short(q, 160)}\"" for q in o.get("quotes") or [])
-            finding = o.get("hf_verdict") or o.get("reference_finding") or ""
+            finding = (_theirs(prose, _short(o["hf_verdict"], 300), k + " record verdict") if o.get("hf_verdict") else
+                       prose(_short(o.get("reference_finding") or "", 300), k + " reference finding", record=True))
             lines.append(f"- **Other reproduction record ({_short(o.get('source', 'reference'), 60)}):** "
                          + (f"entry {_cell((o.get('entry') or {}).get('space'))}; " if (o.get("entry") or {}).get("space") else "")
-                         + f"{prose(_short(finding, 300), k + ' reference finding', record=True)}"
-                         + (f" {prose(_short(o['hf_measurement'], 300), k + ' record measurement', record=True)}"
+                         + finding
+                         + (f". {_theirs(prose, _short(o['hf_measurement'], 300), k + ' record measurement')}"
                             if o.get("hf_measurement") else "")
                          + (f" In its words: {said}." if said else "")
                          + f" Comparable: {o.get('comparable', '?')}. Agreement: {str(o.get('agreement', '')).replace('_', ' ')}."

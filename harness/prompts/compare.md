@@ -25,7 +25,8 @@ bootstrap estimates is not a difference of standard errors; a judge's tally is n
 differ, say what each one is and do not compare them.
 
 Per paper:
-  - `hf_setup` (at most 70 words): the record's data, model, baselines, seeds and metric, as the record states them.
+  - `hf_setup` (at most 80 words): the record's data, model, baselines, seeds and metric, as the record states them,
+    and what each verdict label the record uses means, as the record itself explains it (or that it does not).
   - `differences` (at most 70 words): what differs between the two sets of tests, or why a test did not run.
   - `overall` (at most 80 words): what the two records together support, and the limits of that conclusion.
 For EACH claim id give one entry:

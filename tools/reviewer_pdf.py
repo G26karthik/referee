@@ -16,11 +16,11 @@ from pathlib import Path
 import markdown
 
 CSS = """
-@page { size: A4; margin: 13mm 13mm 13mm 13mm; }
-body { font-family: Georgia, 'Times New Roman', serif; font-size: 9.4pt; line-height: 1.3; color: #111; }
+@page { size: A4; margin: 11mm 12mm 11mm 12mm; }
+body { font-family: Georgia, 'Times New Roman', serif; font-size: 9pt; line-height: 1.26; color: #111; }
 h1 { font-size: 13.5pt; margin: 0 0 3pt 0; } h2 { font-size: 11pt; margin: 8pt 0 3pt 0; border-bottom: 1px solid #bbb; }
 h3 { font-size: 10pt; margin: 8pt 0 2pt 0; } p, li { margin: 2pt 0; } ul { margin: 2pt 0 2pt 0; padding-left: 14pt; }
-table { border-collapse: collapse; margin: 3pt 0 5pt 0; font-size: 8.2pt; width: 100%; }
+table { border-collapse: collapse; margin: 3pt 0 5pt 0; font-size: 7.9pt; width: 100%; }
 th, td { border-bottom: 1px solid #ddd; padding: 2pt 3pt; text-align: left; vertical-align: top; }
 th { background: #f0f0f0; } code { font-family: Consolas, monospace; font-size: 8pt; }
 .paper { page-break-after: always; } .paper:last-child { page-break-after: auto; }
