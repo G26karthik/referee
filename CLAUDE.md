@@ -204,7 +204,7 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     A follow-up claim may link a check an earlier round ran (its covers count). Re-planning never removes a
     claim: a withdrawn follow-up plan stays sealed (`plan:2.withdrawn.N`) and every claim it listed stays in
     the ledger (NOT_CHECKED, blocker `withdrawn`) until a later round takes it up; a quote inside an earlier
-    claim is that claim; more than 8 claims are refused, never cut unseen.
+    claim is that claim; no fixed number of claims is imposed.
     Superseded outcomes stay visible in the report. Every check names its basis (an audit of
     released result files, a recomputation from released predictions, a fresh run) and the
     report says which. A central claim has a `claim_type`; an engineering claim (a component
@@ -259,7 +259,7 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     assumptions under which it is claimed, the evidence the paper offers, what would decide it, and its alternative
     readings; ids K1..Kn are the harness's. A plan tests claims BY ID and can never add, drop, requote or retype one; a
     criterion a planner supplies is a diagnostic (a deviation), never a claim. Seeds, datasets, baselines and cases of one
-    claim are its scope, not new claims. No claim count is imposed (a safety ceiling of 30 refuses a runaway list). Every
+    claim are its scope, not new claims. No claim count is imposed. Every
     extracted claim stays in the ledger, its completion and the report whatever the plans did (a malformed plan, a
     withdrawn follow-up); a follow-up round may add a missed headline claim only through `new_claims`, validated alike.
 28. **One decision per main claim, computed.** `reviewer.decision`: VERIFIED only when the requested test ran as

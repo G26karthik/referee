@@ -4153,17 +4153,17 @@ def test_a_follow_up_quote_inside_a_first_round_claim_is_that_claim():
         assert len(plan["central_claims"]) == 1 and plan["central_claims"][0]["checks"] == ["C1", "C7"], plan["central_claims"]
 
 
-def test_central_claims_past_the_cap_are_refused_never_silently_cut():
-    """claims_in[:8] cut a 9th central claim on every attempt and recorded nothing (probe on HEAD da068d1)."""
+def test_every_main_claim_is_kept_with_no_fixed_number():
+    """claims_in[:8] once cut a 9th central claim silently, and then a cap of 8 refused it (probe on HEAD da068d1); the
+    task: no fixed maximum number of claims. Every claim a round lists is kept, however many."""
     with tempfile.TemporaryDirectory() as t:
         lines = [f"Claim number {w} is shown by the experiments here." for w in
                  ("one", "two", "three", "four", "five", "six", "seven", "eight", "nine")]
         cfg, pid, x = _x(Path(t), ("\n".join(lines),))
         claims = [{"quote": q, "claim_type": "theory", "checks": [], "scope": ["it"], "why_unchecked": "no check fits",
                    "blocker": "other"} for q in lines]
-        assert "at most 8" in _refused(lambda: _plan(x, [], claims))
-        rec = _plan(x, [], claims, final=True)
-        assert len(rec["central_claims"]) == 8 and any(lines[8][:30] in d["why"] for d in rec["dropped"]), rec["dropped"]
+        rec = _plan(x, [], claims)
+        assert len(rec["central_claims"]) == 9 and not rec["dropped"], rec["dropped"]
 
 
 def test_a_follow_up_claim_may_rest_on_a_check_that_already_ran():

@@ -146,6 +146,10 @@ empty or corrupt file, a bad checksum and source code are not admitted), records
 mounts the rest read-only at /work/data/<n>/. Name the dataset's documented size or identity (instances,
 items, splits) in `why` so the script can check it. `include` selects files (for a landing page or a
 record with several files: a record may hold gigabytes you do not need; fetch only what the claim uses).
+FOLLOW THE AUTHORS FIRST: before any registry search, follow where the paper, the authors' checkout (README,
+notebooks, download or preprocessing scripts) and the packages it names (a loader that downloads the data) say the data
+lives. A failed URL is an acquisition failure of that URL (try the same record's other links, its DOI, the authors'
+mirror), never evidence that the data is not public.
 Two ways to a source:
   (a) The paper or a tracked checkout file PRINTS it (a URL, a DOI, a Zenodo record, an hf:// id):
       `"source": "https://..."` or `"hf://datasets|models/<owner>/<name>"`, `"cited_in": "paper"` or the

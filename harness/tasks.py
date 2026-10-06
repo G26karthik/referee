@@ -53,9 +53,6 @@ CRITERIA = ("stated", "supplied")
 # ponytail: 16 deviations per script; more is several choices of one kind, merged into one entry. Past the cap
 # a script is refused, never cut: a verifier must see every departure it judges.
 MAX_DEVIATIONS = 16
-# ponytail: 8 central claims per plan round cover a paper's abstract, contributions and conclusion; more is refused, and
-# on the last attempt each claim past the cap is recorded as dropped, never cut unseen.
-MAX_CLAIMS = 8
 SEVERITY = ("NOTE", "MINOR", "MAJOR", "FATAL")
 CLASSES = ("CONFIRMED_FINDING", "PLAUSIBLE_CONCERN", "OPEN_QUESTION", "DISMISSED")
 PROMPTS = Path(__file__).parent / "prompts"
@@ -1347,9 +1344,8 @@ def _seal_lens(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
             "unasked_question": str(obj.get("unasked_question") or "")[:2000], "notes": str(obj.get("notes") or "")[:2000]}
 
 
-# ponytail: 30 main claims is a safety ceiling against a runaway list, not a target: the extractor is told to list every
-# main claim and no more; past it the answer is refused (merge restatements and scope items), never cut unseen.
-MAX_EXTRACTED = 30
+# No fixed number of main claims: the extractor lists every main claim and no more (one per distinct conclusion; a
+# restatement is `also_stated`, a dataset or case of one conclusion is its scope), and every one is kept.
 # ponytail: 40 scope items per claim (methods, baselines, datasets, settings of one conclusion); more is refused, and on the
 # last attempt the items past it are recorded with the claim (`scope_cut`) and reported as not tested — never cut unseen.
 MAX_SCOPE = 40
@@ -1363,9 +1359,6 @@ def _seal_claims(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     out, dropped, errors = _validate_claims(x, raw, [], 1)
     for o in out:
         o.pop("_raw", None)
-    if len(raw) > MAX_EXTRACTED:
-        errors.append(f"{len(raw)} claims: at most {MAX_EXTRACTED} — a dataset, baseline, seed or case of one conclusion is its "
-                      "scope, and a restatement is `also_stated`, never another claim")
     if not out:
         errors.append("no main claim was extracted: every paper states at least one result")
     _fail_or_drop(errors, final)
@@ -1376,7 +1369,7 @@ def _validate_claims(x: _Ctx, raw: list[dict], known: list[dict], first: int) ->
     """(claims, dropped, errors): each claim re-found and typed, numbered K<first>.. after the `known` ones (a claim that
     restates a known one is refused)."""
     errors, out, dropped = [], [], []
-    for c in raw[:MAX_EXTRACTED]:
+    for c in raw:
         errs: list[str] = []
         h = _find(x, str(c.get("quote") or ""), errs, "claim quote")
         label = f"claim {str(c.get('quote') or '')[:50]!r}"
@@ -1424,8 +1417,6 @@ def _validate_claims(x: _Ctx, raw: list[dict], known: list[dict], first: int) ->
                     "evidence_in_paper": evidence, "required_evidence": req[:600], "interpretations": interp,
                     "_raw": raw.index(c), **({"scope_cut": cut} if cut else {}),
                     **({"sealed_with_errors": errs[:6]} if errs else {})})
-    dropped += [{"claim": str(c.get("quote") or "")[:200], "why": [f"past the ceiling of {MAX_EXTRACTED} claims"]}
-                for c in raw[MAX_EXTRACTED:]]
     return out, dropped, errors
 
 
@@ -1691,7 +1682,7 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     cap, n0 = (x.cfg.max_followup_checks, max(used + [x.cfg.max_checks])) if base else (x.cfg.max_checks, 0)
     proposed = [c for c in obj.get("checks") or [] if isinstance(c, dict)]
     raw_claims = [cc for cc in obj.get("central_claims") or [] if isinstance(cc, dict)]
-    claims_in = raw_claims[:MAX_CLAIMS]
+    claims_in = raw_claims
     ks = (x.sealed("claims") or {}).get("claims") or []
     extracted: dict = {}
     if ks:
@@ -1712,7 +1703,7 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
             known = ks + [c for p in [base] + report.withdrawn_plans(x.root) for c in p.get("central_claims", [])
                           if c.get("id") and c["id"] not in extracted]
             top = max([int(m.group(1)) for c in known if (m := re.fullmatch(r"K(\d+)", str(c.get("id") or "")))] + [0])
-            raw_new = [c for c in obj.get("new_claims") or [] if isinstance(c, dict)][:6]   # ponytail: 6 new claims per follow-up
+            raw_new = [c for c in obj.get("new_claims") or [] if isinstance(c, dict)]
             new, ndrop, nerr = _validate_claims(x, raw_new, known, top + 1)
             errors += nerr
             dropped += [{"check": "new claim", "why": d["why"]} for d in ndrop]
@@ -1722,11 +1713,6 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
                 want.append(n["id"])
         claims_in = [{**given.get(i, {"checks": [], "why_unchecked": "the plan gave no entry for this claim"}),
                       **{k: extracted[i][k] for k in ("quote", "claim_type", "scope")}, "id": i} for i in want]
-    elif len(raw_claims) > MAX_CLAIMS:                        # refused, never cut unseen; on the last attempt, recorded
-        errors.append(f"{len(raw_claims)} central claims: at most {MAX_CLAIMS} — keep the paper's most important ones and "
-                      "merge restatements of one claim; a claim past the cap is recorded as dropped, never checked")
-        dropped += [{"check": "central claim", "why": f"over the cap of {MAX_CLAIMS} central claims: {str(cc.get('quote'))[:160]!r}"}
-                    for cc in raw_claims[MAX_CLAIMS:]]
     # A follow-up claim may rest on a check an earlier round ran (its harness id, C1..): its covers count for the claim
     # (Oct-01 PPRM: "already run in round 1 as C3" could only be written as an omission).
     proposed_ids = {c.get("id") for c in proposed}
