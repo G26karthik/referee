@@ -17,17 +17,23 @@ import re
 from pathlib import Path
 
 from . import report, state
-from .reconcile import FAILURE
+from .reconcile import CONSTRUCTION_FAILED, FAILURE, SUPPORT
 
 VERIFIED, NOT_VERIFIED = "VERIFIED", "NOT_VERIFIED"
 # Each reason is one sentence of plain English; the decision's own facts follow it in `because`.
 REASONS = {
     "supported": "The requested test ran as specified and its result supports the claim within the tested scope.",
+    "existence_shown": "A valid example meets every printed assumption and shows the claimed property. One such example "
+                       "shows that the stated object exists.",
     "contradicted": "The evidence contradicts the claim as printed.",
     "false_as_printed": "A case that meets every printed assumption violates the printed statement.",
     "proof_step_invalid": "A step of the printed proof fails on cases that meet its assumptions. This does not show "
                           "that the statement itself is false.",
-    "premise_impossible": "A printed assumption cannot hold, so the statement as printed applies to no case.",
+    "construction_failed": "The paper's construction of an example failed on cases that meet its assumptions. This shows "
+                           "a gap in the construction. It does not show that no example exists.",
+    "premise_impossible": "A printed assumption can never hold, by a general argument that the verifier checked. So the "
+                          "statement as printed applies to no case. A false assumption is not a counterexample.",
+    "premise_not_met": "No tested case met the printed assumptions. The test says nothing about the statement as printed.",
     "notation_defect": "The statement is not defined as printed (for example, an index out of range). Under a corrected "
                        "reading it held on the tested cases, which is not a proof.",
     "changed_protocol": "The test ran only under a changed protocol, reading or dataset. Its result is about the "
@@ -36,10 +42,20 @@ REASONS = {
                                 "different results.",
     "checks_disagree": "Two tests of the same printed statement disagree.",
     "incomplete_coverage": "Only part of the claimed scope was tested.",
+    "scope_not_tested": "The test linked to this claim computed other cases than the ones the claim states. The claim "
+                        "itself was not tested.",
+    "witness_cases_only": "Valid examples exist for each tested case. The statement covers every case, and finite cases "
+                          "do not show that.",
     "finite_cases_only": "No counterexample was found in the tested cases. Finite cases cannot prove a general "
                          "statement.",
     "undecided": "The test ran, but its result is within noise or undefined, so it decides nothing.",
-    "blocked": "The test could not run, for a reason the harness recorded.",
+    "missing_input": "The test could not run because required data or credentials were not available to this run. This "
+                     "says nothing about the claim.",
+    "resource_limit": "The test stopped at a limit of this run (time, memory or the number of tests). This says nothing "
+                      "about the claim.",
+    "test_failed": "The test started but failed before it gave a result, for a reason the harness recorded (a fault of "
+                   "this run). This says nothing about the claim.",
+    "blocked": "The test was refused by a gate of this run, for a reason the harness recorded.",
     "not_checked": "No test was run.",
     "pending": "The test has not finished.",
 }
@@ -56,17 +72,28 @@ def _failure_audit(cs: list[dict], verdict: str) -> bool:
 
 
 def decision(cc: dict, by_id: dict) -> dict:
-    """VERIFIED only when the requested test ran as specified and supports the claim within the tested scope; a
-    mathematical statement is never verified by finite cases. Otherwise NOT_VERIFIED with one specific reason:
-    contradicted, false as printed, an invalid proof step, an impossible premise, a notation defect, a changed
-    protocol, an ambiguous reading, checks that disagree, incomplete coverage, finite cases only, undecided, a recorded
-    blocker, no test, or not finished. Missing evidence is never read as falsity."""
+    """VERIFIED only when the requested test ran as specified, an audit found its code computes what the claim states, and
+    the result supports the claim within the tested scope: for an existence statement, one valid example meeting every
+    printed assumption; a universal statement is never verified by finite cases. Otherwise NOT_VERIFIED with one specific
+    reason: contradicted, false as printed, an invalid proof step, a failed construction, an impossible or unmet premise, a
+    notation defect, a changed protocol, an ambiguous reading, checks that disagree, incomplete coverage, a scope the test
+    did not compute, examples for the tested cases only, finite cases only, undecided, missing input, a resource limit, a
+    refusal, no test, or not finished. Missing evidence is never read as falsity."""
     st, comp, theory = cc.get("claim_status", ""), cc.get("completion") or {}, cc.get("claim_type") == "theory"
+    form = report.claim_form(cc)
     cs = [by_id[k] for k in cc.get("checks") or [] if k in by_id]
     tgt = [c for c in cs if c.get("role", "target") == "target"]
-    if st == "SUPPORT_FOUND" and not theory and comp.get("experiment") == "RAN_AS_SPECIFIED":
+    witness = [c for c in tgt if c["kind"] == "CERTIFICATE" and c.get("status") == "WITNESS_FOUND"]
+    shown = comp.get("experiment") == "RAN_AS_SPECIFIED" and not comp.get("coverage_unverified")
+    if comp.get("none_covered") and st not in ("FAILURE_FOUND", "PROOF_GAP_FOUND", "PENDING"):
+        reason = "scope_not_tested"
+    elif st == "SUPPORT_FOUND" and theory:
+        reason = ("existence_shown" if witness and form == "existential" and shown else
+                  "witness_cases_only" if witness and form == "universal_existential" else
+                  "incomplete_coverage" if witness and form == "existential" else "finite_cases_only")
+    elif st == "SUPPORT_FOUND" and shown:
         reason = "supported"
-    elif st in ("SUPPORT_FOUND", "NO_VIOLATION_FOUND") and theory:
+    elif st == "NO_VIOLATION_FOUND" and theory:
         reason = "finite_cases_only"
     elif st == "SUPPORT_FOUND" and comp.get("experiment") == "RAN_WITH_CHANGES":
         reason = "changed_protocol"                 # one test as specified, another under a change: not the printed scope
@@ -75,9 +102,9 @@ def decision(cc: dict, by_id: dict) -> dict:
     elif st == "FAILURE_FOUND":
         reason = "false_as_printed" if theory else "contradicted"
     elif st == "PROOF_GAP_FOUND":
-        reason = "proof_step_invalid"
+        reason = "construction_failed" if any(c.get("status") == CONSTRUCTION_FAILED for c in tgt) else "proof_step_invalid"
     elif st == "PREMISE_NOT_MET":
-        reason = "premise_impossible"
+        reason = "premise_impossible" if any(c.get("premise_argument") for c in tgt) else "premise_not_met"
     elif _failure_audit(tgt, "DEPENDS") or st == "READINGS_DISAGREE":
         reason = "interpretation_uncertain"
     elif st == "READING_CHANGED":
@@ -87,8 +114,10 @@ def decision(cc: dict, by_id: dict) -> dict:
         # The printed text evaluated on every case and held in all of them: the claim is untested only in the sense
         # that finite cases never prove it — a changed reading's violation is about the changed statement.
         printed_held = lit("holds") > 0 and not (lit("fails") or lit("undefined") or lit("premise_not_met"))
-        reason = ("notation_defect" if theory and lit("undefined") else "finite_cases_only" if theory and printed_held
-                  else "changed_protocol")
+        never = lit("premise_not_met") > 0 and not (lit("holds") or lit("fails"))
+        reason = (("premise_impossible" if any(c.get("premise_argument") for c in certs) else "premise_not_met")
+                  if theory and never else "notation_defect" if theory and lit("undefined")
+                  else "finite_cases_only" if theory and printed_held else "changed_protocol")
     elif st == "CHECKS_DISAGREE":
         reason = "checks_disagree"
     elif st == "PARTIAL_EVIDENCE":
@@ -99,21 +128,57 @@ def decision(cc: dict, by_id: dict) -> dict:
         reason = "undecided"
     elif st == "NOTHING_DECIDED" and any(c.get("values") for c in tgt):
         reason = "undecided"
-    elif any(c["status"] == "BLOCKED" for c in tgt) or any(
-            b.get("basis") == "harness" and b.get("blocker") not in ("not run", "pending") for b in comp.get("not_run") or []):
-        reason = "blocked"
+    elif (why := _stopped(cc, tgt, comp)):
+        reason = why
     else:
         reason = "not_checked"
     text = REASONS[reason]
     if any(c["status"] == "VIOLATION_UNDER_CHANGED_READING" for c in tgt):
         if reason == "notation_defect":
             text = ("The statement is not defined as printed (for example, an index out of range). Under the changed "
-                    "reading tested instead, cases violate it; that is about the changed statement, not the printed one.")
-        elif reason == "finite_cases_only":
-            text += (" Cases do violate a changed reading of it; that is about the changed statement, not the printed "
-                     "one.")
-    return {"decision": VERIFIED if reason == "supported" else NOT_VERIFIED, "reason": reason,
-            "reason_text": text, "because": _because(cc, tgt, reason, comp)}
+                    "reading tested instead, cases violate it. That result is about the changed statement.")
+        elif reason in ("finite_cases_only", "premise_impossible", "premise_not_met"):
+            text += (" Cases do violate a changed reading of it. That result is about the changed statement, not the "
+                     "printed one.")
+    verified = reason in ("supported", "existence_shown")
+    return {"decision": VERIFIED if verified else NOT_VERIFIED, "reason": reason, "reason_text": text,
+            "because": _because(cc, tgt, reason, comp), "narrower": [] if verified else narrower(tgt)}
+
+
+def _stopped(cc: dict, tgt: list[dict], comp: dict) -> str:
+    """Why no test of the claim gave a result, when the harness (or the planner, for a claim no test took up) recorded a
+    stop: missing input (data, credentials), a limit of this run (time, memory, the number of tests), or a refusal."""
+    words = [b.get("blocker") for b in comp.get("not_run") or [] if b.get("blocker") not in ("not run", "pending")
+             and (b.get("basis") == "harness" or (not tgt and not b.get("unverified")))]
+    words += ["data" if c.get("data_blocker") else report.resource_word(c.get("resource"))
+              if str(c.get("reason", "")).startswith("RESOURCE BLOCKER") else "refused" for c in tgt if c["status"] == "BLOCKED"]
+    if not tgt and cc.get("blocker") and not cc.get("unverified"):
+        words.append(cc["blocker"])
+    if {"data", "credentials"} & set(words):
+        return "missing_input"
+    if {"compute", "cap"} & set(words):
+        return "resource_limit"
+    if "failed" in words:
+        return "test_failed"
+    return "blocked" if "refused" in words or any(c["status"] == "BLOCKED" for c in tgt) else ""
+
+
+def narrower(tgt: list[dict]) -> list[str]:
+    """What the tests did show, narrower than the claim: valid examples among the constructed cases, and the settings in
+    which a comparison held (under every reading the check computed). A narrower finding never decides the claim."""
+    out = []
+    for c in tgt:
+        moved = any(d.get("changes_claim") for d in c.get("deviations") or [])
+        tail = " (under the changes the test recorded)" if moved else ""
+        if c.get("witnesses"):
+            out.append(f"{c['witnesses']} valid example(s) among {c.get('instances') or len(c.get('values') or [])} "
+                       f"constructed cases{tail}")
+        st = c.get("stages") or {}
+        held = [s for s, p in st.items() if p.get("status") in SUPPORT + ("NO_VIOLATION_FOUND",)]
+        if held and len(held) < len(st):
+            out.append(f"the comparison held in {len(held)} of {len(st)} settings" + (" under every reading" if c.get(
+                "readings") else "") + ": " + ", ".join(held[:8]) + (" and more" if len(held) > 8 else "") + tail)
+    return out
 
 
 def _because(cc: dict, tgt: list[dict], reason: str, comp: dict) -> list[str]:
@@ -460,7 +525,13 @@ _MARKUP = re.compile(r"(?i)</?(?:a|b|i|u|s|em|strong|span|div|p|br|hr|img|script
 _ATTRIBUTED = re.compile(r"(?i)^\s*the (?:other )?records?\b")
 
 
-def problems(text: str, led: dict, paper, allowed: list[float], refs_flat: str = "", record: bool = False) -> list[str]:
+# A sentence about the other record (its entries, its judge, HF): its verdict words are the record's, not REFEREE's.
+_RECORD_SENT = re.compile(r"(?i)\b(?:the|this|that|other|each|every|its|one|all|both)\s+(?:\w+\s+)?(?:records?|entries|entry|"
+                          r"summar(?:y|ies)|logbooks?|judges?)\b|\brecord's\b|\bHF\b")
+
+
+def problems(text: str, led: dict, paper, allowed: list[float], refs_flat: str = "", record: bool = False,
+             verified: bool = False) -> list[str]:
     """Why a model-written passage cannot be published: markup or an entity (it would render as something the checks never
     saw), a status word no cited check earns, a quote not in the paper (or the registered record), a number the record
     and the paper do not hold. `record`: the passage says what ANOTHER reproduction record found; when every sentence of
@@ -473,7 +544,12 @@ def problems(text: str, led: dict, paper, allowed: list[float], refs_flat: str =
     quotes = [q for q in re.findall(r'"([^"\n]*)"', text) if len(q) >= 20 and not paper.occurs(q.replace("\\n", "\n"))
               and report.flat(q) not in refs_flat]
     theirs = record and bool(_ATTRIBUTED.match(text))      # the field is the record's finding, opened as such
-    status = [] if theirs else [f"status language: {s[:120]!r}" for s in report.unearned(_unquote(text, paper, refs_flat), led)]
+    body = _unquote(text, paper, refs_flat)
+    if record and not theirs:
+        # In a comparison, a sentence about the other record (and not about REFEREE) reports that record's verdict; a
+        # sentence about REFEREE may use its own decision word only when that is the claim's decision (`verified`).
+        body = " ".join(s for s in re.split(r"(?<=[.!?])\s+", body) if "REFEREE" in s or not _RECORD_SENT.search(s))
+    status = [] if theirs else [f"status language: {s[:120]!r}" for s in report.unearned(body, led, earned_support=verified)]
     return (status[:2] + [f"quote not in the paper or the record: {q[:80]!r}" for q in quotes][:2]
             + [f"number not in the record or the paper: {n}" for n in unknown_numbers(text, allowed)][:3])
 
@@ -498,8 +574,8 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
     refs_flat = report.flat(refs)
     held: list[str] = []
 
-    def prose(text: str, where: str, record: bool = False) -> str:
-        bad = problems(text, led, x.paper, allowed, refs_flat, record)
+    def prose(text: str, where: str, record: bool = False, verified: bool = False) -> str:
+        bad = problems(text, led, x.paper, allowed, refs_flat, record, verified)
         if bad:
             held.append(f"{where}: " + "; ".join(bad))
             return ("_(Model-written text withheld here: it used a number, a quotation or a status word that the record "
@@ -595,7 +671,7 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
             lines.append(f"- **Other reproduction record ({_short(o.get('source', 'reference'), 60)}):** "
                          f"{prose(_short(o.get('reference_finding'), 300), k + ' reference finding', record=True)}"
                          + (f" In its words: {said}." if said else "")
-                         + f" Comparable: {o.get('comparable', '?')} — {prose(o.get('why', ''), k + ' reference')} "
+                         + f" Comparable: {o.get('comparable', '?')} — {prose(o.get('why', ''), k + ' reference', True, d.get('decision') == VERIFIED)} "
                          f"Agreement: {str(o.get('agreement', '')).replace('_', ' ')}.")
         if tgt + sup:
             lines.append("- Evidence: " + ", ".join(c["id"] for c in tgt + sup) + " (under Test details)")

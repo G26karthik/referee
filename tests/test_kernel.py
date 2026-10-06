@@ -1907,6 +1907,7 @@ def test_a_claim_that_ran_only_on_a_substitute_gets_the_follow_up_round():
         cdir = td / pid / "checks" / "C1"
         state.write_json(cdir / "outcome.json", out)
         state.write_json(cdir / "check.json", {"deviations": [{"printed": "", "used": "a simulated stand-in", "changes_claim": True}]})
+        _scope_ok(td / pid, {"C1": ["MMLU"]})                                  # what it computed, audited
         phase, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
         assert phase == "plan" and [o["id"] for o in owed] == ["plan:2"]        # supported, but not the experiment the claim names
         prompt = Path(owed[0]["prompt"]).read_text(encoding="utf-8")
@@ -4016,6 +4017,19 @@ def _ready(td: Path, pages=None):
     return cfg, pid, td / pid
 
 
+def _scope_ok(root: Path, covers: dict) -> None:
+    """A sealed independent audit of what each check's code computes ({check: [scope items computed]}), as the seal would
+    store it: tests that are not about the audit start from one (a check no audit has read supports no Verified)."""
+    sha = lambda cid: (lambda r: r.get("script_sha256") or r.get("command") or "")(
+        state.read_json(root / "checks" / cid / "check.json", {}) or {})
+    rec = {"forms": {}, "checks": {cid: {"script": sha(cid), "covers": {s: {"how": "computed", "code": "x"} for s in items},
+                                         "exact": [], "witness": False, "outputs": []} for cid, items in covers.items()}}
+    state.write_json(root / "sealed" / "scope.json", rec)
+    seals = state.read_json(root / "seals.json", {}) or {}
+    seals["scope"] = state.sha256((root / "sealed" / "scope.json").read_bytes())
+    state.write_json(root / "seals.json", seals)
+
+
 def _audit_ok(cfg, pid, td, cid):
     """An independent audit that finds the failure stands (the quote it relies on re-found)."""
     _seal(cfg, pid, f"audit:{cid}", {"verdict": "STANDS", "depends_on": [], "quotes": [THM]}, td)
@@ -4080,6 +4094,9 @@ def test_a_compatibility_condition_is_the_harness_protocol_never_a_change_of_the
         led = report.ledger(tasks._Ctx(cfg, pid))
         cc = led["central_claims"][0]
         assert cc["claim_status"] == "SUPPORT_FOUND", cc["claim_status"]
+        assert cc["decision"]["decision"] == "NOT_VERIFIED", cc["decision"]               # nobody has read what it computed
+        _scope_ok(root, {"C1": ["CIFAR-10-C"]})
+        cc = report.ledger(tasks._Ctx(cfg, pid))["central_claims"][0]
         assert cc["decision"]["decision"] == "VERIFIED", cc["decision"]
 
 
@@ -4160,6 +4177,7 @@ def test_a_follow_up_claim_may_rest_on_a_check_that_already_ran():
         rec = _plan(x, [f1], [new], tid="plan:2")
         assert rec["central_claims"][0]["checks"] == ["C1", "C7"], rec["central_claims"]
         state.write_json(root / "checks" / "C1" / "outcome.json", {"status": "RELATION_HOLDS", "values": [1.0], "runs": 3})
+        _scope_ok(root, {"C1": ["CIFAR-10-C"]})
         _seal(cfg, pid, "plan:2", {"checks": [f1], "central_claims": [new]}, td)
         state.write_json(root / "checks" / "C7" / "outcome.json", {"status": "RELATION_HOLDS", "values": [1.0], "runs": 3})
         led = report.ledger(tasks._Ctx(cfg, pid))
@@ -4186,6 +4204,7 @@ def test_a_failure_counts_only_after_an_independent_audit_and_never_when_it_rest
         state.append_jsonl(root / "execution.jsonl", {"target": "C1", "mode": "evidence", "script_sha256": "s", "seed": 0,
                                                       "stdout": 'REFEREE_RESULT {"premises_hold": 1, "violated": 1, '
                                                                 '"violated_first_arrival": 0}\n'})
+        _scope_ok(root, {"C1": ["the bound"]})
         x = tasks._Ctx(cfg, pid)
         phase, owed, _ = tasks._plan(x)
         assert [o["id"] for o in owed] == ["audit:C1"], owed                  # owed before any follow-up or report
@@ -4729,16 +4748,18 @@ def _claims_project(td: Path) -> tuple[state.Config, str]:
 
 
 _K = [{"quote": "Our layer can replace a dense layer in any network", "statement": "The layer can be swapped in for a dense layer.",
-       "claim_type": "engineering", "scope": ["our layer", "dense layer"], "required_evidence": "swap the layer in and train it"},
+       "claim_type": "engineering", "form": "compatibility", "scope": ["our layer", "dense layer"],
+       "required_evidence": "swap the layer in and train it"},
       {"quote": "Our method is more accurate than the baseline on CIFAR and SVHN",
        "also_stated": ["our method is more accurate than the baseline on both datasets"],
-       "statement": "The method has higher accuracy than the baseline.", "claim_type": "performance",
+       "statement": "The method has higher accuracy than the baseline.", "claim_type": "performance", "form": "empirical",
        "scope": ["Ours", "Base", "CIFAR, SVHN"], "required_evidence": "the Table 2 experiment over 5 seeds",
        "evidence_in_paper": [{"quote": "Table 2: Results", "what": "two datasets"}],
        "interpretations": [{"name": "top1", "reading": "top-1 accuracy on the test split",
                             "quote": "more accurate than the baseline on CIFAR"}]},
       {"quote": "If the step size is below one half, the error decays", "statement": "The error decays for small steps.",
-       "claim_type": "theory", "scope": ["Theorem 1"], "required_evidence": "a proof; exact cases can only refute it",
+       "claim_type": "theory", "form": "universal", "scope": ["Theorem 1"],
+       "required_evidence": "a proof; exact cases can only refute it",
        "assumptions": [{"quote": "the step size is below one half", "what": "step size < 1/2"}]}]
 
 
@@ -4871,12 +4892,12 @@ def test_every_main_claim_gets_one_decision_with_a_specific_reason():
              (_claim_row("NO_VIOLATION_FOUND", "theory", "RAN_AS_SPECIFIED"), "finite_cases_only"),
              (_claim_row("SUPPORT_FOUND", "theory"), "finite_cases_only"),
              (_claim_row("FAILURE_FOUND", "theory"), "false_as_printed"), (_claim_row("FAILURE_FOUND"), "contradicted"),
-             (_claim_row("PROOF_GAP_FOUND", "theory"), "proof_step_invalid"), (_claim_row("PREMISE_NOT_MET", "theory"), "premise_impossible"),
+             (_claim_row("PROOF_GAP_FOUND", "theory"), "proof_step_invalid"), (_claim_row("PREMISE_NOT_MET", "theory"), "premise_not_met"),
              (_claim_row("READING_CHANGED", exp="RAN_WITH_CHANGES"), "changed_protocol"),
              (_claim_row("READINGS_DISAGREE"), "interpretation_uncertain"), (_claim_row("CHECKS_DISAGREE"), "checks_disagree"),
              (_claim_row("NOT_CHECKED", exp="NOT_RUN", why_unchecked="no code"), "not_checked"),
              (_claim_row("NOT_CHECKED", exp="NOT_RUN", comp={"not_run": [{"item": "IHDP", "blocker": "data", "basis": "harness",
-                                                                  "why": "404"}]}), "blocked"),
+                                                                  "why": "404"}]}), "missing_input"),
              (_claim_row("PENDING"), "pending")]
     for cc, want in cases:
         got = d(cc)
@@ -5057,7 +5078,7 @@ def test_the_reviewer_page_states_each_test_once_and_stays_near_two_pages():
         assert "no target check covering it ran to completion" not in page and "BART: cap" in page, page
         assert "1 of 100 planned runs" in page and "DOES NOT RECONCILE" not in page, page
         assert "No tuning is run." in page and "(100 trees, depth 4)" not in page        # a whole first sentence, no cut
-        assert claims[0]["decision"]["reason"] == "blocked"                             # its one test was blocked
+        assert claims[0]["decision"]["reason"] == "resource_limit"                      # its one test met a limit of this run
         main = page.split("## Test details")[0]
         assert "config.yaml values" not in main and "on toy k=5; 1 of 100 planned runs" in main, main   # the gist up top
         why = "The claim needs every baseline on all three DGPs at four sizes, which no slot is left for."
@@ -5528,6 +5549,193 @@ def test_a_seed_that_ran_out_of_gpu_memory_alone_is_never_resumed_into_a_loop():
         state.write_json(cdir / "outcome.json", {"status": "PARTIAL", "authorized": True, "failed_seeds": {"0": "exit 1: " + err}})
         res = tasks.reopen(cfg, pid, "C1", "again")
         assert "error" in res and "GPU" in res["error"], res
+
+
+def test_an_existence_claim_is_shown_by_a_valid_example_and_a_failed_construction_refutes_nothing():
+    """Oct-06 label ranking C2/C3: the scripts built the paper's examples (a model that is sub-k calibrated and not top-k
+    calibrated) and printed violated = 1 where the construction did NOT give a valid example. The harness read 12 failed
+    constructions as COUNTEREXAMPLE_FOUND against an existence statement, and the 8 valid examples as 'finite cases only'.
+    A valid example that meets every premise shows an existence statement for the cases it covers; a failed construction
+    is a gap in the construction, never a counterexample; only a universal statement is never shown by finite cases."""
+    from harness.reconcile import certificate
+    from harness.reviewer import decision
+    ok = lambda r="": {"violated": 0, "premises": 1, "literal": None, **({"reading": r} if r else {})}
+    bad = lambda r="": {"violated": 1, "premises": 1, "literal": None, **({"reading": r} if r else {})}
+    mixed = certificate([ok()] * 8 + [bad()] * 12 + [ok("fixed")] * 20, False, False, witness=True)
+    assert mixed["status"] == "WITNESS_FOUND" and mixed["witnesses"] == 8 and mixed["constructions_failed"] == 12, mixed
+    assert "counterexample" not in mixed["reason"].lower() or "never a counterexample" in mixed["reason"].lower()
+    none = certificate([bad()] * 4 + [ok("fixed")] * 4, False, False, witness=True)
+    assert none["status"] == "CONSTRUCTION_FAILED" and "changed reading" in none["reason"], none
+    assert certificate([bad()] * 4, False, False)["status"] == "COUNTEREXAMPLE_FOUND"     # a universal statement: unchanged
+    cert = {"id": "C2", "kind": "CERTIFICATE", "role": "target", "status": "WITNESS_FOUND", "values": [0] * 8,
+            "witnesses": 8, "instances": 20, "counts": {}}
+    row = lambda form, **kw: _claim_row("SUPPORT_FOUND", "theory", checks=["C2"], form=form, **kw)
+    got = decision(row("existential"), {"C2": cert})
+    assert got["decision"] == "VERIFIED" and got["reason"] == "existence_shown", got
+    assert decision(row("universal_existential"), {"C2": cert})["reason"] == "witness_cases_only"
+    assert decision(row("universal"), {"C2": cert})["reason"] == "finite_cases_only"
+    assert decision(row(None), {"C2": cert})["reason"] == "finite_cases_only"            # unclassified: the strictest
+    part = decision(_claim_row("PARTIAL_EVIDENCE", "theory", exp="RAN_PARTIAL", checks=["C2"], form="existential",
+                               comp={"scope_not_run": ["Corollary A.4"]}), {"C2": cert})
+    assert part["reason"] == "incomplete_coverage" and any("8 valid example" in n for n in part["narrower"]), part
+    failed = {**cert, "status": "CONSTRUCTION_FAILED", "witnesses": 0}
+    assert decision(_claim_row("PROOF_GAP_FOUND", "theory", checks=["C2"], form="existential"), {"C2": failed})["reason"] \
+        == "construction_failed"
+    assert report.claim_form({"claim_type": "theory", "form": "existential"}) == "existential"
+    assert report.claim_form({"claim_type": "theory", "form": "empirical"}) == "universal"       # inconsistent: strictest
+    assert report.claim_form({"claim_type": "performance"}) == "empirical"
+
+
+def test_a_printed_premise_argued_unsatisfiable_is_premise_not_met_never_undefined():
+    """Oct-06 changepoint C6: the printed premise t_F < t_H can never hold (t_H = min(t_F, t_G)); the script said so in its
+    premise argument, printed the printed premise with premises_hold 0, and labelled the text as printed `undefined`. The
+    page then called the claim a notation defect (an undefined expression). An impossible premise is not an undefined
+    expression, and a false premise is no counterexample to a conditional claim."""
+    from harness.reconcile import certificate
+    from harness.reviewer import decision
+    rows = [{"violated": 0, "premises": 0, "literal": None, "reading": "printed"},
+            {"violated": 1, "premises": 1, "literal": "undefined", "reading": "repaired"}] * 3
+    o = certificate(rows, True, False, argued=True)
+    assert o["literal"] == {"holds": 0, "fails": 0, "undefined": 0, "premise_not_met": 3}, o
+    assert o["status"] == "VIOLATION_UNDER_CHANGED_READING" and "premise argument" in o["reason"], o
+    cert = {"id": "C6", "kind": "CERTIFICATE", "role": "target", "status": o["status"], "literal": o["literal"],
+            "values": [1] * 6, "premise_argument": "t_H = min(t_F, t_G) <= t_F", "counts": {}}
+    got = decision(_claim_row("READING_CHANGED", "theory", checks=["C6"], form="universal"), {"C6": cert})
+    assert got["reason"] == "premise_impossible" and "not a counterexample" in got["reason_text"], got
+    assert decision(_claim_row("READING_CHANGED", "theory", checks=["C6"]), {"C6": {**cert, "premise_argument": ""}})[
+        "reason"] == "premise_not_met"
+    assert decision(_claim_row("PREMISE_NOT_MET", "theory"), {})["reason"] == "premise_not_met"
+    assert certificate(rows, True, False)["literal"]["undefined"] == 3                   # no argument: as the script said
+
+
+def test_a_deterministic_quantity_is_one_exact_measurement():
+    """Oct-06 GRACE C4: a parameter count is an exact function of the configuration. Its three runs differed in data and
+    initial weights (different fingerprints), so the harness read three independent replicates of a zero-variance sample
+    and wanted six for a sign test. A stage an audit showed to compute an exact quantity, whose runs agree, is decided once,
+    on the sign of its margin; one whose runs differ is not deterministic and decides nothing."""
+    rel = "full - relaxed > 0"
+    detail = [{"seed": k, "stage": "params", "reading": "", "out": {"full": 3.8e7, "relaxed": 4.7e6}, "data_fp": f"f{k}",
+               "trials": {}} for k in range(3)]
+    staged = [["params", 3.8e7 - 4.7e6]] * 3
+    plain = reconcile("RECONSTRUCTION", "", [e[1] for e in staged], "", {}, True, True, "", rel, staged=staged, detail=detail)
+    assert plain["status"] == "INCONCLUSIVE" and plain["stages"]["params"]["needs_replicates"] == 6, plain   # as before
+    exact = reconcile("RECONSTRUCTION", "", [e[1] for e in staged], "", {}, True, True, "", rel, staged=staged, detail=detail,
+                      exact=["params"])
+    p = exact["stages"]["params"]
+    assert exact["status"] == "RELATION_HOLDS" and p["n_independent"] == 1 and not p.get("needs_replicates"), exact
+    assert "exact" in exact["rule"]
+    moved = [["params", 3.3e7], ["params", 3.4e7], ["params", 3.3e7]]
+    bad = reconcile("RECONSTRUCTION", "", [e[1] for e in moved], "", {}, True, True, "", rel, staged=moved, detail=detail,
+                    exact=["params"])
+    assert bad["status"] == "INCONCLUSIVE" and "differ" in bad["stages"]["params"]["reason"], bad
+
+
+def test_not_verified_says_whether_input_or_resources_were_missing():
+    """The task: under Not verified, a missing input (data, credentials) and a resource limit (time, memory, the check
+    budget) are different reasons from a contradiction or an ambiguous definition; both are facts about this run."""
+    from harness.reviewer import decision
+    data = _claim_row("NOT_CHECKED", exp="NOT_RUN", comp={"not_run": [{"item": "C3", "blocker": "data", "basis": "harness",
+                                                                        "why": "DATA BLOCKER (missing): HTTP 404"}]})
+    assert decision(data, {})["reason"] == "missing_input"
+    cpu = _claim_row("NOT_CHECKED", exp="NOT_RUN", checks=["C1"],
+                     comp={"not_run": [{"item": "C1", "blocker": "cap", "class": "per_run_timeout", "basis": "harness",
+                                        "why": "RESOURCE BLOCKER: a single run exceeded the configured per-run limit"}]})
+    c1 = {"id": "C1", "kind": "RECONSTRUCTION", "role": "target", "status": "BLOCKED", "reason": "RESOURCE BLOCKER: x",
+          "resource": "per_run_timeout", "counts": {}}
+    assert decision(cpu, {"C1": c1})["reason"] == "resource_limit"
+    slots = _claim_row("NOT_CHECKED", exp="NOT_RUN", why_unchecked="no slot", blocker="cap",
+                       comp={"not_run": [{"item": "(the whole claim)", "blocker": "cap", "basis": "planner", "why": "no slot"}]})
+    assert decision(slots, {})["reason"] == "resource_limit"
+
+
+def test_a_comparison_note_may_report_the_records_verdict_and_referees_own_decision():
+    """Oct-06 label ranking K2/K7: two comparison notes were withheld for 'status language': one reported the other record's
+    verdict ('a verified table witness'), one said REFEREE 'declines to verify'. The record's verdict is the record's, and a
+    refusal is a negation; REFEREE's own decision word is earned by its decision for that claim, and never otherwise."""
+    from harness import reviewer
+    p = Paper(["The model is sub-2 calibrated. Theorem 4.2 holds."])
+    led = {"checks": [], "central_claims": [], "concerns": []}
+    ok = lambda s, **kw: reviewer.problems(s, led, p, [], "", record=True, **kw) == []
+    assert ok("The record reports that all five summaries verified the table witness.")
+    assert ok("REFEREE computed both readings and they differ, so it declines to verify the claim.")
+    assert ok("REFEREE verified this claim within its tested scope.", verified=True)
+    assert not ok("REFEREE verified this claim within its tested scope.")                 # its decision says otherwise
+    assert not ok("Both tests confirm the theorem.")                                      # nobody's verdict is free
+
+
+def test_scope_items_count_as_tested_only_where_an_audit_found_them_computed():
+    """Oct-06 changepoint C4/C5/C6 listed the KM-ADD theorems in `covers` while their scripts computed only ARL quantities;
+    the ledger read the ADD claims as run as specified. Label ranking C3 listed Theorems A.1 and A.7-A.16 and computed one
+    table. A scope item counts as tested only where an independent audit found code that computes it; a transfer argument
+    is recorded beside the item and never counts; without an audit the coverage is unverified and nothing is Verified."""
+    from harness.reviewer import decision
+    c = {"id": "C4", "kind": "CERTIFICATE", "role": "target", "state": "COMPLETED", "status": "NO_VIOLATION_FOUND",
+         "values": [0] * 4, "covers": ["Theorem 4.1", "Theorem 4.2"], "deviations": [], "data_identity": {}, "data_changed": [],
+         "stages": {}, "scope_audit": {"covers": {"Theorem 4.1": {"how": "computed"},
+                                                  "Theorem 4.2": {"how": "transfer", "argument": "same with delays"}}}}
+    cc = {"quote": "q", "page": 1, "claim_type": "theory", "checks": ["C4"], "scope": ["Theorem 4.1", "Theorem 4.2"]}
+    row = report._completion_row(cc, {"C4": c})
+    assert row["scope_not_run"] == ["Theorem 4.2"] and row["experiment"] == "RAN_PARTIAL", row
+    assert row["transfers"] == [{"check": "C4", "item": "Theorem 4.2", "argument": "same with delays"}], row
+    legacy = {**c, "scope_audit": None}
+    row = report._completion_row({**cc, "scope": ["Theorem 4.1"]}, {"C4": legacy})
+    assert row["coverage_unverified"] == ["C4"], row
+    perf = {"id": "C1", "kind": "RECONSTRUCTION", "role": "target", "status": "RELATION_HOLDS", "values": [1.0], "counts": {}}
+    unverified = _claim_row("SUPPORT_FOUND", checks=["C1"], comp={"coverage_unverified": ["C1"]})
+    assert decision(unverified, {"C1": perf})["decision"] == "NOT_VERIFIED"
+
+
+def test_the_audit_of_what_a_test_computes_rests_on_the_scripts_own_lines():
+    """The scope audit decides which claim items a finished test computed, which of its stages are exact quantities and
+    whether a certificate builds examples: every code line it cites is the script's own text, a transfer argument is kept
+    and never counted, what it cannot settle reads strictest, and the checks it reclassifies are decided again from their
+    recorded runs (once). A claim's logical form is required where claims are extracted."""
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        cfg, pid, root = _ready(td)
+        cert = {"id": "B", "kind": "CERTIFICATE", "claim_quote": THM, "statement_quote": THM, "role": "target",
+                "covers": ["Theorem 1 (ARL)", "Theorem 2 (ADD)"]}
+        _seal(cfg, pid, "plan", {"checks": [cert], "central_claims": [
+            {"quote": THM, "claim_type": "theory", "checks": ["B"], "scope": ["Theorem 1 (ARL)", "Theorem 2 (ADD)"]}]}, td)
+        cdir = root / "checks" / "C1"
+        cdir.mkdir(parents=True, exist_ok=True)
+        script = "ok = valid and arl_bound_holds(inst)\nviolated = int(premises and not ok)\n"
+        (cdir / "script.py").write_text(script, encoding="utf-8")
+        state.write_json(cdir / "check.json", {"kind": "CERTIFICATE", "script_sha256": "s", "deviations": []})
+        state.write_json(cdir / "outcome.json", {"status": "COUNTEREXAMPLE_FOUND", "values": [0, 1], "authorized": True})
+        for k, v in ((0, 0), (1, 1)):
+            state.append_jsonl(root / "execution.jsonl", {"target": "C1", "mode": "evidence", "script_sha256": "s", "seed": k,
+                                                          "returncode": 0, "stdout": f'REFEREE_RESULT {{"premises_hold": 1, '
+                                                                                     f'"violated": {v}}}\n'})
+        x = tasks._Ctx(cfg, pid)
+        owed = [o["id"] for o in tasks._plan(x)[1]]
+        assert "scope" in owed, owed
+        bad = {"checks": [{"id": "C1", "covers": [{"item": "Theorem 1 (ARL)", "how": "computed", "code": "adds the ADD bound"},
+                                                 {"item": "Theorem 2 (ADD)", "how": "computed", "code": "add_bound(inst)"}]}]}
+        assert "verbatim" in _refused(lambda: tasks._seal_scope(tasks._Ctx(cfg, pid), "scope", bad, final=False))
+        good = {"checks": [{"id": "C1", "covers": [
+            {"item": "Theorem 1 (ARL)", "how": "computed", "code": "arl_bound_holds(inst)"},
+            {"item": "Theorem 2 (ADD)", "how": "transfer", "argument": "the same proof with delays in place of run lengths"}],
+            "witness": {"is_witness": True, "code": "violated = int(premises and not ok)"}}]}
+        _seal(cfg, pid, "scope", good, td)
+        rec = report.sealed_record(root, "scope")["checks"]["C1"]
+        assert rec["covers"]["Theorem 2 (ADD)"]["how"] == "transfer" and rec["witness"] is True, rec
+        x = tasks._Ctx(cfg, pid)
+        assert "scope" not in [o["id"] for o in tasks._plan(x)[1]]                     # audited once, not asked again
+        o = state.read_json(cdir / "outcome.json")
+        assert o["status"] == "WITNESS_FOUND" and o["audit_applied"] and o["witnesses"] == 1, o   # decided again, once
+        assert (cdir / "outcome.redecided.1.json").exists() and not (cdir / "outcome.redecided.2.json").exists()
+        tasks._plan(tasks._Ctx(cfg, pid))
+        assert not (cdir / "outcome.redecided.2.json").exists()
+        row = report.ledger(tasks._Ctx(cfg, pid))["central_claims"][0]["completion"]
+        assert row["scope_not_run"] == ["Theorem 2 (ADD)"] and row["transfers"][0]["item"] == "Theorem 2 (ADD)", row
+    with tempfile.TemporaryDirectory() as t:                     # an extracted claim states its form
+        cfg, pid = _project_pages(Path(t), CLAIM_PAGES)
+        x = tasks._Ctx(cfg, pid)
+        noform = [{k: v for k, v in c.items() if k != "form"} for c in _K]
+        assert "`form`" in _refused(lambda: tasks._seal_claims(x, "claims", {"claims": noform}, final=False))
+        rec = tasks._seal_claims(x, "claims", {"claims": noform}, final=True)
+        assert [c["form"] for c in rec["claims"]] == ["compatibility", "empirical", "universal"], rec   # the strictest
 
 
 if __name__ == "__main__":

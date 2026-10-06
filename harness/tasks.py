@@ -60,7 +60,7 @@ SEVERITY = ("NOTE", "MINOR", "MAJOR", "FATAL")
 CLASSES = ("CONFIRMED_FINDING", "PLAUSIBLE_CONCERN", "OPEN_QUESTION", "DISMISSED")
 PROMPTS = Path(__file__).parent / "prompts"
 _EFFORT = {"lens": "high", "critic": "high", "claims": "high", "plan": "high", "bind": "high", "gen": "high", "vision": "medium",
-           "verify": "high", "report": "medium", "audit": "high", "compare": "medium"}
+           "verify": "high", "report": "medium", "audit": "high", "compare": "medium", "scope": "high"}
 
 
 class SealError(ValueError):
@@ -128,7 +128,7 @@ class _Ctx:
         """The plan with its follow-up round merged in (checks C1..Cn, then the follow-up's), and the claims of any
         follow-up plan the operator withdrew."""
         return report.merged(self.sealed("plan"), self.sealed("plan:2"), report.withdrawn_plans(self.root),
-                             (self.sealed("claims") or {}).get("claims") or [])
+                             report.claims_of(self.root))
 
     def tracked(self) -> set[str]:
         if not hasattr(self, "_tracked"):
@@ -268,6 +268,10 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
     for c in plan["checks"]:
         tasks += _step(x, c)
     tasks += _audits(x, plan)
+    # What each finished test computed is audited by an independent reader as soon as it ends (scope items, exact
+    # quantities, examples): coverage, the follow-up round and every decision rest on it, never on the plan's word.
+    _apply_scope(x, plan)
+    tasks += _scope_task(x, plan)
     executing = [c["id"] for c in plan["checks"] if execute.poll(x.cfg, x.pid, c["id"])]
     running = executing + sorted(x.waiting)
     # The follow-up round does not wait on a long run: once only executions remain and each has at least
@@ -312,6 +316,183 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
     from . import reviewer
     reviewer.render(x, ledger, x.sealed("report"), x.sealed("compare"))
     return "done", [], []
+
+
+# --- what each finished test computes: an independent audit of its code (scope items, exact quantities, examples) ---
+def _scope_owed(x: _Ctx, plan: dict) -> tuple[list[dict], list[dict]]:
+    """(claims needing a form, checks needing an audit). A claim extracted before claims carried a `form`; a check that
+    ran something (an outcome with values) whose approved script (or command) no audit has read yet. One the audit could
+    not settle is recorded as such (`unformed`, `unaudited`: the strictest reading) and is never asked again."""
+    rec = x.sealed("scope") or {}
+    done, skip = rec.get("checks") or {}, rec.get("unaudited") or {}
+    checks = []
+    for c in plan["checks"]:
+        o = state.read_json(x.root / "checks" / c["id"] / "outcome.json") or {}
+        run = state.read_json(x.root / "checks" / c["id"] / "check.json") or {}
+        if not o.get("values") or o.get("status") in ("BLOCKED", "NOT_CHECKABLE") or o.get("authorized") is False:
+            continue
+        sha = run.get("script_sha256") or run.get("command") or ""
+        if (done.get(c["id"]) or {}).get("script") == sha or (skip.get(c["id"]) or {}).get("script") == sha:
+            continue
+        checks.append({**c, "_run": run, "_outcome": o, "_sha": sha})
+    forms = [k for k in report.claims_of(x.root) if not k.get("form") and k.get("id") not in (rec.get("unformed") or [])]
+    return forms, checks
+
+
+def _scope_task(x: _Ctx, plan: dict) -> list[dict]:
+    forms, checks = _scope_owed(x, plan)
+    if not forms and not checks:
+        return []
+    claims = "\n".join(json.dumps({k: c.get(k) for k in ("id", "statement", "claim_type", "quote", "scope")}, ensure_ascii=False)
+                       for c in forms) or "(none: every claim already has a form)"
+    lines, reads = [], []
+    for c in checks:
+        o, run, script = c["_outcome"], c["_run"], x.root / "checks" / c["id"] / "script.py"
+        if script.exists():
+            reads.append(script)
+        lines.append(json.dumps({
+            "id": c["id"], "kind": c["kind"], "claim": c["claim"][:300], "covers": c.get("covers") or [],
+            "relation": (c.get("target") or {}).get("relation") or "", "metric": run.get("metric") or c.get("metric") or "",
+            "readings": [r.get("name") for r in run.get("readings") or c.get("readings") or [] if isinstance(r, dict)],
+            "stages": sorted(o.get("stages") or {})[:80], "statement": c.get("statement") or "", "step": c.get("step") or "",
+            "script": script.as_posix() if script.exists() else f"(no script: the authors' command {str(run.get('command'))[:200]!r})",
+            "declared_changes": [str(d.get("used", ""))[:200] for d in run.get("deviations") or []][:12]}, ensure_ascii=False))
+    return [x.task("scope", "scope", _template("scope", title=x.meta["title"], claims=claims, checks="\n".join(lines)),
+                   tuple(reads))]
+
+
+def _scope_nothing(x: _Ctx, why: str) -> dict:
+    """An audit no worker could give: what was owed is recorded as not audited (strictest: its coverage stays unverified,
+    no exact quantity, no example), and the earlier audits stand."""
+    prev = x.sealed("scope") or {}
+    forms, checks = _scope_owed(x, x.plan() or {"checks": []})
+    return {**prev, "forms": prev.get("forms") or {}, "checks": prev.get("checks") or {},
+            "unformed": list(prev.get("unformed") or []) + [k["id"] for k in forms],
+            "unaudited": {**(prev.get("unaudited") or {}), **{c["id"]: {"script": c["_sha"], "why": why[:300]} for c in checks}}}
+
+
+def _seal_scope(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
+    """The audit of what each finished test computes, kept only where the code it cites is the script's own text: each
+    covered item computed (a script line), a transfer (an argument, shown, never counted) or not computed; the stages that
+    compute an exact quantity; whether a certificate builds examples of an existence statement (the line computing
+    `violated`); each compared output's definition, unit and aggregation. A claim's form rests on the paper's words.
+    Earlier audits are kept; on the last attempt what could not be settled is recorded at its strictest reading."""
+    forms_owed, owed = _scope_owed(x, x.plan() or {"checks": []})
+    prev = x.sealed("scope") or {}
+    rec = {"forms": dict(prev.get("forms") or {}), "unformed": list(prev.get("unformed") or []),
+           "checks": dict(prev.get("checks") or {}), "unaudited": dict(prev.get("unaudited") or {}),
+           "notes": str(obj.get("notes") or "")[:2000]}
+    errors: list[str] = []
+    want = {k["id"]: k for k in forms_owed}
+    for f in [f for f in obj.get("forms") or [] if isinstance(f, dict)]:
+        k = want.get(str(f.get("id") or ""))
+        if not k:
+            errors.append(f"form for {f.get('id')!r}: not a claim that needs a form ({sorted(want) or 'none'})")
+            continue
+        allowed = report.FORMS.get(k.get("claim_type") or "", ("empirical",))
+        form, hit = _enum(f.get("form"), allowed), x.paper.find(str(f.get("quote") or ""))[0]
+        if not form:
+            errors.append(f"{k['id']}: `form` of a {k.get('claim_type')} claim is one of {list(allowed)}")
+        elif form != allowed[0] and not hit:            # anything but the strictest form rests on the paper's own words
+            errors.append(f"{k['id']}: `quote`, the paper's words that make it {form!r}, is not verbatim in the paper")
+        else:
+            rec["forms"][k["id"]] = {"form": form, **({"quote": hit["quote"], "page": hit["page"]} if hit else {})}
+    missing = [i for i in want if i not in rec["forms"]]
+    errors += [f"{i}: no `forms` entry" for i in missing]
+    rec["unformed"] += missing
+    by, seen = {c["id"]: c for c in owed}, set()
+    for e in [e for e in obj.get("checks") or [] if isinstance(e, dict)]:
+        c = by.get(str(e.get("id") or ""))
+        if not c:
+            errors.append(f"check {e.get('id')!r} is not a test that needs an audit ({sorted(by) or 'none'})")
+            continue
+        seen.add(c["id"])
+        script = x.root / "checks" / c["id"] / "script.py"
+        text = flat(script.read_text(encoding="utf-8", errors="replace")) if script.exists() else ""
+        found = lambda code: len(flat(code)) >= 8 and (flat(code) in text or (not text and _in_checkout(x, code)))
+        items, cov = {flat(s): s for s in c.get("covers") or []}, {}
+        for v in [v for v in e.get("covers") or [] if isinstance(v, dict)]:
+            s = items.get(flat(str(v.get("item") or "")))
+            if not s:
+                errors.append(f"{c['id']}: covered item {str(v.get('item'))[:80]!r} is not in its `covers` list")
+                continue
+            how = _enum(v.get("how"), ("computed", "transfer", "not_computed"))
+            if how == "computed" and not found(str(v.get("code") or "")):
+                errors.append(f"{c['id']} {s[:60]!r}: `code` is not verbatim text of the script (8+ characters)")
+                how = "not_computed"
+            if how == "transfer" and len(str(v.get("argument") or "").strip()) < 20:
+                errors.append(f"{c['id']} {s[:60]!r}: a transfer states its `argument`")
+                how = "not_computed"
+            if not how:
+                errors.append(f"{c['id']} {s[:60]!r}: `how` is computed, transfer or not_computed")
+                how = "not_computed"
+            cov[s] = {"how": how, **({"code": str(v.get("code"))[:300]} if how == "computed" else {}),
+                      **({"argument": str(v.get("argument"))[:600]} if how == "transfer" else {}),
+                      **({"why": str(v.get("why") or "")[:400]} if how == "not_computed" else {})}
+        for s in items.values():
+            if s not in cov:
+                errors.append(f"{c['id']}: no `covers` entry for {s[:80]!r}")
+                cov[s] = {"how": "not_computed", "why": "the audit gave no entry for it"}
+        w = e.get("witness") if isinstance(e.get("witness"), dict) else {}
+        witness = c["kind"] == "CERTIFICATE" and w.get("is_witness") is True
+        if witness and not (found(str(w.get("code") or "")) and "violated" in str(w.get("code"))):
+            errors.append(f"{c['id']}: a witness certificate cites the verbatim script line that computes `violated`")
+            witness = False
+        stages = set((c["_outcome"].get("stages") or {}).keys()) or {""}
+        exact = []
+        for v in [v for v in e.get("exact") or [] if isinstance(v, dict) and (v.get("stage") or v.get("code"))]:
+            st_ = str(v.get("stage") or "")
+            if st_ not in stages or not found(str(v.get("code") or "")):
+                errors.append(f"{c['id']}: exact stage {st_!r} must be one of its stages, with the verbatim line computing it")
+                continue
+            exact.append(st_)
+        rel = (c.get("target") or {}).get("relation") or ""
+        names = set(relation(rel)[3] if rel else []) | set((c.get("define") or {}).keys()) | {
+            c["_run"].get("metric") or c.get("metric") or ""} - {""}
+        outs = []
+        for v in [v for v in e.get("outputs") or [] if isinstance(v, dict) and v.get("name")]:
+            if str(v["name"]) not in names or not all(str(v.get(k) or "").strip() for k in ("definition", "unit", "aggregation")) \
+                    or not found(str(v.get("code") or "")):
+                errors.append(f"{c['id']}: output {str(v['name'])[:40]!r} needs to be a compared output ({sorted(names)}) "
+                              "with its definition, unit, aggregation and the verbatim line computing it")
+                continue
+            outs.append({k: str(v.get(k) or "")[:300] for k in ("name", "reading", "definition", "unit", "aggregation")})
+        rec["checks"][c["id"]] = {"script": c["_sha"], "covers": cov, "witness": witness, "exact": exact, "outputs": outs}
+        rec["unaudited"].pop(c["id"], None)
+    for cid in by:
+        if cid not in seen:
+            errors.append(f"{cid}: no `checks` entry")
+            rec["unaudited"][cid] = {"script": by[cid]["_sha"], "why": "the audit gave no entry for it"}
+    _fail_or_drop(errors, final)
+    return rec
+
+
+def _in_checkout(x: _Ctx, code: str) -> bool:
+    """Is `code` literal text of a tracked source file of the pinned checkout (an author-code check has no script)?"""
+    for rel in sorted(x.tracked())[:2000]:                       # ponytail: 2000 tracked files searched
+        f = x.checkout / rel
+        if rel.endswith((".py", ".sh", ".yaml", ".yml", ".json", ".cfg", ".toml", ".md")) and f.is_file() and \
+                flat(code) in flat(f.read_text(encoding="utf-8", errors="replace")):
+            return True
+    return False
+
+
+def _apply_scope(x: _Ctx, plan: dict) -> None:
+    """Once an audit found a finished check computes an exact quantity or builds examples of an existence statement (or
+    its author argued a printed premise unsatisfiable), the check is decided again from its recorded runs, once per
+    audit: nothing re-runs, and the earlier outcome is kept beside the new one."""
+    rec = (x.sealed("scope") or {}).get("checks") or {}
+    for c in plan["checks"]:
+        a, run = rec.get(c["id"]), state.read_json(x.root / "checks" / c["id"] / "check.json") or {}
+        o = state.read_json(x.root / "checks" / c["id"] / "outcome.json") or {}
+        argued = c["kind"] == "CERTIFICATE" and run.get("premise_argument") and (o.get("literal") or {}).get("undefined")
+        if not o or not (a and (a.get("exact") or a.get("witness")) or argued):
+            continue
+        key = state.sha256(json.dumps({"exact": (a or {}).get("exact"), "witness": (a or {}).get("witness"),
+                                       "argued": bool(argued)}, sort_keys=True))[:16]
+        if o.get("audit_applied") != key and o.get("status") not in ("BLOCKED", "NOT_CHECKABLE") and o.get("authorized") is not False:
+            execute._redecide(x.cfg, x.root, c["id"], "applying the independent audit of what its code computes",
+                              {"audit_applied": key})
 
 
 def _brief(c: dict) -> dict:
@@ -1036,7 +1217,7 @@ def abandon(cfg: state.Config, pid: str, tid: str, why: str) -> dict:
         if tid not in {t["id"] for t in _plan(x)[1]}:
             return {"error": f"'{tid}' is not a pending task"}
         role = tid.split(":")[0]
-        rec = {**_EMPTY[role], "abandoned": why[:500]}
+        rec = {**(_scope_nothing(x, why) if role == "scope" else _EMPTY[role]), "abandoned": why[:500]}
         out = root / "sealed" / f"{_safe(tid)}.json"
         state.write_json(out, rec)
         seals = state.read_json(root / "seals.json", {}) or {}
@@ -1081,13 +1262,16 @@ def seal(cfg: state.Config, pid: str, tid: str, path: str) -> dict:
             # honest nothing, so one bad answer cannot stall the review.
             if not final:
                 raise SealError(f"malformed answer ({type(e).__name__}: {e}); follow the JSON shape exactly") from e
-            rec = {**_EMPTY[role], "malformed": f"{type(e).__name__}: {e}"[:300]}
+            rec = {**(_scope_nothing(x, "malformed answer") if role == "scope" else _EMPTY[role]),
+                   "malformed": f"{type(e).__name__}: {e}"[:300]}
         out = root / "sealed" / f"{_safe(tid)}.json"
         state.write_json(out, rec)
         seals = state.read_json(root / "seals.json", {})
         seals[tid] = state.sha256(out.read_bytes())
         state.write_json(root / "seals.json", seals)
         state.append_jsonl(root / "log.jsonl", {"event": "seal", "task": tid})
+        if role == "scope":           # owed again as further tests end: each round starts with its whole attempt budget
+            state.write_json(root / "attempts.json", {k: v for k, v in attempts.items() if k != "scope"})
     return {"sealed": tid, "dropped": len(rec.get("dropped", []))}
 
 
@@ -1172,6 +1356,10 @@ def _validate_claims(x: _Ctx, raw: list[dict], known: list[dict], first: int) ->
         ctype = _enum(c.get("claim_type"), CLAIM_TYPES)
         if not ctype:
             errs.append(f"{label}: `claim_type` is one of {list(CLAIM_TYPES)}")
+        # Its logical form is classified before any test (what can show it); unclassified reads the strictest form.
+        form = _enum(c.get("form"), report.FORMS.get(ctype, ()))
+        if ctype and not form:
+            errs.append(f"{label}: `form` of a {ctype} claim is one of {list(report.FORMS[ctype])}")
         statement = re.sub(r"\s+", " ", str(c.get("statement") or "")).strip()
         if not 10 <= len(statement) <= 400:
             errs.append(f"{label}: `statement` is the claim in one plain sentence (10-400 characters)")
@@ -1204,7 +1392,8 @@ def _validate_claims(x: _Ctx, raw: list[dict], known: list[dict], first: int) ->
             continue
         errors += errs
         out.append({"id": f"K{first + len(out)}", "quote": h["quote"], "page": h["page"], "also_stated": also,
-                    "statement": statement[:400], "claim_type": ctype, "scope": scope, "assumptions": assumptions,
+                    "statement": statement[:400], "claim_type": ctype, "form": form or report.FORMS[ctype][0],
+                    "scope": scope, "assumptions": assumptions,
                     "evidence_in_paper": evidence, "required_evidence": req[:600], "interpretations": interp,
                     "_raw": raw.index(c), **({"scope_cut": cut} if cut else {}),
                     **({"sealed_with_errors": errs[:6]} if errs else {})})
@@ -1217,7 +1406,7 @@ def _claims_text(x: _Ctx) -> str:
     """The sealed main claims, as the planner and the follow-up round see them (fixed: never added to, dropped or retyped
     by a plan)."""
     ks = (x.sealed("claims") or {}).get("claims") or []
-    return "\n".join(json.dumps({k: c.get(k) for k in ("id", "statement", "claim_type", "quote", "page", "scope",
+    return "\n".join(json.dumps({k: c.get(k) for k in ("id", "statement", "claim_type", "form", "quote", "page", "scope",
                                                        "assumptions", "required_evidence", "interpretations") if c.get(k)},
                                 ensure_ascii=False) for c in ks) or "(no claims were extracted)"
 
@@ -2191,7 +2380,7 @@ def _seal_report(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
 
 VALIDATORS = {"lens": _seal_lens, "critic": _seal_critic, "claims": _seal_claims, "plan": _seal_plan, "bind": _seal_bind,
               "gen": _seal_gen, "verify": _seal_verify, "report": _seal_report, "vision": _seal_vision,
-              "audit": _seal_audit, "compare": _seal_compare}
+              "audit": _seal_audit, "compare": _seal_compare, "scope": _seal_scope}
 _EMPTY = {"lens": {"concerns": [], "dropped": []}, "critic": {"reviews": []}, "claims": {"claims": [], "dropped": []},
           "plan": {"checks": [], "central_claims": [], "dropped": [], "repo_is_authors": False, "repo_note": ""},
           "bind": {"identity": {"established": False, "reason": "malformed binding answer"}, "command": "",
@@ -2201,6 +2390,7 @@ _EMPTY = {"lens": {"concerns": [], "dropped": []}, "critic": {"reviews": []}, "c
                      "quotes": [], "script_sha256": ""},
           "report": {"summary_md": "", "overview": "", "claims": [], "terms": [], "open_questions": []},
           "compare": {"claims": [], "notes": "malformed answer"}, "vision": {"read": {}, "notes": "malformed answer"},
+          "scope": {"forms": {}, "checks": {}},
           "audit": {"verdict": "UNRESOLVED", "depends_on": [], "quotes": [], "notes": "malformed answer"}}
 
 

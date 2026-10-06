@@ -34,7 +34,11 @@ from . import independence
 from .evidence import half_width, margin, parse_value, relation
 from .execute import admits
 
-SUPPORT = ("RESOLVED_VERIFIED", "ARITHMETIC_CONSISTENT", "RELATION_HOLDS")
+# A valid example of an existence statement (a witness certificate) is support for the cases it covers.
+SUPPORT = ("RESOLVED_VERIFIED", "ARITHMETIC_CONSISTENT", "RELATION_HOLDS", "WITNESS_FOUND")
+# A witness certificate whose construction never gave a valid example: a gap in the construction (like a failed proof
+# step), never a counterexample and never a failure of the statement (an example may exist that it did not build).
+CONSTRUCTION_FAILED = "CONSTRUCTION_FAILED"
 FAILURE = ("FAILED_REPRODUCTION", "COUNTEREXAMPLE_FOUND", "ARITHMETIC_CONTRADICTION", "RELATION_VIOLATED")
 QUALIFIED = ("PREMISE_NOT_MET", "VIOLATION_UNDER_CHANGED_READING")   # neither support nor a falsification
 # Some measurements completed and are kept (`stages`, `status_on_completed`), but the protocol did
@@ -64,14 +68,21 @@ def _below_precision(r: dict) -> bool:
     return abs(r["lhs"] - r["rhs"]) <= _TOL * max(1.0, abs(r["lhs"]), abs(r["rhs"]))
 
 
-def certificate(results: list[dict], changed: bool, step: bool, crashed: int = 0) -> dict:
+def certificate(results: list[dict], changed: bool, step: bool, crashed: int = 0, witness: bool = False,
+                argued: bool = False) -> dict:
     """Per instance: `violated`, `premises` (1 if every premise of the tested reading holds on
     it, evaluated exactly; None if the script did not say — not admissible, and not 'unmet'),
     `literal` (the text exactly as printed: holds, fails = its printed premises hold and its printed
     conclusion fails, undefined, premise_not_met), `reading` (a named definition the instance was
     computed under: a certificate tests the printed claim, so such an instance is treated as tested
     under a changed reading). Only an admissible instance is a counterexample; a violation below
-    double precision without exact values is not one; a crashed instance is inadmissible."""
+    double precision without exact values is not one; a crashed instance is inadmissible.
+    `witness`: the script builds EXAMPLES of an existence statement (violated = the constructed instance is not a valid
+    example), as an independent audit of the script found: a valid example under the printed reading shows the statement
+    for the cases it covers, and a failed construction is a gap in the construction, never a counterexample.
+    `argued`: the script author gave a premise argument (checked by the verifier) that a printed premise can never hold;
+    the text as printed is then `premise_not_met`, whatever label the script gave it (an unsatisfiable premise is not an
+    undefined expression)."""
     what = "a step of the printed proof" if step else "the statement as printed"
     n = len(results)
     fuzzy = [r for r in results if _below_precision(r)]
@@ -92,6 +103,13 @@ def certificate(results: list[dict], changed: bool, step: bool, crashed: int = 0
     base = groups.get("") or next((groups[g] for g in sorted(groups) if any(r.get("literal") for r in groups[g])),
                                   None) or results
     lit = {k: sum(1 for r in base if r.get("literal") == k) for k in ("holds", "fails", "undefined", "premise_not_met")}
+    relabel = ""
+    if argued and lit["undefined"] and not lit["premise_not_met"]:
+        lit["premise_not_met"], lit["undefined"] = lit["undefined"], 0
+        relabel = ("; the script labels the text as printed 'undefined', but its premise argument (checked by its verifier) "
+                   "says a printed premise can never hold: as printed, the premise is not met")
+    if witness:
+        return _witness(results, base, groups, lit, crashed, n, len(fuzzy))
     out = {"rule": "exact arithmetic; a counterexample must satisfy every premise of the exact claim", "n": n,
            "instances": len(base), "admissible_instances": sum(1 for r in base if r.get("premises") == 1),
            **({"readings_per_instance": len(groups)} if len(groups) > 1 else {}),
@@ -121,7 +139,7 @@ def certificate(results: list[dict], changed: bool, step: bool, crashed: int = 0
         return _r("VIOLATION_UNDER_CHANGED_READING", f"{len(bad_moved) + len(lit_moved)} instance(s) violate the claim "
                   f"only under {how}; this is not a counterexample to {what}"
                   + (f"; as printed: {lit['premise_not_met']} premise never met, {lit['undefined']} undefined"
-                     if lit["premise_not_met"] or lit["undefined"] else ""), **out)
+                     if lit["premise_not_met"] or lit["undefined"] else "") + relabel, **out)
     if unsaid and any(r.get("violated") == 1 for r in unsaid):
         return _r("INCONCLUSIVE", "violations were reported on instances whose premises the script did not "
                   "evaluate, so none is a counterexample", **out)
@@ -141,6 +159,60 @@ def certificate(results: list[dict], changed: bool, step: bool, crashed: int = 0
               "instances only, never a proof", **out)
 
 
+def _witness(results: list[dict], base: list[dict], groups: dict, lit: dict, crashed: int, n: int, fuzzy: int) -> dict:
+    """Examples of an existence statement: the printed reading's instances (the untagged lines) that meet every premise
+    and do not violate the property are valid examples; those that meet the premises and violate it are failed
+    constructions. A valid example only under a named (changed) reading is about the changed statement."""
+    printed = groups.get("") or []
+    valid = [r for r in printed if r.get("premises") == 1 and r.get("violated") == 0]
+    failed = [r for r in printed if r.get("premises") == 1 and r.get("violated") == 1]
+    moved = [r for g, rs in groups.items() if g for r in rs if r.get("premises") == 1 and r.get("violated") == 0]
+    out = {"rule": "exact arithmetic; an example of an existence statement meets every premise and shows the property as "
+                   "printed; a failed construction is a gap in the construction, never a counterexample",
+           "n": n, "instances": len(base), "admissible_instances": sum(1 for r in base if r.get("premises") == 1),
+           "admissible": sum(1 for r in results if r.get("premises") == 1), "witness": True, "witnesses": len(valid),
+           "constructions_failed": len(failed), **({"readings_per_instance": len(groups)} if len(groups) > 1 else {}),
+           **({"literal": lit} if any(lit.values()) else {}), **({"crashed": crashed} if crashed else {}),
+           **({"below_precision": fuzzy} if fuzzy else {})}
+    gap = (f"; the construction failed in {len(failed)} case(s) that meet its premises: a gap in the construction, never a "
+           "counterexample" if failed else "")
+    if valid:
+        return _r("WITNESS_FOUND", f"{len(valid)} of {len(printed)} constructed case(s) meet every premise and show the "
+                  f"property as printed: valid examples, which show the existence statement for the cases they cover{gap}", **out)
+    if failed:
+        return _r(CONSTRUCTION_FAILED, f"none of the {len(failed)} constructed case(s) that meet the premises is a valid "
+                  "example as printed" + (f"; {len(moved)} are valid only under a changed reading, which is about the "
+                                          "changed statement" if moved else "")
+                  + ": a failed construction shows a gap in the construction, never that no example exists", **out)
+    if not printed and moved:
+        return _r(CONSTRUCTION_FAILED, f"valid examples only under a changed reading ({len(moved)}), none as printed: about "
+                  "the changed statement, never that no example exists", **out)
+    return _r("PREMISE_NOT_MET", f"none of the {n} constructed case(s) meets the premises of the statement: nothing was "
+              "shown", **out)
+
+
+def _exact(kind: str, rel: str, printed: str, vals: list[float]) -> dict:
+    """A quantity an independent audit found the script computes exactly from the configuration (a parameter count, a
+    size): identical in every run, it is one exact measurement, decided once (no noise band, no replicates); runs that
+    differ show it is not deterministic, and nothing is decided."""
+    n = len(vals)
+    if not n:
+        return _r("INCONCLUSIVE", "no result carried the compared outputs")
+    if n > 1 and not _repeats(vals):
+        return _r("INCONCLUSIVE", f"audited as an exact quantity, but its {n} runs differ: it is not deterministic, so "
+                  "nothing is decided", n=n, rule="an exact quantity must repeat exactly")
+    rule = (f"an exact quantity (computed from the configuration alone, as an audit of the script found): identical in "
+            f"all {n} run(s), one exact measurement" + (" decided on the sign of its margin" if rel else ""))
+    if not rel:
+        out = _point(kind, printed, vals[:1], False, True)
+        return {**out, "n": n, "n_independent": 1, "rule": rule}
+    m, strict = vals[0], relation(rel)[1] in ("<", ">")
+    out = {"relation": rel, "margin": round(m, 6), "band": 0.0, "n": n, "n_independent": 1, "rule": rule}
+    if m > 0 or (not strict and m == 0):
+        return _r("RELATION_HOLDS", f"{rel}: margin {m:.4g} (one exact measurement)", **out)
+    return _r("RELATION_VIOLATED", f"{rel} does not hold: margin {m:.4g} (one exact measurement)", **out)
+
+
 def _r(status: str, reason: str, **kw) -> dict:
     return {"status": status, "reason": reason, **kw}
 
@@ -150,7 +222,8 @@ def reconcile(kind: str, printed: str, values: list[float], failure: str, ev: di
               changed: bool = False, step: bool = False, staged: list | None = None,
               failed: dict | None = None, stage_errors: dict | None = None, readings: list | None = None,
               cohort_mismatch: list | None = None, deterministic: bool = False, test: str = "",
-              detail: list | None = None, rng: bool | None = None, metric: str = "", undefined: dict | None = None) -> dict:
+              detail: list | None = None, rng: bool | None = None, metric: str = "", undefined: dict | None = None,
+              exact: list | None = None, witness: bool = False, argued: bool = False) -> dict:
     """`failure` ends a check that measured nothing; `failed` (seed -> error) records seeds that
     failed after the check had measured something, whose completed measurements are kept.
     `staged` entries are [stage, value] or [stage, value, reading]; `readings` names the
@@ -171,7 +244,7 @@ def reconcile(kind: str, printed: str, values: list[float], failure: str, ev: di
             return _r("INCONCLUSIVE", f"the certificate did not complete ({failure[:400]}). A failed hypothesis "
                       "assertion means the instance was not admissible — never a counterexample.")
         return certificate(cert if cert is not None else [{"violated": v, "premises": None} for v in values],
-                           changed, step, crashed=len(failed))
+                           changed, step, crashed=len(failed), witness=witness, argued=argued)
     if failure:
         if ev.get("infra_error"):
             return _r("INCONCLUSIVE", f"infrastructure failure ('{ev['infra_error']}'), a fact about this host, not "
@@ -192,6 +265,8 @@ def reconcile(kind: str, printed: str, values: list[float], failure: str, ev: di
                  and not r.get("missing")]
         if rel and test == "compatibility":
             return _condition(rel, vals)
+        if exact is not None and stage in exact:      # an audited exact quantity: one measurement, never replicates
+            return _exact(kind, rel, printed, vals)
         if rel:
             return _relation(kind, rel, vals, deterministic, ind, lines)
         return _point(kind, printed, vals, seeded, deterministic, ind, lines, metric)

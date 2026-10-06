@@ -22,7 +22,7 @@ from . import state
 from .evidence import flat
 from . import execute
 from .execute import EVIDENCE
-from .reconcile import FAILURE, PARTIAL, READINGS_DIFFER, SUPPORT
+from .reconcile import CONSTRUCTION_FAILED, FAILURE, PARTIAL, READINGS_DIFFER, SUPPORT
 
 _SUPPORT_WORDS = ("verif(?!ier)", "reproduc", "confirm", "validat(?!ion)", "replicat", "corroborat")  # a validation set is data
 _FAILURE_WORDS = ("refut", "disprov", "counterexampl", "contradict", "falsif", "failed to reproduc",
@@ -32,6 +32,20 @@ _NOUNS = re.compile(r"\b(?:\d+|seeded|independent|per|of)\s+replicates?\b|\brepl
 # A claim about an experiment (a comparison, a printed number, a component that trains) is satisfied
 # only by that experiment; the checks of any other role stand beside it.
 EMPIRICAL = ("performance", "value", "engineering")
+# What kind of statement a claim is, which decides what can show it (classified before any test is planned): a universal
+# statement is never shown by finite cases; an existence statement is shown by one valid example meeting every premise; a
+# statement over every parameter value that some example exists ("for every k there is a model ...") only for the values
+# its examples cover; an empirical claim by its experiment, over replicates; a deterministic measurement by one exact
+# computation; an engineering claim by a compatibility test.
+FORMS = {"theory": ("universal", "existential", "universal_existential"), "performance": ("empirical", "deterministic"),
+         "value": ("empirical", "deterministic"), "engineering": ("compatibility",)}
+
+
+def claim_form(cc: dict) -> str:
+    """A claim's form as sealed, or — unclassified, or inconsistent with its type — the strictest form of its type
+    (fail closed): a universal statement for a theorem, an empirical comparison otherwise."""
+    allowed = FORMS.get(cc.get("claim_type") or "", ("empirical",))
+    return cc.get("form") if cc.get("form") in allowed else allowed[0]
 _EXPERIMENT = ("AUTHOR_CODE", "RECONSTRUCTION", "RELEASED_DATA")
 _STAGES_SHOWN = 40   # ponytail: stages listed per check in review.md; every stage is in ledger.json
 _RANK = {"FATAL": 3, "MAJOR": 2, "MINOR": 1, "NOTE": 0}
@@ -88,8 +102,12 @@ def _one(a: dict, b: dict) -> bool:
 
 
 def claims_of(root: Path) -> list[dict]:
-    """The main claims extracted before any plan (sealed/claims.json, only if it still hashes to its seal)."""
-    return (sealed_record(root, "claims") or {}).get("claims") or []
+    """The main claims extracted before any plan (sealed/claims.json, only if it still hashes to its seal). A claim sealed
+    before claims carried a `form` takes the form an independent audit classified later (sealed/scope.json), said so."""
+    ks = (sealed_record(root, "claims") or {}).get("claims") or []
+    later = ((sealed_record(root, "scope") or {}).get("forms") or {}) if any(not k.get("form") for k in ks) else {}
+    return [k if k.get("form") or k.get("id") not in later else {**k, "form": later[k["id"]]["form"], "form_by": "audit"}
+            for k in ks]
 
 
 def merged(plan: dict | None, follow: dict | None, withdrawn: list[dict] | tuple = (), extracted: list | tuple = ()) -> dict | None:
@@ -137,7 +155,7 @@ def merged(plan: dict | None, follow: dict | None, withdrawn: list[dict] | tuple
     for cc in claims:
         k = by_k.get(cc.get("id"))
         if k:
-            cc.update({f: k[f] for f in ("quote", "page", "claim_type", "scope") if f in k})
+            cc.update({f: k[f] for f in ("quote", "page", "claim_type", "scope", "form", "form_by") if f in k})
             have = {flat(o["item"]) for o in cc.get("omitted") or []}
             cc["omitted"] = list(cc.get("omitted") or []) + [
                 {"item": s, "why": f"past the {len(k['scope'])}-item scope the claim record holds (MAX_SCOPE)", "blocker": "cap",
@@ -284,6 +302,8 @@ def _found(cs: list[dict], moved) -> str:
         return "READINGS_DISAGREE"
     if any(c["status"] in SUPPORT and not moved(c) for c in cs):
         return "SUPPORT_FOUND"
+    if any(c["status"] == CONSTRUCTION_FAILED for c in cs):
+        return "PROOF_GAP_FOUND"             # the paper's construction of an example failed: a gap, never a refutation
     if any(c["status"] == "PREMISE_NOT_MET" for c in cs):
         return "PREMISE_NOT_MET"
     if any(c["status"] == "VIOLATION_UNDER_CHANGED_READING" or (c["status"] in SUPPORT + FAILURE and moved(c))
@@ -456,14 +476,15 @@ def _counts(stages: dict) -> str:
 
 def _checks(root: Path, plan: dict) -> list[dict]:
     central = {k for cc in plan["central_claims"] for k in cc["checks"]}
+    audit = (sealed_record(root, "scope") or {}).get("checks") or {}
     out = []
     for c in plan["checks"]:
         cdir = root / "checks" / c["id"]
         o = state.read_json(cdir / "outcome.json", {}) or {"status": "PENDING", "reason": "not finished"}
         run = state.read_json(cdir / "check.json", {})
         ev = EVIDENCE.get(c["kind"], "NONE")
-        if c["kind"] == "CERTIFICATE" and c.get("step"):
-            ev = "PROOF_AUDIT"
+        if c["kind"] == "CERTIFICATE" and (c.get("step") or o.get("witness")):
+            ev = "PROOF_AUDIT"          # a proof step, or the paper's construction of an example: a gap, never a refutation
         # Superseded outcomes (an earlier run of this check that a later one replaced) stay visible.
         history = [{"file": f.name, "status": (state.read_json(f) or {}).get("status"),
                     "reason": str((state.read_json(f) or {}).get("reason", ""))[:300]}
@@ -486,7 +507,10 @@ def _checks(root: Path, plan: dict) -> list[dict]:
                     "runs": o.get("runs") or (o.get("protocol") or {}).get("seeds_reused_from_checkpoints"),
                     "values": o.get("values"), "literal": o.get("literal"),
                     "admissible": o.get("admissible"), "protocol": o.get("protocol"),
-                    **{k: o[k] for k in ("instances", "admissible_instances", "readings_per_instance", "redecided") if k in o},
+                    **{k: o[k] for k in ("instances", "admissible_instances", "readings_per_instance", "redecided", "witness",
+                                         "witnesses", "constructions_failed", "resource_failures", "halted") if k in o},
+                    # what an independent audit found the check's code computes (scope items, exact quantities, outputs)
+                    "scope_audit": audit.get(c["id"]),
                     "image_check": o.get("image_check"), "pilot_values": o.get("pilot_values"), "pilot_stages": o.get("pilot_stages"),
                     "status": o.get("status"), "reason": o.get("reason", ""), "reason_by": o.get("reason_by", "harness"),
                     "rule": o.get("rule") or next((p["rule"] for p in (o.get("stages") or {}).values() if p.get("rule")), ""),
@@ -619,6 +643,11 @@ def _blockers(cc: dict, cs: list[dict], unrun: list[str] = (), done: set = froze
                 "RESOURCE BLOCKER") else "refused", "class": c.get("resource") or "", "why": c["reason"][:300], "basis": "harness"})
         elif c["status"] == "NOT_CHECKABLE":
             out.append({"item": c["id"], "blocker": "protocol", "why": c["reason"][:300], "basis": "script author or verifier"})
+        elif c.get("resource_failures"):          # completed seeds kept; the seeds a limit ended are named with it
+            lim = next(iter(c["resource_failures"].values()))
+            out.append({"item": c["id"], "blocker": resource_word(lim["kind"]), "class": lim["kind"], "basis": "harness",
+                        "why": (f"seed(s) {', '.join(sorted(c['resource_failures']))} ended at a resource limit"
+                                + (f" during {lim['stage']}" if lim.get("stage") else "") + f": {lim['text']}")[:300]})
         elif c["status"] in ("INCONCLUSIVE", "PENDING") and not c.get("values"):
             out.append({"item": c["id"], "blocker": "failed" if c["status"] == "INCONCLUSIVE" else "pending",
                         "why": c["reason"][:300], "basis": "harness"})
@@ -648,7 +677,26 @@ def _completion_row(cc: dict, by_id: dict) -> dict:
     said = {flat(m) for c in ran for i in (c.get("data_identity") or {}).values() if isinstance(i, dict)
             for box in (i, i.get("observed")) if isinstance(box, dict)                # the line itself, or what it observed
             for k in ("missing", "not_available") for m in (box.get(k) or []) if isinstance(m, str) and len(flat(m)) >= 3}
-    entries = [s for c in ran if c["state"] == "COMPLETED" for s in c.get("covers") or []]
+    # A covered item counts as run only where an independent audit of the check's code found it computed; a transfer
+    # argument (the same proof "with relevant replacements") is recorded beside the item and never counts; a check no audit
+    # has read keeps its plan's covers, flagged unverified, and supports no Verified decision (Oct-06 changepoint C4-C6:
+    # the KM-ADD theorems were "covered" by scripts that computed ARL quantities only).
+    entries, transfers, unverified = [], [], []
+    for c in ran:
+        if c["state"] != "COMPLETED":
+            continue
+        au = c.get("scope_audit")
+        if au is None:
+            entries += c.get("covers") or []
+            unverified.append(c["id"])
+            continue
+        how = {flat(k): v for k, v in (au.get("covers") or {}).items()}
+        for s in c.get("covers") or []:
+            h = how.get(flat(s)) or {}
+            if h.get("how") == "computed":
+                entries.append(s)
+            elif h.get("how") == "transfer":
+                transfers.append({"check": c["id"], "item": s, "argument": h.get("argument", "")})
     done = ({flat(p) for s in entries for p in parts(s)} | {flat(s) for s in entries if not {flat(p) for p in parts(s)} & said}) - said
     scope = cc.get("scope") or []
     unrun = [s for s in scope if flat(s) not in done] if scope else [o["item"] for o in cc.get("omitted") or [] if o.get("why")]
@@ -665,7 +713,9 @@ def _completion_row(cc: dict, by_id: dict) -> dict:
         exp, matched = "RAN_PARTIAL", False           # protocol matched includes its scope (invariant 24)
     else:
         exp, matched = "RAN_AS_SPECIFIED", True
-    return {"claim": cc["quote"], "page": cc["page"], "claim_type": cc.get("claim_type") or "",
+    return {"claim": cc["quote"], "page": cc["page"], "claim_type": cc.get("claim_type") or "", "form": claim_form(cc),
+            "transfers": transfers, "coverage_unverified": unverified,
+            "none_covered": bool(ran and scope and not any(flat(s) in done for s in scope)),
             "requested": "a mathematical statement on exact instances" if not empirical else "an experiment",
             "experiment": exp, "protocol_matched": matched, "partial": partial, "changes": changes[:6],
             "data_mismatch": mismatch, "scope_not_run": unrun, "targets_not_run": unran, "ran": [c["id"] for c in ran],
@@ -933,7 +983,7 @@ def table(led: dict) -> str:
     return "\n".join(rows)
 
 
-def unearned(text: str, led: dict) -> list[str]:
+def unearned(text: str, led: dict, earned_support: bool = False) -> list[str]:
     """Sentences using a status word (any inflection, through markdown or look-alike
     characters) that no check cited in the same sentence earns. Negated use ("was not
     reproduced", "unverified", "nothing here shows that any result was reproduced") is fine. A support
@@ -968,9 +1018,10 @@ def unearned(text: str, led: dict) -> list[str]:
             for m in re.finditer(r"\b(?:un)?(?:" + "|".join(stems) + r")\w*", low):
                 start = max([low.rfind(p, 0, m.start()) for p in (";", ":", ",", "—", "–", "(")] + [-1]) + 1
                 neg = r"\b(?:not|no|never|cannot|without|nothing|neither|nor|none)\b|n't"
+                refuse = r"\b(?:declin|refus|withh[eo]ld)\w*"           # "declines to verify": inside its own clause only
                 negated = m.group().startswith("un") or re.search(neg, low[start:m.start()]) or re.search(
-                    neg, low[max(0, m.start() - 30):m.start()])          # the clause the word stands in, or just before it
-                if not negated and not any(earns(i, earned) for i in ids):
+                    neg, low[max(0, m.start() - 30):m.start()]) or re.search(refuse, low[start:m.start()])
+                if not negated and not (earned_support and earned is SUPPORT) and not any(earns(i, earned) for i in ids):
                     bad.append(sentence.strip()[:200])
                     break
     return bad
