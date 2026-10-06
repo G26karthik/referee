@@ -16,13 +16,15 @@ The other record(s), registered by the operator (Read each in full):
 {{checks}}
 
 For EACH claim id give one entry:
-  - `reference_finding`: what the other record found about this claim, in one or two plain sentences (its verdict label
-    and its numbers, attributed to it: "The record reports ...").
+  - `reference_finding`: what the other record found about this claim, in one or two plain sentences that BEGIN "The
+    record reports ..." (its verdict label and its numbers, attributed to it).
   - `quotes`: 1-4 short passages copied VERBATIM from the record that state that finding (the harness re-finds each).
   - `comparable`: "yes" (same data, metric, settings and estimator), "partly" (some differ), or "no".
   - `why`: what differs or matches between the two tests, concretely: the dataset or subset, the metric or estimator,
     the settings, the baselines, the number of seeds, released results audited versus models re-run, the printed
-    condition versus a repaired one. A different number from a different test is not a disagreement.
+    condition versus a repaired one. A different number from a different test is not a disagreement. Describe what
+    each test did; use no verdict words here (verified, confirmed, reproduced, refuted, validated) for either side —
+    REFEREE's decision is printed beside it by the harness.
   - `agreement`: "agrees" (comparable tests, same direction), "disagrees" (comparable tests, opposite findings),
     "not_comparable" (the tests differ too much to say), or "not_covered" (the record says nothing about this claim).
   - `source`: a short name for the record (for example "HF logbook arvkevi").
