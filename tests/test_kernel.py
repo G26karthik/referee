@@ -4874,6 +4874,13 @@ def test_the_follow_up_round_does_not_wait_on_a_long_run():
             execute.poll, execute.remaining_s = real
 
 
+def _trace(x, led: dict, rep, cmp=None) -> str:
+    """Render the reviewer pages and return the trace record (trace.md): every claim and test by its code, in full."""
+    from harness import reviewer
+    reviewer.render(x, led, rep, cmp)
+    return (Path(x.root) / "trace.md").read_text(encoding="utf-8")
+
+
 def _claim_row(st, ctype="performance", exp="RAN_AS_SPECIFIED", checks=(), **kw):
     return {"id": "K1", "quote": "q", "claim_type": ctype, "claim_status": st, "checks": list(checks),
             "completion": {"experiment": exp, "changes": [], "scope_not_run": [], "not_run": [], **kw.pop("comp", {})}, **kw}
@@ -4946,25 +4953,39 @@ def test_the_reviewer_page_is_built_from_the_record_and_publishes_only_checked_p
                "source": {"url": "https://github.com/x/GRACE", "commit": "58d2f643aa11"}, "checks": [c1],
                "central_claims": claims, "workflow": {"finished": 1, "checks_planned": 1}, "concerns": []}
         x = types.SimpleNamespace(root=root, paper=Paper(["GRACE consistently surpasses the baselines. Theorem 5.1 holds."]))
-        rep = {"overview": "The paper proposes GRACE, a tree layer trained with gradients.",
-               "claims": [{"id": "K1", "explanation": "GRACE had lower error in two settings. It improved error by 37.2% there."},
-                          {"id": "K2", "explanation": "The theorem was not tested."}],
+        rep = {"overview": "The paper proposes GRACE, a tree layer trained with gradients \u2014 a new backbone.",
+               "claims": [{"id": "K1", "title": "Lower error than the baselines",
+                           "result": "A fresh run on two settings. It improved error by 37.2% there.",
+                           "explanation": "GRACE had lower error in two settings. It improved error by 37.2% there."},
+                          {"id": "K2", "title": "Sparse form of the layer", "result": "No test ran.",
+                           "explanation": "The theorem was not tested."}],
+               "setup": "Simulated data with 100 seeds; RMSE of the treatment effect.",
                "terms": [{"term": "RMSE", "definition": "root mean squared error, lower is better"}],
                "open_questions": ["Which seeds were used for the baselines? This is verified in Table 2."]}
         page = reviewer.render(x, led, rep)
-        assert "| K1. GRACE has lower error than the baselines. | **Not verified** | incomplete coverage |" in page
-        assert "**Unresolved claims:** K1, K2." in page
-        assert page.index("**Decision: Not verified.**") < page.index("**Not tested to completion**")       # the finding before its limits
-        assert "0.9918" in page and "0.0973 ± 0.0319" in page and "100 (100)" in page            # magnitudes and uncertainty
-        assert "3 settings declared = 2 with a result + 1 undefined + 0 missing" in page          # denominators reconcile
-        assert "ran all its runs): BART, IHDP" in page and "budget" in page
+        trace = (root / "trace.md").read_text(encoding="utf-8")
+        # The trace record: every claim and test by its code, with every number and limit.
+        assert "| K1. GRACE has lower error than the baselines. | empirical | **Not verified** | incomplete coverage |" in trace
+        assert trace.index("**Decision: Not verified.**") < trace.index("**Not tested to completion**")     # finding before limits
+        assert "0.9918" in trace and "0.0973 ± 0.0319" in trace and "100 (100)" in trace         # magnitudes and uncertainty
+        assert "3 settings declared = 2 with a result + 1 undefined + 0 missing" in trace         # denominators reconcile
+        assert "BART, IHDP" in trace and "budget" in trace
+        assert "37.2%" not in trace and "the code averages over seeds first" in trace
+        assert "Evidence: C1 · script `8b7df4c174ee`" in trace and "K1 to Kn are the paper's main claims" in trace
+        # The page: the comparison template, full descriptions, no codes, no dashes, no next-step section.
+        for h in ("## The paper", "## Claims and evidence", "## How the tests line up", "## Comparison",
+                  "## Terms and symbols", "## Record checked"):
+            assert h in page, h
+        assert "| Claim in the paper | Other record | This REFEREE run |" in page
+        assert "**1. Lower error than the baselines.** GRACE has lower error than the baselines. (p6)" in page, page
+        assert "**Not verified** (only part of the scope tested)" in page
+        assert not re.search(r"\b[KC]\d+\b", page), re.findall(r"\b[KC]\d+\b", page)               # codes only in the trace
+        assert "\u2014" not in page and "\u2014" not in trace and "a new backbone" in page               # no dash as punctuation
         assert "37.2%" not in page and "withheld" in page                                        # an invented number
-        assert "This is verified in Table 2" not in page                                         # an unearned status word
+        assert "Questions for the authors" not in page and "This is verified in Table 2" not in page
         assert "GRACE, a tree layer trained with gradients" in page and "root mean squared error" in page
-        assert "the code averages over seeds first" in page                                      # paper vs code, explained
-        assert "Evidence: C1 · script `8b7df4c174ee`" in page
-        assert not re.search(r"^#+ .*\bC\d+\b", page, re.M)                                       # no check codes as headings
-        assert len(page.split()) < 1100                                                          # about two pages
+        assert "PDF file" in page or "arXiv" in page or "OpenReview" in page
+        assert len(page.split()) < 700
 
 
 def test_each_reading_shows_its_numbers_and_an_audit_says_what_a_failure_depends_on():
@@ -5002,7 +5023,7 @@ def test_each_reading_shows_its_numbers_and_an_audit_says_what_a_failure_depends
         cc["decision"] = reviewer.decision(cc, {"C6": many})
         led = {"paper": {"title": "LR", "sha256": "ab" * 32, "arxiv_id": "", "source": "x"}, "source": {},
                "checks": [many], "central_claims": [cc], "workflow": {"finished": 1, "checks_planned": 1}, "concerns": []}
-        page = reviewer.render(types.SimpleNamespace(root=Path(t), paper=Paper(["It correlates strongly."])), led, None)
+        page = _trace(types.SimpleNamespace(root=Path(t), paper=Paper(["It correlates strongly."])), led, None)
         assert page.count("compared: `tau_fs_min > tau_mp_max`") == 1 and "chosen by REFEREE" in page, page
         assert page.count("settings: 9 decided") == 1, page                          # the summary is not printed twice
     grouped = {**c6, "readings": {r: {"status": "RELATION_HOLDS", "stages": {f"s{i}": {"status": "RELATION_HOLDS", "margin": 1,
@@ -5031,7 +5052,7 @@ def test_each_reading_shows_its_numbers_and_an_audit_says_what_a_failure_depends
                "checks": [cert], "central_claims": [cc], "workflow": {"finished": 1, "checks_planned": 1}, "concerns": []}
         x = types.SimpleNamespace(root=Path(t), paper=Paper(["Thus full calibration implies top-k calibration, "
                                                              "where P denotes the projection onto B."]))
-        page = reviewer.render(x, led, None)
+        page = _trace(x, led, None)
         assert cc["decision"]["reason"] == "interpretation_uncertain"
         assert "independent audit" in page.lower() and '"where P denotes the projection onto B" (p5)' in page, page
         assert "top-k prefix event" in page                                              # what the other reading gives
@@ -5071,7 +5092,7 @@ def test_the_reviewer_page_states_each_test_once_and_stays_near_two_pages():
             cc["decision"] = reviewer.decision(cc, {"C1": c1})
         led = {"paper": {"title": "GRACE", "sha256": "ab" * 32, "arxiv_id": "", "source": "x"}, "source": {},
                "checks": [c1], "central_claims": claims, "workflow": {"finished": 1, "checks_planned": 1}, "concerns": []}
-        page = reviewer.render(types.SimpleNamespace(root=Path(t), paper=Paper(["GRACE outperformed the baselines."])), led, None)
+        page = _trace(types.SimpleNamespace(root=Path(t), paper=Paper(["GRACE outperformed the baselines."])), led, None)
         k8 = page.split("### K8.")[1]
         assert page.count("config.yaml values") == 1 and "same test as under K1" in k8, page
         assert '{"n_train"' not in page and "n_train 5000" in page and "treated_fraction 0.50207" in page, page
@@ -5087,8 +5108,8 @@ def test_the_reviewer_page_states_each_test_once_and_stays_near_two_pages():
               "completion": {"experiment": "NOT_RUN", "changes": [], "scope_not_run": ["GRACE"], "not_run": [
                   {"item": "(the whole claim)", "blocker": "cap", "basis": "planner", "why": why[:90]}]}}
         k7["decision"] = reviewer.decision(k7, {})
-        page = reviewer.render(types.SimpleNamespace(root=Path(t), paper=Paper(["GRACE outperformed the baselines."])),
-                               {**led, "central_claims": [k7]}, None)
+        page = _trace(types.SimpleNamespace(root=Path(t), paper=Paper(["GRACE outperformed the baselines."])),
+                      {**led, "central_claims": [k7]}, None)
         assert page.count("which no slot is left") == 1, page                            # the planner's reason once
 
 
@@ -5132,7 +5153,7 @@ def test_another_reproduction_record_is_compared_only_after_the_decisions_are_se
         cfg.max_followup_checks = 0
         phase, owed, _ = tasks._plan(tasks._Ctx(cfg, pid))
         assert phase == "report" and "Decisions on the main claims" in Path(owed[0]["prompt"]).read_text(encoding="utf-8")
-        _seal(cfg, pid, "report", {"overview": "A paper.", "claims": [{"id": k, "explanation": "Not tested."}
+        _seal(cfg, pid, "report", {"overview": "A paper.", "claims": [{"id": k, "title": "A claim", "result": "Not tested."}
                                                                      for k in ("K1", "K2", "K3")]}, td)
         assert tasks._plan(tasks._Ctx(cfg, pid))[0] == "done"
         before = report.ledger(tasks._Ctx(cfg, pid))["central_claims"]
@@ -5145,9 +5166,14 @@ def test_another_reproduction_record_is_compared_only_after_the_decisions_are_se
         x = tasks._Ctx(cfg, pid)
         assert "verbatim" in _refused(lambda: tasks._seal_compare(x, "compare", {"claims": [
             {**entry, "quotes": ["the record says GRACE is verified everywhere"]}]}, final=False))
-        _seal(cfg, pid, "compare", {"claims": [{**entry, "quotes": ["RMSE 0.0471 for GRACE versus 0.0802"]}]}, td)
+        assert "`overall`" in _refused(lambda: tasks._seal_compare(x, "compare", {"claims": [
+            {**entry, "quotes": ["RMSE 0.0471 for GRACE versus 0.0802"]}]}, final=False))
+        _seal(cfg, pid, "compare", {"claims": [{**entry, "quotes": ["RMSE 0.0471 for GRACE versus 0.0802"],
+                                                "entry": {"space": "toy_1", "revision": ""}}],
+                                    "overall": "The record ran two datasets; REFEREE ran no test, so nothing is compared."}, td)
         assert tasks._plan(tasks._Ctx(cfg, pid))[0] == "done"
-        page = (td / pid / "reviewer.md").read_text(encoding="utf-8")
+        assert "toy_1" in (td / pid / "reviewer.md").read_text(encoding="utf-8")                    # the selected entry, named
+        page = (td / pid / "trace.md").read_text(encoding="utf-8")
         assert "Other reproduction record (HF logbook)" in page and "Comparable: partly" in page
         after = report.ledger(tasks._Ctx(cfg, pid))["central_claims"]
         assert [c["decision"] for c in after] == [c["decision"] for c in before]                 # nothing moved

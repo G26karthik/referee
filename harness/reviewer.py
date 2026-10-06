@@ -563,12 +563,35 @@ def _unquote(text: str, paper, refs_flat: str = "") -> str:
     return re.sub(r'"([^"\n]*)"', keep, text or "")
 
 
-# --- the page ------------------------------------------------------------------------------------------------------
+# --- the pages --------------------------------------------------------------------------------------------------------
+_DASHES = re.compile(r"\s*[—―]\s*|\s+–\s+")
+
+
+def _undash(text: str) -> str:
+    """No dash as punctuation in the harness's or a model's words (the reader's style rule): an em dash or a spaced en
+    dash becomes a semicolon, an en dash between numbers "to". The paper's own words, quoted, are kept as printed."""
+    out = []
+    for part in re.split(r'("[^"\n]*")', text):
+        if part.startswith('"') and part.endswith('"') and len(part) > 1:
+            out.append(part)
+        else:
+            part = re.sub(r"(?<=\d)–(?=\d)", " to ", part)
+            out.append(_DASHES.sub("; ", part))
+    return "".join(out)
+
+
+def _ident(p: dict) -> str:
+    """The paper's public identifier: its arXiv id and version, else the PDF's file name (never a path on this host)."""
+    if p.get("arxiv_id"):
+        return f"arXiv {p['arxiv_id']}{p.get('arxiv_version', '')}"
+    name = re.split(r"[\\/]", str(p.get("source") or ""))[-1]
+    return f"PDF file {name}" if name else "paper PDF"
+
+
 def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
-    p, s = led["paper"], led["source"]
+    """Write the two-page reviewer page (reviewer.md) and the trace record that maps every claim to its tests by code
+    (trace.md); return the page. Model prose is published on either only through the same checks."""
     rep, cmp = rep or {}, cmp or {}
-    by_id = {c["id"]: c for c in led["checks"]}
-    claims = led["central_claims"]
     refs = _reference_text(x.root)
     allowed = allowed_numbers(led, "\n".join(x.paper.pages) if hasattr(x.paper, "pages") else "", refs, *harness_texts(led))
     refs_flat = report.flat(refs)
@@ -577,20 +600,164 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
     def prose(text: str, where: str, record: bool = False, verified: bool = False) -> str:
         bad = problems(text, led, x.paper, allowed, refs_flat, record, verified)
         if bad:
-            held.append(f"{where}: " + "; ".join(bad))
+            if not any(h.startswith(f"{where}: ") for h in held):
+                held.append(f"{where}: " + "; ".join(bad))
             return ("_(Model-written text withheld here: it used a number, a quotation or a status word that the record "
                     "does not support. The reason is in `reviewer.withheld.json`.)_")
         return text.strip()
+    trace_text = _undash(trace(x, led, rep, cmp, prose))
+    (x.root / "trace.md").write_text(trace_text, encoding="utf-8")
+    text = _undash(page(x, led, rep, cmp, prose))
+    (x.root / "reviewer.md").write_text(text, encoding="utf-8")
+    state.write_json(x.root / "reviewer.withheld.json", held)
+    return text
 
-    ident = (f"arXiv {p['arxiv_id']}{p.get('arxiv_version', '')}" if p.get("arxiv_id") else p.get("source", "")) or "paper PDF"
-    code = f"authors' code {s['url']} at `{s['commit'][:10]}`" if s.get("url") else "no author code attributed"
-    commit = _harness_commit()
+
+def _theirs(prose, text: str, where: str) -> str:
+    """A field that is the other record's own finding (its verdict, its measurement): its verdict words are the
+    record's; its numbers and quotes are still checked against the registered record."""
+    got = prose("The record reports: " + text, where, record=True)
+    return text if got.startswith("The record reports: ") else got
+
+
+def _cell(s) -> str:
+    return re.sub(r"\s+", " ", str(s or "")).replace("|", "/").strip()
+
+
+def page(x, led: dict, rep: dict, cmp: dict, prose) -> str:
+    """The reviewer page, on the comparison template: the paper; each main claim (grouped where related) beside what the
+    other record found and what this run executed, with its decision; how the tests line up; what the evidence
+    supports; terms and symbols; the record checked. Full descriptions only: codes are in the trace record."""
+    p, s = led["paper"], led["source"]
+    claims, by_id = led["central_claims"], {c["id"]: c for c in led["checks"]}
+    pos = {cc.get("id"): i + 1 for i, cc in enumerate(claims)}
+    mine = {str(e.get("id")): e for e in rep.get("claims") or [] if isinstance(e, dict)}
+    other = {str(e.get("id")): e for e in cmp.get("claims") or [] if isinstance(e, dict)}
+    title = lambda cc: _cell(mine.get(cc.get("id"), {}).get("title")) or _short(cc.get("statement") or cc["quote"], 90)
+    refs = state.read_json(x.root / "reference" / "index.json", []) or []
+    entries = sorted({f"{_cell((o.get('entry') or {}).get('space'))} at `{_cell((o.get('entry') or {}).get('revision'))[:10]}`"
+                      for o in other.values() if (o.get("entry") or {}).get("space")})
     lines = [f"# {p['title']}", "",
-             f"REFEREE review · {ident} · PDF sha256 `{p['sha256'][:12]}` · {code} · harness `{commit}`", "",
-             "_A first-pass review aid for a human referee. It gives no accept or reject recommendation. Decisions are "
-             "computed by the harness from the recorded tests; the plain-language explanations are model-written and "
-             "were checked against the record._", ""]
-    lines += ["## What the paper does", "", prose(rep.get("overview", ""), "overview") or "_(no overview)_", ""]
+             f"**Paper:** {_ident(p)}, PDF sha256 `{p['sha256'][:12]}`. **Authors' code:** "
+             + (f"{s['url']} at `{s['commit'][:10]}`." if s.get("url") else "none attributed.")
+             + (f" **Other record:** {', '.join(_cell(r.get('source')) for r in refs)}"
+                + (f"; selected entries: {'; '.join(entries[:4])}" if entries else "") + "." if refs else
+                " **Other record:** none registered.") + f" **This run:** REFEREE harness `{_harness_commit()}`.", "",
+             "_A first-pass review aid. It makes no accept or reject recommendation. The harness computes every decision "
+             "from the recorded tests. The plain-language parts were written by a model and checked against the record. "
+             "The other record is another attempt, not ground truth._", "",
+             "## The paper", "", prose(rep.get("overview", ""), "overview") or "_(no overview)_", ""]
+    n_ver = sum(1 for cc in claims if (cc.get("decision") or {}).get("decision") == VERIFIED)
+    lines += ["## Claims and evidence", "",
+              f"The paper makes {len(claims)} main claims, extracted before any test was planned. {n_ver} verified, "
+              f"{len(claims) - n_ver} not verified. The trace record (`trace.md`) maps each claim to its tests.", "",
+              "| Claim in the paper | Other record | This REFEREE run |", "|---|---|---|"]
+    for group in _groups(claims, rep):
+        left, mid, right = [], [], []
+        for cc in group:
+            k, d, o = cc.get("id"), cc.get("decision") or {}, other.get(cc.get("id"))
+            left.append(f"**{pos[k]}. {title(cc)}.** {_cell(cc.get('statement') or cc['quote'])} (p{cc.get('page')})")
+            if not o:
+                mid.append("No other record registered." if not refs else "Not covered by the record.")
+            elif o.get("agreement") == "not_covered" and not o.get("hf_verdict"):
+                mid.append("Not covered by the record.")
+            else:
+                verdict = _short(_cell(o.get("hf_verdict") or o.get("reference_finding")), 200)
+                meas = _theirs(prose, _cell(o.get("hf_measurement")), f"{k} record measurement") if o.get("hf_measurement") else ""
+                mid.append(f"{pos[k]}: " + _theirs(prose, verdict, f"{k} record verdict") + (f" {meas}" if meas else ""))
+            res = mine.get(k, {}).get("result")
+            said = prose(_cell(res), f"{k} result") if res else _harness_result(cc, by_id)
+            right.append(f"{pos[k]}: {said} **{'Verified' if d.get('decision') == VERIFIED else 'Not verified'}** "
+                         f"({REASON_WORDS.get(d.get('reason', ''), d.get('reason', '').replace('_', ' '))}).")
+        lines.append("| " + " | ".join("<br>".join(col) for col in (left, mid, right)) + " |")
+    lines += ["", "## How the tests line up", "",
+              "- **Other record (data, model, baselines, seeds, metric):** "
+              + (prose(_cell(cmp.get("hf_setup")), "record setup", record=True) if cmp.get("hf_setup") else "not stated."),
+              "- **This run (data, model, baselines, seeds, metric):** "
+              + (prose(_cell(rep.get("setup")), "our setup") if rep.get("setup") else "see the trace record."),
+              "- **What differs, or why a test did not run:** "
+              + (prose(_cell(cmp.get("differences")), "differences", record=True) if cmp.get("differences") else "see the trace record."),
+              "", "## Comparison", ""]
+    for cc in claims:
+        k, d, o = cc.get("id"), cc.get("decision") or {}, other.get(cc.get("id")) or {}
+        sup = o.get("supports") or ""
+        if sup:
+            lines.append(f"- **For claim {pos[k]}, the evidence supports:** "
+                         + prose(_cell(sup), f"{k} supports", True, d.get("decision") == VERIFIED))
+    if cmp.get("overall"):
+        lines.append("- **Overall comparison and limits of this conclusion:** "
+                     + prose(_cell(cmp["overall"]), "overall", record=True))
+    if not cmp:
+        lines.append("- No other record is registered for this paper, so there is nothing to compare.")
+    terms = [t for t in rep.get("terms") or [] if isinstance(t, dict) and t.get("term") and t.get("definition")][:10]
+    if terms:
+        lines += ["", "## Terms and symbols", ""] + [
+            f"- **{_short(t['term'], 40)}**: {prose(_short(t['definition'], 240), 'term ' + str(t['term'])[:20])}" for t in terms]
+    revs = sorted({_cell((o.get("entry") or {}).get("revision")) for o in other.values() if (o.get("entry") or {}).get("revision")})
+    lines += ["", "## Record checked", "",
+              f"Paper: PDF sha256 `{p['sha256'][:12]}`. Other record revision: "
+              + (", ".join(f"`{r[:10]}`" for r in revs[:4]) if revs else "not stated") + ". Run output: "
+              f"`projects/{x.root.name}/` (this page `reviewer.md`, trace record `trace.md`, ledger `ledger.json`, every "
+              "process `execution.jsonl`)."]
+    return "\n".join(lines) + "\n"
+
+
+# The decision reasons in a reader's words (the decision line itself is the harness's).
+REASON_WORDS = {"supported": "supported within the tested scope", "existence_shown": "a valid example shows it",
+                "contradicted": "contradicted", "false_as_printed": "false as printed", "construction_failed":
+                "the paper's construction failed in tested cases", "proof_step_invalid": "a proof step fails as printed",
+                "premise_impossible": "a printed assumption can never hold", "premise_not_met":
+                "no tested case met the assumptions", "notation_defect": "undefined as printed",
+                "changed_protocol": "tested only under a changed protocol", "interpretation_uncertain":
+                "depends on how a definition is read", "checks_disagree": "tests disagree", "incomplete_coverage":
+                "only part of the scope tested", "scope_not_tested": "the test computed other cases",
+                "witness_cases_only": "examples for tested cases only", "finite_cases_only": "finite cases only",
+                "undecided": "within noise", "missing_input": "missing data or credentials", "resource_limit":
+                "a time or memory limit of this run", "test_failed": "the test failed to run", "blocked": "refused by a gate",
+                "not_checked": "no test", "pending": "not finished"}
+
+
+def _groups(claims: list[dict], rep: dict) -> list[list[dict]]:
+    """Rows of the claims table: the report writer's groups of related claims (each claim at most once, in the
+    extraction order), every other claim alone."""
+    by = {cc.get("id"): cc for cc in claims}
+    seen, rows = set(), []
+    first = {}
+    for g in rep.get("groups") or []:
+        ids = [i for i in g.get("claims") or [] if i in by and i not in seen]
+        if len(ids) > 1:
+            seen |= set(ids)
+            first[ids[0]] = [by[i] for i in ids]
+    for cc in claims:
+        k = cc.get("id")
+        if k in first:
+            rows.append(first[k])
+        elif k not in seen:
+            rows.append([cc])
+    return rows
+
+
+def _harness_result(cc: dict, by_id: dict) -> str:
+    """What ran for a claim and what it showed, in the harness's own words (when no checked model sentence exists)."""
+    tgt = [by_id[i] for i in cc.get("checks") or [] if i in by_id and by_id[i].get("role", "target") == "target"]
+    if not tgt:
+        return "Not run: no test was planned for it."
+    return " ".join(f"{_what(c).rsplit(' (', 1)[0].capitalize()}: {_status_words(c).split(' — ')[0]}." for c in tgt[:2])
+
+
+def trace(x, led: dict, rep: dict, cmp: dict, prose) -> str:
+    """The trace record: every claim by its code (K1..) with its decision, the tests (C1..) behind it with their
+    numbers, readings, deviations, audits, blockers and the other record beside it; every test once, in full."""
+    p, s = led["paper"], led["source"]
+    by_id = {c["id"]: c for c in led["checks"]}
+    claims = led["central_claims"]
+    code = f"authors' code {s['url']} at `{s['commit'][:10]}`" if s.get("url") else "no author code attributed"
+    lines = [f"# Trace record: {p['title']}", "",
+             f"{_ident(p)} · PDF sha256 `{p['sha256'][:12]}` · {code} · harness `{_harness_commit()}`", "",
+             "_This record maps each finding to its tests. K1 to Kn are the paper's main claims, numbered as they were "
+             "extracted before any test. C1 to Cn are REFEREE's tests (checks), numbered as planned. The two-page page "
+             "(`reviewer.md`) states the same decisions in words. Decisions are computed by the harness; model-written "
+             "text is published only after the same checks._", ""]
     verified = [cc for cc in claims if (cc.get("decision") or {}).get("decision") == VERIFIED]
     first = sum(1 for cc in claims if cc.get("id") and cc.get("origin") != "plan:2")
     added = sum(1 for cc in claims if cc.get("origin") == "plan:2")
@@ -599,20 +766,18 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
            f"{len(claims)} main claims were listed by the planner (no extraction is on record)")
     lines += ["## Decisions on the main claims", "",
               f"{how}. {len(verified)} verified; {len(claims) - len(verified)} not verified.", "",
-              "| Claim | Decision | Reason |", "|---|---|---|"]
+              "| Claim | Form | Decision | Reason |", "|---|---|---|---|"]
     for cc in claims:
         d = cc.get("decision") or {}
         lines.append(f"| {cc.get('id', '')}. {_short(cc.get('statement') or cc['quote'], 140)} | "
+                     f"{report.claim_form(cc)}{' (classified by the audit)' if cc.get('form_by') == 'audit' else ''} | "
                      f"**{'Verified' if d.get('decision') == VERIFIED else 'Not verified'}** | "
                      f"{d.get('reason', '').replace('_', ' ')} |")
-    open_ = [cc.get("id", "") for cc in claims if (cc.get("decision") or {}).get("decision") != VERIFIED]
-    if open_:
-        lines += ["", f"**Unresolved claims:** {', '.join(open_)}. Each is explained below."]
     lines.append("")
-    expl = {str(e.get("id")): e.get("explanation", "") for e in rep.get("claims") or [] if isinstance(e, dict)}
+    expl = {str(e.get("id")): e.get("explanation") or e.get("result") or "" for e in rep.get("claims") or [] if isinstance(e, dict)}
     other = {str(e.get("id")): e for e in cmp.get("claims") or [] if isinstance(e, dict)}
     shown: dict = {}
-    details: list[str] = []          # each test once, in full, after the claims: the main text stays near two pages
+    details: list[str] = []          # each test once, in full, after the claims
     cites = {}
     for cc in claims:
         for i in cc.get("checks") or []:
@@ -639,6 +804,7 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
                 lines.append(f"  - compared: `{rel}` (margin = left side minus right side; "
                              + ("the paper's own comparison)" if c.get("criterion") == "stated" else
                                 "a criterion chosen by REFEREE, which the paper's sentence does not state)"))
+            lines += [f"  - {n}" for n in output_notes(c)]
             rows = [r for r in result_rows(c, limit=6) if not r.startswith("- counts:")]
             table = [r for r in rows if r.startswith("|")]
             lines += (["", *table, ""] if table else []) + ["  " + r for r in rows if not r.startswith("|")]
@@ -648,18 +814,24 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
             lines += [f"  {n}" if n.startswith("  ") else f"  - {n}" for n in audit[:2]]
             details += _details(c, x.root, prose, cites.get(c["id"], []), led)
         for c in sup:
-            lines.append(f"- Supporting test (does not decide the claim): {_what(c)} — {_status_words(c)}.")
+            lines.append(f"- Supporting test (does not decide the claim): {_what(c)}; {_status_words(c)}.")
             if c["id"] not in shown:
                 shown[c["id"]] = k
                 details += _details(c, x.root, prose, cites.get(c["id"], []), led)
+        for n in d.get("narrower") or []:
+            lines.append(f"- **Narrower finding (does not decide the claim):** {n}.")
+        for t in comp.get("transfers") or []:
+            lines.append(f"- **Argued by transfer, not computed:** {t['item']} ({t['check']}): {_sentence(t.get('argument'), 200)}")
+        if comp.get("coverage_unverified"):
+            lines.append(f"- **Coverage not verified:** no audit read what {', '.join(comp['coverage_unverified'])} computed.")
         if comp.get("scope_not_run"):
-            lines.append("- **Not tested to completion** (no test covering it ran all its runs): " + ", ".join(comp["scope_not_run"][:12])
-                         + (" …" if len(comp["scope_not_run"]) > 12 else "") + ".")
+            lines.append("- **Not tested to completion** (no test covering it computed it and ran all its runs): "
+                         + ", ".join(comp["scope_not_run"][:12]) + ("; and more" if len(comp["scope_not_run"]) > 12 else "") + ".")
         # Only a reason of its own is listed: an item whose test did not finish says so under "What ran" already.
         why_not = [b for b in comp.get("not_run") or [] if not (b.get("item", "").startswith("C") and b["item"][1:].isdigit())
                    and b.get("blocker") not in ("not run", "pending")]
         for b in why_not[:3]:
-            lines.append(f"  - {b['item']}: {b['blocker']} — {_sentence(b.get('why'), 160)} "
+            lines.append(f"  - {b['item']}: {b['blocker']}; {_sentence(b.get('why'), 160)} "
                          f"({'harness record' if b.get('basis') == 'harness' else (b.get('basis') or 'planner') + ' says'})")
         if len(why_not) > 3:
             lines.append(f"  - {len(why_not) - 3} more items with a stated reason are in `ledger.json`.")
@@ -668,34 +840,36 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
         o = other.get(k)
         if o:
             said = "; ".join(f"\"{_short(q, 160)}\"" for q in o.get("quotes") or [])
+            finding = o.get("hf_verdict") or o.get("reference_finding") or ""
             lines.append(f"- **Other reproduction record ({_short(o.get('source', 'reference'), 60)}):** "
-                         f"{prose(_short(o.get('reference_finding'), 300), k + ' reference finding', record=True)}"
+                         + (f"entry {_cell((o.get('entry') or {}).get('space'))}; " if (o.get("entry") or {}).get("space") else "")
+                         + f"{prose(_short(finding, 300), k + ' reference finding', record=True)}"
+                         + (f" {prose(_short(o['hf_measurement'], 300), k + ' record measurement', record=True)}"
+                            if o.get("hf_measurement") else "")
                          + (f" In its words: {said}." if said else "")
-                         + f" Comparable: {o.get('comparable', '?')} — {prose(o.get('why', ''), k + ' reference', True, d.get('decision') == VERIFIED)} "
-                         f"Agreement: {str(o.get('agreement', '')).replace('_', ' ')}.")
+                         + f" Comparable: {o.get('comparable', '?')}. Agreement: {str(o.get('agreement', '')).replace('_', ' ')}."
+                         + (f" {prose(o['why'], k + ' reference', True, d.get('decision') == VERIFIED)}" if o.get("why") else ""))
         if tgt + sup:
             lines.append("- Evidence: " + ", ".join(c["id"] for c in tgt + sup) + " (under Test details)")
         lines.append("")
     if details:
         lines += ["## Test details", "", "_Each test once: what it ran on, the paper/code differences and changes its "
                   "script declared, the full result counts, the independent audit, and its records._", "", *details]
-    terms =[t for t in rep.get("terms") or [] if isinstance(t, dict) and t.get("term") and t.get("definition")][:12]
+    terms = [t for t in rep.get("terms") or [] if isinstance(t, dict) and t.get("term") and t.get("definition")][:12]
     if terms:
         lines += ["## Terms", ""] + [f"- **{_short(t['term'], 60)}**: {prose(_short(t['definition'], 300), 'term ' + str(t['term'])[:20])}"
                                      for t in terms] + [""]
-    qs = [q for q in rep.get("open_questions") or [] if isinstance(q, str)][:5]
-    if qs:
-        lines += ["## Questions for the authors", ""] + [f"- {prose(_short(q, 300), 'question')}" for q in qs] + [""]
     lines += ["## Record", "",
-              f"Full trace: `review.md`; machine ledger: `ledger.json`; every process: `execution.jsonl`. Workflow: "
-              f"{led['workflow']['finished']} of {led['workflow']['checks_planned']} planned tests reached an end state "
-              "(an end state is not a reproduction)."]
-    if held:
-        lines += ["", f"{len(held)} model-written passage(s) were withheld; why is recorded in `reviewer.withheld.json`."]
-    text = "\n".join(lines) + "\n"
-    (x.root / "reviewer.md").write_text(text, encoding="utf-8")
-    state.write_json(x.root / "reviewer.withheld.json", held)
-    return text
+              f"Full trace of statuses: `review.md`; machine ledger: `ledger.json`; every process: `execution.jsonl`. "
+              f"Workflow: {led['workflow']['finished']} of {led['workflow']['checks_planned']} planned tests reached an end "
+              "state (an end state is not a reproduction)."]
+    return "\n".join(lines) + "\n"
+
+
+def output_notes(c: dict) -> list[str]:
+    """What each compared output is, as an independent audit of the script found it (definition, unit, aggregation)."""
+    return [f"{o['name']}" + (f" [{o['reading']}]" if o.get("reading") else "") + f" is {o['definition']} (unit: {o['unit']}; "
+            f"{o['aggregation']}; audited)" for o in ((c.get("scope_audit") or {}).get("outputs") or [])[:6]]
 
 
 def _reference_text(root: Path) -> str:

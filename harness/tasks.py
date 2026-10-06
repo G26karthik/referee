@@ -301,7 +301,8 @@ def _plan(x: _Ctx) -> tuple[str, list[dict], list[dict]]:
         return "verify", [], running
     if x.sealed("report") is None:
         from . import reviewer
-        draft = reviewer.render(x, ledger, None)          # the harness's own page, before any model text
+        reviewer.render(x, ledger, None)                  # the harness's own pages, before any model text
+        draft = (x.root / "trace.md").read_text(encoding="utf-8")
         return "report", [x.task("report", "report", _template(
             "report", title=title, draft=draft[:30_000],
             checks=json.dumps([_brief(c) for c in ledger["checks"]], ensure_ascii=False, indent=1)[:40_000],
@@ -571,17 +572,29 @@ def _seal_compare(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
         comparable = _enum(e.get("comparable"), ("yes", "partly", "no"))
         agreement = _enum(e.get("agreement"), ("agrees", "disagrees", "not_comparable", "not_covered"))
         why = str(e.get("why") or "").strip()
-        if not comparable or not agreement or len(why) < 20:
+        supports = re.sub(r"\s+", " ", str(e.get("supports") or "")).strip()
+        if not comparable or not agreement or (len(why) < 20 and len(supports) < 15):
             errors.append(f"{k}: `comparable` (yes|partly|no), `agreement` (agrees|disagrees|not_comparable|not_covered) "
-                          "and `why` (what differs: data, metric, settings, estimator, seeds) are required")
+                          "and `supports` (what the evidence of both records supports for this claim) are required")
         if agreement in ("agrees", "disagrees") and not quotes:
             errors.append(f"{k}: an agreement or disagreement rests on the record's own words (`quotes`)")
             agreement = "not_comparable"
+        # The selected entry (a Space or logbook id and its revision) is the record's own: re-found in a registered file.
+        entry = e.get("entry") if isinstance(e.get("entry"), dict) else {}
+        entry = {f: str(entry.get(f) or "").strip()[:120] for f in ("space", "revision")}
+        if any(v and not any(flat(v) in t for t in texts.values()) for v in entry.values()):
+            errors.append(f"{k}: `entry` (space, revision) must be copied from a registered record")
+            entry = {"space": "", "revision": ""}
         out.append({"id": k, "source": str(e.get("source") or (refs[0]["source"] if refs else "reference"))[:80],
                     "reference_finding": str(e.get("reference_finding") or "")[:600], "quotes": quotes,
-                    "comparable": comparable or "no", "agreement": agreement or "not_comparable", "why": why[:800]})
+                    "comparable": comparable or "no", "agreement": agreement or "not_comparable", "why": why[:800],
+                    "entry": entry, "hf_verdict": str(e.get("hf_verdict") or "")[:300],
+                    "hf_measurement": str(e.get("hf_measurement") or "")[:400], "supports": supports[:400]})
+    paper_level = {f: re.sub(r"\s+", " ", str(obj.get(f) or "")).strip()[:900] for f in ("hf_setup", "differences", "overall")}
+    if refs and out and len(paper_level["overall"]) < 20:
+        errors.append("`overall`: what the two records together support, and the limits of that conclusion")
     _fail_or_drop(errors, final)
-    return {"claims": out, "notes": str(obj.get("notes") or "")[:2000]}
+    return {"claims": out, **paper_level, "notes": str(obj.get("notes") or "")[:2000]}
 
 
 def _discovery_text(x: _Ctx) -> str:
@@ -2397,13 +2410,23 @@ def _seal_vision(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
 
 
 def _seal_report(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
-    """The plain-language parts of the reviewer page (reviewer.render checks each before it is published)."""
+    """The plain-language parts of the reviewer page (reviewer.render checks each before it is published): the
+    overview, a short title and a result sentence per claim, groups of related claims for the page's table, the
+    setup of this run's tests, and the terms and symbols a reader needs."""
     ids = {cc.get("id") for cc in (x.plan() or {}).get("central_claims", []) if cc.get("id")}
-    claims = [{"id": str(e.get("id")), "explanation": str(e.get("explanation") or "")[:1200]}
+    claims = [{"id": str(e.get("id")), "title": re.sub(r"\s+", " ", str(e.get("title") or "")).strip()[:120],
+               "result": str(e.get("result") or "")[:700], "explanation": str(e.get("explanation") or "")[:1200]}
               for e in obj.get("claims") or [] if isinstance(e, dict) and str(e.get("id")) in ids]
-    if ids and (miss := sorted(ids - {c["id"] for c in claims})) and not final:
-        raise SealError(f"every main claim needs an `explanation`: missing {miss}")
-    return {"overview": str(obj.get("overview") or "")[:1400], "claims": claims,
+    if ids and (miss := sorted(ids - {c["id"] for c in claims if c["title"] and (c["result"] or c["explanation"])})) and not final:
+        raise SealError(f"every main claim needs a `title` and a `result`: missing {miss}")
+    groups, seen = [], set()
+    for g in [g for g in obj.get("groups") or [] if isinstance(g, dict)]:
+        gi = [str(i) for i in g.get("claims") or [] if str(i) in ids and str(i) not in seen]
+        if len(gi) > 1:
+            seen |= set(gi)
+            groups.append({"title": str(g.get("title") or "")[:120], "claims": gi})
+    return {"overview": str(obj.get("overview") or "")[:1400], "claims": claims, "groups": groups,
+            "setup": str(obj.get("setup") or "")[:900],
             "terms": [{"term": str(t.get("term"))[:60], "definition": str(t.get("definition") or "")[:400]}
                       for t in obj.get("terms") or [] if isinstance(t, dict) and t.get("term")][:12],
             "open_questions": [str(q)[:400] for q in obj.get("open_questions") or [] if isinstance(q, str)][:5],
