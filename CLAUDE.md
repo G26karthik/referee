@@ -14,7 +14,7 @@ reconciling numbers, and computing every status.
 
 ## Pipeline
 
-`ingest -> 4 lenses + claim extractor -> critic -> planner -> per check: bind | gen -> verify (1 revision) -> execute + reconcile -> audit (a failure) -> follow-up plan -> report writer -> done (-> compare, once another record is registered)`
+`ingest -> 4 lenses + claim extractor -> critic -> planner -> per check: bind | gen -> verify (1 revision) -> execute + reconcile -> scope audit (what each finished test computed) -> audit (a failure) -> follow-up plan -> report writer -> done (-> compare, once another record is registered)`
 
 | File | Responsibility |
 |---|---|
@@ -29,7 +29,7 @@ reconciling numbers, and computing every status.
 | `harness/independence.py` | are seeded replicates different runs? (result-line outputs, data fingerprints, the seed's flow into a generator) |
 | `harness/reconcile.py` | executed value vs printed value; statuses |
 | `harness/report.py` | ledger, deterministic status table, earned-language check, `review.md` (the trace) |
-| `harness/reviewer.py` | per-claim decision (Verified / Not verified + reason), `reviewer.md` (two-page reviewer page), prose checks |
+| `harness/reviewer.py` | per-claim decision (Verified / Not verified + reason), `reviewer.md` (the two-page comparison page), `trace.md` (every claim and test by code), prose checks |
 | `harness/state.py` | config/gates, atomic JSON, project lock |
 | `harness/prompts/*.md` | every model instruction (lenses, claims, critic, planner, bind, gen, verify, audit, report, compare) |
 | `tests/test_kernel.py` | the trust kernel only |
@@ -93,7 +93,14 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
 16. **A counterexample satisfies every premise of the exact claim.** Certificates report
     `premises_hold` per instance; a violation on an inadmissible instance is nothing, one found
     only under a changed reading is VIOLATION_UNDER_CHANGED_READING, no admissible instance is
-    PREMISE_NOT_MET (claim status READING_CHANGED / PREMISE_NOT_MET, never a failure).
+    PREMISE_NOT_MET (claim status READING_CHANGED / PREMISE_NOT_MET, never a failure). A false premise
+    is no counterexample to a conditional claim, and an impossible premise is not an undefined
+    expression: a printed premise the author argued unsatisfiable (`premise_argument`) reads
+    `premise_not_met`, whatever the script labelled it. A certificate the scope audit found BUILDS
+    EXAMPLES of an existence statement (`violated` = not a valid example) is a witness certificate: a
+    valid example under the printed reading is WITNESS_FOUND (it shows the statement for the cases it
+    covers); a failed construction is CONSTRUCTION_FAILED, a gap in the construction (like a failed proof
+    step), never a counterexample.
 17. **Small samples are decided with Student-t** (two-sided 95%): a relation beyond t·SE; a
     reproduction RESOLVED inside the CI of the mean, FAILED outside the prediction interval.
     Runs are ONE measurement (`n_independent` 1) only when they are identical in every output and
@@ -101,7 +108,10 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     author declares deterministic (`stochastic: false`) runs twice and must repeat exactly. Equal
     SUMMARY values are not identical runs: replicates whose other outputs differ, whose
     `data_fingerprint` differs, or whose `--seed` provably reaches a random generator are independent
-    replicates of a zero-variance sample, decided by the statistic that fits the quantity — a compared
+    replicates of a zero-variance sample (unless the scope audit found the stage computes an EXACT quantity
+    of the configuration, such as a parameter count, cited by its code line: then identical runs are one
+    exact measurement decided on the sign of its margin, and runs that differ decide nothing), decided by the
+    statistic that fits the quantity — a compared
     proportion of counted trials (`binomial`, zero events included) by its exact Clopper-Pearson interval,
     anything else by an exact sign test (six replicates reach 95%; a finished check that only more
     replicates can decide — a repeated value, or a margin within t*SE at fewer than six, t(2) being 4.3 — is
@@ -125,7 +135,13 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     import, or a checkout it may drive): a CPU script never queues behind a GPU run. SH_PARALLEL counts
     script runs (evidence runs and drafts); a fetch or an install takes no slot. A refused replicate extension is
     recorded (`extension_refused`, its setting). Remaining
-    runs are projected from the completed seeds' median time (the pilot's until two completed). Completed seeds are checkpointed
+    runs are projected from the completed seeds' median time (the pilot's until two completed). A limit that ends a seed after
+    measurements exist (earlier seeds, or stages this run finished first) is that seed's failure, with its kind and stage
+    (`resource_failures`): the other seeds still run, a limit that would end every further seed (per-run time, disk) or that
+    already ended a second seed stops further launches, and the check is PARTIAL (invariant 20). A run given the GPU holds it
+    alone, so its out-of-memory is never "retried alone"; retries are per seed; a seed that ran out of GPU memory twice with
+    the same script is never resumed by `reopen`. The seeds to launch are derived from what ended, never from a stored
+    counter. An operator `stop` keeps the completed seeds (PARTIAL) and records every run it cancels. Completed seeds are checkpointed
     (seeds.jsonl) and reused; each seed has a scratch volume at /work/ckpt. Planners and script
     authors are told the measured host (CPUs, container RAM, GPU yes/no).
 20. **Completed measurements survive later failures.** A script prints one result line per
@@ -165,7 +181,10 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     is in `include` or in `exclude` with a reason when the planner was shown that listing (`discover --files`): the
     seal refuses one left out unseen, and one still left out (a lenient last attempt) is a gap of the acquisition
     (RAN_WITH_CHANGES); a listing only the fetcher saw is shown, never counted. A covered dataset a script could not load is named in its
-    REFEREE_DATA line's `missing`, and reads as not run. Every attempt, redirect
+    REFEREE_DATA line's `missing`, and reads as not run. A dead link (HTTP 404) to an archive named after the folder its
+    admitted members sit in is a superseded duplicate (recorded with what superseded it), never a gap; past MAX_ARCHIVES the
+    archives named most like `include` are opened and the rest recorded (`archives_not_opened`); of several archives opened
+    on speculation only matching members are admitted. Every attempt, redirect
     and file sha256 is kept (`checks/<id>/data.json`); admitted files mount read-only at /work/data. A
     check whose required data was not admitted ends as a DATA BLOCKER (or INCONCLUSIVE for a network
     fault of this run) before any script is written — a simulation in its place would be a different
@@ -176,7 +195,12 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     deviation (data, split, tuning, rebuilt baseline, aggregation, premise, index) is
     READING_CHANGED, never support or failure of the printed claim. Every scope item a central
     claim names (methods, datasets) is covered by a check or omitted with a reason; a central
-    claim still undecided after all checks gets one follow-up plan (plan:2, SH_MAX_FOLLOWUP_CHECKS).
+    claim still undecided after all checks gets one follow-up plan (plan:2, SH_MAX_FOLLOWUP_CHECKS). A scope item counts as
+    tested only where an independent scope audit (task `scope`, owed as each test ends) found code of the test that computes
+    it, re-found in the script; a transfer argument ("the same proof with delays") is shown and never counted; a test no
+    audit has read supports no Verified decision. Each main claim's first target check takes a slot before any claim gets
+    a second; a plan that leaves a claim unchecked for want of a slot beside a claim with several is refused. A check may
+    state its projected cost (`estimate`), recorded as the planner's projection beside the limits of this run.
     A follow-up claim may link a check an earlier round ran (its covers count). Re-planning never removes a
     claim: a withdrawn follow-up plan stays sealed (`plan:2.withdrawn.N`) and every claim it listed stays in
     the ledger (NOT_CHECKED, blocker `withdrawn`) until a later round takes it up; a quote inside an earlier
@@ -210,7 +234,9 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     `run.py status` recomputes from disk and says IN PROGRESS until review.md is newer than every outcome and seal.
 
 25. **Classifications fail closed.** Every field that decides which rule applies is a closed vocabulary
-    the seal requires, never a default: a central claim's `claim_type` and `scope`, a check's `role` and
+    the seal requires, never a default: a central claim's `claim_type`, `form` (universal, existential,
+    universal_existential for a theorem; empirical or deterministic for a performance or value claim; compatibility for
+    an engineering claim; unclassified reads the strictest) and `scope`, a check's `role` and
     (except a CERTIFICATE) `criterion`, a RECONSTRUCTION's `test`, a RELEASED_DATA's `basis`, every omission's
     `blocker`. A follow-up round never retypes a claim. On the last attempt an invalid claim is sealed at its
     strictest reading and says so (`sealed_with_errors`): untyped = empirical, a link its kind cannot carry is
@@ -237,14 +263,18 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     extracted claim stays in the ledger, its completion and the report whatever the plans did (a malformed plan, a
     withdrawn follow-up); a follow-up round may add a missed headline claim only through `new_claims`, validated alike.
 28. **One decision per main claim, computed.** `reviewer.decision`: VERIFIED only when the requested test ran as
-    specified and supports the claim within the tested scope — a theorem is never verified by finite cases. Otherwise
-    NOT_VERIFIED with one reason: contradicted, false as printed, proof step invalid (never "false"), premise impossible,
-    notation defect, changed protocol, interpretation uncertain (readings differ, or an audit found the failure DEPENDS),
-    checks disagree, incomplete coverage, finite cases only, undecided, blocked (a harness-recorded blocker), not checked,
-    pending. Missing evidence is never read as falsity.
+    specified, an audit found its code computes what the claim states, and it supports the claim within the tested scope:
+    an existence statement by one valid example meeting every printed premise; a universal statement never by finite cases.
+    Otherwise NOT_VERIFIED with one reason: contradicted, false as printed, proof step invalid (never "false"), construction
+    failed, premise impossible (argued) or not met (in tested cases), notation defect, changed protocol, interpretation
+    uncertain (readings differ, or an audit found the failure DEPENDS), checks disagree, incomplete coverage, scope not
+    tested (the test computed other cases), examples for tested cases only, finite cases only, undecided, missing input
+    (data, credentials), resource limit (time, memory, the number of tests), test failed, refused, not checked, pending. Each
+    lists the narrower findings that held (`narrower`). Missing evidence is never read as falsity.
 29. **Expected, completed, undefined and missing reconcile.** A unit whose compared quantity is undefined prints
     `undefined` with why: UNDEFINED (completed, deciding nothing), never NOT_COMPLETED. `report.counts` gives settings
-    declared = with a result + undefined + missing, readings, launches, independent replicates and result lines apart,
+    declared = with a result + undefined + missing, readings, launches, evidence processes, distinct seeds, retries,
+    cancelled runs, datasets, independent replicates and result lines apart,
     and says when they do not reconcile. Replicates equal to round-off (12 significant digits) are one measurement.
     An approved stochastic script whose seeds varied nothing in every stage goes back to its author (`revisable`).
 30. **What the comparison computes follows the paper and the code, never a convenient third.** A claim-changing
@@ -258,14 +288,19 @@ Old implementation: git tags `v4-final-2026-09-28` (v4) and `reference-implement
     (`execute.wait_turn`): a check that just ran waits behind the ones that waited. Once only executions remain and
     each has at least FOLLOWUP_AFTER_S (20 min) left, the follow-up round is planned beside them; a claim a running check
     decides is listed as running, never re-planned.
-32. **The reviewer page is the record, in plain words.** `reviewer.md` (about two pages) gives the decisions table and
-    the unresolved claims first, then per claim the decision before its limits, what ran on what (data identity,
-    method, metric, scope, runs), the per-setting numbers with their 95% band and reconciled counts, paper/code
-    disagreements, what was not tested and who says so, and evidence references (check ids only there). Model prose
-    (overview, explanations, terms, questions) is published only if every number is in the record or the paper, every
-    quote in the paper and every status word earned; otherwise it is withheld (`reviewer.withheld.json`). Another
-    reproduction record (an HF logbook) is registered only after the review is sealed (`run.py reference`), quoted
-    verbatim beside each claim with whether the tests are comparable, and never moves a decision.
+32. **The reviewer page is the record, in plain words.** `reviewer.md` follows the one-paper comparison template and is
+    measured at two printed pages or fewer (`tools/reviewer_pdf.py --max-pages 2`): the paper; each main claim (grouped
+    where related) beside what the other record found (its selected entry and revision, verdict, measurement, scale,
+    repeats) and what this run executed, with its decision and reason; how the tests line up; what the evidence supports
+    per claim and overall, with its limits; terms and symbols; the record checked. Claims are named in words; K and C codes
+    appear only in `trace.md`, which explains them and holds every number with its 95% band, reconciled counts, readings,
+    deviations, audits, blockers, transfers and narrower findings. No dash is punctuation outside the paper's quoted
+    words; no next-step section. Model prose is published only if every number is in the record or the paper, every quote
+    in the paper or the registered record, and every status word earned; a sentence about the other record may carry
+    that record's verdict, and REFEREE's own decision word only when it is the claim's decision; otherwise it is withheld
+    (`reviewer.withheld.json`). Another reproduction record (an HF logbook) is registered only after the review is sealed
+    (`run.py reference`), compared with matched magnitudes and scope (a standard error is not a variance), and never moves
+    a decision.
 
 ## Dependency recovery (documented, isolated, recorded)
 
