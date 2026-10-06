@@ -1056,7 +1056,7 @@ def _replan(cfg: state.Config, pid: str, root: Path, why: str) -> dict:
                 d.rename(d.with_name(f"{c['id']}.withdrawn.{n}"))
                 moved.append(c["id"])
         seals = state.read_json(root / "seals.json", {}) or {}
-        gone = [t for t in seals if t in ("plan:2", "report") or (t.split(":", 1)[0] in ("bind", "gen", "verify", "audit")
+        gone = [t for t in seals if t in ("plan:2", "report", "compare") or (t.split(":", 1)[0] in ("bind", "gen", "verify", "audit")
                                                                   and _check_of(t) in {c["id"] for c in follow["checks"]})]
         n = len(list((root / "sealed").glob("plan__2.withdrawn.*.json"))) + 1
         kept = root / "sealed" / f"plan__2.withdrawn.{n}.json"
