@@ -5131,6 +5131,18 @@ def test_another_reproduction_record_is_compared_only_after_the_decisions_are_se
         after = report.ledger(tasks._Ctx(cfg, pid))["central_claims"]
         assert [c["decision"] for c in after] == [c["decision"] for c in before]                 # nothing moved
         assert "In its words: \"RMSE 0.0471 for GRACE versus 0.0802\"" in page                    # its own words, shown
+        # Oct-06 label ranking: "The record reports all five summaries verified ..." was withheld as REFEREE status
+        # language. A finding attributed to the record may carry the record's own verdict words; REFEREE's comparison
+        # note ("why") and an unattributed finding may not.
+        from harness import reviewer
+        led = report.ledger(tasks._Ctx(cfg, pid))
+        cmp = {"claims": [{**entry, "quotes": [], "reference_finding": "The record reports five summaries verified GRACE on toy_1."},
+                          {**entry, "id": "K1", "quotes": [], "reference_finding": "GRACE was verified on toy_1."},
+                          {**entry, "id": "K3", "quotes": [], "why": "REFEREE reproduced the toy result."}]}
+        page = reviewer.render(tasks._Ctx(cfg, pid), led, None, cmp)
+        held = state.read_json(td / pid / "reviewer.withheld.json")
+        assert "five summaries verified GRACE" in page and not any(h.startswith("K2 reference finding") for h in held), held
+        assert any(h.startswith("K1 reference finding") for h in held) and any(h.startswith("K3 reference:") for h in held), held
         bad = td / "hf.pdf"
         bad.write_bytes(b"%PDF-1.4 \xff\xfe\x00binary")
         assert "not UTF-8" in tasks.register_reference(cfg, pid, str(bad), "HF")["error"]        # never stops the review

@@ -448,18 +448,24 @@ def allowed_numbers(record, *texts: str) -> list[float]:
 _MARKUP = re.compile(r"<[A-Za-z/!]|&#?\w+;")
 
 
-def problems(text: str, led: dict, paper, allowed: list[float], refs_flat: str = "") -> list[str]:
+_ATTRIBUTED = re.compile(r"(?i)^\s*the (?:other )?records?\b")
+
+
+def problems(text: str, led: dict, paper, allowed: list[float], refs_flat: str = "", record: bool = False) -> list[str]:
     """Why a model-written passage cannot be published: markup or an entity (it would render as something the checks never
     saw), a status word no cited check earns, a quote not in the paper (or the registered record), a number the record
-    and the paper do not hold."""
+    and the paper do not hold. `record`: the passage says what ANOTHER reproduction record found; when every sentence of
+    it is attributed to that record ("The record reports ..."), its verdict words are the record's, not REFEREE's, and
+    are not REFEREE status language (numbers and quotes are still checked)."""
     if not text:
         return []
     if _MARKUP.search(text):
         return ["markup or a character entity in the text"]
     quotes = [q for q in re.findall(r'"([^"\n]*)"', text) if len(q) >= 20 and not paper.occurs(q.replace("\\n", "\n"))
               and report.flat(q) not in refs_flat]
-    return ([f"status language: {s[:120]!r}" for s in report.unearned(_unquote(text, paper, refs_flat), led)][:2]
-            + [f"quote not in the paper or the record: {q[:80]!r}" for q in quotes][:2]
+    theirs = record and bool(_ATTRIBUTED.match(text))      # the field is the record's finding, opened as such
+    status = [] if theirs else [f"status language: {s[:120]!r}" for s in report.unearned(_unquote(text, paper, refs_flat), led)]
+    return (status[:2] + [f"quote not in the paper or the record: {q[:80]!r}" for q in quotes][:2]
             + [f"number not in the record or the paper: {n}" for n in unknown_numbers(text, allowed)][:3])
 
 
@@ -483,8 +489,8 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
     refs_flat = report.flat(refs)
     held: list[str] = []
 
-    def prose(text: str, where: str) -> str:
-        bad = problems(text, led, x.paper, allowed, refs_flat)
+    def prose(text: str, where: str, record: bool = False) -> str:
+        bad = problems(text, led, x.paper, allowed, refs_flat, record)
         if bad:
             held.append(f"{where}: " + "; ".join(bad))
             return ("_(Model-written text withheld here: it used a number, a quotation or a status word that the record "
@@ -578,7 +584,7 @@ def render(x, led: dict, rep: dict | None, cmp: dict | None = None) -> str:
         if o:
             said = "; ".join(f"\"{_short(q, 160)}\"" for q in o.get("quotes") or [])
             lines.append(f"- **Other reproduction record ({_short(o.get('source', 'reference'), 60)}):** "
-                         f"{prose(_short(o.get('reference_finding'), 300), k + ' reference finding')}"
+                         f"{prose(_short(o.get('reference_finding'), 300), k + ' reference finding', record=True)}"
                          + (f" In its words: {said}." if said else "")
                          + f" Comparable: {o.get('comparable', '?')} — {prose(o.get('why', ''), k + ' reference')} "
                          f"Agreement: {str(o.get('agreement', '')).replace('_', ' ')}.")
