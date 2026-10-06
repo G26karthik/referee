@@ -4025,8 +4025,9 @@ def _scope_ok(root: Path, covers: dict) -> None:
     store it: tests that are not about the audit start from one (a check no audit has read supports no Verified)."""
     sha = lambda cid: (lambda r: r.get("script_sha256") or r.get("command") or "")(
         state.read_json(root / "checks" / cid / "check.json", {}) or {})
-    rec = {"forms": {}, "checks": {cid: {"script": sha(cid), "covers": {s: {"how": "computed", "code": "x"} for s in items},
-                                         "exact": [], "witness": False, "outputs": []} for cid, items in covers.items()}}
+    rec = report.sealed_record(root, "scope") or {"forms": {}, "checks": {}}
+    rec["checks"].update({cid: {"script": sha(cid), "covers": {s: {"how": "computed", "code": "x"} for s in items},
+                                "exact": [], "witness": False, "outputs": []} for cid, items in covers.items()})
     state.write_json(root / "sealed" / "scope.json", rec)
     seals = state.read_json(root / "seals.json", {}) or {}
     seals["scope"] = state.sha256((root / "sealed" / "scope.json").read_bytes())
@@ -4034,7 +4035,10 @@ def _scope_ok(root: Path, covers: dict) -> None:
 
 
 def _audit_ok(cfg, pid, td, cid):
-    """An independent audit that finds the failure stands (the quote it relies on re-found)."""
+    """An independent audit that finds the failure stands (the quote it relies on re-found), after the scope audit read
+    the check (a certificate's failure is audited once it is known not to be a failed construction)."""
+    plan = report.plan_of(td / pid) or {"checks": []}
+    _scope_ok(td / pid, {cid: next((c.get("covers") or [] for c in plan["checks"] if c["id"] == cid), [])})
     _seal(cfg, pid, f"audit:{cid}", {"verdict": "STANDS", "depends_on": [], "quotes": [THM]}, td)
 
 
@@ -5596,6 +5600,14 @@ def test_an_existence_claim_is_shown_by_a_valid_example_and_a_failed_constructio
     none = certificate([bad()] * 4 + [ok("fixed")] * 4, False, False, witness=True)
     assert none["status"] == "CONSTRUCTION_FAILED" and "changed reading" in none["reason"], none
     assert certificate([bad()] * 4, False, False)["status"] == "COUNTEREXAMPLE_FOUND"     # a universal statement: unchanged
+    # A definition change that applies to every line: an example is about the changed statement unless the printed text
+    # itself holds on it (`literal`); Oct-06 label ranking C9 (as printed, Definition 7 admits no model) vs C2 (8 hold).
+    lit = lambda v, l: {"violated": v, "premises": 1, "literal": l}
+    assert certificate([lit(0, "fails")] * 3, True, False, witness=True)["status"] == "WITNESS_UNDER_CHANGED_READING"
+    o = certificate([lit(0, "holds")] * 2 + [lit(1, "fails")], True, False, witness=True)
+    assert o["status"] == "WITNESS_FOUND" and o["witnesses"] == 2, o
+    assert report._claim_status([{"id": "C9", "kind": "CERTIFICATE", "status": "WITNESS_UNDER_CHANGED_READING",
+                                  "evidence": "PROOF_AUDIT", "deviations": []}], claim_type="theory") == "READING_CHANGED"
     named = [{"violated": 0, "premises": 1, "literal": "undefined", "reading": "zero_based"}] * 3
     o = certificate(named, True, False, witness=True)      # Oct-06 GRACE C3: no example of the PRINTED text was built
     assert o["status"] == "NO_VIOLATION_FOUND" and o["literal"]["undefined"] == 3, o   # its printed state decides

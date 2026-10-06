@@ -235,6 +235,8 @@ def _status_words(c: dict) -> str:
              "NO_VIOLATION_FOUND": "no violation in the tested cases", "COUNTEREXAMPLE_FOUND": "a counterexample was found",
              "PREMISE_NOT_MET": "no tested case met the printed assumptions",
              "VIOLATION_UNDER_CHANGED_READING": "violated only under a changed reading",
+             "WITNESS_FOUND": "valid examples were built", "CONSTRUCTION_FAILED": "the construction gave no valid example",
+             "WITNESS_UNDER_CHANGED_READING": "valid examples only under a changed reading",
              "READINGS_DIFFER": "the readings give different results", "PARTIAL": "only part of the planned runs completed",
              "INCONCLUSIVE": "not decided", "BLOCKED": "not run", "NOT_CHECKABLE": "no approved test",
              "ARITHMETIC_CONSISTENT": "the paper's numbers agree", "ARITHMETIC_CONTRADICTION": "the paper's numbers disagree",

@@ -306,7 +306,8 @@ def _found(cs: list[dict], moved) -> str:
         return "PROOF_GAP_FOUND"             # the paper's construction of an example failed: a gap, never a refutation
     if any(c["status"] == "PREMISE_NOT_MET" for c in cs):
         return "PREMISE_NOT_MET"
-    if any(c["status"] == "VIOLATION_UNDER_CHANGED_READING" or (c["status"] in SUPPORT + FAILURE and moved(c))
+    if any(c["status"] in ("VIOLATION_UNDER_CHANGED_READING", "WITNESS_UNDER_CHANGED_READING")
+           or (c["status"] in SUPPORT + FAILURE and moved(c))
            or (c["status"] == "NO_VIOLATION_FOUND" and (_changed(c) or moved(c))) for c in cs):
         return "READING_CHANGED"
     if any(c["status"] == "NO_VIOLATION_FOUND" for c in cs):

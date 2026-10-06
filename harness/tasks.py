@@ -1125,8 +1125,12 @@ def _audits(x: _Ctx, plan: dict) -> list[dict]:
     failing instances unmasked, looks for a premise the paper states that they miss, a reading of open text, or a choice
     REFEREE supplied that the failure rests on. Like the critic, it can only lower: a failure it finds resting on such a
     thing reads as about a changed claim, never as support, and is shown beside what it rests on (invariant 16)."""
+    read = set(((x.sealed("scope") or {}).get("checks") or {})) | set(((x.sealed("scope") or {}).get("unaudited") or {}))
+    # a certificate's failure is audited once the scope audit said whether it builds examples (a failed construction is
+    # no counterexample, and needs no audit)
     return [_audit_task(x, c) for c in plan["checks"]
-            if report.needs_audit(x.root, c) and x.sealed(f"audit:{c['id']}") is None]
+            if (c["kind"] != "CERTIFICATE" or c["id"] in read)
+            and report.needs_audit(x.root, c) and x.sealed(f"audit:{c['id']}") is None]
 
 
 def _audit_task(x: _Ctx, c: dict) -> dict:

@@ -40,7 +40,8 @@ SUPPORT = ("RESOLVED_VERIFIED", "ARITHMETIC_CONSISTENT", "RELATION_HOLDS", "WITN
 # step), never a counterexample and never a failure of the statement (an example may exist that it did not build).
 CONSTRUCTION_FAILED = "CONSTRUCTION_FAILED"
 FAILURE = ("FAILED_REPRODUCTION", "COUNTEREXAMPLE_FOUND", "ARITHMETIC_CONTRADICTION", "RELATION_VIOLATED")
-QUALIFIED = ("PREMISE_NOT_MET", "VIOLATION_UNDER_CHANGED_READING")   # neither support nor a falsification
+QUALIFIED = ("PREMISE_NOT_MET", "VIOLATION_UNDER_CHANGED_READING",     # neither support nor a falsification
+             "WITNESS_UNDER_CHANGED_READING")
 # Some measurements completed and are kept (`stages`, `status_on_completed`), but the protocol did
 # not: a stage or a seed failed. Never support, never a failure of the paper.
 PARTIAL = "PARTIAL"
@@ -109,7 +110,7 @@ def certificate(results: list[dict], changed: bool, step: bool, crashed: int = 0
         relabel = ("; the script labels the text as printed 'undefined', but its premise argument (checked by its verifier) "
                    "says a printed premise can never hold: as printed, the premise is not met")
     if witness and groups.get(""):
-        return _witness(results, base, groups, lit, crashed, n, len(fuzzy))
+        return _witness(results, base, groups, lit, crashed, n, len(fuzzy), changed)
     # A witness certificate whose every line is a named (changed) reading built no example of the statement AS PRINTED
     # (Oct-06 GRACE C3: the printed index runs out of the tree, `undefined` in every case): it is decided as any
     # certificate is, so the printed text's own state (undefined, premise not met) decides, never a failed construction.
@@ -162,10 +163,13 @@ def certificate(results: list[dict], changed: bool, step: bool, crashed: int = 0
               "instances only, never a proof", **out)
 
 
-def _witness(results: list[dict], base: list[dict], groups: dict, lit: dict, crashed: int, n: int, fuzzy: int) -> dict:
+def _witness(results: list[dict], base: list[dict], groups: dict, lit: dict, crashed: int, n: int, fuzzy: int,
+             changed: bool = False) -> dict:
     """Examples of an existence statement: the printed reading's instances (the untagged lines) that meet every premise
     and do not violate the property are valid examples; those that meet the premises and violate it are failed
-    constructions. A valid example only under a named (changed) reading is about the changed statement."""
+    constructions. A valid example only under a named (changed) reading is about the changed statement, and so is one
+    built under a claim-changing deviation that applies to every line, unless the printed text itself holds on the
+    instance (`literal` holds: an example as printed)."""
     printed = groups.get("") or []
     valid = [r for r in printed if r.get("premises") == 1 and r.get("violated") == 0]
     failed = [r for r in printed if r.get("premises") == 1 and r.get("violated") == 1]
@@ -179,6 +183,17 @@ def _witness(results: list[dict], base: list[dict], groups: dict, lit: dict, cra
            **({"below_precision": fuzzy} if fuzzy else {})}
     gap = (f"; the construction failed in {len(failed)} case(s) that meet its premises: a gap in the construction, never a "
            "counterexample" if failed else "")
+    if changed and lit["holds"]:
+        out["witnesses"] = lit["holds"]
+        return _r("WITNESS_FOUND", f"{lit['holds']} constructed case(s) are valid examples of the statement as printed "
+                  "(`literal`), beside the recorded change of reading: they show the existence statement for the cases they "
+                  f"cover{gap}", **out)
+    if changed:
+        return _r("WITNESS_UNDER_CHANGED_READING" if valid else "VIOLATION_UNDER_CHANGED_READING",
+                  (f"{len(valid)} valid example(s) only under the recorded change of reading" if valid else
+                   f"no valid example under the recorded change of reading ({len(failed)} failed)")
+                  + "; as printed: " + ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in lit.items() if v)
+                  + ": about the changed statement, never that no example exists", **out)
     if valid:
         return _r("WITNESS_FOUND", f"{len(valid)} of {len(printed)} constructed case(s) meet every premise and show the "
                   f"property as printed: valid examples, which show the existence statement for the cases they cover{gap}", **out)
