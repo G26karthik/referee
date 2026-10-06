@@ -428,11 +428,16 @@ def counts(c: dict) -> dict:
         ind = [c.get("n_independent", c.get("n"))]
     readings = sorted(c.get("readings") or {}) if isinstance(c.get("readings"), dict) else []
     units = len(declared) if declared else len(unit_names)
+    pr = c.get("processes") or {}
     return {"units_declared": units, "units_with_result": with_result, "units_undefined": undef,
             "units_not_completed": missing + len(lost), "units_unaccounted": lost[:20], "readings": readings,
             "comparisons": with_result * max(1, len(readings)), "launches": ex.get("runs_ended", c.get("runs") or 0),
             "launches_planned": ex.get("runs_planned"), "result_lines": len(c.get("values") or []),
             "independent_replicates": min(ind) if ind else None,
+            # the evidence processes started (execution.jsonl), the distinct seeds among them, and the extra launches of
+            # a seed (an infrastructure restart, a retry alone) — never added into one number with the runs above
+            "processes": pr.get("processes"), "seeds": pr.get("seeds"), "retries": pr.get("retries"),
+            "cancelled": pr.get("cancelled"), "datasets": len(c.get("data_identity") or {}),
             # a unit missing beside units that reported is unaccounted; a check that reported none (blocked, failed before
             # any result) has every declared unit missing, which adds up
             "reconciles": units == with_result + undef + missing + len(lost) and not (lost and st)}
@@ -474,9 +479,29 @@ def _counts(stages: dict) -> str:
     return ", ".join(f"{v} {k}" for k, v in sorted(n.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
+def _processes(root: Path) -> dict:
+    """Per check, from its execution records: evidence processes started, distinct seeds, extra launches of a seed
+    (retries), and runs cancelled by the harness or the operator."""
+    f, by = Path(root) / "execution.jsonl", {}
+    for line in f.read_text(encoding="utf-8").splitlines() if f.exists() else []:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("mode") != "evidence" or not r.get("target"):
+            continue
+        b = by.setdefault(r["target"], {"processes": 0, "seeds": set(), "cancelled": 0})
+        b["processes"] += 1
+        b["seeds"].add(str(r.get("seed")))
+        b["cancelled"] += "cancelled" in str(r.get("error") or "")
+    return {k: {"processes": v["processes"], "seeds": len(v["seeds"]), "cancelled": v["cancelled"],
+                "retries": v["processes"] - len(v["seeds"])} for k, v in by.items()}
+
+
 def _checks(root: Path, plan: dict) -> list[dict]:
     central = {k for cc in plan["central_claims"] for k in cc["checks"]}
     audit = (sealed_record(root, "scope") or {}).get("checks") or {}
+    procs = _processes(root)
     out = []
     for c in plan["checks"]:
         cdir = root / "checks" / c["id"]
@@ -510,7 +535,7 @@ def _checks(root: Path, plan: dict) -> list[dict]:
                     **{k: o[k] for k in ("instances", "admissible_instances", "readings_per_instance", "redecided", "witness",
                                          "witnesses", "constructions_failed", "resource_failures", "halted") if k in o},
                     # what an independent audit found the check's code computes (scope items, exact quantities, outputs)
-                    "scope_audit": audit.get(c["id"]),
+                    "scope_audit": audit.get(c["id"]), "processes": procs.get(c["id"]),
                     "image_check": o.get("image_check"), "pilot_values": o.get("pilot_values"), "pilot_stages": o.get("pilot_stages"),
                     "status": o.get("status"), "reason": o.get("reason", ""), "reason_by": o.get("reason_by", "harness"),
                     "rule": o.get("rule") or next((p["rule"] for p in (o.get("stages") or {}).values() if p.get("rule")), ""),

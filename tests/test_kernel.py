@@ -5787,6 +5787,31 @@ def test_a_stale_duplicate_link_never_blocks_data_that_arrived_and_an_archive_ca
             srv.shutdown()
 
 
+def test_every_main_claim_gets_a_slot_and_each_check_states_its_projected_cost():
+    """Oct-06 GRACE K7 had no check 'for want of a slot' while other claims held several, and three runs each spent an
+    hour reaching a per-run limit a planner's estimate would have flagged. One slot per main claim is reserved first; a
+    claim starved for slots beside a claim with several is refused; every check may state its projected cost, recorded
+    as the planner's projection beside the limits of this run (never a reason to shrink it)."""
+    with tempfile.TemporaryDirectory() as t:
+        cfg, pid, x = _x(Path(t))
+        two = [_run("R"), _run("S")]
+        starved = {"quote": MMLU, "claim_type": "performance", "checks": [], "scope": ["MMLU"],
+                   "why_unchecked": "no slot left", "blocker": "cap"}
+        assert "one check slot per main claim" in _refused(lambda: _plan(x, two, [_claim(checks=["R", "S"]), starved]))
+        est = _run(estimate={"minutes_per_run": 43, "runs": 100})
+        rec = _plan(x, [est], [_claim()])
+        e = rec["checks"][0]["estimate"]
+        assert e["feasible"] is False and "check budget" in e["exceeds"] and e["hours"] == 71.67, e
+        ok = _plan(x, [_run(estimate={"minutes_per_run": 1, "runs": 3})], [_claim()])["checks"][0]["estimate"]
+        assert ok["feasible"] is True, ok
+        dfn = _plan(x, [_run(define={"acc_a": {"definition": "top-1 accuracy", "unit": "fraction", "aggregation": "mean over test"}})],
+                    [_claim()])["checks"][0]["define"]
+        assert dfn["acc_a"]["unit"] == "fraction", dfn
+    n = report.counts({"stages": {}, "values": [1.0], "processes": {"processes": 5, "seeds": 3, "retries": 2, "cancelled": 0},
+                       "data_identity": {"a": {}, "b": {}}, "execution": {"runs_ended": 3}})
+    assert (n["processes"], n["seeds"], n["retries"], n["datasets"], n["launches"]) == (5, 3, 2, 2, 3), n
+
+
 if __name__ == "__main__":
     fns = [v for k, v in dict(globals()).items() if k.startswith("test_")]
     for fn in fns:

@@ -603,6 +603,8 @@ def _plan_task(x: _Ctx, tid: str, followup: str) -> dict:
         claims=_claims_text(x), claims_step=_section("plan_steps", "extracted" if extracted else "legacy"),
         host=execute.host_facts(x.cfg), concerns=_concern_lines(x.concerns()), listing=lst,
         max_checks=x.cfg.max_followup_checks if followup else x.cfg.max_checks, followup=followup,
+        limits=(f"{x.cfg.run_timeout_s // 60} min per run (SH_RUN_TIMEOUT_S) and {x.cfg.check_budget_s / 3600:.1f} h per "
+                f"check (SH_CHECK_BUDGET_S; {x.cfg.compat_budget_s // 60} min for a compatibility test)"),
         discover_cmd=find, discover_files_cmd=f"{find} --files", discoveries=_discovery_text(x), max_discoveries=x.cfg.max_discoveries,
         data_search="on" if x.cfg.allow_network and x.cfg.allow_data_search else "OFF (SH_ALLOW_DATA_SEARCH / SH_ALLOW_NETWORK)"),
         (x.root / "paper" / "rows.md",))
@@ -1711,7 +1713,19 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
     # check no (re-found) central claim cites is incidental, is cut before any central one, and must say why
     # no central claim could use its slot; a supporting check is cut before a target one.
     central_ids = {k for cc in claims_in if x.paper.find(str(cc.get("quote") or ""))[0] for k in cc.get("checks") or []}
-    proposed.sort(key=lambda c: (c.get("id") not in central_ids, c.get("role") != "target"))
+    # ...and one target slot per main claim before any claim gets a second check: each claim's first target check is
+    # kept before every other (Oct-06 GRACE K7: no slot was left for a claim the benchmark run could have answered).
+    by_prop = {c.get("id"): c for c in proposed}
+    firsts = {next((k for k in cc.get("checks") or [] if (by_prop.get(k) or {}).get("role") == "target"), None)
+              for cc in claims_in} - {None}
+    proposed.sort(key=lambda c: (c.get("id") not in central_ids, c.get("id") not in firsts, c.get("role") != "target"))
+    starved = [str(cc.get("id") or cc.get("quote"))[:40] for cc in claims_in if not (cc.get("checks") or [])
+               and str(cc.get("blocker") or "") == "cap"]
+    crowded = [str(cc.get("id") or cc.get("quote"))[:40] for cc in claims_in
+               if sum(1 for k in cc.get("checks") or [] if (by_prop.get(k) or {}).get("role") == "target") > 1]
+    if starved and crowded:
+        errors.append(f"main claim(s) {starved} have no check for want of a slot while {crowded} have several: reserve one "
+                      "check slot per main claim first (or link a planned check that computes the claim's quantity)")
     for c in proposed[cap:]:
         dropped.append({"check": c.get("id"), "why": f"over the budget of {cap} checks"})
     # What a check cut by the check budget would have covered is uncovered because of a configured cap, said by the harness
@@ -1763,7 +1777,23 @@ def _seal_plan(x: _Ctx, tid: str, obj: dict, final: bool) -> dict:
                 errs.append(f"{cid}: a compatibility test states its condition as a relation target (e.g. "
                             "\"loss_first - loss_last > 0\")")
         if isinstance(c.get("define"), dict):
-            rec["define"] = {str(k)[:60]: str(v)[:300] for k, v in list(c["define"].items())[:12]}
+            # what each compared output is, carried to the script author, the verifier, the audit and the report: its
+            # definition, unit and aggregation (a legacy plain string is its definition)
+            rec["define"] = {str(k)[:60]: ({f: str(v.get(f) or "")[:300] for f in ("definition", "unit", "aggregation")}
+                                           if isinstance(v, dict) else str(v)[:300]) for k, v in list(c["define"].items())[:12]}
+        est = c.get("estimate") if isinstance(c.get("estimate"), dict) else {}
+        try:
+            mins, n = float(est.get("minutes_per_run") or 0), int(est.get("runs") or 0)
+        except (TypeError, ValueError):
+            mins, n = 0.0, 0
+        if mins > 0 and n > 0:
+            limit = x.cfg.compat_budget_s if rec.get("test") == "compatibility" or c.get("test") == "compatibility" else x.cfg.check_budget_s
+            over = ([f"one run past the per-run limit of {x.cfg.run_timeout_s // 60} min (SH_RUN_TIMEOUT_S)"]
+                    if mins * 60 > x.cfg.run_timeout_s else []) + (
+                [f"{n} runs past the check budget of {limit / 3600:.1f} h"] if mins * 60 * n > limit else [])
+            rec["estimate"] = {"minutes_per_run": mins, "runs": n, "hours": round(mins * n / 60, 2),
+                               "feasible": not over, **({"exceeds": "; ".join(over)} if over else {}),
+                               "by": "the planner (a projection; the timed pilot measures it)"}
         if c.get("readings"):
             if kind == "CERTIFICATE":
                 errs.append(f"{cid}: a CERTIFICATE states another reading of its statement through its deviations and "

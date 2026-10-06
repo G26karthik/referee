@@ -67,7 +67,13 @@ layer AND improves accuracy") is two central claims, each with its own verbatim 
 a test of one never stands for the other.
 
 STEP 2 — CHECKS, at most {{max_checks}}, spent on the central claims FIRST; distinct claims get
-independent checks. A check no central claim lists is INCIDENTAL: propose one only when no
+independent checks. RESERVE ONE SLOT PER MAIN CLAIM before any claim gets a second check: a claim whose
+quantity an experiment you already plan computes (a ranking of gaps that a benchmark run prints, an ADD case of
+an ARL bound) LINKS that check and names the item in its `covers`, never goes unchecked for want of a slot.
+Give every check an `estimate` of the full protocol on the host above: {"minutes_per_run": m, "runs": n}. The
+limits of this run are {{limits}}; a check estimated past them is still planned at the full protocol (never
+shrunk): the harness records your projection, its timed pilot measures it, and a blocker names the limit.
+A check no central claim lists is INCIDENTAL: propose one only when no
 central claim can use the slot, and say why in `incidental_why`. Kinds:
   AUTHOR_CODE    Run the authors' documented command that produces ONE printed number. Only
                  if the repository is the authors' own and documents a command for that exact
@@ -209,7 +215,8 @@ Write ONLY this JSON to the output path you were given:
     "role": "target|supporting (target: it runs the experiment the claim names; supporting: it stands beside it)",
     "basis": "published_results|predictions (RELEASED_DATA only)",
     "test": "performance|compatibility (RECONSTRUCTION only)",
-    "define": {"<output name>": "what the script computes under that name"},
+    "define": {"<output name>": {"definition": "what the script computes under that name (a mean of standard errors is not a variance)", "unit": "", "aggregation": "over what it is pooled or averaged"}},
+    "estimate": {"minutes_per_run": 0, "runs": 0},
     "readings": [],
     "criterion": "stated|supplied (stated: the claim's own sentence states the comparison or number this target encodes; supplied: it states neither — 'describes well', 'is robust' — and YOU chose the relation, rival, baseline or threshold)",
     "concerns": ["contradiction-02"],
