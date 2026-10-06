@@ -498,10 +498,15 @@ def _apply_scope(x: _Ctx, plan: dict) -> None:
 
 def _brief(c: dict) -> dict:
     """What a report writer needs of one check (statuses, numbers, deviations), without the raw value lists."""
-    return {k: c.get(k) for k in ("id", "kind", "role", "claim", "covers", "status", "state", "reason", "rule", "basis",
-                                  "test", "target", "stages", "outputs", "counts", "readings", "fidelity", "deviations",
-                                  "data_identity", "literal", "admissible", "status_on_completed", "data_changed", "audit")
-            if c.get(k) not in (None, "", [], {})}
+    out = {k: c.get(k) for k in ("id", "kind", "role", "claim", "covers", "status", "state", "reason", "rule", "basis",
+                                 "test", "target", "stages", "outputs", "counts", "readings", "fidelity", "deviations",
+                                 "data_identity", "literal", "admissible", "status_on_completed", "data_changed", "audit")
+           if c.get(k) not in (None, "", [], {})}
+    au = c.get("scope_audit") or {}
+    if au:     # what an independent audit found the code computes: each output's definition, unit and aggregation
+        out["computed"] = {"outputs": au.get("outputs") or [], "exact_stages": au.get("exact") or [],
+                           "items": {s: h.get("how") for s, h in (au.get("covers") or {}).items()}}
+    return out
 
 
 def references(x: _Ctx) -> list[dict]:
