@@ -283,6 +283,14 @@ def _by_reading(names: list, staged: list, failed: dict, stage_errors: dict, dec
                  f"every reading gives the same finding in every completed stage [{brief}]", **stages)
         return {**_partial(res, failed, cross if stages else None, extra="; readings: " + brief), **base,
                 **({"readings_differ_in": [name(k) for k in differ]} if differ else {})}
+    overall = {p["status"] for p in per.values()}
+    if differ and len(overall) == 1 and next(iter(overall)) in FAILURE:
+        # Every reading fails (each in some stage): the claim fails under every reading, so the failure stands — and is
+        # audited like any other — with the stages where the readings differ named (Oct-06 label ranking C4: 4 of 10
+        # datasets failed under both readings, and the check read as an open interpretation).
+        return _r(next(iter(overall)), f"every reading fails [{brief}]; the readings differ only in which stages fail "
+                  f"({len(differ)} of {len(cross)} stage(s): {listed})", readings_differ_in=[name(k) for k in differ],
+                  **stages, **base)
     if differ:
         return _r(READINGS_DIFFER, f"the readings give different results on the same runs, data and cohort in "
                   f"{len(differ)} of {len(cross)} stage(s) [{listed}]; which one the paper's number means is for a human "

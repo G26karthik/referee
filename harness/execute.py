@@ -1633,11 +1633,12 @@ def _reconciled(check: dict, st: dict, authorized: bool, why: str, failure: str 
 
 
 def redecide(cfg: state.Config, pid: str, cid: str, why: str) -> dict:
-    """Re-decide a finished certificate from its recorded runs under the current kernel, after a fix of the decision code
-    alone: each evidence run of the approved script (execution.jsonl, its sha) is read again by `cert_rows` and decided by
-    `reconcile.certificate` — no model, no container, nothing re-run; the inputs, script and protocol are unchanged. The
-    earlier outcome is kept beside it (outcome.redecided.N.json) and the new one says what it was, why, and the harness
-    commit that decided it."""
+    """Re-decide a finished check from its recorded runs under the current kernel, after a fix of the decision code
+    alone — no model, no container, nothing re-run; the inputs, script and protocol are unchanged. A certificate: each
+    evidence run of the approved script (execution.jsonl, its sha) is read again by `cert_rows` and decided by
+    `reconcile.certificate`. A script check: the seeds it saved (seeds.jsonl) are folded and decided by the functions a
+    finished check uses. The earlier outcome is kept beside it (outcome.redecided.N.json) and the new one says what it
+    was, why, and the harness commit that decided it."""
     from .reconcile import certificate
     from .reviewer import _harness_commit
     root = state.pdir(cfg, pid)
@@ -1646,10 +1647,30 @@ def redecide(cfg: state.Config, pid: str, cid: str, why: str) -> dict:
         o, c = state.read_json(cdir / "outcome.json"), state.read_json(cdir / "check.json")
         if not o or not c:
             return {"error": f"{cid} has no finished outcome"}
-        if c.get("kind") != "CERTIFICATE":
-            return {"error": "only a certificate is re-decided from its records (tools/replay.py re-decides script checks)"}
+        if c.get("kind") not in ("CERTIFICATE", "RELEASED_DATA", "RECONSTRUCTION"):
+            return {"error": "only a certificate or a script check is re-decided from its records"}
         if o.get("status") in ("BLOCKED", "NOT_CHECKABLE") or o.get("authorized") is False:
             return {"error": f"{cid} ended {o.get('status')}: nothing was decided from runs"}
+        k = 1 + len(list(cdir.glob("outcome.redecided.*.json")))
+        stamp = lambda n: {"was": {x: o.get(x) for x in ("status", "reason", "n", "literal", "admissible")},
+                           "why": why[:300], "at": state.now(), "harness": _harness_commit(), "records": n}
+        if c["kind"] != "CERTIFICATE":
+            # The seeds it saved, folded and decided by the very functions a finished check uses (as tools/replay.py).
+            st: dict = {}
+            reuse_checkpoints(root, cdir, c, st)
+            if not st.get("done_seeds"):
+                return {"error": f"{cid}: no saved seed of the approved script"}
+            new = _reconciled(c, st, True, o.get("authorization", ""), failure="")
+            kept = ("check", "kind", "evidence", "authorized", "authorization", "commit", "values", "runs", "records",
+                    "finished_at", "revisable", "protocol", "execution", "test", "basis", "stochastic", "reading_defs",
+                    "completed_stages", "reused_seeds", "data_identity", "stage_times", "peak_mb", "units", "undefined",
+                    "data", "environment", "setup_error", "setup_log")
+            shutil.copyfile(cdir / "outcome.json", cdir / f"outcome.redecided.{k}.json")
+            state.write_json(cdir / "outcome.json", {**{x: o[x] for x in kept if x in o}, **new,
+                                                     "redecided": stamp(len(st["done_seeds"]))})
+            state.append_jsonl(root / "log.jsonl", {"event": "redecide", "check": cid, "was": o.get("status"),
+                                                    "now": new["status"], "why": why[:300]})
+            return {"redecided": cid, "was": o.get("status"), "status": new["status"]}
         log = root / "execution.jsonl"
         recs: dict = {}
         for r in map(json.loads, log.read_text(encoding="utf-8").splitlines() if log.exists() else []):
@@ -1665,14 +1686,12 @@ def redecide(cfg: state.Config, pid: str, cid: str, why: str) -> dict:
                 rows += cert_rows(recs[seed].get("stdout") or "")
         new = certificate(rows, any(d.get("changes_claim") for d in c.get("deviations") or []), bool(c.get("step")),
                           crashed=crashed)
-        k = 1 + len(list(cdir.glob("outcome.redecided.*.json")))
         shutil.copyfile(cdir / "outcome.json", cdir / f"outcome.redecided.{k}.json")
         decided = ("status", "reason", "rule", "n", "instances", "admissible", "admissible_instances", "readings_per_instance",
                    "violated_admissible", "reading", "literal", "premises_unsaid", "under_named_reading", "below_precision",
                    "crashed", "values")
         out = {**{x: v for x, v in o.items() if x not in decided}, **new, "values": [r["violated"] for r in rows],
-               "redecided": {"was": {x: o.get(x) for x in ("status", "reason", "n", "literal", "admissible")},
-                             "why": why[:300], "at": state.now(), "harness": _harness_commit(), "records": len(recs)}}
+               "redecided": stamp(len(recs))}
         state.write_json(cdir / "outcome.json", out)
         state.append_jsonl(root / "log.jsonl", {"event": "redecide", "check": cid, "was": o.get("status"),
                                                 "now": new["status"], "why": why[:300]})

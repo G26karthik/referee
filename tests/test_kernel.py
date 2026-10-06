@@ -2824,7 +2824,10 @@ def test_readings_are_decided_per_stage_over_the_union_of_stages():
     hidden = [["s1", 1, "paper"], ["s2", 1, "paper"], ["s3", -1, "paper"],
               ["s1", 1, "code"], ["s2", -1, "code"], ["s3", 1, "code"]]
     h = dec(hidden)
-    assert h["status"] == READINGS_DIFFER and "s2" in h["reason"] and "s3" in h["reason"] and "s1" not in h["reason"], h
+    # Oct-06 label ranking C4: both readings fail (each in some stage), so the claim fails under every reading — the
+    # failure stands (and is audited) with the stages where they differ named, never read as an open interpretation.
+    assert h["status"] == "RELATION_VIOLATED" and h["readings_differ_in"] == ["s2", "s3"], h
+    assert "every reading" in h["reason"] and "s2" in h["reason"] and "s3" in h["reason"] and "s1" not in h["reason"], h
     assert h["readings"]["paper"]["stages"]["s3"]["status"] == "RELATION_VIOLATED"
     assert h["readings"]["code"]["stages"]["s2"]["status"] == "RELATION_VIOLATED"   # every reading's own table is kept
     assert h["stages"]["s1"]["status"] == "RELATION_HOLDS" and h["stages"]["s2"]["status"] == READINGS_DIFFER
@@ -2933,6 +2936,31 @@ def test_certificate_counts_are_instances_and_a_finished_one_is_redecided_from_i
         assert new["literal"]["fails"] == 12 and new["redecided"]["was"]["literal"] == {"holds": 24, "fails": 36}, new
         assert (cdir / "outcome.redecided.1.json").exists() and new["runs"] == 20 and new["execution"]["runs_ended"] == 20
         assert "error" in execute.redecide(cfg, pid, "C9", "no such check")
+
+
+def test_a_finished_script_check_is_redecided_from_its_saved_seeds():
+    """After a fix of the decision rules alone, a finished RELEASED_DATA / RECONSTRUCTION check is decided again from
+    the seeds it saved (seeds.jsonl), by the very function a finished check uses: no model, no container, nothing re-run.
+    The earlier outcome is kept beside it; fields that are not the decision (execution, data identity) stay."""
+    with tempfile.TemporaryDirectory() as t:
+        cfg, pid, root = _ready(Path(t))
+        cdir = root / "checks" / "C1"
+        cdir.mkdir(parents=True, exist_ok=True)
+        chk = {"id": "C1", "kind": "RELEASED_DATA", "script_sha256": "s", "runs": 1, "stochastic": None, "deviations": [],
+               "target": {"relation": "x >= 0", "names": ["x"]}, "readings": [{"name": "paper", "source": "paper"},
+                                                                         {"name": "code", "source": "a.py"}]}
+        state.write_json(cdir / "check.json", chk)
+        staged = [["s1", 1, "paper"], ["s2", 1, "paper"], ["s3", -1, "paper"], ["s1", 1, "code"], ["s2", -1, "code"], ["s3", 1, "code"]]
+        state.append_jsonl(cdir / "seeds.jsonl", {"key": "s", "seed": 0, "values": [e[1] for e in staged], "staged": staged,
+                                                  "seconds": 5, "error": "", "units": ["s1", "s2", "s3"], "detail": []})
+        old = {"check": "C1", "kind": "RELEASED_DATA", "status": READINGS_DIFFER, "authorized": True, "values": [1] * 6,
+               "data_identity": {"d": {"matches": True}}, "execution": {"runs_planned": 1, "runs_ended": 1}}
+        state.write_json(cdir / "outcome.json", old)
+        res = execute.redecide(cfg, pid, "C1", "every failing reading is a failure (test)")
+        new = state.read_json(cdir / "outcome.json")
+        assert res["status"] == new["status"] == "RELATION_VIOLATED" and new["readings_differ_in"] == ["s2", "s3"], new
+        assert new["data_identity"] == old["data_identity"] and new["redecided"]["was"]["status"] == READINGS_DIFFER
+        assert (cdir / "outcome.redecided.1.json").exists()
 
 
 def _replay():
