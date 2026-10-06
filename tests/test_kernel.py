@@ -4984,6 +4984,14 @@ def test_each_reading_shows_its_numbers_and_an_audit_says_what_a_failure_depends
         page = reviewer.render(types.SimpleNamespace(root=Path(t), paper=Paper(["It correlates strongly."])), led, None)
         assert page.count("compared: `tau_fs_min > tau_mp_max`") == 1 and "chosen by REFEREE" in page, page
         assert page.count("settings: 9 decided") == 1, page                          # the summary is not printed twice
+    grouped = {**c6, "readings": {r: {"status": "RELATION_HOLDS", "stages": {f"s{i}": {"status": "RELATION_HOLDS", "margin": 1,
+                                                                                      "n": 1} for i in range(5)}}
+                                  for r in ("paper", "code")}, "outputs": {}}
+    text = "\n".join(reviewer.result_rows(grouped, limit=6))
+    assert "settings under reading code: 5 decided" in text and "[code]" not in text, text   # readings named in words
+    one = "\n".join(reviewer.result_rows({"kind": "CERTIFICATE", "values": [0, 0], "instances": 1, "readings_per_instance": 2,
+                                          "admissible_instances": 1}))
+    assert "- 1 case (" in one, one
     bare = {**c6, "readings": {}, "outputs": {}, "stages": {"a": {"status": "RELATION_HOLDS", "margin": 0.5, "band": 0.1, "n": 3}}}
     t2 = [r for r in reviewer.result_rows(bare) if r.startswith("|")]
     assert len({r.count("|") for r in t2}) == 1 and "0.5 ± 0.1" in t2[-1], t2         # no outputs: still one width

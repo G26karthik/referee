@@ -215,7 +215,7 @@ def result_rows(c: dict, limit: int = _ROWS) -> list[str]:
         cases = c.get("instances") or n                     # older records: one line per case
         k = c.get("readings_per_instance") or 1
         if n:
-            lines.append(f"- {cases} cases" + (f" ({n} result lines: each case under {k} readings)" if k > 1 else "")
+            lines.append(f"- {cases} case{'s' if cases != 1 else ''}" + (f" ({n} result lines: each case under {k} readings)" if k > 1 else "")
                          + f"; {c.get('admissible_instances', c.get('admissible', 0))} met every assumption of the tested reading"
                          + ("; as printed: " + ", ".join(f"{v} {words.get(x, x)}" for x, v in lit.items()) if lit else ""))
         return lines
@@ -247,14 +247,15 @@ def result_rows(c: dict, limit: int = _ROWS) -> list[str]:
     elif st:
         groups: dict = {}
         for s, p in decided.items():
-            r = s[s.rfind(" ["):] if by_reading else ""             # a reading is never pooled with another
-            groups.setdefault((_group(s) + r).strip(), []).append(p)
-        for g, ps in sorted(groups.items()):
+            r = s[s.rfind(" [") + 2:-1] if by_reading else ""       # a reading is never pooled with another
+            groups.setdefault((_group(s), r), []).append(p)
+        for (g, r), ps in sorted(groups.items()):
             ms = sorted(p["margin"] for p in ps if isinstance(p.get("margin"), (int, float)))
             by: dict = {}
             for p in ps:
                 by[p["status"]] = by.get(p["status"], 0) + 1
-            lines.append(f"- {'settings ' + repr(g) if g else 'settings'}: {len(ps)} decided — " + ", ".join(
+            label = ("settings " + repr(g) if g else "settings") + (f" under reading {r}" if r else "")
+            lines.append(f"- {label}: {len(ps)} decided — " + ", ".join(
                 f"{v} {k.lower().replace('_', ' ')}" for k, v in sorted(by.items(), key=lambda kv: -kv[1]))
                 + (f"; margin median {fmt(ms[len(ms) // 2])}, range {fmt(ms[0])} to {fmt(ms[-1])}" if ms else ""))
     elif isinstance(c.get("values"), list) and c["values"] and t.get("value"):
