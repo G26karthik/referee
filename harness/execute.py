@@ -1302,7 +1302,7 @@ def poll(cfg: state.Config, pid: str, cid: str) -> bool:
         fly["-1" if st["stage"] == "prepare" else str(st["seed"])] = st["rec"]
         st.setdefault("next", st["seed"] + (st["stage"] == "run"))
     st["rec"] = None
-    st.setdefault("next", st.get("seed", 0))
+    st.setdefault("next", 0)        # the loop below skips finished seeds; a resumed check's lost seed may lie below them
     runs, width = max(int(check.get("runs") or 1), int(st.get("runs_extended") or 0)), 1 if kind == "AUTHOR_CODE" else max(1, cfg.parallel)
     timeout = cfg.install_timeout_s if st["stage"] == "prepare" else cfg.run_timeout_s
     for key, rec in sorted(fly.items(), key=lambda kv: int(kv[0])):
