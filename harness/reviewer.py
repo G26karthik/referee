@@ -445,7 +445,10 @@ def allowed_numbers(record, *texts: str) -> list[float]:
     return sorted(vals)
 
 
-_MARKUP = re.compile(r"<[A-Za-z/!]|&#?\w+;")
+# an HTML tag by name, a comment or an entity — never an inequality such as t_F<t_H or x<y>z
+_MARKUP = re.compile(r"(?i)</?(?:a|b|i|u|s|em|strong|span|div|p|br|hr|img|script|style|sub|sup|table|tr|td|th|ul|ol|li|"
+                     r"h[1-6]|font|iframe|code|pre|details|summary|svg|math|object|embed|link|meta|form|input|button)\b[^<>]*>"
+                     r"|<!--|&#?\w+;")
 
 
 _ATTRIBUTED = re.compile(r"(?i)^\s*the (?:other )?records?\b")

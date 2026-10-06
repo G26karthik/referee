@@ -5329,7 +5329,10 @@ def test_prose_cannot_slip_a_status_word_a_number_or_markup_past_the_checks():
     assert not ok("The count was 9000.")                                         # '9e3' in a string is no number held
     assert ok("At threshold 316.2 the gap held.")                                # a stage name's number is held
     assert not ok("The result was &#114;eproduced.") and not ok("<b>bold</b> claim")
+    assert not ok("<script src=x>") and not ok("a &amp; b") and not ok("<!-- hidden -->")
     assert ok("Two of five settings ran.")
+    # Oct-06 changepoint K6: "the printed premise t_F<t_H" is mathematics, not a tag
+    assert ok("The printed premise t_F<t_H fails while H(t)>=F holds, and x<y>z is an inequality.")
 
 
 def test_follow_up_claims_keep_their_own_entries_and_never_reuse_an_id():
