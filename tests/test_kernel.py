@@ -16,6 +16,8 @@ import types
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# The kernel tests never read a host's settings file (referee.env): its gates, budgets and projects folder would leak in.
+os.environ["SH_ENV_FILE"] = str(Path(tempfile.gettempdir()) / "referee-tests-no-settings.env")
 
 from harness import discover, execute, independence, report, state, tasks  # noqa: E402
 from harness.evidence import Paper, evaluate, interval, value_in  # noqa: E402
@@ -5741,6 +5743,7 @@ def test_settings_come_from_one_file_and_each_project_records_the_ones_it_ran_un
         tasks._record_settings(cfg, root)
         ev = [json.loads(ln) for ln in (root / "log.jsonl").read_text(encoding="utf-8").splitlines()]
         assert [e["event"] for e in ev] == ["settings", "settings"] and ev[1]["check_budget_s"] == 43200, ev
+        assert ev[1]["host"]["parallel"] >= 1 and "gpus" in ev[1]["host"], ev[1]                # what the host gave
     real = execute.cpu_mem
     try:
         execute.cpu_mem = lambda: (64, 256_000)

@@ -1309,6 +1309,8 @@ def _record_settings(cfg: state.Config, root: Path) -> None:
     the log): a run resumed under another budget or cap says which applied when."""
     now = {k: (list(v) if isinstance(v, tuple) else v if isinstance(v, (bool, int, float, str)) else str(v))
            for k, v in vars(cfg).items() if k not in ("projects", "python")}
+    # what the host gave: runs at once (SH_PARALLEL, or sized from the host) and the GPUs found (cached; never probed here)
+    now["host"] = {"parallel": execute.parallel(cfg), "gpus": state.read_json(cfg.projects / ".gpu.json")}
     if state.read_json(root / "settings.json") != now:
         state.write_json(root / "settings.json", now)
         state.append_jsonl(root / "log.jsonl", {"event": "settings", **now})
